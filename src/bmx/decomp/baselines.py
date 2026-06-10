@@ -1,7 +1,6 @@
 """Baseline decompositions: per-slice SVD, CP-ALS, Tucker/HOOI, shared-factor
 Tucker (TensorLLM's operator: shared mode-0/1 factors, per-slice cores)."""
 
-import numpy as np
 import tensorly as tl
 import torch
 from tensorly.decomposition import parafac, partial_tucker, tucker
@@ -9,15 +8,9 @@ from tensorly.tenalg import multi_mode_dot
 
 from bmx.decomp.base import FitResult, register
 
-tl.set_backend("numpy")
-
-
-def _np(T: torch.Tensor) -> np.ndarray:
-    return T.detach().cpu().numpy()
-
-
-def _back(x: np.ndarray, like: torch.Tensor) -> torch.Tensor:
-    return torch.as_tensor(x, dtype=like.dtype, device=like.device)
+# PyTorch backend: tensorly fits run on whatever device/dtype T lives on,
+# so CP/Tucker baselines ride the GPU alongside BMD-RALS on VM sweeps.
+tl.set_backend("pytorch")
 
 
 class SliceSVDFit(FitResult):
@@ -66,10 +59,8 @@ class DenseFit(FitResult):
 def fit_cp(T: torch.Tensor, rank: int, *, n_iter_max: int = 500, seed: int = 0):
     m, p, n = T.shape
     r = int(rank)
-    cp = parafac(
-        _np(T), rank=r, n_iter_max=n_iter_max, init="random", random_state=seed
-    )
-    rec = _back(tl.cp_to_tensor(cp), T)
+    cp = parafac(T, rank=r, n_iter_max=n_iter_max, init="random", random_state=seed)
+    rec = tl.cp_to_tensor(cp)
     fit = DenseFit("cp", r, rec, r * (m + p + n))
     fit.loss_history = [fit.relative_error(T)]
     return fit
@@ -84,8 +75,8 @@ def fit_tucker(T: torch.Tensor, rank, *, n_iter_max: int = 200, seed: int = 0):
     )
     # tucker() returns a TuckerTensor (namedtuple-like): TuckerTensor[0]=core,
     # TuckerTensor[1]=factors — standard (core, factors) unpack works correctly.
-    core, factors = tucker(_np(T), rank=[R1, R2, R3], n_iter_max=n_iter_max, init="svd")
-    rec = _back(tl.tucker_to_tensor((core, factors)), T)
+    core, factors = tucker(T, rank=[R1, R2, R3], n_iter_max=n_iter_max, init="svd")
+    rec = tl.tucker_to_tensor((core, factors))
     n_params = m * R1 + p * R2 + n * R3 + R1 * R2 * R3
     fit = DenseFit("tucker", (R1, R2, R3), rec, n_params)
     fit.loss_history = [fit.relative_error(T)]
@@ -105,10 +96,10 @@ def fit_shared_tucker(T: torch.Tensor, rank, *, n_iter_max: int = 200):
     # core=(core_array, factors_list) and factors=[err_scalars].
     # Correct unpack: unwrap result[0] to get core and factors.
     result = partial_tucker(
-        _np(T), rank=[R1, R2], modes=[0, 1], n_iter_max=n_iter_max, init="svd"
+        T, rank=[R1, R2], modes=[0, 1], n_iter_max=n_iter_max, init="svd"
     )
     core, factors = result[0]
-    rec = _back(multi_mode_dot(core, factors, modes=[0, 1]), T)
+    rec = multi_mode_dot(core, factors, modes=[0, 1])
     n_params = m * R1 + p * R2 + n * R1 * R2
     fit = DenseFit("shared_tucker", (R1, R2), rec, n_params)
     fit.loss_history = [fit.relative_error(T)]

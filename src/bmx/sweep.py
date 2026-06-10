@@ -17,6 +17,7 @@ def decomp_sweep(
     plan: dict[str, list],
     fit_opts: dict[str, dict] | None = None,
     extra_cols: dict | None = None,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     fit_opts = fit_opts or {}
     extra_cols = extra_cols or {}
@@ -34,6 +35,11 @@ def decomp_sweep(
                 if fit.loss_history
                 else fit.relative_error(stack.tensor)
             )
+            if verbose:
+                print(
+                    f"    {method} rank={rank}: re={rel_error:.4f} ({seconds:.1f}s)",
+                    flush=True,
+                )
             row = {
                 "model": stack.model,
                 "layer": stack.layer,

@@ -22,6 +22,7 @@ class Config:
     layers: tuple[int, ...] = tuple(range(12))
     objects: tuple[str, ...] = ("wqk", "wov")  # also: raw_q raw_k raw_v raw_o
     dtype: str = "float32"
+    device: str = "cpu"  # "cuda" on the VM; BMD + tensorly baselines follow
     null_seed: int | None = None  # set to apply the permutation null (a3)
     bmd_iters: int = 200
     bmd_check_every: int = 5  # sample the dense error check during long fits
@@ -62,7 +63,9 @@ def main(cfg: Config) -> None:
     for layer in cfg.layers:
         for obj in cfg.objects:
             stack = stack_by_name(sd, layer, meta["n_head"], obj, model=cfg.model_name)
-            stack.tensor = stack.tensor.to(getattr(torch, cfg.dtype))
+            stack.tensor = stack.tensor.to(
+                dtype=getattr(torch, cfg.dtype), device=cfg.device
+            )
             null_seed = None if cfg.null_seed is None else cfg.null_seed + layer
             if null_seed is not None:
                 stack.tensor, _ = permutation_null(stack.tensor, seed=null_seed)
@@ -77,6 +80,7 @@ def main(cfg: Config) -> None:
                 },
                 # always present so a2 and a3 parquet share one schema
                 extra_cols={"null_seed": null_seed},
+                verbose=True,
             )
             frames.append(df)
             print(f"layer {layer} {obj}: {len(df)} fits done")

@@ -25,10 +25,12 @@ def _random_orthogonal_batch(count: int, dim: int, g, dtype):
 
 def permutation_null(T: torch.Tensor, seed: int):
     m, p, n = T.shape
+    # Rotations are generated on CPU so the transform is a function of the
+    # seed alone (identical across CPU/GPU runs), then moved to T's device.
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(n, generator=g)
-    Q = _random_orthogonal_batch(n, m, g, T.dtype)
-    R = _random_orthogonal_batch(n, p, g, T.dtype)
+    Q = _random_orthogonal_batch(n, m, g, T.dtype).to(T.device)
+    R = _random_orthogonal_batch(n, p, g, T.dtype).to(T.device)
     X = T[:, :, perm].permute(2, 0, 1)  # (n, m, p)
     Y = Q @ X @ R.mT  # slice k -> Q_k T[:,:,perm_k] R_k^T
     return Y.permute(1, 2, 0).contiguous(), NullTransform(seed, perm, Q, R)
