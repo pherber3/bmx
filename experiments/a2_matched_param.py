@@ -83,8 +83,10 @@ def main(cfg: Config) -> None:
                 verbose=True,
             )
             frames.append(df)
-            print(f"layer {layer} {obj}: {len(df)} fits done")
-    write_metrics(run, pd.concat(frames, ignore_index=True))
+            # Rewrite after every block so a mid-sweep crash loses at most
+            # one layer/object of fits.
+            write_metrics(run, pd.concat(frames, ignore_index=True))
+            print(f"layer {layer} {obj}: {len(df)} fits done", flush=True)
     print(f"-> {run}")
 
 

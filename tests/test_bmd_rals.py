@@ -74,3 +74,22 @@ def test_tuple_init_shape_mismatch_raises():
     T, (A, B, C) = bm_rank_tensor(8, 7, 5, ell=2, seed=0)
     with pytest.raises(AssertionError):
         fit_bmd_rals(T, rank=3, init=(A, B, C))  # rank-2 factors, rank=3
+
+
+def test_auto_ridge_survives_singular_large_scale_blocks():
+    """Regression: the GPU auto-ridge path crashed mid-sweep with 'singular
+    matrix' because an absolute epsilon vanished against large-magnitude
+    blocks. Rank-deficient H blocks at scale 1e4, fp32, must solve."""
+    from bmx.decomp.bmd_rals import _solve_middle
+
+    torch.manual_seed(0)
+    m, p, n, ell = 4, 3, 6, 2
+    scale = 1e4
+    F1 = torch.randn(m, ell, n, dtype=torch.float32) * scale
+    F3 = torch.randn(ell, p, n, dtype=torch.float32) * scale
+    F1[:, 1, :] = F1[:, 0, :]  # duplicate component -> exactly singular blocks
+    F3[1] = F3[0]
+    T = torch.randn(m, p, n, dtype=torch.float32) * scale**2
+    sol = _solve_middle(T, F1, F3, lam=0.0, auto_ridge=True)
+    assert torch.isfinite(sol).all()
+    assert sol.shape == (m, p, ell)
