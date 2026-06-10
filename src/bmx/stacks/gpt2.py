@@ -35,7 +35,7 @@ def _per_head(sd: dict, layer: int, n_head: int):
     v = Wv.reshape(d, n_head, dh).permute(0, 2, 1)
     Wo = sd[f"transformer.h.{layer}.attn.c_proj.weight"]
     o = Wo.reshape(n_head, dh, d)  # o[h] = W_O^h : (d_head, d)
-    return q, k, v, o, d, dh
+    return q, k, v, o
 
 
 def raw_stack(sd: dict, layer: int, n_head: int, which: str, model="gpt2") -> Stack:
@@ -44,7 +44,7 @@ def raw_stack(sd: dict, layer: int, n_head: int, which: str, model="gpt2") -> St
     Note: which="o" stores W_O^h TRANSPOSED (slice h is W_O^h.T, (d, d_head))
     so all four stacks share one shape; transpose back before using as W_O.
     """
-    q, k, v, o, d, dh = _per_head(sd, layer, n_head)
+    q, k, v, o = _per_head(sd, layer, n_head)
     tensors = {"q": q, "k": k, "v": v, "o": o.permute(2, 1, 0)}  # o -> (d, dh, h)
     assert which in tensors, f"which must be one of {sorted(tensors)}"
     return Stack(
@@ -57,7 +57,7 @@ def raw_stack(sd: dict, layer: int, n_head: int, which: str, model="gpt2") -> St
 
 
 def circuit_stack(sd: dict, layer: int, n_head: int, kind: str, model="gpt2") -> Stack:
-    q, k, v, o, d, dh = _per_head(sd, layer, n_head)
+    q, k, v, o = _per_head(sd, layer, n_head)
     if kind == "wqk":
         T = torch.einsum("ich,jch->ijh", q, k)  # W_Q^h @ W_K^h.T
     elif kind == "wov":
@@ -69,7 +69,7 @@ def circuit_stack(sd: dict, layer: int, n_head: int, kind: str, model="gpt2") ->
 
 def w_all_4d(sd: dict, layer: int, n_head: int, model="gpt2") -> Stack:
     """TensorLLM's object: (d_model, d_head, matrix-type[Q,K,V,O^T], head)."""
-    q, k, v, o, d, dh = _per_head(sd, layer, n_head)
+    q, k, v, o = _per_head(sd, layer, n_head)
     T = torch.stack([q, k, v, o.permute(2, 1, 0)], dim=2)
     return Stack(
         T.contiguous(),
@@ -78,3 +78,19 @@ def w_all_4d(sd: dict, layer: int, n_head: int, model="gpt2") -> Stack:
         "w_all",
         ("d_model", "d_head", "matrix_type", "head"),
     )
+
+
+def stack_by_name(
+    sd: dict, layer: int, n_head: int, obj: str, model: str = "gpt2"
+) -> Stack:
+    """Object-name dispatch shared by experiments and (later) eval.layer_swap.
+
+    Accepts 'wqk', 'wov', 'w_all', or 'raw_q'/'raw_k'/'raw_v'/'raw_o'.
+    """
+    if obj.startswith("raw_"):
+        return raw_stack(sd, layer, n_head, which=obj.removeprefix("raw_"), model=model)
+    if obj in ("wqk", "wov"):
+        return circuit_stack(sd, layer, n_head, kind=obj, model=model)
+    if obj == "w_all":
+        return w_all_4d(sd, layer, n_head, model=model)
+    raise ValueError(f"unknown stack object {obj!r}")

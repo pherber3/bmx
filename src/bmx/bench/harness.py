@@ -12,6 +12,7 @@ from bmx.bench.factored_matvec import (
     factored_matvec,
     factored_matvec_compiled,
 )
+from bmx.decomp.ops import bmd_param_count
 from bmx.stacks.synthetic import random_bmd_factors
 
 
@@ -85,9 +86,8 @@ def run_cases(
                 "device": device,
                 "model_bytes_dense": case.h * case.m * case.p * esize,
                 "model_bytes_factored": (
-                    case.ell * case.m * case.p + case.ell * (case.m + case.p) * case.h
-                )
-                * esize,
+                    bmd_param_count(case.m, case.p, case.h, case.ell) * esize
+                ),
                 "flops": (
                     dense_flops if case.impl == "dense" else case.ell * dense_flops
                 ),

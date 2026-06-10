@@ -71,8 +71,6 @@ def test_registered():
 
 
 def test_tuple_init_shape_mismatch_raises():
-    import pytest
-
     T, (A, B, C) = bm_rank_tensor(8, 7, 5, ell=2, seed=0)
     with pytest.raises(AssertionError):
         fit_bmd_rals(T, rank=3, init=(A, B, C))  # rank-2 factors, rank=3

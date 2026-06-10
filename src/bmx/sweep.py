@@ -19,6 +19,7 @@ def decomp_sweep(
     extra_cols: dict | None = None,
 ) -> pd.DataFrame:
     fit_opts = fit_opts or {}
+    extra_cols = extra_cols or {}
     rows = []
     for method, ranks in plan.items():
         fn = get_method(method)
@@ -26,18 +27,26 @@ def decomp_sweep(
             t0 = time.perf_counter()
             fit = fn(stack.tensor, rank, **fit_opts.get(method, {}))
             seconds = time.perf_counter() - t0
-            rows.append(
-                {
-                    "model": stack.model,
-                    "layer": stack.layer,
-                    "object": stack.object_name,
-                    "method": method,
-                    "rank": str(rank),
-                    "params": fit.param_count(),
-                    "rel_error": fit.relative_error(stack.tensor),
-                    "seconds": seconds,
-                    "n_iters": len(fit.loss_history),
-                }
-                | (extra_cols or {})
+            # Every fit records its final relative error in loss_history;
+            # reusing it avoids a second dense reconstruction per fit.
+            rel_error = (
+                fit.loss_history[-1]
+                if fit.loss_history
+                else fit.relative_error(stack.tensor)
             )
+            row = {
+                "model": stack.model,
+                "layer": stack.layer,
+                "object": stack.object_name,
+                "method": method,
+                "rank": str(fit.rank),  # the fit's own rank, not the plan entry
+                "params": fit.param_count(),
+                "rel_error": rel_error,
+                "seconds": seconds,
+                "n_iters": len(fit.loss_history),
+                "solver": getattr(fit, "solver", ""),
+            }
+            collisions = extra_cols.keys() & row.keys()
+            assert not collisions, f"extra_cols would override {sorted(collisions)}"
+            rows.append(row | extra_cols)
     return pd.DataFrame(rows)

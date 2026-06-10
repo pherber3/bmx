@@ -12,7 +12,7 @@ def random_bmd_factors(
     ell: int,
     seed: int,
     dtype: torch.dtype = torch.float64,
-    device: str = "cpu",
+    device: "str | torch.device" = "cpu",
 ):
     g = torch.Generator(device="cpu").manual_seed(seed)
     A = torch.randn(m, ell, n, generator=g, dtype=dtype)

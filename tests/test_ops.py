@@ -1,14 +1,11 @@
 import torch
 
 from bmx.decomp.ops import bmp, cyclic_transpose, cyclic_transpose_inv
+from bmx.stacks.synthetic import random_bmd_factors
 
 
-def _factors(m=4, p=3, n=5, ell=2, seed=0, dtype=torch.float64):
-    g = torch.Generator().manual_seed(seed)
-    A = torch.randn(m, ell, n, generator=g, dtype=dtype)
-    B = torch.randn(m, p, ell, generator=g, dtype=dtype)
-    C = torch.randn(ell, p, n, generator=g, dtype=dtype)
-    return A, B, C
+def _factors(m=4, p=3, n=5, ell=2, seed=0):
+    return random_bmd_factors(m, p, n, ell, seed)
 
 
 def test_bmp_shape():

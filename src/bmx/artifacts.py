@@ -27,7 +27,8 @@ def git_sha() -> str:
 
 
 def create_run(experiment: str, config, root="results") -> Path:
-    run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{git_sha()}"
+    sha = git_sha()
+    run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{sha}"
     run = Path(root) / experiment / run_id
     run.mkdir(parents=True, exist_ok=False)
 
@@ -40,7 +41,7 @@ def create_run(experiment: str, config, root="results") -> Path:
     (run / "config.json").write_text(json.dumps(cfg, indent=2, default=str))
 
     env = {
-        "git_sha": git_sha(),
+        "git_sha": sha,
         "python": platform.python_version(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,

@@ -11,7 +11,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.stacks.gpt2 import circuit_stack, load_gpt2_state, raw_stack
+from bmx.stacks.gpt2 import load_gpt2_state, stack_by_name
 from bmx.stacks.null import permutation_null
 from bmx.sweep import decomp_sweep
 
@@ -22,8 +22,9 @@ class Config:
     layers: tuple[int, ...] = tuple(range(12))
     objects: tuple[str, ...] = ("wqk", "wov")  # also: raw_q raw_k raw_v raw_o
     dtype: str = "float32"
-    null_seed: int = -1  # >= 0 applies the permutation null (used by a3)
+    null_seed: int | None = None  # set to apply the permutation null (a3)
     bmd_iters: int = 200
+    bmd_check_every: int = 5  # sample the dense error check during long fits
     experiment: str = "a2_matched_param"
 
 
@@ -54,33 +55,28 @@ PLAN = {
 }
 
 
-def build_stack(sd, meta, layer: int, obj: str, dtype):
-    if obj.startswith("raw_"):
-        s = raw_stack(sd, layer, meta["n_head"], which=obj.removeprefix("raw_"))
-    else:
-        s = circuit_stack(sd, layer, meta["n_head"], kind=obj)
-    s.tensor = s.tensor.to(getattr(torch, dtype))
-    return s
-
-
 def main(cfg: Config) -> None:
     sd, meta = load_gpt2_state(cfg.model_name)
     run = create_run(cfg.experiment, cfg)
     frames = []
     for layer in cfg.layers:
         for obj in cfg.objects:
-            stack = build_stack(sd, meta, layer, obj, cfg.dtype)
-            extra = {}
-            if cfg.null_seed >= 0:
-                stack.tensor, _ = permutation_null(
-                    stack.tensor, seed=cfg.null_seed + layer
-                )
-                extra = {"null_seed": cfg.null_seed + layer}
+            stack = stack_by_name(sd, layer, meta["n_head"], obj, model=cfg.model_name)
+            stack.tensor = stack.tensor.to(getattr(torch, cfg.dtype))
+            null_seed = None if cfg.null_seed is None else cfg.null_seed + layer
+            if null_seed is not None:
+                stack.tensor, _ = permutation_null(stack.tensor, seed=null_seed)
             df = decomp_sweep(
                 stack,
                 PLAN,
-                fit_opts={"bmd_rals": {"n_iters": cfg.bmd_iters}},
-                extra_cols=extra,
+                fit_opts={
+                    "bmd_rals": {
+                        "n_iters": cfg.bmd_iters,
+                        "check_every": cfg.bmd_check_every,
+                    }
+                },
+                # always present so a2 and a3 parquet share one schema
+                extra_cols={"null_seed": null_seed},
             )
             frames.append(df)
             print(f"layer {layer} {obj}: {len(df)} fits done")

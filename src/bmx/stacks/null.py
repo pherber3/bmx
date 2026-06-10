@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from bmx.quant.hadamard import orthogonalize
+
 
 @dataclass
 class NullTransform:
@@ -18,13 +20,7 @@ class NullTransform:
 
 def _random_orthogonal_batch(count: int, dim: int, g, dtype):
     M = torch.randn(count, dim, dim, generator=g, dtype=dtype)
-    Q, R = torch.linalg.qr(M)
-    # Canonicalize: torch QR does not fix R's diagonal signs, so Q would be
-    # platform/backend-dependent. Forcing diag(R) >= 0 makes the rotation a
-    # pure function of the seed (and Haar-distributed).
-    signs = R.diagonal(dim1=-2, dim2=-1).sign()
-    signs[signs == 0] = 1.0
-    return Q * signs.unsqueeze(-2)
+    return orthogonalize(M)
 
 
 def permutation_null(T: torch.Tensor, seed: int):

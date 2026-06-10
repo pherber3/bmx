@@ -28,13 +28,22 @@ def randomized_hadamard(x: torch.Tensor, seed: int) -> torch.Tensor:
     return fwht(x * signs)
 
 
+def orthogonalize(M: torch.Tensor) -> torch.Tensor:
+    """QR-orthogonalize the last two dims (batched ok), sign-canonicalized.
+
+    torch QR leaves diag(R)'s signs backend-dependent; forcing diag(R) >= 0
+    makes the result a pure function of M (and Haar-distributed for
+    Gaussian M).
+    """
+    Q, R = torch.linalg.qr(M)
+    signs = R.diagonal(dim1=-2, dim2=-1).sign()
+    signs[signs == 0] = 1.0
+    return Q * signs.unsqueeze(-2)
+
+
 def random_orthogonal(
     d: int, seed: int, dtype=torch.float32, device="cpu"
 ) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
     M = torch.randn(d, d, generator=g, dtype=dtype)
-    Q, R = torch.linalg.qr(M)
-    # Canonicalize: fix diag(R) >= 0 so Q is a pure function of the seed.
-    signs = R.diagonal().sign()
-    signs[signs == 0] = 1.0
-    return (Q * signs.unsqueeze(0)).to(device)
+    return orthogonalize(M).to(device)

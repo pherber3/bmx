@@ -13,7 +13,7 @@ from a2_matched_param import Config, main
 
 @dataclasses.dataclass
 class NullConfig(Config):
-    null_seed: int = 0
+    null_seed: int | None = 0
     experiment: str = "a3_permutation_null"
 
 
