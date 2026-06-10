@@ -58,12 +58,15 @@ def run_cases(
         x = torch.randn(case.batch, case.p, dtype=dtype, device=device)
         W = dense_from_factors(A, B, C)
 
-        # correctness gate before timing (fp32 tolerance)
-        torch.testing.assert_close(
-            factored_matvec(A, B, C, x),
-            dense_slice_matvec(W, x),
-            rtol=1e-3,
-            atol=1e-4,
+        # Correctness gate before timing. Norm-based, not elementwise: cuBLAS
+        # and einsum reduce in different orders, so single elements can show
+        # ~1e-4 cancellation noise in fp32 while the kernels agree. A real
+        # indexing bug produces O(1) relative error, far above these gates.
+        y_ref = dense_slice_matvec(W, x)
+        rel = ((factored_matvec(A, B, C, x) - y_ref).norm() / y_ref.norm()).item()
+        tol = {torch.float64: 1e-10, torch.float32: 1e-4}.get(dtype, 1e-2)
+        assert rel < tol, (
+            f"factored vs dense mismatch: rel Frobenius {rel:.3e} (tol {tol})"
         )
 
         if case.impl == "dense":
