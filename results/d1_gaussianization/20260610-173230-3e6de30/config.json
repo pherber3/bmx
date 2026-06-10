@@ -1,0 +1,5 @@
+{
+  "model_name": "gpt2",
+  "seed": 0,
+  "min_dim": 64
+}
