@@ -1,0 +1,24 @@
+{
+  "d": [
+    768
+  ],
+  "h": [
+    12
+  ],
+  "ell": [
+    2
+  ],
+  "batch": [
+    1
+  ],
+  "impls": [
+    "dense",
+    "eager",
+    "compiled",
+    "bmm"
+  ],
+  "dtype": "float32",
+  "device": "cuda",
+  "warmup": 2,
+  "iters": 5
+}

@@ -1,0 +1,27 @@
+{
+  "model_name": "gpt2",
+  "layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "objects": [
+    "wqk",
+    "wov"
+  ],
+  "dtype": "float32",
+  "device": "cuda",
+  "null_seed": 0,
+  "bmd_iters": 200,
+  "bmd_check_every": 5,
+  "experiment": "a3_permutation_null"
+}
