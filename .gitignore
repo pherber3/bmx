@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# large artifacts never committed; parquet metrics and figures ARE committed
+results/**/*.safetensors
+results/**/*.bin
+results/**/*.pt
+hf_cache/
