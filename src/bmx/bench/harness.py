@@ -10,7 +10,9 @@ from bmx.bench.factored_matvec import (
     dense_from_factors,
     dense_slice_matvec,
     factored_matvec,
+    factored_matvec_bmm,
     factored_matvec_compiled,
+    templates_to_bmm_layout,
 )
 from bmx.decomp.ops import bmd_param_count
 from bmx.stacks.synthetic import random_bmd_factors
@@ -23,7 +25,7 @@ class BenchCase:
     h: int
     ell: int
     batch: int
-    impl: str  # dense | eager | compiled
+    impl: str  # dense | eager | compiled | bmm
     dtype: str = "float32"
 
 
@@ -75,6 +77,15 @@ def run_cases(
             fn, args = factored_matvec, (A, B, C, x)
         elif case.impl == "compiled":
             fn, args = factored_matvec_compiled, (A, B, C, x)
+        elif case.impl == "bmm":
+            # Template relayout happens once, outside timing: a deployment
+            # stores templates in bmm order to begin with.
+            Bt = templates_to_bmm_layout(B)
+            rel_bmm = (
+                (factored_matvec_bmm(A, Bt, C, x) - y_ref).norm() / y_ref.norm()
+            ).item()
+            assert rel_bmm < tol, f"bmm vs dense mismatch: {rel_bmm:.3e}"
+            fn, args = factored_matvec_bmm, (A, Bt, C, x)
         else:
             raise ValueError(f"unknown impl {case.impl!r}")
 

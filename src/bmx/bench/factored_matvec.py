@@ -38,6 +38,30 @@ def factored_matvec(A, B, C, x: torch.Tensor) -> torch.Tensor:
     return torch.einsum("itk,tkbi->kbi", A, ys)  # output gains + sum over t
 
 
+def templates_to_bmm_layout(B: torch.Tensor) -> torch.Tensor:
+    """One-time relayout of templates (m, p, ell) -> (ell, m, p) contiguous.
+
+    A deployment stores templates in this layout. The einsum path instead
+    re-copies B into bmm order on every call, which is what destroys the
+    bandwidth win at ell >= 2 (measured on H100: ~8x jump from ell=1 to 2).
+    """
+    return B.permute(2, 0, 1).contiguous()
+
+
+def factored_matvec_bmm(A, Bt, C, x: torch.Tensor) -> torch.Tensor:
+    """Pre-transposed-template variant: the template read is one clean bmm.
+
+    A: (m, ell, h), Bt: (ell, m, p) from templates_to_bmm_layout, C: (ell, p, h),
+    x: (b, p) -> (h, b, m).
+    """
+    ell, m, p = Bt.shape
+    h = A.shape[2]
+    b = x.shape[0]
+    xs = torch.einsum("bj,tjk->tjkb", x, C).reshape(ell, p, h * b)
+    ys = torch.bmm(Bt, xs).view(ell, m, h, b)  # reads ell*m*p template bytes
+    return torch.einsum("itk,tikb->kbi", A, ys)
+
+
 _compiled = None
 
 

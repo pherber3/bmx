@@ -20,7 +20,7 @@ class Config:
     h: tuple[int, ...] = (8, 12, 32, 64)
     ell: tuple[int, ...] = (1, 2, 4, 8)
     batch: tuple[int, ...] = (1, 4, 16, 32)
-    impls: tuple[str, ...] = ("dense", "eager", "compiled")
+    impls: tuple[str, ...] = ("dense", "eager", "compiled", "bmm")
     dtype: str = "float32"
     device: str = "cpu"
     warmup: int = 10
