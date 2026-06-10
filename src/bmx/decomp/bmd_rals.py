@@ -15,8 +15,8 @@ from bmx.decomp.ops import (
     bmp,
     cyclic_transpose,
     cyclic_transpose_inv,
+    random_bmd_factors,
 )
-from bmx.stacks.synthetic import random_bmd_factors
 
 
 class BMDFit(FitResult):

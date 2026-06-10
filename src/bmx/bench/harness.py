@@ -96,4 +96,9 @@ def run_cases(
                 ),
             }
         )
+        if device.startswith("cuda"):
+            # ~500 shape variants in a full sweep; without this the allocator
+            # fragments across cases and large late cases OOM.
+            del A, B, C, x, W, y_ref
+            torch.cuda.empty_cache()
     return pd.DataFrame(rows)

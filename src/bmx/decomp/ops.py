@@ -27,6 +27,23 @@ def bmd_param_count(m: int, p: int, n: int, ell: int) -> int:
     return ell * (m * p + m * n + p * n)
 
 
+def random_bmd_factors(
+    m: int,
+    p: int,
+    n: int,
+    ell: int,
+    seed: int,
+    dtype: torch.dtype = torch.float64,
+    device: "str | torch.device" = "cpu",
+):
+    """Seeded random BMD factors (generated on CPU so seeds are device-portable)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    A = torch.randn(m, ell, n, generator=g, dtype=dtype)
+    B = torch.randn(m, p, ell, generator=g, dtype=dtype)
+    C = torch.randn(ell, p, n, generator=g, dtype=dtype)
+    return A.to(device), B.to(device), C.to(device)
+
+
 def cyclic_transpose(T: torch.Tensor) -> torch.Tensor:
     """X^T in the BM sense: 1-based permute [2,3,1]. Order 3."""
     return T.permute(1, 2, 0)
