@@ -1,0 +1,14 @@
+{
+  "model_id": "allenai/OLMoE-1B-7B-0125",
+  "checkpoint_dir": null,
+  "layers": [],
+  "whichs": [
+    "gate",
+    "up",
+    "down"
+  ],
+  "top_r": 32,
+  "device": "cuda",
+  "dtype": "float32",
+  "experiment": "c1_redundancy_census"
+}

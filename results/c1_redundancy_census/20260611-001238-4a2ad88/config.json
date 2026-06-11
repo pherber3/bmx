@@ -1,0 +1,14 @@
+{
+  "model_id": "Qwen/Qwen1.5-MoE-A2.7B",
+  "checkpoint_dir": null,
+  "layers": [],
+  "whichs": [
+    "gate",
+    "up",
+    "down"
+  ],
+  "top_r": 32,
+  "device": "cuda",
+  "dtype": "float32",
+  "experiment": "c1_redundancy_census"
+}
