@@ -83,3 +83,30 @@ ncu profiles `ncu-20260610-225349` (d=4096 h=64 ℓ=2), `…-225555` (d=768 h=12
 - C1 redundancy census on OLMoE / Qwen1.5-MoE / DeepSeek-V2-Lite.
 - 4D `w_all` object untested (bmd_rals is 3D-only); low priority given the
   circuit-stack verdict.
+
+## Late-session addendum: Tracks C1 + C2 (same instance)
+
+**C1 census** (`c1_redundancy_census/`, OLMoE + Qwen1.5-MoE + DeepSeek-V2-Lite):
+all three fine-grained checkpoints show the same signature — experts are
+orthogonal as flat weight vectors (cos ~ 0, zero mergeable pairs) but share
+substantial global second-moment structure (mean off-diag CKA 0.25-0.38,
+participation ratio ~ 0.15*E => ~10 global modes). Redundancy is global, not
+clustered: failure mode 2 not triggered, gate said proceed.
+
+**C2 discriminator** (`c2_expert_structure/`, OLMoE layers 0/7/15, gate+down,
+matched parameters): the global structure is too thin to exploit. At 27% of
+dense params the best method reaches only RE ~ 0.73-0.75; at streaming-relevant
+budgets (<=10%) everything is 0.93-0.99. BMD never separates from Tucker or
+slice-SVD at any matched budget (e.g. 18M params: 0.874 vs 0.878). Entry 2's
+falsifiable claim (BM-rank <= E/8 meaningfully below per-expert SVD/Tucker)
+is **falsified on OLMoE**: at ell = E/8 = 8, RE ~ 0.86-0.87, indistinguishable
+from baselines.
+
+**Program-level conclusion:** the diag-template prior does not describe
+trained transformer weight stacks — neither attention circuits nor
+fine-grained MoE experts. Entries 1 and 2 are discarded with measured reasons;
+what survives the session is the Track B kernel result (bytes mechanism
+confirmed exactly by ncu; h/ell realizable with kernel work — applicable if a
+template-shaped object is ever found), the C1 census finding (global thin
+second-moment sharing across experts — interesting in its own right), the d1
+Gaussianization evidence, and entry 3's re-scoped unbiased-matvec cluster.
