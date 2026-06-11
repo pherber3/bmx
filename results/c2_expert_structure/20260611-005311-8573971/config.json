@@ -1,0 +1,18 @@
+{
+  "model_id": "allenai/OLMoE-1B-7B-0125",
+  "checkpoint_dir": null,
+  "layers": [
+    0,
+    7,
+    15
+  ],
+  "whichs": [
+    "gate",
+    "down"
+  ],
+  "dtype": "float32",
+  "device": "cuda",
+  "bmd_iters": 100,
+  "bmd_check_every": 5,
+  "experiment": "c2_expert_structure"
+}
