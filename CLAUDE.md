@@ -39,12 +39,18 @@ uv run python experiments/a2_matched_param.py --help   # tyro CLIs; tuples are s
 uv run python experiments/d1_gaussianization.py        # cheap (~30 s + GPT-2 download)
 ```
 
-Expected suite status: **46 passed, 1 xfailed**. The xfail is intentional
+Expected suite status: **53 passed, 1 xfailed**. The xfail is intentional
 (see Research state). The SageMath agreement fixture is generated, not
 hand-written — regenerate with
 `uv run python scripts/export_sagemath_fixture.py` (reads
 `D:\Projects\Hypermatrix ML`; self-validates BM-product conventions before
 writing).
+
+**NEW DIRECTION (start here if continuing the science):** the BM program is
+concluded (all entries discarded/re-scoped). The next build is **Avenue 1,
+low-rank-plus-sparse quantization residual** — see `docs/HANDOFF.md` then
+`docs/next-avenues-structured-residual.md`. The BM machinery below is still
+the substrate (registry, sweep, quant, artifacts all reused).
 
 ## The math conventions (memorize; everything assumes them)
 
@@ -68,42 +74,43 @@ writing).
 metadata); `gpt2.stack_by_name` is the name→object dispatch; `null.py` is the
 A3 control (seeded slice shuffle + per-slice orthogonal rotations — the
 rotations are the load-bearing part). `src/bmx/bench/` — Track B factored
-matvec + timing harness (correctness asserted before timing). `src/bmx/quant/`
-— Track D rotations/RTN/stats. `src/bmx/sweep.py` — the shared
-matched-parameter sweep engine; rows keyed by (model, layer, object, method,
-rank, params, solver, null_seed) so layers-as-replicates is the default.
-`src/bmx/artifacts.py` — `results/<exp>/<run-id>/` with config + env + git SHA
-+ `metrics.parquet`. Experiments in `experiments/` are thin tyro scripts;
-figures read parquet, never refit. Commit metrics/figures, never checkpoints.
+matvec + timing harness (correctness asserted before timing); the `bmm` impl
+(pre-transposed templates) is the one that realizes the byte win at ell>=2.
+`src/bmx/quant/` — rotations (`hadamard`), groupwise RTN (`rtn`), distribution
+stats (`stats`: kurtosis, outlier_mass, ip_distortion, sq_floor). `src/bmx/census.py`
+— pairwise expert-similarity metrics (cos/CKA/subspace + participation ratio).
+`src/bmx/sweep.py` — the shared matched-parameter sweep engine; rows keyed by
+(model, layer, object, method, rank, params, solver, null_seed) so
+layers-as-replicates is the default. `src/bmx/artifacts.py` —
+`results/<exp>/<run-id>/` with config + env + git SHA + `metrics.parquet`.
+Experiments in `experiments/` are thin tyro scripts; figures read parquet,
+never refit. Commit metrics/figures, never checkpoints.
 
-## Research state & gates (as of 2026-06)
+## Research state — BM program CONCLUDED (2026-06-10 H100 session)
 
-- **Track A** (is attention-stack structure template-shaped?): a2/a3 ready,
-  not yet run at scale. Gate A4: CP≈Tucker floor with BMD below it *on real
-  stacks but not on the a3 null* → template-shaped. BMD advantage surviving
-  the null = expressivity artifact → hypothesis dead.
-- **Track B** (does the h/ℓ bandwidth win materialize?): b1 + Nsight scripts
-  ready; needs the NVIDIA VM. Report the curve over batch, not a point.
-- **Track C** (MoE expert streaming): gated on C1 redundancy census; stubs in
-  `stacks/moe.py`, `eval/expert_error.py` raise NotImplementedError with the
-  gate named.
-- **Track D** (VQ theory transfer): d1 ready and cheap. Early smoke result:
-  rotation crushes GPT-2 weight kurtosis (+30…+48 → ≈0) — entry 3's mechanism
-  survives trained weights.
-- **Known empirical fact, not a bug:** plain RALS cold-starts (SS-SVD or
-  random) swamp at RE ≈ 0.21 on random-dense-factor BM-rank-2 synthetics;
-  near-truth inits converge below 1e-8 (update equations verified exact).
-  Kept visible as the xfailed `test_cold_start_recovery`.
-- **But the swamp is specific to that synthetic family.** On the 10 real
-  interaction tensors from the user's BM-ALS paper (Hypermatrix ML repo,
-  n=4/8, estimated from dynamical systems), cold-start RALS reaches
-  1e-13…1e-5 RE — beating the paper's greedy-deflation SageMath BM-ALS
-  (2.7e-4…9.8e-3) by 3-10 orders of magnitude on every case
-  (`tests/test_sagemath_agreement.py`, fixture committed). Two consequences:
-  (a) Track A fits on real weight stacks are less optimizer-limited than the
-  swamp finding alone suggested — keep the perturbation-init disambiguation
-  protocol anyway; (b) the paper's reported BM-ALS numbers understate BMD on
-  its own benchmark — RALS would strengthen those results.
+Full results: `docs/2026-06-10-h100-session-results.md`. Forward avenues:
+`docs/next-avenues-structured-residual.md`. One-line verdict per track:
+
+- **Track A — entry 1 DISCARDED.** 12-layer a2/a3 sweeps: BMD worst at matched
+  params; real-vs-null gap ≈0 for BMD while Tucker keeps 0.06–0.10 → attention
+  structure is **subspace-shaped, not template-shaped**.
+- **Track B — mechanism CONFIRMED, kernel-limited.** ncu DRAM counters match
+  the byte model exactly (dense h·m·p vs factored ell·m·p, 32× at h=64 ell=2);
+  wall-clock speedup tracks bytes at batch 1, decays with batch; ~9× headroom
+  for a fused kernel. Reusable result if a template-shaped object is ever found.
+- **Track C — entry 2 FALSIFIED on OLMoE.** C1 census (3 checkpoints): experts
+  orthogonal-as-vectors but share ~10 global second-moment modes (global, not
+  clustered). C2 discriminator: that structure is too thin — BMD never separates
+  from Tucker/slice-SVD; at ell=E/8, RE ≈ 0.87.
+- **Track D — D1 strong, entry 3 RE-SCOPED.** Rotation crushes GPT-2 kurtosis
+  (median +2.0 / max +47.9 → ≈0). D0 lit pass: the Gaussianization + 4^-b floor
+  theory is already published (NestQuant, Ordentlich–Polyanskiy); the open edge
+  is unbiased weight matvecs + structured residuals → **Avenue 1**.
+- **Solver is sound (not the cause of any negative):** plain RALS swamps at
+  RE ≈ 0.21 only on random-dense synthetics; near-truth inits hit <1e-8, and on
+  the BM-ALS paper's own 10 tensors RALS beats the paper's solver by 3–10 orders
+  of magnitude (`tests/test_sagemath_agreement.py`). Kept visible as the xfailed
+  `test_cold_start_recovery`.
 
 ## Pitfalls already hit (don't rediscover)
 
