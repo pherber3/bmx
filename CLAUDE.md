@@ -61,8 +61,14 @@ K2 (codec bake-off): **low-rank on pre-RoPE keys wins at matched bits (2–3×
 lower logit distortion); values want turboquant-style per-token Lloyd; KIVI's
 key/value asymmetry reproduced; TurboQuant's bounds replicate but worst-case
 optimality concedes to structure** (`docs/2026-06-12-k2-arms-results.md`).
-Next: K2b perplexity round (3 finalists) + K3 unbiasedness study. The
-machinery below is the substrate (registry, sweep, quant/arms, cache, artifacts).
+K2b (perplexity round): **G2b closed positive — deployable recipe: keys
+pre-RoPE lowrank+per-channel @3b, values rotate+Lloyd @2b ⇒ ~3.0 bpe avg,
++0.5% ppl, 5.3× KV memory vs fp16; bits belong to K (2× more sensitive);
+unbiased coding dominated everywhere (K3 largely answered: bias is cheap,
+variance is expensive)** (`docs/2026-06-12-k2b-ppl-results.md`). Open if
+pursued further: streaming low-rank codec (MLA-shaped), 32k validation,
+fused dequant-attention kernel. The machinery below is the substrate
+(registry, sweep, quant/arms, cache, artifacts).
 
 ## The math conventions (memorize; everything assumes them)
 
