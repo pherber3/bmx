@@ -4,8 +4,27 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from bmx.census import experts_shared_last, pairwise_similarities, similarity_summary
+from bmx.census import (
+    experts_shared_last,
+    pairwise_similarities,
+    similarity_summary,
+    subspace_overlap,
+)
+from bmx.quant.hadamard import orthogonalize
 from bmx.stacks.moe import expert_stack, moe_layers
+
+
+def test_subspace_overlap_extremes_and_scale_invariance():
+    g = torch.Generator().manual_seed(0)
+    Q = orthogonalize(torch.randn(12, 12, generator=g, dtype=torch.float64))
+    U, U_perp = Q[:, :3], Q[:, 3:6]
+    # same subspace under a non-orthonormal change of basis (e.g. SVD factors
+    # carrying singular values) -> 1; orthogonal complement -> 0
+    mix = torch.tensor(
+        [[2.0, 1.0, 0.0], [0.0, 1.0, 3.0], [0.0, 0.0, 1.0]], dtype=torch.float64
+    )
+    assert abs(subspace_overlap(U @ mix, U) - 1.0) < 1e-10
+    assert abs(subspace_overlap(U_perp, U)) < 1e-10
 
 
 @pytest.fixture

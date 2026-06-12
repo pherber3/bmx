@@ -1,0 +1,35 @@
+{
+  "stage": "a",
+  "model_name": "gpt2",
+  "weights": [
+    "transformer.h.5.attn.c_attn.weight",
+    "transformer.h.5.attn.c_proj.weight",
+    "transformer.h.5.mlp.c_fc.weight",
+    "transformer.h.5.mlp.c_proj.weight"
+  ],
+  "stage_a_extra": [
+    "transformer.wpe.weight"
+  ],
+  "ranks": [
+    0,
+    8,
+    16,
+    32,
+    64
+  ],
+  "sparse_fracs": [
+    0.0,
+    0.0001,
+    0.001,
+    0.01
+  ],
+  "bits": [
+    2,
+    3,
+    4
+  ],
+  "group_size": 64,
+  "n_alternations": 2,
+  "n_probes": 512,
+  "seed": 0
+}

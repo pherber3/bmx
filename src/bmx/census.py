@@ -14,7 +14,20 @@ dimension (d_model -- the input side for gate/up, the output side for down):
 
 import torch
 
+from bmx.quant.hadamard import orthogonalize
 from bmx.stacks.base import Stack
+
+
+def subspace_overlap(A: torch.Tensor, U_ref: torch.Tensor) -> float:
+    """Mean squared cosine between span(A) and span(U_ref), in [0, 1].
+
+    A is any full-column-rank basis (orthonormalized here — the QR is
+    load-bearing when A's columns are scaled, e.g. SVD factors carrying
+    singular values); U_ref must already have orthonormal columns.
+    Single-pair counterpart of pairwise_similarities' "sub" metric.
+    """
+    Q = orthogonalize(A)
+    return ((U_ref.mT @ Q) ** 2).sum().item() / U_ref.shape[1]
 
 
 def experts_shared_last(stack: Stack) -> torch.Tensor:
