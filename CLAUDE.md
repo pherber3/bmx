@@ -39,18 +39,21 @@ uv run python experiments/a2_matched_param.py --help   # tyro CLIs; tuples are s
 uv run python experiments/d1_gaussianization.py        # cheap (~30 s + GPT-2 download)
 ```
 
-Expected suite status: **53 passed, 1 xfailed**. The xfail is intentional
+Expected suite status: **68 passed, 1 xfailed**. The xfail is intentional
 (see Research state). The SageMath agreement fixture is generated, not
 hand-written — regenerate with
 `uv run python scripts/export_sagemath_fixture.py` (reads
 `D:\Projects\Hypermatrix ML`; self-validates BM-product conventions before
 writing).
 
-**NEW DIRECTION (start here if continuing the science):** the BM program is
-concluded (all entries discarded/re-scoped). The next build is **Avenue 1,
-low-rank-plus-sparse quantization residual** — see `docs/HANDOFF.md` then
-`docs/next-avenues-structured-residual.md`. The BM machinery below is still
-the substrate (registry, sweep, quant, artifacts all reused).
+**Research state (start here if continuing the science):** the BM program is
+concluded (all entries discarded/re-scoped), and **Avenue 1 (low-rank+sparse
+quantization residual) is now also CLOSED** — built, measured, honest negative;
+see `docs/2026-06-11-lrs-results.md` for the verdict and its scope conditions
+(notably: the L-overhead argument weakens ~10× at frontier dims). Remaining
+live leads: Avenue 2 (uniform-bound sketched matvec) and the D0-surviving
+unbiased-matvec cluster — `docs/next-avenues-structured-residual.md`. The
+machinery below is the substrate (registry, sweep, quant/arms, eval, artifacts).
 
 ## The math conventions (memorize; everything assumes them)
 
@@ -106,6 +109,15 @@ Full results: `docs/2026-06-10-h100-session-results.md`. Forward avenues:
   (median +2.0 / max +47.9 → ≈0). D0 lit pass: the Gaussianization + 4^-b floor
   theory is already published (NestQuant, Ordentlich–Polyanskiy); the open edge
   is unbiased weight matvecs + structured residuals → **Avenue 1**.
+- **Avenue 1 (L+S residual) — CLOSED 2026-06-11, honest negative.** Stage A:
+  the structure exists (subspace overlap 0.91–0.99; supp(Ŝ) hits d1's channels,
+  top-10 overlap 1.0 on c_proj; residual kurtosis → ≈0) but is thin (L+S
+  captures ~21% of energy at r=32+0.1%). Stage B: at honestly-accounted total
+  bits every L+S point sits above the interpolated rotate-RTN rate–distortion
+  curve — additive fp16 side-information is the wrong currency at GPT-2 dims.
+  Confirmed twice more: rotation is free win; rotating the post-extraction
+  residual helps only while it's still non-Gaussian and hurts once extraction
+  Gaussianizes it (dose–response in frac). `docs/2026-06-11-lrs-results.md`.
 - **Solver is sound (not the cause of any negative):** plain RALS swamps at
   RE ≈ 0.21 only on random-dense synthetics; near-truth inits hit <1e-8, and on
   the BM-ALS paper's own 10 tensors RALS beats the paper's solver by 3–10 orders

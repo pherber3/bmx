@@ -1,5 +1,14 @@
 # Handoff — bmx, end of 2026-06-10
 
+> **UPDATE 2026-06-11:** the Avenue 1 build described below was executed the next day
+> (plan: `docs/superpowers/plans/2026-06-11-lrs-residual.md`) and **closed with an
+> honest negative** — structure confirmed, bit-economics against it. Verdict, scope
+> conditions, and what survives: `docs/2026-06-11-lrs-results.md`. All infrastructure
+> items below now exist (`decomp/lrs.py`, `quant/arms.py`, `eval/layer_swap.py`
+> implemented + offline-tested; suite 68 passed, 1 xfailed). Remaining live leads are
+> Avenue 2 and the unbiased-matvec cluster. The build-steps section is kept for the
+> record of what was planned; it is DONE, not a to-do.
+
 State at handoff for a fresh session. The original BM/hypermatrix research program is
 **complete and concluded** (all three speculative entries discarded or re-scoped with
 measured reasons). The framework is healthy and the next work is a new direction:
@@ -43,27 +52,34 @@ The framework is deliberately built so a new decomposition is a drop-in:
 - `src/bmx/eval/layer_swap.py` — **stub** (NotImplementedError); implementing it (LASER-style
   weight replacement + WikiText perplexity) is the functional-eval step Avenue 1 step 4 needs.
 
-## Avenue 1 first build (concrete)
-Per `docs/next-avenues-structured-residual.md`:
-1. New module `src/bmx/decomp/lrs.py`: low-rank+sparse fit. Start with the cheap two-step
-   estimator (soft-threshold S, residual truncated-SVD L — Wainwright §11.4.2 / Prop 11.19),
-   not the full convex program. Register as `"lrs"`. Unit-test on planted L+S tensors.
-2. Experiment `experiments/lr_sparse_residual.py`: on GPT-2 / Llama-1B matrices, fit L+S at
-   several (rank, nnz) budgets; **first check the spikiness condition `‖L‖_max ≤ α/√(d₁d₂)`
-   empirically — that's the go/no-go**; then quantize the residual with `quant.rtn` and
-   measure `ip_distortion` + kurtosis vs quantizing W directly, at matched total bits.
+## Avenue 1 first build (concrete — read the corrected design in
+## `docs/next-avenues-structured-residual.md` Avenue 1 first; it is grounded against
+## the foundational texts and supersedes any earlier sketch)
+1. New module `src/bmx/decomp/lrs.py`: the two-step estimator — **hard**-threshold
+   `Ŝ = T_ν(W)` with `T_ν(v) = v·𝟙[|v| > ν]` (Wainwright §11.4.2 Eq. 11.58 — NOT
+   soft-thresholding), then `L̂ = truncated-SVD(W − Ŝ)`, optionally alternated.
+   Register as `"lrs"`. Unit-test on planted L+S tensors (recovery of planted support
+   and rank). The convex program (10.53) is a later referee, not the first build.
+2. Experiment `experiments/lrs_residual.py`, two stages **in this order**:
+   - **Stage A diagnostic** (one matrix, original basis — NOT post-rotation; rotation
+     provably spreads the sparse mass L+S needs concentrated): does rank(L̂) match a2's
+     Tucker subspace, does supp(Ŝ) match d1's flagged channels, does spikiness
+     `‖L̂‖_max ≤ α/√(d₁d₂)` hold? Three assumptions, one estimator call.
+   - **Stage B compression**: fit on clean W, quantize `R = W − L̂ − Ŝ` via `quant.rtn`,
+     compare at **matched total bits (count L̂/Ŝ storage)** against plain RTN,
+     rotate-then-RTN, and L+S-then-rotate-residual. Metrics: `ip_distortion`, kurtosis
+     of R, then layer-swap perplexity.
 3. If it clears: implement `eval/layer_swap.py`, measure perplexity delta; then the
    fused-kernel byte accounting (needs a VM again — same workflow as this session,
    `scripts/vm_setup.sh` + the bench harness; reuse the bmm/fused-matvec path in
-   `bmx.bench.factored_matvec`).
+   `bmx.bench.factored_matvec`). Stage-3 extension hook: unbiased QJL on the quant
+   residual (TurboQuant's composition) ties into the D0-surviving (c)-cluster.
 
 ## Loose ends (none blocking)
-- **Vault `.speculative` status updates not yet written** (user deferred). When the user
-  approves: entry 1 → discarded (subspace-shaped, real-vs-null gap ≈0); entry 2 → discarded
-  (C2: expert structure too thin, falsified on OLMoE); entry 3 → re-scoped to the
-  unbiased-matvec / structured-residual cluster (a/b already published per D0). These are
-  edits to `D:\Projects\personal-brain\wiki\.speculative\2026-06-09 *.md` and must be done
-  with user approval per vault rules.
+- **Vault `.speculative` status updates are written and user-approved** (entry 1 → discarded,
+  entry 2 → discarded, entry 3 → re-scoped, with dated evidence-citing verdicts in
+  `D:\Projects\personal-brain\wiki\.speculative\2026-06-09 *.md`) but the **vault repo
+  commit is still pending** — the user commits in that repo themselves.
 - `docs/friday-brief-tensor-compression.md` — a meeting brief, not research; ignore for
   implementation.
 - The unweight/Omni Cloudflare notes in the vault are good context for the
