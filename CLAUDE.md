@@ -54,8 +54,9 @@ see `docs/2026-06-11-lrs-results.md` for the verdict, then
 transform weights hug the Shannon break-even line at 768→8192 (stable rank
 grows with width at the canceling rate); the only payers are table-like
 objects (wpe, routers, layer-0 rogue-channel readers), all axis-aligned or
-negligible. Remaining live leads: the unbiased-rounding depth-coherence study
-(QuIP Supp C.8 anomaly) and Avenue 2 (uniform-bound sketched matvec). The
+negligible. **Next program: KV-cache compression** — `docs/2026-06-11-kv-research-plan.md`
+(Tracks K0–K3: cache harness, activation census/break-even, matched-bits arms
+incl. TurboQuant kill-or-confirm, unbiasedness/QuIP-anomaly study). The
 machinery below is the substrate (registry, sweep, quant/arms, eval, artifacts).
 
 ## The math conventions (memorize; everything assumes them)
