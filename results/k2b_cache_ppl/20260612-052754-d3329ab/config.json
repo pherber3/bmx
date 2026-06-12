@@ -1,0 +1,13 @@
+{
+  "model_name": "gpt2",
+  "n_prefill": 768,
+  "n_eval": 256,
+  "bits": [
+    2,
+    3
+  ],
+  "rank": 32,
+  "group": 64,
+  "seed": 0,
+  "contexts": []
+}

@@ -1,0 +1,14 @@
+{
+  "model_name": "meta-llama/Llama-3.1-8B",
+  "n_prefill": 1792,
+  "n_eval": 256,
+  "bits": [
+    2,
+    3
+  ],
+  "rank": 32,
+  "group": 64,
+  "seed": 0,
+  "contexts": [],
+  "ablation": true
+}
