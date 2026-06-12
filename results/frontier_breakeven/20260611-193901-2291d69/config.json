@@ -1,0 +1,10 @@
+{
+  "model": "meta-llama/Llama-3.1-8B",
+  "n_layers_sample": 4,
+  "experts_per_layer": 8,
+  "max_dim": 32768,
+  "min_dim": 64,
+  "max_side_bpw": 6.0,
+  "keep_shards": false,
+  "shard_dir": ""
+}

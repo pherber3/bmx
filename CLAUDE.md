@@ -49,10 +49,13 @@ writing).
 **Research state (start here if continuing the science):** the BM program is
 concluded (all entries discarded/re-scoped), and **Avenue 1 (low-rank+sparse
 quantization residual) is now also CLOSED** — built, measured, honest negative;
-see `docs/2026-06-11-lrs-results.md` for the verdict and its scope conditions
-(notably: the L-overhead argument weakens ~10× at frontier dims). Remaining
-live leads: Avenue 2 (uniform-bound sketched matvec) and the D0-surviving
-unbiased-matvec cluster — `docs/next-avenues-structured-residual.md`. The
+see `docs/2026-06-11-lrs-results.md` for the verdict, then
+`docs/2026-06-11-frontier-breakeven.md`: the scale loophole is resolved —
+transform weights hug the Shannon break-even line at 768→8192 (stable rank
+grows with width at the canceling rate); the only payers are table-like
+objects (wpe, routers, layer-0 rogue-channel readers), all axis-aligned or
+negligible. Remaining live leads: the unbiased-rounding depth-coherence study
+(QuIP Supp C.8 anomaly) and Avenue 2 (uniform-bound sketched matvec). The
 machinery below is the substrate (registry, sweep, quant/arms, eval, artifacts).
 
 ## The math conventions (memorize; everything assumes them)
