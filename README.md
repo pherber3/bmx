@@ -1,38 +1,70 @@
 # bmx
 
-Research framework for structured weight compression of LLMs, originally built to test
-whether Bhattacharya–Mesner (hypermatrix) algebra gives a bandwidth-amplifying weight
-decomposition. **That program is concluded** (the diag-template prior does not describe
-trained weights — see `docs/2026-06-10-h100-session-results.md`); the framework now
-carries the follow-on work on **structured-residual quantization**
-(`docs/next-avenues-structured-residual.md`).
+Kill-or-confirm research on LLM tensor compression: matched-budget experiments,
+permutation/random controls, honest bit accounting, every result a committed
+parquet. Two completed programs:
 
-**New here?** Read `docs/HANDOFF.md` first, then `CLAUDE.md`. The framework — a
-registry of matched-parameter decomposition methods, weight-stack builders, a Track-B
-GPU kernel bench, quantization utilities, and a reproducible artifact harness — is
-reusable for any "compress this weight object, measure error vs parameters/bytes" task.
+**1. Weights (closed, negative-with-a-law).** Started as a test of
+Bhattacharya–Mesner (hypermatrix) decomposition for bandwidth-amplified decode;
+the diag-template prior does not describe trained weights
+(`docs/2026-06-10-h100-session-results.md`). Generalizing the failure produced a
+break-even inequality — side-information costing Δb bits/weight pays iff it
+removes energy fraction ε > 1 − 4^(−Δb) — and measuring it from GPT-2 to
+Llama-70B shows transform weights sit *on* the break-even line at every width
+(stable rank grows with width at the canceling rate). Lossy structural weight
+compression is scale-invariantly marginal; the only payers are table-like
+objects (position embeddings, MoE routers, layer-0 rogue-channel readers — all
+axis-aligned, i.e. absorbed free by per-channel scales).
+Docs: `2026-06-11-lrs-results.md` (L+S negative + theory postmortem),
+`2026-06-11-frontier-breakeven.md` (the law).
+
+**2. KV cache (closed, positive).** The same instrument scores cache
+activations at +0.5–2.5 bits of margin where weights scored ≈0. End state, all
+measured end-to-end on Llama-3.1-8B: **keys pre-RoPE low-rank(r≈16–32) +
+per-channel residual @3b, values rotate+Lloyd @2b ⇒ ~3.0 bits/entry,
++0.5% perplexity, 5.3× KV memory vs fp16**; bits belong to K (2× more
+sensitive than V); RoPE costs ~1–1.5 bits of key compressibility (store keys
+pre-RoPE, rotate at read); prefill-frozen subspaces generalize to later tokens
+(0.94 of oracle, drift-flat), so the recipe streams. TurboQuant's bounds
+replicate exactly on real caches but worst-case-optimal coding concedes 2–3×
+to structure-aware coding on keys; unbiased coding is dominated everywhere.
+Docs, in order: `2026-06-11-kv-research-plan.md` → `2026-06-11-k1-census-results.md`
+→ `2026-06-12-k2-arms-results.md` → `2026-06-12-k2b-ppl-results.md` →
+`2026-06-12-k2c-results.md`. Headline figure:
+`results/k2_cache_arms/k2_headline.png`.
+
+Remaining work is engineering, not science: quantize-on-append cache class,
+32k-context re-check, fused dequant-attention kernel (the Track B byte model
+in `src/bmx/bench/` predicts kernel wins before any CUDA is written).
 
 ## Quickstart
 
     uv sync
-    uv run pytest -q                 # 53 passed, 1 xfailed (intentional)
-    uv run python experiments/a2_matched_param.py --help
+    uv run pytest -q                      # 129 passed, 1 xfailed (intentional)
+    uv run python experiments/k1_cache_census.py --help   # tyro CLIs everywhere
+
+Experiments run on CPU except where noted (this repo was developed against an
+AMD GPU; NVIDIA-authoritative numbers come from a rented VM — see below).
+Raw caches (`results/cache/`, gitignored) regenerate via
+`experiments/collect_cache.py`.
 
 ## Layout
 
-- `src/bmx/` — framework: decomp methods (registry), stacks, bench, quant, census, eval, artifacts
-- `experiments/` — thin scripts per research item (a2/a3 attention, b1 kernel, c1/c2 MoE, d1 quant)
-- `results/` — committed metrics/figures (config + git SHA captured per run)
-- `scripts/` — NVIDIA-VM workflow (setup, Nsight wrappers), SageMath fixture exporter
-- `tests/` — validation suite (BM solver gate + module unit tests)
-- `docs/` — `HANDOFF.md`, session results, forward avenues, D0 lit notes, design spec
+- `src/bmx/` — the framework: `decomp/` (registered methods incl. the BM-RALS
+  solver, which beats the BM-ALS paper's own solver by 3–10 orders of
+  magnitude), `cache/` (KV collection, codecs, RoPE, distortion metrics,
+  quantized-prefill ppl eval), `quant/` (rotations, RTN, break-even
+  instrument, stats), `stacks/`, `bench/`, `sweep.py`, `artifacts.py`
+- `experiments/` — thin tyro scripts, one per research item; `plots/` read
+  parquet, never refit
+- `results/` — committed metrics + figures (config + env + git SHA per run)
+- `docs/` — results docs (the program record), research plans,
+  `superpowers/` (implementation plans/specs)
+- `scripts/` — NVIDIA-VM setup + Nsight wrappers, SageMath fixture exporter
+- `tests/` — 129 tests; agents: see `CLAUDE.md` for conventions and pitfalls
 
-## NVIDIA VM workflow (Track B authoritative numbers)
+## NVIDIA VM workflow (GPU-authoritative numbers)
 
-1. Push your branch; on the VM: `git clone <repo> && cd bmx && scripts/vm_setup.sh`
-2. `scripts/nsight_b1.sh` (wraps `experiments/b1_kernel_bench.py --device cuda` in ncu)
-3. `git add results/ && git commit && git push` — metrics come home as parquet + csv
-
-## SageMath fixtures
-
-Export per `tests/fixtures/README.md` to activate the agreement test.
+1. Push; on the VM: `git clone <repo> && cd bmx && scripts/vm_setup.sh`
+2. Run the experiment (Nsight wrapper: `scripts/nsight_b1.sh`)
+3. `git add results/ && git commit && git push` — metrics come home as parquet
