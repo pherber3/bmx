@@ -23,10 +23,24 @@ class Config:
     out: str = "results/k2_cache_arms/k2_headline.png"
 
 
-def newest(root: str, require: str = "metrics.parquet") -> pd.DataFrame:
-    runs = sorted(Path(root).glob(f"*/{require}"))
-    assert runs, f"no {require} under {root}"
-    return pd.concat([pd.read_parquet(p) for p in runs], ignore_index=True)
+def load_runs(root: str) -> pd.DataFrame:
+    """All runs under root, with a run id column so selections stay per-run
+    (concatenating runs blindly double-counts reruns and mixes ablations)."""
+    runs = sorted(Path(root).glob("*/metrics.parquet"))
+    assert runs, f"no metrics.parquet under {root}"
+    dfs = []
+    for p in runs:
+        df = pd.read_parquet(p)
+        df["run"] = p.parent.name
+        dfs.append(df)
+    return pd.concat(dfs, ignore_index=True)
+
+
+def newest_run_with(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
+    """Rows matching mask from the NEWEST run that has any such rows."""
+    hits = df[mask]
+    assert not hits.empty, "no run matches the selection"
+    return hits[hits.run == hits.run.max()]
 
 
 ARM_LABELS = {
@@ -40,10 +54,15 @@ ARM_LABELS = {
 
 
 def main(cfg: Config) -> None:
-    k2 = newest(cfg.k2_root)
-    k2 = k2[(k2.model == "llama-3.1-8b") & (k2.kind == "k_pre")]
-    k2b = newest(cfg.k2b_root)
-    k2b = k2b[(k2b.n_prefill == 1792) & (k2b.bits != 16)]
+    k2_all = load_runs(cfg.k2_root)
+    k2 = newest_run_with(
+        k2_all, (k2_all.model == "llama-3.1-8b") & (k2_all.kind == "k_pre")
+    )
+    # standard-sweep rows only: ablation rows carry bits == -1 sentinels
+    k2b_all = load_runs(cfg.k2b_root)
+    k2b = newest_run_with(
+        k2b_all, (k2b_all.n_prefill == 1792) & (k2b_all.bits.isin([2, 3]))
+    )
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
 

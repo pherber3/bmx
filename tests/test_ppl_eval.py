@@ -12,45 +12,11 @@ empirically ~0 for Llama and ~3e-5 absolute for GPT-2.
 """
 
 import torch
-from transformers import (
-    GPT2Config,
-    GPT2LMHeadModel,
-    LlamaConfig,
-    LlamaForCausalLM,
-)
+from factories import ids as _ids
+from factories import tiny_gpt2 as _tiny_gpt2
+from factories import tiny_llama as _tiny_llama
 
-from bmx.cache.ppl_eval import CacheCodecSpec, quantized_prefill_ppl
-
-
-# ---------------------------------------------------------------------------
-# Tiny model factories (copied from test_cache_collect.py for locality)
-# ---------------------------------------------------------------------------
-
-
-def _tiny_gpt2():
-    cfg = GPT2Config(n_layer=2, n_head=2, n_embd=32, vocab_size=97, n_positions=64)
-    torch.manual_seed(0)
-    return GPT2LMHeadModel(cfg).eval()
-
-
-def _tiny_llama():
-    cfg = LlamaConfig(
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        hidden_size=32,
-        intermediate_size=64,
-        vocab_size=97,
-        max_position_embeddings=64,
-    )
-    torch.manual_seed(1)
-    return LlamaForCausalLM(cfg).eval()
-
-
-def _ids(vocab=97, seq=24, seed=42):
-    return torch.randint(
-        0, vocab, (1, seq), generator=torch.Generator().manual_seed(seed)
-    )
+from bmx.cache.ppl_eval import CacheCodecSpec, quantized_prefill_ppl, run_prefill
 
 
 # ---------------------------------------------------------------------------
@@ -233,4 +199,46 @@ def test_bpe_reporting_matches_quantize_cache():
     )
     assert result["bpe_v"] == expected_bpe_v, (
         f"bpe_v={result['bpe_v']}, expected {expected_bpe_v}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: PrefillState reuse — identical results, no cross-arm contamination
+# ---------------------------------------------------------------------------
+
+
+def test_prefill_state_reuse_matches_fresh():
+    """One run_prefill serving multiple arms must give the exact same ppl as
+    per-arm fresh prefills, and a later fp16 call through the shared state must
+    equal the plain fp16 baseline (no contamination from earlier surgery)."""
+    model = _tiny_llama()
+    ids = _ids(seq=_N_SEQ)
+
+    state = run_prefill(model, ids, _N_PREFILL, capture_pre_rope=False)
+
+    # State-reused calls: a quantized arm first, then fp16 through the same state
+    result_rtn_state = quantized_prefill_ppl(
+        model, ids, _N_PREFILL, _RTN8_SPEC, _RTN8_SPEC, state=state
+    )
+    result_fp16_state = quantized_prefill_ppl(
+        model, ids, _N_PREFILL, _FP16_SPEC, _FP16_SPEC, state=state
+    )
+
+    # Fresh references (no state)
+    result_rtn_fresh = quantized_prefill_ppl(
+        model, ids, _N_PREFILL, _RTN8_SPEC, _RTN8_SPEC
+    )
+    result_fp16_fresh = quantized_prefill_ppl(
+        model, ids, _N_PREFILL, _FP16_SPEC, _FP16_SPEC
+    )
+
+    assert result_rtn_state["ppl"] == result_rtn_fresh["ppl"], (
+        f"state-reused rtn_token ppl {result_rtn_state['ppl']} != "
+        f"fresh ppl {result_rtn_fresh['ppl']}"
+    )
+    # fp16 evaluated AFTER the rtn surgery through the same state: any
+    # contamination of the shared cache would break this equality.
+    assert result_fp16_state["ppl"] == result_fp16_fresh["ppl"], (
+        f"state-reused fp16 ppl {result_fp16_state['ppl']} != "
+        f"plain fp16 baseline {result_fp16_fresh['ppl']}"
     )

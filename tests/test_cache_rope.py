@@ -5,35 +5,12 @@ Offline, seeded tiny random models only.
 
 import pytest
 import torch
-from transformers import GPT2Config, LlamaConfig, LlamaForCausalLM
+from factories import ids as _ids
+from factories import tiny_llama as _tiny_llama
+from transformers import GPT2Config
 
 from bmx.cache.collect import collect_cache
 from bmx.cache.rope import apply_rope, rope_cos_sin
-
-
-# ---------------------------------------------------------------------------
-# Tiny model factory (mirrors tests/test_cache_collect.py)
-# ---------------------------------------------------------------------------
-
-
-def _tiny_llama():
-    cfg = LlamaConfig(
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        hidden_size=32,
-        intermediate_size=64,
-        vocab_size=97,
-        max_position_embeddings=64,
-    )
-    torch.manual_seed(1)
-    return LlamaForCausalLM(cfg)
-
-
-def _ids(vocab=97, seq=16, seed=42):
-    return torch.randint(
-        0, vocab, (1, seq), generator=torch.Generator().manual_seed(seed)
-    )
 
 
 # ---------------------------------------------------------------------------

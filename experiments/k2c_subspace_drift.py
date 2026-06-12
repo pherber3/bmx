@@ -38,8 +38,8 @@ import tyro
 
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.codecs import quantize_cache
-from bmx.cache.collect import load_cache
-from bmx.cache.metrics import logit_distortion
+from bmx.cache.collect import from_matrix, load_cache, to_matrix
+from bmx.cache.metrics import logit_distortion, rel_fro
 from bmx.decomp.lrs import truncated_svd
 
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
@@ -69,18 +69,6 @@ class Config:
 # ---------------------------------------------------------------------------
 
 
-def build_matrix(tensor: torch.Tensor) -> torch.Tensor:
-    """(h, S, d) fp16 → (S, h*d) fp32 — K1 convention."""
-    return tensor.permute(1, 0, 2).reshape(tensor.shape[1], -1).float()
-
-
-def matrix_to_tensor(M: torch.Tensor, h_kv: int) -> torch.Tensor:
-    """(S, h*d) → (h_kv, S, d) — inverse K1 convention."""
-    S, hd = M.shape
-    d = hd // h_kv
-    return M.reshape(S, h_kv, d).permute(1, 0, 2)
-
-
 def eps_captured(X: torch.Tensor, V: torch.Tensor) -> float:
     """||X @ V @ V.T||_F^2 / ||X||_F^2 via cheaper ((X @ V)**2).sum() / (X**2).sum()."""
     denom = (X**2).sum().item()
@@ -89,21 +77,16 @@ def eps_captured(X: torch.Tensor, V: torch.Tensor) -> float:
     return ((X @ V) ** 2).sum().item() / denom
 
 
-def rel_fro(M_hat: torch.Tensor, M: torch.Tensor) -> float:
-    """||M_hat - M||_F / ||M||_F."""
-    return ((M_hat - M).norm() / M.norm().clamp_min(1e-12)).item()
-
-
 def codec_arm(
     TEST: torch.Tensor,
     V: torch.Tensor,
     bits: int,
     group: int,
-) -> tuple[torch.Tensor, float]:
+) -> torch.Tensor:
     """Frozen or oracle codec arm: project via V, quantize residual.
 
     V is (C, r), fp16-roundtripped for honest stored precision.
-    Returns (M_hat, rel_fro_error).
+    Returns M_hat.
     """
     V_stored = V.half().float()  # honest fp16 roundtrip
     L = TEST @ (V_stored @ V_stored.mT)  # (S_test, C)
@@ -175,7 +158,7 @@ def main(cfg: Config) -> None:
             h_kv = tensor.shape[0]
             S_full = tensor.shape[1]
 
-            M_full = build_matrix(tensor)  # (S_full, C)
+            M_full = to_matrix(tensor)  # (S_full, C)
             C = M_full.shape[1]
 
             # Split: FIT / TEST
@@ -198,13 +181,36 @@ def main(cfg: Config) -> None:
                 )
                 continue
 
-            for rank in cfg.ranks:
-                if rank > min(S_fit, C, S_test):
-                    continue
+            # SVDs once per segment at the max valid rank, then sliced inside
+            # the rank loop — the top-r of a rank-R SVD IS the rank-r SVD.
+            ranks_valid = [r for r in cfg.ranks if r <= min(S_fit, C, S_test)]
+            if not ranks_valid:
+                continue
+            r_max = max(ranks_valid)
+            _, V_fit_full = truncated_svd(FIT, r_max)  # (C, r_max)
+            Us_test_full, V_test_full = truncated_svd(TEST, r_max)
 
-                # Subspaces
-                _, V_fit = truncated_svd(FIT, rank)  # V_fit: (C, rank)
-                _, V_oracle = truncated_svd(TEST, rank)  # V_oracle: (C, rank)
+            # Drift-curve subspaces: fit on block 0 of (n_blocks+1) equal
+            # blocks of the full seq; per-block oracles for the upper bound.
+            n_total_blocks = cfg.n_blocks + 1
+            block_size = S_full // n_total_blocks
+            drift_ranks = [r for r in ranks_valid if r <= block_size]
+            V_drift_full: torch.Tensor | None = None
+            block_oracle_V: dict[int, torch.Tensor] = {}
+            if drift_ranks:
+                r_dmax = max(drift_ranks)
+                BLOCK0 = M_full[:block_size]
+                _, V_drift_full = truncated_svd(BLOCK0, r_dmax)
+                for b in range(1, cfg.n_blocks + 1):
+                    BLOCK = M_full[b * block_size : (b + 1) * block_size]
+                    if BLOCK.shape[0] == 0:
+                        continue
+                    block_oracle_V[b] = truncated_svd(BLOCK, r_dmax)[1]
+
+            for rank in ranks_valid:
+                # Subspaces (sliced from the shared SVDs)
+                V_fit = V_fit_full[:, :rank]  # V_fit: (C, rank)
+                V_oracle = V_test_full[:, :rank]  # V_oracle: (C, rank)
 
                 # --- Generalization metrics on TEST --------------------------
                 eps_frz = eps_captured(TEST, V_fit)
@@ -220,6 +226,7 @@ def main(cfg: Config) -> None:
                     bits=cfg.bits,
                     group=cfg.group,
                     rank=rank,
+                    svd_factors=(Us_test_full[:, :rank], V_test_full[:, :rank]),
                 )
 
                 rel_frz = rel_fro(M_hat_frz, TEST)
@@ -227,10 +234,10 @@ def main(cfg: Config) -> None:
                 rel_off = rel_fro(M_hat_off, TEST)
 
                 # Logit distortion — need (h_kv, S_test, d) tensors
-                K_test_true = matrix_to_tensor(TEST, h_kv)
-                K_hat_frz_t = matrix_to_tensor(M_hat_frz, h_kv)
-                K_hat_orc_t = matrix_to_tensor(M_hat_orc, h_kv)
-                K_hat_off_t = matrix_to_tensor(M_hat_off, h_kv)
+                K_test_true = from_matrix(TEST, h_kv)
+                K_hat_frz_t = from_matrix(M_hat_frz, h_kv)
+                K_hat_orc_t = from_matrix(M_hat_orc, h_kv)
+                K_hat_off_t = from_matrix(M_hat_off, h_kv)
 
                 logit_frz = logit_distortion(K_test_true, K_hat_frz_t, Q_fp32)
                 logit_orc = logit_distortion(K_test_true, K_hat_orc_t, Q_fp32)
@@ -260,19 +267,11 @@ def main(cfg: Config) -> None:
 
                 # --- Drift curve ---------------------------------------------
                 # Fit on block 0 of (n_blocks+1) equal blocks of the full seq
-                n_total_blocks = cfg.n_blocks + 1
-                block_size = S_full // n_total_blocks
-
                 if block_size < rank:
                     # Degenerate; skip drift
                     continue
 
-                block0_start = 0
-                block0_end = block_size
-                BLOCK0 = M_full[block0_start:block0_end]
-                if BLOCK0.shape[0] < rank:
-                    continue
-                _, V_drift = truncated_svd(BLOCK0, rank)
+                V_drift = V_drift_full[:, :rank]
 
                 for b in range(1, cfg.n_blocks + 1):
                     bstart = b * block_size
@@ -283,7 +282,7 @@ def main(cfg: Config) -> None:
 
                     eps_b = eps_captured(BLOCK, V_drift)
                     # oracle eps for this block (upper bound)
-                    eps_b_orc = eps_captured(BLOCK, truncated_svd(BLOCK, rank)[1])
+                    eps_b_orc = eps_captured(BLOCK, block_oracle_V[b][:, :rank])
                     eps_b_ratio = (eps_b / eps_b_orc) if eps_b_orc > 1e-30 else NaN
                     token_mid = bstart + (bend - bstart) // 2
 

@@ -23,7 +23,7 @@ import math
 import torch
 
 from bmx.decomp.lrs import truncated_svd
-from bmx.quant.hadamard import random_orthogonal, randomized_hadamard
+from bmx.quant.hadamard import is_power_of_2, random_orthogonal, randomized_hadamard
 from bmx.quant.rtn import rtn_quantize
 
 # ---------------------------------------------------------------------------
@@ -41,15 +41,6 @@ CACHE_ARMS = (
 
 
 # ---------------------------------------------------------------------------
-# Helper: is d a power of 2?
-# ---------------------------------------------------------------------------
-
-
-def _is_power_of_2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
-
-# ---------------------------------------------------------------------------
 # Helper: rotation / unrotation over the channel dim
 # ---------------------------------------------------------------------------
 
@@ -57,7 +48,7 @@ def _is_power_of_2(n: int) -> bool:
 def _rotate(M: torch.Tensor, seed: int) -> torch.Tensor:
     """Rotate rows of (S, C) matrix using Hadamard (C power-of-2) or random orthogonal."""
     C = M.shape[-1]
-    if _is_power_of_2(C):
+    if is_power_of_2(C):
         return randomized_hadamard(M, seed)
     else:
         Q = random_orthogonal(C, seed, dtype=M.dtype)
@@ -67,7 +58,7 @@ def _rotate(M: torch.Tensor, seed: int) -> torch.Tensor:
 def _unrotate(M_rot: torch.Tensor, seed: int) -> torch.Tensor:
     """Inverse rotation (Hadamard is self-inverse up to same signs; QR needs Q)."""
     C = M_rot.shape[-1]
-    if _is_power_of_2(C):
+    if is_power_of_2(C):
         # randomized_hadamard is H @ diag(signs) @ x; inverse is diag(signs) @ H @ x
         # but H^{-1} = H (orthonormal), so: signs * H @ M_rot
         g = torch.Generator().manual_seed(seed)
@@ -196,10 +187,11 @@ def _turboquant_mse(
     sqrt_c = math.sqrt(C)
     M_scaled = M_rot * sqrt_c
 
-    # Nearest-codebook assignment using vectorized approach
+    # Nearest-codebook assignment: the codebook is sorted, so bucketize on the
+    # midpoints between adjacent levels is exact (up to measure-zero fp ties).
     # M_scaled: (S, C), cb: (2^bits,)
-    diffs = (M_scaled.unsqueeze(2) - cb.view(1, 1, -1)).abs()  # (S, C, 2^bits)
-    indices = diffs.argmin(dim=2)  # (S, C)
+    mid = (cb[:-1] + cb[1:]) / 2  # (2^bits - 1,)
+    indices = torch.bucketize(M_scaled, mid)  # (S, C), values 0 .. 2^bits-1
     M_quantized = cb[indices] / sqrt_c  # (S, C)
 
     # Unrotate
@@ -215,6 +207,17 @@ def _turboquant_mse(
 # ---------------------------------------------------------------------------
 # QJL public helper (also used by turboquant_prod)
 # ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=8)
+def _qjl_sketch(C: int, seed: int) -> torch.Tensor:
+    """Shared (C, C) fp32 Gaussian QJL sketch, cached by (C, seed).
+
+    The returned tensor is shared across callers and must be treated as
+    read-only — never mutate it in place.
+    """
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(C, C, generator=g)
 
 
 def qjl_reconstruct(R: torch.Tensor, seed: int) -> torch.Tensor:
@@ -236,9 +239,8 @@ def qjl_reconstruct(R: torch.Tensor, seed: int) -> torch.Tensor:
     # Unit vectors
     R_unit = R / r_norms_stored
 
-    # One shared sketch for the whole matrix
-    g = torch.Generator().manual_seed(seed)
-    G = torch.randn(C, C, generator=g, dtype=R.dtype)
+    # One shared sketch for the whole matrix (cached, read-only)
+    G = _qjl_sketch(C, seed).to(R.dtype)
 
     # Signs: (S, C) — sign of projection
     signs = torch.sign(R_unit @ G.T)  # (S, C)
@@ -376,7 +378,5 @@ def quantize_cache(
         return _turboquant_mse(M, bits, seed)
     elif arm == "turboquant_prod":
         return _turboquant_prod(M, bits, seed)
-    elif arm == "lowrank_rtn_channel":
+    else:  # lowrank_rtn_channel — guarded by the CACHE_ARMS assert above
         return _lowrank_rtn_channel(M, bits, group, rank, svd_factors=svd_factors)
-    else:
-        raise AssertionError(f"unreachable arm {arm!r}")

@@ -8,6 +8,9 @@ collect_cache(model, input_ids, n_q_keep=256) -> dict[str, Tensor]
 save_cache(tensors, path) -> None
 load_cache(path) -> dict[str, Tensor]
 
+to_matrix(kv) -> Tensor / from_matrix(M, h) -> Tensor
+    The K1 layout convention: (h, S, d) <-> (S, h*d) fp32 matrix.
+
 Supported architectures (dispatched structurally, not by model_type string)
 ---------------------------------------------------------------------------
 - GPT-2 style (``model.transformer.h[i].attn.c_attn`` packed QKV projection):
@@ -28,6 +31,18 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
+
+
+def to_matrix(kv: torch.Tensor) -> torch.Tensor:
+    """(h, S, d) cache tensor -> (S, h*d) fp32 matrix (the census/codec layout)."""
+    h, S, d = kv.shape
+    return kv.permute(1, 0, 2).reshape(S, h * d).float()
+
+
+def from_matrix(M: torch.Tensor, h: int) -> torch.Tensor:
+    """(S, h*d) matrix -> (h, S, d), inverse of to_matrix (dtype preserved)."""
+    S, hd = M.shape
+    return M.reshape(S, h, hd // h).permute(1, 0, 2)
 
 
 def _get_kv_layer(past_key_values, i: int):

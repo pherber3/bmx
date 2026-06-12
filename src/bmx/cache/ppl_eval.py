@@ -5,7 +5,14 @@ Public API
 CacheCodecSpec : dataclass
     Codec specification for one side (K or V) of the KV cache.
 
-quantized_prefill_ppl(model, input_ids, n_prefill, k_spec, v_spec) -> dict
+PrefillState : dataclass
+    Reusable prefill artifacts: the DynamicCache plus the hooked k_pre store.
+
+run_prefill(model, input_ids, n_prefill, capture_pre_rope) -> PrefillState
+    The hooked prefill forward, factored out so one prefill can serve many
+    codec arms (quantized_prefill_ppl deepcopies the cache before surgery).
+
+quantized_prefill_ppl(model, input_ids, n_prefill, k_spec, v_spec, state=None) -> dict
     Prefill N tokens, quantize the full prefill cache, write it back, then
     teacher-force the next M tokens and return their NLL perplexity.
 
@@ -25,12 +32,13 @@ and inverse: reshape(S, h_kv, d).permute(1, 0, 2).
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 
 import torch
 
 from bmx.cache.codecs import CACHE_ARMS, quantize_cache
-from bmx.cache.collect import _register_hooks
+from bmx.cache.collect import _register_hooks, from_matrix, to_matrix
 from bmx.cache.rope import apply_rope, rope_cos_sin
 
 
@@ -64,16 +72,49 @@ class CacheCodecSpec:
     pre_rope: bool = False
 
 
-def _k1_to_matrix(kv: torch.Tensor) -> torch.Tensor:
-    """(h, S, d) -> (S, h*d) fp32 matrix for quantize_cache."""
-    h, S, d = kv.shape
-    return kv.permute(1, 0, 2).reshape(S, h * d).float()
+@dataclasses.dataclass
+class PrefillState:
+    """Reusable prefill artifacts for quantized_prefill_ppl.
+
+    Attributes
+    ----------
+    cache :
+        The DynamicCache from the prefill forward.  quantized_prefill_ppl
+        deepcopies it before surgery, so one state can serve many arms.
+    k_pre :
+        ``layer{i}.k_pre`` tensors captured via hooks (empty dict when the
+        state was built with ``capture_pre_rope=False``).  Read-only.
+    """
+
+    cache: object
+    k_pre: dict[str, torch.Tensor]
 
 
-def _matrix_to_k1(M: torch.Tensor, h: int, d: int) -> torch.Tensor:
-    """(S, h*d) -> (h, S, d)."""
-    S = M.shape[0]
-    return M.reshape(S, h, d).permute(1, 0, 2)
+def run_prefill(
+    model,
+    input_ids: torch.Tensor,
+    n_prefill: int,
+    capture_pre_rope: bool,
+) -> PrefillState:
+    """Hooked prefill forward over the first *n_prefill* tokens.
+
+    Set ``capture_pre_rope=True`` if ANY codec arm that will consume this
+    state needs pre-RoPE keys (``k_spec.pre_rope=True``).
+    """
+    k_pre_store: dict[str, torch.Tensor] = {}
+    handles: list = []
+
+    if capture_pre_rope:
+        handles, _ = _register_hooks(model, k_pre_store, n_q_keep=1)
+
+    try:
+        with torch.no_grad():
+            prefill_out = model(input_ids[:, :n_prefill], use_cache=True)
+    finally:
+        for h in handles:
+            h.remove()
+
+    return PrefillState(cache=prefill_out.past_key_values, k_pre=k_pre_store)
 
 
 def _quantize_kv(
@@ -85,14 +126,14 @@ def _quantize_kv(
     ``kv_fp`` is expected to be fp32.  For ``arm="fp16"``, returns the input
     unchanged and ``bpe=16.0``.
     """
-    h, S, d = kv_fp.shape
+    h = kv_fp.shape[0]
     if spec.arm == "fp16":
         return kv_fp, 16.0
 
     assert spec.arm in CACHE_ARMS, (
         f"unknown arm {spec.arm!r}; use one of {CACHE_ARMS} or 'fp16'"
     )
-    M = _k1_to_matrix(kv_fp)  # (S, h*d)
+    M = to_matrix(kv_fp)  # (S, h*d)
     M_hat, bpe = quantize_cache(
         spec.arm,
         M,
@@ -101,7 +142,7 @@ def _quantize_kv(
         group=spec.group,
         rank=spec.rank,
     )
-    kv_hat = _matrix_to_k1(M_hat, h, d)
+    kv_hat = from_matrix(M_hat, h)
     return kv_hat, bpe
 
 
@@ -111,6 +152,7 @@ def quantized_prefill_ppl(
     n_prefill: int,
     k_spec: CacheCodecSpec,
     v_spec: CacheCodecSpec,
+    state: PrefillState | None = None,
 ) -> dict:
     """Prefill N tokens, quantize the KV cache, evaluate M-token continuation ppl.
 
@@ -126,6 +168,14 @@ def quantized_prefill_ppl(
         Codec spec for keys.
     v_spec : CacheCodecSpec
         Codec spec for values.
+    state : PrefillState | None
+        Optional pre-computed prefill (see run_prefill).  When provided, the
+        cache is deepcopied before surgery so the state stays reusable across
+        arms; the stored k_pre tensors are read-only and shared.  When None,
+        run_prefill is called internally (behavior identical to a fresh call).
+        A state passed here must have been built from the same
+        (model, input_ids[:, :n_prefill]) — and with capture_pre_rope=True if
+        ``k_spec.pre_rope``.
 
     Returns
     -------
@@ -139,31 +189,37 @@ def quantized_prefill_ppl(
     assert input_ids.shape[0] == 1, "batch dim must be 1"
     N = input_ids.shape[1]
     assert n_prefill < N, "n_prefill must be < total sequence length"
+    assert not v_spec.pre_rope, "pre_rope has no effect on V; set it on k_spec"
 
     # ------------------------------------------------------------------
-    # Step 1: prefill, optionally capturing k_pre via hooks
+    # Step 1: prefill (or reuse), optionally capturing k_pre via hooks
     # ------------------------------------------------------------------
-    k_pre_store: dict[str, torch.Tensor] = {}
-    handles: list = []
+    if state is None:
+        state = run_prefill(model, input_ids, n_prefill, k_spec.pre_rope)
+        cache = state.cache  # freshly built; safe to mutate in place
+    else:
+        cache = copy.deepcopy(state.cache)  # surgery mutates; keep state reusable
 
-    if k_spec.pre_rope:
-        handles, _ = _register_hooks(model, k_pre_store, n_q_keep=1)
-
-    try:
-        with torch.no_grad():
-            prefill_out = model(input_ids[:, :n_prefill], use_cache=True)
-    finally:
-        for h in handles:
-            h.remove()
-
-    cache = prefill_out.past_key_values
+    k_pre_store = state.k_pre
     n_layer = len(cache.layers)
+
+    # RoPE tables: spec-level, identical for every layer — compute once.
+    if k_spec.pre_rope:
+        assert k_pre_store, (
+            "k_spec.pre_rope=True but state has no k_pre; "
+            "build the state with capture_pre_rope=True"
+        )
+        S = cache.layers[0].keys.shape[2]
+        cos, sin = rope_cos_sin(model.config, S)
+        cos = cos.float()  # _quantize_kv outputs are fp32
+        sin = sin.float()
 
     # ------------------------------------------------------------------
     # Step 2: quantize and write back into cache
     # ------------------------------------------------------------------
-    bpe_k_list: list[float] = []
-    bpe_v_list: list[float] = []
+    # bpe is spec-determined and identical across layers (all layers share
+    # (S, C)), so a plain per-layer overwrite suffices.
+    bpe_k = bpe_v = float("nan")
 
     for i in range(n_layer):
         layer = cache.layers[i]
@@ -172,7 +228,6 @@ def quantized_prefill_ppl(
         vals_orig = layer.values  # (1, h_kv, S, d)
 
         cache_dtype = keys_orig.dtype
-        S = keys_orig.shape[2]
 
         # --- Key quantization ---
         if k_spec.pre_rope:
@@ -181,9 +236,6 @@ def quantized_prefill_ppl(
             k_pre_fp32 = k_pre_fp16.float()
             k_hat_fp32, bpe_k = _quantize_kv(k_pre_fp32, k_spec)
             # Apply RoPE to get post-RoPE quantized keys
-            cos, sin = rope_cos_sin(model.config, S)
-            cos = cos.to(k_hat_fp32.dtype)
-            sin = sin.to(k_hat_fp32.dtype)
             k_hat_fp32 = apply_rope(k_hat_fp32, cos, sin)
         else:
             k_fp32 = keys_orig.squeeze(0).float()  # (h_kv, S, d)
@@ -196,14 +248,6 @@ def quantized_prefill_ppl(
         # --- Write back (cast to original cache dtype, re-add batch dim) ---
         layer.keys = k_hat_fp32.to(cache_dtype).unsqueeze(0)  # (1, h_kv, S, d)
         layer.values = v_hat_fp32.to(cache_dtype).unsqueeze(0)  # (1, h_kv, S, d)
-
-        bpe_k_list.append(bpe_k)
-        bpe_v_list.append(bpe_v)
-
-    # Average bpe across layers (all layers use same spec so they're identical,
-    # but average is honest when shapes vary, e.g. lowrank bpe depends on S, C).
-    bpe_k_avg = sum(bpe_k_list) / len(bpe_k_list)
-    bpe_v_avg = sum(bpe_v_list) / len(bpe_v_list)
 
     # ------------------------------------------------------------------
     # Step 3: teacher-forced continuation forward
@@ -218,7 +262,7 @@ def quantized_prefill_ppl(
 
     return {
         "ppl": ppl,
-        "bpe_k": bpe_k_avg,
-        "bpe_v": bpe_v_avg,
+        "bpe_k": bpe_k,
+        "bpe_v": bpe_v,
         "n_eval": n_eval,
     }

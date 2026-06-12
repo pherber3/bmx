@@ -92,13 +92,9 @@ class TestMonotonicity:
     def test_higher_bits_lower_error(self, arm: str):
         M = _seeded_matrix(seed=99)
         kwargs: dict = dict(seed=SEED, group=GROUP, rank=RANK)
-        if arm == "turboquant_prod":
-            # b>=2 required; b=2 and b=4 are both valid
-            m2, _ = quantize_cache(arm, M, bits=2, **kwargs)
-            m4, _ = quantize_cache(arm, M, bits=4, **kwargs)
-        else:
-            m2, _ = quantize_cache(arm, M, bits=2, **kwargs)
-            m4, _ = quantize_cache(arm, M, bits=4, **kwargs)
+        # b=2 and b=4 are valid for every arm (turboquant_prod requires b>=2)
+        m2, _ = quantize_cache(arm, M, bits=2, **kwargs)
+        m4, _ = quantize_cache(arm, M, bits=4, **kwargs)
         assert _rel_err(m4, M) < _rel_err(m2, M), (
             f"arm={arm}: b=4 err {_rel_err(m4, M):.4f} not < b=2 err {_rel_err(m2, M):.4f}"
         )

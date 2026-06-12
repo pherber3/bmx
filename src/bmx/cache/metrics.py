@@ -59,6 +59,17 @@ def _frobenius_rel_error(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def rel_fro(A: torch.Tensor, B: torch.Tensor) -> float:
+    """Relative Frobenius error ||A - B||_F / ||B||_F (fp32, clamped denominator).
+
+    A is the approximation, B the reference. Inputs may be fp16; both are cast
+    to fp32 at entry (see module note).
+    """
+    A = A.float()
+    B = B.float()
+    return ((A - B).norm() / B.norm().clamp_min(1e-12)).item()
+
+
 def logit_distortion(
     K: torch.Tensor,
     Kq: torch.Tensor,

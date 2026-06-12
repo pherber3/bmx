@@ -36,8 +36,9 @@ import tyro
 
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.codecs import CACHE_ARMS, quantize_cache
-from bmx.cache.collect import load_cache
-from bmx.cache.metrics import attn_output_distortion, logit_distortion
+from bmx.cache.collect import from_matrix, load_cache, to_matrix
+from bmx.cache.metrics import attn_output_distortion, logit_distortion, rel_fro
+from bmx.cache.rope import apply_rope
 from bmx.decomp.lrs import truncated_svd
 
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
@@ -62,24 +63,6 @@ class Config:
     ranks: tuple[int, ...] = (8, 16, 32)
     seed: int = 0
     n_random_controls: int = 2
-
-
-# ---------------------------------------------------------------------------
-# Matrix construction / inverse
-# ---------------------------------------------------------------------------
-
-
-def build_matrix(tensor: torch.Tensor) -> torch.Tensor:
-    """(h, S, d) fp16 → (S, h*d) fp32 — K1 convention."""
-    return tensor.permute(1, 0, 2).reshape(tensor.shape[1], -1).float()
-
-
-def matrix_to_tensor(M_hat: torch.Tensor, h_kv: int) -> torch.Tensor:
-    """(S, h*d) → (h_kv, S, d) — inverse of build_matrix."""
-    S, hd = M_hat.shape
-    d = hd // h_kv
-    # reshape to (S, h, d) then permute to (h, S, d)
-    return M_hat.reshape(S, h_kv, d).permute(1, 0, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +148,7 @@ def main(cfg: Config) -> None:
         k_post_t = layer_keys[0]["k"].float()
         S0 = k_pre_t.shape[1]
         cos0, sin0 = get_cos_sin(S0)
-        from bmx.cache.rope import apply_rope as _apply_rope
-
-        k_reconstructed = _apply_rope(k_pre_t, cos0, sin0)
+        k_reconstructed = apply_rope(k_pre_t, cos0, sin0)
         rel_err = (k_reconstructed - k_post_t).norm() / k_post_t.norm().clamp_min(1e-12)
         rel_err_val = rel_err.item()
         print(
@@ -201,9 +182,6 @@ def main(cfg: Config) -> None:
         if key not in svd_cache:
             svd_cache[key] = truncated_svd(M, rank)
         return svd_cache[key]
-
-    def rel_fro(M_hat: torch.Tensor, M: torch.Tensor) -> float:
-        return ((M_hat - M).norm() / M.norm().clamp_min(1e-12)).item()
 
     def emit(row: dict) -> None:
         rows.append(row)
@@ -258,22 +236,20 @@ def main(cfg: Config) -> None:
         # For kind k_pre: true post-RoPE K for logit_rope metric
         K_post_true: torch.Tensor | None = None
         if rope_ready and rope_validated:
-            from bmx.cache.rope import apply_rope as _apply_rope
-
-            K_post_true = _apply_rope(k_pre_t.float(), cos_layer, sin_layer)
+            K_post_true = apply_rope(k_pre_t.float(), cos_layer, sin_layer)
 
         print(f"\n[layer {layer_i}] (h_kv={h_kv}, S={S}, d={d}, C={C})", flush=True)
 
         for kind in ("k", "k_pre", "v"):
             if kind == "k":
                 tensor = k_t
-                M_orig = build_matrix(tensor)  # (S, C)
+                M_orig = to_matrix(tensor)  # (S, C)
             elif kind == "k_pre":
                 tensor = k_pre_t
-                M_orig = build_matrix(tensor)
+                M_orig = to_matrix(tensor)
             else:  # v
                 tensor = v_t
-                M_orig = build_matrix(tensor)
+                M_orig = to_matrix(tensor)
 
             # ---- base arms -----------------------------------------------
             for arm in _BASE_ARMS:
@@ -283,7 +259,7 @@ def main(cfg: Config) -> None:
                     )
 
                     # Reshape back
-                    K_hat_t = matrix_to_tensor(M_hat, h_kv)  # (h_kv, S, d)
+                    K_hat_t = from_matrix(M_hat, h_kv)  # (h_kv, S, d)
 
                     # Metrics
                     rf = rel_fro(M_hat, M_orig)
@@ -294,9 +270,7 @@ def main(cfg: Config) -> None:
                         # for k_pre with rope: cross-basis metric
                         logit_rope = float("nan")
                         if kind == "k_pre" and rope_ready and K_post_true is not None:
-                            from bmx.cache.rope import apply_rope as _apply_rope
-
-                            K_hat_rope = _apply_rope(
+                            K_hat_rope = apply_rope(
                                 K_hat_t.float(), cos_layer, sin_layer
                             )
                             logit_rope = logit_distortion(
@@ -341,16 +315,14 @@ def main(cfg: Config) -> None:
                         svd_factors=svd_factors,
                     )
 
-                    K_hat_t = matrix_to_tensor(M_hat, h_kv)
+                    K_hat_t = from_matrix(M_hat, h_kv)
                     rf = rel_fro(M_hat, M_orig)
 
                     if kind == "k" or kind == "k_pre":
                         logit = logit_distortion(tensor.float(), K_hat_t, Q_fp32)
                         logit_rope = float("nan")
                         if kind == "k_pre" and rope_ready and K_post_true is not None:
-                            from bmx.cache.rope import apply_rope as _apply_rope
-
-                            K_hat_rope = _apply_rope(
+                            K_hat_rope = apply_rope(
                                 K_hat_t.float(), cos_layer, sin_layer
                             )
                             logit_rope = logit_distortion(

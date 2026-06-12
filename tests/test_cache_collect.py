@@ -8,40 +8,18 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import GPT2Config, GPT2LMHeadModel, LlamaConfig, LlamaForCausalLM
+from factories import ids as _ids
+from factories import tiny_gpt2 as _tiny_gpt2
+from factories import tiny_llama as _tiny_llama
+from transformers import GPT2Config
 
-from bmx.cache.collect import collect_cache, load_cache, save_cache
-
-
-# ---------------------------------------------------------------------------
-# Tiny model factories
-# ---------------------------------------------------------------------------
-
-
-def _tiny_gpt2():
-    cfg = GPT2Config(n_layer=2, n_head=2, n_embd=32, vocab_size=97, n_positions=64)
-    torch.manual_seed(0)
-    return GPT2LMHeadModel(cfg)
-
-
-def _tiny_llama():
-    cfg = LlamaConfig(
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        hidden_size=32,
-        intermediate_size=64,
-        vocab_size=97,
-        max_position_embeddings=64,
-    )
-    torch.manual_seed(1)
-    return LlamaForCausalLM(cfg)
-
-
-def _ids(vocab=97, seq=12, seed=42):
-    return torch.randint(
-        0, vocab, (1, seq), generator=torch.Generator().manual_seed(seed)
-    )
+from bmx.cache.collect import (
+    collect_cache,
+    from_matrix,
+    load_cache,
+    save_cache,
+    to_matrix,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +181,23 @@ def test_unsupported_architecture_raises():
 
     with pytest.raises(ValueError, match="unsupported architecture"):
         collect_cache(Dummy(), torch.zeros(1, 4, dtype=torch.long))
+
+
+# ---------------------------------------------------------------------------
+# Test 5: K1 layout convention round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_to_matrix_from_matrix_roundtrip():
+    """from_matrix(to_matrix(kv), h) == kv.float() for an odd-shaped tensor."""
+    h, S, d = 3, 7, 5  # deliberately odd / non-power-of-2 shape
+    g = torch.Generator().manual_seed(123)
+    kv = torch.randn(h, S, d, generator=g, dtype=torch.float16)
+
+    M = to_matrix(kv)
+    assert M.shape == (S, h * d)
+    assert M.dtype == torch.float32
+
+    kv_back = from_matrix(M, h)
+    assert kv_back.shape == (h, S, d)
+    assert torch.equal(kv_back, kv.float())

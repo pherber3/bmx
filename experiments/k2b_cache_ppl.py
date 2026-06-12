@@ -27,7 +27,7 @@ import tyro
 from transformers import AutoModelForCausalLM
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.ppl_eval import CacheCodecSpec, quantized_prefill_ppl
+from bmx.cache.ppl_eval import CacheCodecSpec, quantized_prefill_ppl, run_prefill
 from bmx.eval.layer_swap import load_eval_tokens
 
 
@@ -52,10 +52,10 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# Arms table builder
-# Each entry: (arm_k_label, arm_v_label, k_spec_fn, v_spec_fn, is_baseline)
-# k_spec_fn / v_spec_fn are callables (cfg, bits) -> CacheCodecSpec.
-# The fp16 baseline row uses bits=0 (dummy) and is evaluated once.
+# Arm spec registry
+# SPEC_FNS maps arm name -> (cfg, bits, pre_rope) -> CacheCodecSpec.
+# STANDARD_ARMS lists the (arm_k, arm_v) name pairs of the standard sweep;
+# the fp16 baseline row is handled separately (evaluated once per context).
 # ---------------------------------------------------------------------------
 
 
@@ -64,51 +64,51 @@ def _has_rope(model: torch.nn.Module) -> bool:
     return hasattr(model.config, "rope_parameters")
 
 
-def _build_arms_table(cfg: Config, model: torch.nn.Module):
-    """Return the arms table with pre_rope resolved for this model."""
-    pre_rope = _has_rope(model)
+def _spec_fp16(cfg: Config, bits: int, pre_rope: bool) -> CacheCodecSpec:
+    return CacheCodecSpec(arm="fp16")
 
-    def fp16(bits):
-        return CacheCodecSpec(arm="fp16")
 
-    def rtn_channel(bits):
-        return CacheCodecSpec(
-            arm="rtn_channel", bits=bits, group=cfg.group, seed=cfg.seed
-        )
+def _spec_rtn_channel(cfg: Config, bits: int, pre_rope: bool) -> CacheCodecSpec:
+    return CacheCodecSpec(arm="rtn_channel", bits=bits, group=cfg.group, seed=cfg.seed)
 
-    def lowrank_rtn_channel(bits):
-        return CacheCodecSpec(
-            arm="lowrank_rtn_channel",
-            bits=bits,
-            rank=cfg.rank,
-            group=cfg.group,
-            seed=cfg.seed,
-            pre_rope=pre_rope,
-        )
 
-    def turboquant_mse(bits):
-        return CacheCodecSpec(
-            arm="turboquant_mse", bits=bits, group=cfg.group, seed=cfg.seed
-        )
+def _spec_lowrank_rtn_channel(cfg: Config, bits: int, pre_rope: bool) -> CacheCodecSpec:
+    return CacheCodecSpec(
+        arm="lowrank_rtn_channel",
+        bits=bits,
+        rank=cfg.rank,
+        group=cfg.group,
+        seed=cfg.seed,
+        pre_rope=pre_rope,
+    )
 
-    def turboquant_prod(bits):
-        return CacheCodecSpec(
-            arm="turboquant_prod", bits=bits, group=cfg.group, seed=cfg.seed
-        )
 
-    return [
-        ("fp16", "fp16", fp16, fp16, True),
-        ("rtn_channel", "rtn_channel", rtn_channel, rtn_channel, False),
-        (
-            "lowrank_rtn_channel",
-            "turboquant_mse",
-            lowrank_rtn_channel,
-            turboquant_mse,
-            False,
-        ),
-        ("turboquant_mse", "turboquant_mse", turboquant_mse, turboquant_mse, False),
-        ("turboquant_prod", "turboquant_prod", turboquant_prod, turboquant_prod, False),
-    ]
+def _spec_turboquant_mse(cfg: Config, bits: int, pre_rope: bool) -> CacheCodecSpec:
+    return CacheCodecSpec(
+        arm="turboquant_mse", bits=bits, group=cfg.group, seed=cfg.seed
+    )
+
+
+def _spec_turboquant_prod(cfg: Config, bits: int, pre_rope: bool) -> CacheCodecSpec:
+    return CacheCodecSpec(
+        arm="turboquant_prod", bits=bits, group=cfg.group, seed=cfg.seed
+    )
+
+
+SPEC_FNS: dict[str, callable] = {
+    "fp16": _spec_fp16,
+    "rtn_channel": _spec_rtn_channel,
+    "lowrank_rtn_channel": _spec_lowrank_rtn_channel,
+    "turboquant_mse": _spec_turboquant_mse,
+    "turboquant_prod": _spec_turboquant_prod,
+}
+
+STANDARD_ARMS: list[tuple[str, str]] = [
+    ("rtn_channel", "rtn_channel"),
+    ("lowrank_rtn_channel", "turboquant_mse"),
+    ("turboquant_mse", "turboquant_mse"),
+    ("turboquant_prod", "turboquant_prod"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +143,12 @@ def main(cfg: Config) -> None:
     print(f"Run dir: {run}")
 
     # All n_prefill values to evaluate: primary + any extras
-    all_contexts: list[int] = [cfg.n_prefill] + [c for c in cfg.contexts]
+    all_contexts: list[int] = [cfg.n_prefill] + list(cfg.contexts)
     n_tokens_needed = max(all_contexts) + cfg.n_eval
 
     print(f"Loading model: {cfg.model_name}")
     model = _load_model(cfg.model_name)
 
-    arms_table = _build_arms_table(cfg, model)
     has_rope = _has_rope(model)
     print(
         f"RoPE detected: {has_rope}  (lowrank pre_rope={'True' if has_rope else 'False (no RoPE in model)'})"
@@ -172,19 +171,24 @@ def main(cfg: Config) -> None:
 
         print(f"\n--- n_prefill={n_pref} ---")
 
+        # One prefill per context, shared by every arm below (the cache is
+        # deepcopied inside quantized_prefill_ppl before surgery).
+        # capture_pre_rope must be True if ANY arm needs pre-RoPE keys.
+        state = run_prefill(model, ids, n_pref, capture_pre_rope=has_rope)
+
         # ------------------------------------------------------------------
         # 1.  fp16 baseline (bits-independent, evaluated once per context)
         # ------------------------------------------------------------------
-        arm_k_lbl, arm_v_lbl, fn_k, fn_v, _ = arms_table[0]
-        k_spec = fn_k(0)
-        v_spec = fn_v(0)
-        result = quantized_prefill_ppl(model, ids, n_pref, k_spec, v_spec)
+        fp16_spec = SPEC_FNS["fp16"](cfg, 0, False)
+        result = quantized_prefill_ppl(
+            model, ids, n_pref, fp16_spec, fp16_spec, state=state
+        )
         ppl_base = result["ppl"]
         fp16_ppl[n_pref] = ppl_base
         row = dict(
             model=cfg.model_name,
-            arm_k=arm_k_lbl,
-            arm_v=arm_v_lbl,
+            arm_k="fp16",
+            arm_v="fp16",
             bits=16,
             bits_k=16,
             bits_v=16,
@@ -206,42 +210,57 @@ def main(cfg: Config) -> None:
         # 2.  Quantized arms: standard table × bits, or the sensitivity
         #     ablation (K-only / V-only / asymmetric bits on the finalists)
         # ------------------------------------------------------------------
-        lowrank_fn = arms_table[2][2]
-        tq_fn = arms_table[2][3]
-        fp16_spec = CacheCodecSpec(arm="fp16")
         if cfg.ablation:
+            lowrank_fn = SPEC_FNS["lowrank_rtn_channel"]
+            tq_fn = SPEC_FNS["turboquant_mse"]
+
+            def lowrank(b):
+                return lowrank_fn(cfg, b, has_rope)
+
+            def tq(b):
+                return tq_fn(cfg, b, has_rope)
+
             b_lo, b_hi = min(cfg.bits), max(cfg.bits)
             entries = [
-                ("lowrank_rtn_channel", "fp16", lowrank_fn(b_hi), fp16_spec, b_hi, 16),
-                ("lowrank_rtn_channel", "fp16", lowrank_fn(b_lo), fp16_spec, b_lo, 16),
-                ("fp16", "turboquant_mse", fp16_spec, tq_fn(b_hi), 16, b_hi),
-                ("fp16", "turboquant_mse", fp16_spec, tq_fn(b_lo), 16, b_lo),
+                ("lowrank_rtn_channel", "fp16", lowrank(b_hi), fp16_spec, b_hi, 16),
+                ("lowrank_rtn_channel", "fp16", lowrank(b_lo), fp16_spec, b_lo, 16),
+                ("fp16", "turboquant_mse", fp16_spec, tq(b_hi), 16, b_hi),
+                ("fp16", "turboquant_mse", fp16_spec, tq(b_lo), 16, b_lo),
                 (
                     "lowrank_rtn_channel",
                     "turboquant_mse",
-                    lowrank_fn(b_hi),
-                    tq_fn(b_lo),
+                    lowrank(b_hi),
+                    tq(b_lo),
                     b_hi,
                     b_lo,
                 ),
                 (
                     "lowrank_rtn_channel",
                     "turboquant_mse",
-                    lowrank_fn(b_lo),
-                    tq_fn(b_hi),
+                    lowrank(b_lo),
+                    tq(b_hi),
                     b_lo,
                     b_hi,
                 ),
             ]
         else:
             entries = [
-                (ak, av, fn_k(b), fn_v(b), b, b)
-                for ak, av, fn_k, fn_v, _ in arms_table[1:]
+                (
+                    ak,
+                    av,
+                    SPEC_FNS[ak](cfg, b, has_rope),
+                    SPEC_FNS[av](cfg, b, has_rope),
+                    b,
+                    b,
+                )
+                for ak, av in STANDARD_ARMS
                 for b in sorted(cfg.bits)
             ]
 
         for arm_k_lbl, arm_v_lbl, k_spec, v_spec, bits_k, bits_v in entries:
-            result = quantized_prefill_ppl(model, ids, n_pref, k_spec, v_spec)
+            result = quantized_prefill_ppl(
+                model, ids, n_pref, k_spec, v_spec, state=state
+            )
             ppl_q = result["ppl"]
             dppl = 100.0 * (ppl_q / ppl_base - 1.0)
             row = dict(

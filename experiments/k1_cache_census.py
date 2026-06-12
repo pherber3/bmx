@@ -28,16 +28,12 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.collect import load_cache
+from bmx.cache.collect import load_cache, to_matrix
 from bmx.quant.breakeven import breakeven_row
-from bmx.quant.hadamard import random_orthogonal, randomized_hadamard
+from bmx.quant.hadamard import is_power_of_2, random_orthogonal, randomized_hadamard
 from bmx.quant.stats import kurtosis, outlier_mass
 
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
-
-
-def _is_power_of_2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
 
 
 @dataclasses.dataclass
@@ -45,16 +41,6 @@ class Config:
     cache_path: str
     model_label: str = ""
     max_side_bpw: float = 6.0
-
-
-def build_matrix(tensor: torch.Tensor) -> torch.Tensor:
-    """Convert (h, S, d) fp16 cache tensor to (S, h*d) fp32 matrix.
-
-    For q tensors shape is also (h, T, d) — same convention applies.
-    """
-    # tensor: (h, S, d) — permute to (S, h, d) then flatten last two dims
-    M = tensor.permute(1, 0, 2).reshape(tensor.shape[1], -1).float()
-    return M
 
 
 def main(cfg: Config) -> None:
@@ -82,7 +68,7 @@ def main(cfg: Config) -> None:
             if kind not in kinds:
                 continue
 
-            M = build_matrix(kinds[kind])  # (S, h*d) fp32
+            M = to_matrix(kinds[kind])  # (S, h*d) fp32
             S, channels = M.shape
 
             col_norms = M.norm(dim=0)
@@ -90,7 +76,7 @@ def main(cfg: Config) -> None:
             kurt_tok = kurtosis(M, dim=-1).mean().item()
             kurt_ch = kurtosis(M, dim=0).mean().item()
 
-            if _is_power_of_2(channels):
+            if is_power_of_2(channels):
                 rotation = "hadamard"
                 M_rot = randomized_hadamard(M, seed=0)
             else:

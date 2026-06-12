@@ -4,6 +4,11 @@ ordering) and QR random orthogonal (any dim, the Haar reference)."""
 import torch
 
 
+def is_power_of_2(n: int) -> bool:
+    """True iff n is a positive power of 2."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
 def fwht(x: torch.Tensor) -> torch.Tensor:
     """Orthonormal FWHT over the last dim (must be a power of 2)."""
     d = x.shape[-1]
