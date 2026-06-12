@@ -1,0 +1,5 @@
+{
+  "cache_path": "results/cache/gpt2_1024.safetensors",
+  "model_label": "gpt2",
+  "max_side_bpw": 6.0
+}

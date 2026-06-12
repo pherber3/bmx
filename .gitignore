@@ -8,3 +8,5 @@ results/**/*.safetensors
 results/**/*.bin
 results/**/*.pt
 hf_cache/
+# raw KV-cache dumps (data, not metrics)
+results/cache/
