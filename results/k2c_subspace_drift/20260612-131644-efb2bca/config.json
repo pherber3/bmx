@@ -1,0 +1,17 @@
+{
+  "cache_path": "results/cache/gpt2_1024.safetensors",
+  "model_label": "gpt2",
+  "ranks": [
+    8,
+    16,
+    32
+  ],
+  "bits": 3,
+  "group": 64,
+  "fit_frac": 0.5,
+  "n_blocks": 4,
+  "kinds": [
+    "k_pre",
+    "k"
+  ]
+}

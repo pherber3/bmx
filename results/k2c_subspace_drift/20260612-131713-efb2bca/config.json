@@ -1,0 +1,17 @@
+{
+  "cache_path": "results/cache/llama-3.1-8b_2048.safetensors",
+  "model_label": "llama-3.1-8b",
+  "ranks": [
+    8,
+    16,
+    32
+  ],
+  "bits": 3,
+  "group": 64,
+  "fit_frac": 0.5,
+  "n_blocks": 4,
+  "kinds": [
+    "k_pre",
+    "k"
+  ]
+}
