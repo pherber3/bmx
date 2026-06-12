@@ -54,10 +54,15 @@ see `docs/2026-06-11-lrs-results.md` for the verdict, then
 transform weights hug the Shannon break-even line at 768→8192 (stable rank
 grows with width at the canceling rate); the only payers are table-like
 objects (wpe, routers, layer-0 rogue-channel readers), all axis-aligned or
-negligible. **Next program: KV-cache compression** — `docs/2026-06-11-kv-research-plan.md`
-(Tracks K0–K3: cache harness, activation census/break-even, matched-bits arms
-incl. TurboQuant kill-or-confirm, unbiasedness/QuIP-anomaly study). The
-machinery below is the substrate (registry, sweep, quant/arms, eval, artifacts).
+negligible. **Current program: KV-cache compression** — `docs/2026-06-11-kv-research-plan.md`.
+K1 (census): E1 confirmed, cache carries the structure weights lack; RoPE costs
+~1–1.5 bits of key compressibility (`docs/2026-06-11-k1-census-results.md`).
+K2 (codec bake-off): **low-rank on pre-RoPE keys wins at matched bits (2–3×
+lower logit distortion); values want turboquant-style per-token Lloyd; KIVI's
+key/value asymmetry reproduced; TurboQuant's bounds replicate but worst-case
+optimality concedes to structure** (`docs/2026-06-12-k2-arms-results.md`).
+Next: K2b perplexity round (3 finalists) + K3 unbiasedness study. The
+machinery below is the substrate (registry, sweep, quant/arms, cache, artifacts).
 
 ## The math conventions (memorize; everything assumes them)
 
