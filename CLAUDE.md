@@ -65,10 +65,13 @@ K2b (perplexity round): **G2b closed positive — deployable recipe: keys
 pre-RoPE lowrank+per-channel @3b, values rotate+Lloyd @2b ⇒ ~3.0 bpe avg,
 +0.5% ppl, 5.3× KV memory vs fp16; bits belong to K (2× more sensitive);
 unbiased coding dominated everywhere (K3 largely answered: bias is cheap,
-variance is expensive)** (`docs/2026-06-12-k2b-ppl-results.md`). Open if
-pursued further: streaming low-rank codec (MLA-shaped), 32k validation,
-fused dequant-attention kernel. The machinery below is the substrate
-(registry, sweep, quant/arms, cache, artifacts).
+variance is expensive)** (`docs/2026-06-12-k2b-ppl-results.md`). K2c: **streaming validated — prefill-frozen pre-RoPE subspaces generalize
+(eps_ratio 0.94, drift-flat to 2k tokens; post-RoPE drifts monotonically =
+the RoPE mechanism a 4th way); rank 16 is the validated streaming point**
+(`docs/2026-06-12-k2c-results.md`). Remaining: engineering only —
+quantize-on-append cache class, 32k re-check, fused dequant-attention
+kernel (Track B byte model predicts it first). The machinery below is the
+substrate (registry, sweep, quant/arms, cache, artifacts).
 
 ## The math conventions (memorize; everything assumes them)
 
