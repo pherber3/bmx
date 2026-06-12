@@ -1,0 +1,18 @@
+{
+  "cache_path": "results/cache/llama-3.1-8b_2048.safetensors",
+  "model_label": "llama-3.1-8b",
+  "model_name": "meta-llama/Llama-3.1-8B",
+  "bits": [
+    2,
+    3,
+    4
+  ],
+  "group": 64,
+  "ranks": [
+    8,
+    16,
+    32
+  ],
+  "seed": 0,
+  "n_random_controls": 2
+}

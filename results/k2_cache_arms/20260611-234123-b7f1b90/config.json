@@ -1,0 +1,18 @@
+{
+  "cache_path": "results/cache/gpt2_1024.safetensors",
+  "model_label": "gpt2",
+  "model_name": "",
+  "bits": [
+    2,
+    3,
+    4
+  ],
+  "group": 64,
+  "ranks": [
+    8,
+    16,
+    32
+  ],
+  "seed": 0,
+  "n_random_controls": 2
+}
