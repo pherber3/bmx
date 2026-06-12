@@ -65,24 +65,83 @@ the matmul prologue so `W` never lands in HBM. It is also the natural continuati
 one D-track thread that survived D0 (structured residuals / unbiased estimators), so it
 extends the program rather than restarting it.
 
-**First experiment (cheap, local, mostly built):**
-1. On GPT-2 / Llama-1B weight matrices, fit `L + S` via the convex program (or the simpler
-   two-step thresholding estimator, Wainwright §11.4.2 / Prop 11.19: soft-threshold for S,
-   residual SVD for L) at several `(rank(L), nnz(S))` budgets.
-2. **Empirically verify the spikiness condition** `‖L‖_max ≤ α/√(d₁d₂)` on real matrices —
-   this is the go/no-go: if the recovered low-rank part is itself spiky, the decomposition
-   is ill-posed and the avenue narrows.
-3. Quantize the residual `R = W − L − S` with the existing `bmx.quant.rtn` and measure
-   **inner-product distortion** (`bmx.quant.stats.ip_distortion`) and per-row kurtosis vs
-   quantizing `W` directly. The claim under test: at matched total bits (counting L and S),
-   structured-residual quantization beats round-to-nearest and matches/beats AWQ.
-4. If it clears: functional eval (layer-swap perplexity, the `bmx.eval.layer_swap` stub),
-   then the fused-kernel byte accounting on the VM.
+**The cheap estimator to implement first** (verified against the text, Wainwright
+§11.4.2 Eq. 11.58 / Proposition 11.19): a two-step **hard**-threshold-then-residual
+procedure — `T_ν(v) = v·𝟙[|v| > ν]` (NOT soft-thresholding; the operator defined at
+Eq. 11.58 keeps the value, it does not shrink it). Adapted to our object: `Ŝ = T_ν(W)`
+(the large entries), `L̂ = truncated-SVD(W − Ŝ)`, optionally alternated 2–3 times.
+Attribution that matters for follow-up reading: the direct thresholding+truncated-SVD
+approach and the *noisy-setting* spikiness analysis are **Agarwal et al. 2012**
+(Wainwright's bibliographic note, §11.5); exact-recovery originals are Chandrasekaran
+et al. 2011 and Candès et al. 2011 (robust PCA). Implement the cheap estimator first;
+the convex program (10.53) is the referee, not the workhorse.
+
+**The basis decision (load-bearing — settled by grounding, not taste).** Rotation and
+sparse-extraction are *competing treatments of the same outlier structure*. The
+Beta-coordinate theorem (the same fact that makes rotation good for RTN) says a rotated
+vector's coordinates go to ~N(0, 1/d) regardless of input — i.e. rotation provably
+**spreads a sparse vector's mass across all d coordinates** at scale ‖x‖/√d. So fitting
+a sparse `S` *after* rotation is structurally self-defeating: the rotation already
+destroyed the concentration that `S` needs. The same principle is triangulated in
+practice across three quantization domains (FA3 FP8 attention §3.3, NVFP4 wgrad RHT,
+QuIP/QuIP# weight PTQ — see the vault's "Incoherence Processing Across Quantization
+Domains" note, whose failure-mode list states it directly: "RHT helps when outliers are
+sparse-and-large; it does nothing when the distribution is already approximately
+Gaussian"). **Therefore: fit L+S in the ORIGINAL basis** (where D1 measured worst-channel
+outlier fraction 0.69 — concentrated), and treat rotation as the *alternative* arm, plus
+a composed arm (L+S first, then rotate the residual) which should out-Gaussianize either
+alone. Null result noted: the AI-perf foundational corpus covers AWQ/GPTQ/SmoothQuant
+but has no QuIP/rotation-incoherence material — the practice grounding is the primary
+papers via the vault note.
+
+**Metric calibration (correcting an easy misreading).** bmx's `outlier_mass` is the
+*fraction of entries* in a channel beyond 3σ (a count, not Frobenius mass), and the
+headline 0.23 was the **worst channel of the worst matrix, post-rotation** (pre-rotation
+0.69; medians far lower — likely one structured offender such as `wpe`). Baselines for
+the sparsity-match check come from the per-matrix distribution in the committed d1
+parquet, not from the single worst-case number.
+
+**First experiment — two stages, in this order** (the decompose-clean-then-code-residual
+ordering has a direct precedent in TurboQuant's two-stage construction, vault note
+"Two-Stage Quantization for Unbiased Inner Products": stage 1 captures the bulk with the
+primitive suited to it, stage 2 codes the residual stage 1 missed; composition works
+because stage 2 operates on the clean object's leftover, never on the coded output):
+
+- **Stage A — diagnostic (one matrix, one estimator call).** On a GPT-2 attention
+  projection `W` in the original basis, run the two-step estimator. Validate:
+  (a) does `rank(L̂)` match the subspace Tucker found independently in a2?
+  (b) does `supp(Ŝ)` concentrate on the channels D1 flagged?
+  (c) does `‖L̂‖_max ≤ α/√(d₁d₂)` hold (the spikiness go/no-go — if the recovered
+  low-rank part is itself spiky, the decomposition is ill-posed and the avenue narrows)?
+  This treats quantization later; here the "noise" slot of Wainwright's model is just
+  the unmodeled bulk. Three structural assumptions tested in one shot.
+- **Stage B — compression (the payoff number).** Fit `(L̂, Ŝ)` on **clean** `W`, form
+  `R = W − L̂ − Ŝ`, quantize with `bmx.quant.rtn`, reconstruct
+  `Ŵ = dq(Q(R)) + L̂ + Ŝ`. Compare at **matched total bits (counting L̂ and Ŝ storage)**
+  against: plain `dq(Q(W))`, rotate-then-RTN, and the composed arm. Metrics:
+  `ip_distortion`, per-row kurtosis of `R` vs `W`, then layer-swap perplexity
+  (`bmx.eval.layer_swap`, to be implemented) if Stage A cleared. Natural stage-3
+  extension once this works: an unbiased QJL pass on the *quantization* residual —
+  TurboQuant's exact composition — which is how this avenue plugs into the (c)-cluster
+  (unbiased weight matvecs) that survived D0.
+
+**The composite model (synthesis worth testing once A/B clear).** The CCA-shaped C1
+finding and the L+S decomposition are the same additive split at different scales
+(cross-matrix vs within-matrix), suggesting `W_e = L_shared + S_e + B_e` for expert
+stacks: cross-expert shared low-rank (the ~10 CKA modes), per-expert sparse outliers,
+per-expert private low-rank. Caveats recorded now: 3-way identifiability has no
+closed-form theory (the 2-way spikiness condition doesn't trivially extend), and the
+per-component compression factors apply to *different slices of the mass* — they do not
+multiply into a combined ratio.
 
 Most of the infrastructure exists: `quant/` (rotation, RTN, stats, IP-distortion), the
 matched-parameter `sweep` engine, `eval/layer_swap` stub, the artifacts/plotting harness.
-What's new: an `lrs` (low-rank+sparse) decomposition module behind the existing
-`Decomposition` protocol, and a quant-residual experiment.
+What's new: an `lrs` (low-rank+sparse) module behind the existing `Decomposition`
+protocol (the hard-threshold + truncated-SVD two-step, unit-tested on planted L+S), and
+the two-stage experiment. Systems composition support from the foundational layer:
+Grokking Megakernels' INT4 analysis ("dequantization fits cleanly into the existing
+execution timeline" because decode is bandwidth- not compute-bound) applies verbatim to
+adding the `+ L̂ + Ŝ` terms in the dequant epilogue.
 
 ---
 
