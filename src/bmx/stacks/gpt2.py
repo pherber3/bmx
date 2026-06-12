@@ -83,7 +83,7 @@ def w_all_4d(sd: dict, layer: int, n_head: int, model="gpt2") -> Stack:
 def stack_by_name(
     sd: dict, layer: int, n_head: int, obj: str, model: str = "gpt2"
 ) -> Stack:
-    """Object-name dispatch shared by experiments and (later) eval.layer_swap.
+    """Object-name dispatch shared by the stack experiments (a2/a3).
 
     Accepts 'wqk', 'wov', 'w_all', or 'raw_q'/'raw_k'/'raw_v'/'raw_o'.
     """
