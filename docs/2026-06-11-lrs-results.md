@@ -104,6 +104,67 @@ bits on the bulk.
   real activations; no perplexity eval (gated off — with no rate–distortion win,
   perplexity cannot rescue the arm).
 
+## Theoretical postmortem — did we test what the theory describes, and why it failed
+
+Written after a read-around pass through the foundational layer (Wainwright HDS §10.7
+and §11.4.2 in full, the vault's VQ rate–distortion machinery, AI Systems Performance
+Engineering Ch. 16). Two questions: was the methodology faithful to the theory, and
+what does the math say about why the answer was no.
+
+**Methodology audit (faithful, with one precision and one deviation):**
+
+- Eq. 11.58's own two-step estimator is *threshold → take the raw residual as Λ̂*;
+  there is no SVD step in it. What we built — threshold → **truncated-SVD** of the
+  residual, alternated — is the Agarwal et al. (2012) direct method (Wainwright's
+  §11.5 bibliographic note attributes "thresholding and truncated SVD" exactly
+  there), a strictly stronger projection. Our attribution was already correct.
+  Side-catch for the record: the book's prose at §11.4.2 says "a *soft*-thresholded
+  version" while the displayed Eq. 11.58 defines the *hard* operator — the prose and
+  the equation disagree, and we followed the equation.
+- **The one real deviation: threshold selection.** Eq. 11.60 prescribes
+  ν = (noise max-norm scale) + (spikiness ceiling α/d) — S may contain only entries
+  the bulk's own extremes cannot explain. For our matrices the bulk max is
+  √(2·ln N)·σ ≈ 5.2–5.4σ, and what survives that prescription is tiny:
+  k = 52 (c_fc), 105 (c_attn), 275 (attn.c_proj), 949 (mlp.c_proj) — fractions
+  2e-5–5e-4. Our budget sweep thresholded deeper into the bulk tail (up to 1%), so
+  most of the swept "S" was noise-tail; but the sweep *contained* the
+  theory-faithful point (frac=1e-4 ≈ the c_proj prescription, ~0.02 bpw), and even
+  that genuinely-sanctioned S lost to rotation (mlp.c_proj 0.266 vs 0.252).
+  Correcting the deviation strengthens the negative.
+- **Regime transplant.** §10.7/§11.4.2 is an *estimation* theory: recover a true
+  (Λ*, Γ*) whose generative homes are covariance-shaped (factor analysis
+  Σ = LLᵀ + Γ, Example 10.19; hidden-variable precision matrices, Eq. 11.56), with
+  every error bound scaling in the noise (Cor 10.22: λₙ ≥ 2(‖W‖_max + 4α/√(d₁d₂));
+  oracle error ≲ λ²(ω²·rank + |supp|)). With the "noise" at 89% of the matrix and
+  no n to shrink it, the bounds are vacuous — the theory promises nothing in this
+  regime. Stage A was precisely the empirical test of whether GPT-2 weights live in
+  the theory's regime; matmul weights don't (21% structure), `wpe` does (rel 0.035 —
+  the estimator works when the object actually is L+S).
+
+**Why it could not have paid, even where the structure is real (the central
+arithmetic):** the Shannon+Yao 4⁻ᵇ floor (vault: Vector Quantization Distortion
+Objectives; TurboQuant Thm 3) prices each bit-per-weight at ×¼ MSE. Side-information
+costing Δb bpw therefore pays iff the energy fraction ε it removes satisfies
+
+    ε > 1 − 4^(−Δb),   with Δb = 16·r·(1/m + 1/p) for fp16 L-factors.
+
+At r=64 on 768×2304: Δb ≈ 1.78 → break-even ε = 91.6%. Measured ε ≈ 22–26%. A 4×
+shortfall on the wrong side of an exponential — not a near miss. The same inequality
+makes the scale caveat quantitative: at d ≈ 8k the same r costs Δb ≈ 0.25 →
+break-even ε = 29%, *near* the measured structure fraction; the pre-test for any
+frontier-scale revisit is "energy captured at rank r vs 1 − 4^(−16r(1/m+1/p))",
+measurable in one SVD.
+
+Two compounding reasons the baselines were unbeatable: (1) rotation and AWQ-style
+channel scales are *multiplicative/basis* corrections — seed-generated or absorbed
+into existing scales, never facing the 4⁻ᵇ hurdle; L+S is an *additive* correction
+and must pay rent (the correct revision of our original "AWQ is a crude L+S" frame:
+AWQ is in a different, free currency). (2) Groupwise RTN had already quarantined the
+outliers — per-block scales adapt to local distributions (AI-perf Ch. 16
+microscaling), so a 29σ spike corrupts only its own 64-entry group; the damage S
+could prevent was already localized, which is also why rotate-RTN's win over plain
+RTN is real but small.
+
 ## Gate call
 
 Avenue 1 **closes** in its tested form. The fused-kernel byte-accounting step does not
