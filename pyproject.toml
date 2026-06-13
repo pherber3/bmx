@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Tensor-decomposition weight-compression research framework (BMD / hypermatrix algebra on LLM weights)"
 readme = "README.md"
 authors = [
-    { name = "pherber3", email = "43260437+pherber3@users.noreply.github.com" }
+    { name = "pherber3", email = "" }
 ]
 requires-python = ">=3.12"
 dependencies = [
