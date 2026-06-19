@@ -161,6 +161,7 @@ class StreamingQuantizedCache(Cache):
         self.layers[i] exists. To guard this, we pre-size the layers list here
         so self.layers[i] always exists when the hook fires.
         """
+        self.detach()  # Clear any previously-registered hooks (idempotence).
         if not self.k_spec.pre_rope:
             return self
 

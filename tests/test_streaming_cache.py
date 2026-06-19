@@ -99,3 +99,24 @@ def test_quantized_prerope_recon_finite_and_compressed():
     assert torch.isfinite(k_post).all() and torch.isfinite(v).all()
     bpe_k, bpe_v = cache.bits_per_entry()
     assert bpe_k < 16.0 and bpe_v < 16.0
+
+
+def test_attach_is_idempotent():
+    # Double attach must not double-register hooks (which would double-stash _k_pre).
+    model = tiny_llama()
+    input_ids = ids(vocab=97, seq=40, seed=7)
+    cache = StreamingQuantizedCache(
+        model.config,
+        k_spec=CacheCodecSpec(arm="fp16", pre_rope=True),
+        v_spec=CacheCodecSpec(arm="fp16"),
+    )
+    cache.attach(model)
+    cache.attach(model)  # second attach must not duplicate hooks
+    with torch.no_grad():
+        model(input_ids, past_key_values=cache, use_cache=True)
+    cache.detach()
+    # If hooks double-fired, _k_pre would be 2x the sequence length. Confirm correct S.
+    k_post, _ = cache.reconstruct_layer(0)
+    assert k_post.shape[2] == input_ids.shape[1], (
+        f"expected S={input_ids.shape[1]}, got {k_post.shape[2]} (double-stash?)"
+    )
