@@ -56,3 +56,10 @@ def test_kivi_pairing_is_channel_then_token():
     _, bpe_v = quantize_cache("rtn_token", M, bits=2, group=64)
     assert math.isclose(bpe_k, 2 + 16.0 / 64, rel_tol=1e-9)
     assert math.isclose(bpe_v, 2 + 16.0 / 64, rel_tol=1e-9)
+    # Axis discriminator: the two arms must quantize along DIFFERENT axes, so on a
+    # generic matrix their reconstructions differ. (bpe alone wouldn't catch a swap.)
+    Mk, _ = quantize_cache("rtn_channel", M, bits=2, group=64)
+    Mt, _ = quantize_cache("rtn_token", M, bits=2, group=64)
+    assert not torch.allclose(Mk, Mt), (
+        "rtn_channel and rtn_token must differ (axis swap?)"
+    )
