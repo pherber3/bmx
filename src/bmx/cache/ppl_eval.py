@@ -40,36 +40,7 @@ import torch
 from bmx.cache.codecs import CACHE_ARMS, quantize_cache
 from bmx.cache.collect import _register_hooks, from_matrix, to_matrix
 from bmx.cache.rope import apply_rope, rope_cos_sin
-
-
-@dataclasses.dataclass
-class CacheCodecSpec:
-    """Codec specification for one side (K or V) of the KV cache.
-
-    Attributes
-    ----------
-    arm : str
-        A member of bmx.cache.codecs.CACHE_ARMS, or ``"fp16"`` for a no-op.
-    bits : int
-        Quantization bit width.
-    rank : int
-        Low-rank components for ``lowrank_rtn_channel`` (ignored otherwise).
-    group : int
-        Group size for rtn_token / rtn_channel / rotate_rtn_token / lowrank arms.
-    seed : int
-        RNG seed for rotation/sketch arms.
-    pre_rope : bool
-        If True, capture k_pre via hooks, quantize in pre-RoPE space, then
-        apply_rope before writing back into the cache. Ignored for V (V has
-        no RoPE in standard transformer families).
-    """
-
-    arm: str = "fp16"
-    bits: int = 3
-    rank: int = 0
-    group: int = 64
-    seed: int = 0
-    pre_rope: bool = False
+from bmx.cache.specs import CacheCodecSpec  # re-export; was defined here
 
 
 @dataclasses.dataclass
