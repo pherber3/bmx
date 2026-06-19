@@ -73,7 +73,7 @@ def live_generation_ppl(
         cache.detach()
 
     bpe_k, bpe_v = cache.bits_per_entry()
-    mem = cache.memory_report(seq_len=n_prefill)
+    mem = cache.memory_report(seq_len=input_ids.shape[1])
     return {
         "ppl": torch.exp(out.loss).item(),
         "bpe_k": bpe_k,
