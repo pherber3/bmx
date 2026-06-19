@@ -214,6 +214,37 @@ class StreamingQuantizedCache(Cache):
         last = self.layers[-1]
         return last.bpe_k, last.bpe_v
 
+    def memory_report(
+        self, seq_len: int, h_kv: int | None = None, d_head: int | None = None
+    ) -> dict:
+        """Honest KV footprint: dense fp16 baseline vs packed (bpe-derived) bytes.
+
+        packed_bytes uses the honest bits_per_entry() (ALL metadata counted by the
+        codec) — the real deployable cache size. Raw fp16-slab bytes would understate
+        the win because Stage-B stores the dequant for the model to read; the bpe is
+        the deployable number. Process-level peak memory (the literal 5x) is the
+        fused-kernel/paged-store VM measurement.
+        """
+        cfg = self.model_config
+        h_kv = h_kv or getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+        d = d_head or (
+            getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+        )
+        n_layer = cfg.num_hidden_layers
+        entries_per_side = n_layer * h_kv * seq_len * d  # K (and V) entries
+        fp16_bytes = 2 * entries_per_side * 2  # 2 sides, 2 bytes/entry
+        bpe_k, bpe_v = self.bits_per_entry()
+        # nan (passthrough) => treat as 16 bpe (no compression).
+        bpe_k = 16.0 if bpe_k != bpe_k else bpe_k
+        bpe_v = 16.0 if bpe_v != bpe_v else bpe_v
+        packed_bits = entries_per_side * (bpe_k + bpe_v)
+        packed_bytes = packed_bits / 8.0
+        return {
+            "fp16_bytes": float(fp16_bytes),
+            "packed_bytes": float(packed_bytes),
+            "compression": fp16_bytes / max(packed_bytes, 1e-9),
+        }
+
 
 def model_config_n_layers(model) -> int:
     """Number of transformer layers in model (structural probe, not model_type)."""

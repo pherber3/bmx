@@ -101,6 +101,24 @@ def test_quantized_prerope_recon_finite_and_compressed():
     assert bpe_k < 16.0 and bpe_v < 16.0
 
 
+def test_memory_report_packed_below_fp16():
+    model = tiny_llama()
+    input_ids = ids(vocab=97, seq=64, seed=21)
+    cache = StreamingQuantizedCache(
+        model.config,
+        k_spec=CacheCodecSpec(arm="rtn_channel", bits=2, group=16, pre_rope=True),
+        v_spec=CacheCodecSpec(arm="rtn_token", bits=2, group=16),
+    )
+    cache.attach(model)
+    with torch.no_grad():
+        model(input_ids, past_key_values=cache, use_cache=True)
+    cache.detach()
+    rep = cache.memory_report(seq_len=input_ids.shape[1])
+    # Packed footprint is honestly below fp16 (≈2-bit K/V => ~6-7x before metadata).
+    assert rep["packed_bytes"] < rep["fp16_bytes"]
+    assert rep["compression"] > 2.0
+
+
 def test_attach_is_idempotent():
     # Double attach must not double-register hooks (which would double-stash _k_pre).
     model = tiny_llama()

@@ -42,14 +42,13 @@ def live_generation_ppl(
     Returns
     -------
     dict with keys:
-        ``ppl``    — float, perplexity over the M-1 continuation tokens.
-        ``bpe_k``  — float, honest bits-per-entry for keys.
-        ``bpe_v``  — float, honest bits-per-entry for values.
-        ``n_eval`` — int, number of tokens contributing to the loss (M-1).
-
-    Notes
-    -----
-    # memory_report fields (packed_bytes/fp16_bytes/compression) wired in Task 5.
+        ``ppl``          — float, perplexity over the M-1 continuation tokens.
+        ``bpe_k``        — float, honest bits-per-entry for keys.
+        ``bpe_v``        — float, honest bits-per-entry for values.
+        ``n_eval``       — int, number of tokens contributing to the loss (M-1).
+        ``packed_bytes`` — float, honest compressed KV footprint (bpe × entries).
+        ``fp16_bytes``   — float, dense fp16 KV baseline footprint.
+        ``compression``  — float, fp16_bytes / packed_bytes.
     """
     assert input_ids.shape[0] == 1, "batch dim must be 1"
     N = input_ids.shape[1]
@@ -74,9 +73,13 @@ def live_generation_ppl(
         cache.detach()
 
     bpe_k, bpe_v = cache.bits_per_entry()
+    mem = cache.memory_report(seq_len=n_prefill)
     return {
         "ppl": torch.exp(out.loss).item(),
         "bpe_k": bpe_k,
         "bpe_v": bpe_v,
         "n_eval": n_eval,
+        "packed_bytes": mem["packed_bytes"],
+        "fp16_bytes": mem["fp16_bytes"],
+        "compression": mem["compression"],
     }
