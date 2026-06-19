@@ -92,6 +92,8 @@ class StreamingQuantizedLayer(DynamicLayer):
 
         # Passthrough: no pre_rope flag and fp16 arms — skip codec entirely.
         if self._is_passthrough() and not self.k_spec.pre_rope:
+            self.bpe_k = 16.0
+            self.bpe_v = 16.0
             return keys, values
 
         cache_dtype = keys.dtype
