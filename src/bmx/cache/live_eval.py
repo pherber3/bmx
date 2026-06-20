@@ -4,11 +4,34 @@ Unlike ppl_eval (which quantizes the whole prefill at once), this prefills N
 tokens INTO the streaming cache, then teacher-forces the continuation so each
 step attends to the on-append compressed cache. The end-to-end 'in practice'
 metric for the K3 verdict.
+
+token_by_token mode (Task 11):
+    When token_by_token=True, the continuation is scored one token at a time.
+    Each decode step appends exactly one token to the cache (triggering
+    quantize-on-append), and the logit predicting the NEXT token is scored.
+    This is the honest streaming regime: quant errors compound step by step.
+
+    Indexing: after prefill([0:n_prefill]), cache holds [0..n_prefill-1].
+    HF causal LM: model(ids[:,a:b], past_key_values=cache) appends tokens
+    a..b-1 to the cache; logits[:,-1] predicts token b.
+    So to score token i+1, we feed token i (ids[:,i:i+1]); the cache then
+    holds [0..i].  Loop: for i in range(n_prefill, N-1) → feed token i,
+    score target token i+1.  This yields n_eval = N-1-n_prefill tokens,
+    matching the batched path (which uses HF label-shift: cont_ids=[n_prefill:]
+    scored over [n_prefill+1..N-1]).
+
+NOTE on tiny-model quality numbers:
+    tiny_llama has random weights, so absolute ppl is meaningless (~vocab size).
+    The token-by-token gate tests MECHANISM (finite, no explosion, fp16-modes-agree),
+    NOT real quality. Real quality numbers come from experiments on real models.
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
+import torch.nn.functional as F
 
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
@@ -21,6 +44,7 @@ def live_generation_ppl(
     k_spec: CacheCodecSpec,
     v_spec: CacheCodecSpec,
     recent_window: int = 32,
+    token_by_token: bool = False,
 ) -> dict:
     """Prefill into a streaming cache, teacher-force the continuation, return ppl.
 
@@ -38,6 +62,12 @@ def live_generation_ppl(
         Codec spec for values.
     recent_window : int
         Most-recent tokens kept fp16 before flushing (passed to StreamingQuantizedCache).
+    token_by_token : bool
+        If False (default), teacher-force the full continuation in one batched forward
+        (fast; unchanged from before Task 11).
+        If True, score the continuation one token at a time so each next-token NLL
+        attends to the incrementally-built compressed cache (write-once, errors
+        compound).  This is the honest streaming regime for the K3 verdict.
 
     Returns
     -------
@@ -63,15 +93,43 @@ def live_generation_ppl(
     cache.attach(model)  # pre-RoPE capture; no-op when k_spec.pre_rope is False
     with cache:
         with torch.no_grad():
+            # --- Prefill: feed tokens [0..n_prefill-1] ---
             model(input_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
-            cont_ids = input_ids[:, n_prefill:]
-            n_eval = cont_ids.shape[1] - 1
-            out = model(cont_ids, past_key_values=cache, labels=cont_ids)
+
+            if not token_by_token:
+                # --- Batched continuation (original path) ---
+                cont_ids = input_ids[:, n_prefill:]
+                n_eval = cont_ids.shape[1] - 1
+                out = model(cont_ids, past_key_values=cache, labels=cont_ids)
+                ppl = torch.exp(out.loss).item()
+            else:
+                # --- Token-by-token continuation (honest streaming regime) ---
+                #
+                # After prefill, cache holds tokens [0..n_prefill-1].
+                # To score token i+1: feed token i (ids[:,i:i+1]) → cache appends
+                # token i → logits[:,-1] predicts token i+1.
+                # Loop: i in [n_prefill, N-1) feeds token i, scores target i+1.
+                # This gives n_eval = N-1-n_prefill tokens, matching the batched
+                # path's label-shift convention (cont_ids=[n_prefill:N], scored
+                # over [n_prefill+1..N-1]).
+                total_nll = 0.0
+                n_eval = 0
+                for i in range(n_prefill, N - 1):
+                    step_ids = input_ids[:, i : i + 1]  # token i → appended to cache
+                    out = model(step_ids, past_key_values=cache, use_cache=True)
+                    logits_next = out.logits[0, -1]  # predicts token i+1
+                    target = input_ids[0, i + 1]
+                    nll = F.cross_entropy(
+                        logits_next.unsqueeze(0), target.unsqueeze(0)
+                    ).item()
+                    total_nll += nll
+                    n_eval += 1
+                ppl = math.exp(total_nll / n_eval) if n_eval > 0 else float("nan")
 
     bpe_k, bpe_v = cache.bits_per_entry()
     mem = cache.memory_report(seq_len=input_ids.shape[1])
     return {
-        "ppl": torch.exp(out.loss).item(),
+        "ppl": ppl,
         "bpe_k": bpe_k,
         "bpe_v": bpe_v,
         "n_eval": n_eval,

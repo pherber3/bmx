@@ -29,6 +29,11 @@ class Config:
     group: int = 64
     seed: int = 0
     seq_seed: int = 42
+    token_by_token: bool = True
+    """Score the continuation one token at a time (honest streaming regime).
+    Set to False to use the fast batched path (equivalent to old quantized-prefill
+    ppl relabelled live; does not measure compounding quant errors).
+    Default True so the experiment measures the honest live regime (K3 verdict)."""
 
 
 def _spec_pair(arm: str, cfg: Config):
@@ -79,7 +84,14 @@ def run(cfg: Config, model=None, root: str = "results"):
     rows = []
     for arm in cfg.arms:
         k_spec, v_spec = _spec_pair(arm, cfg)
-        res = live_generation_ppl(model, input_ids, cfg.n_prefill, k_spec, v_spec)
+        res = live_generation_ppl(
+            model,
+            input_ids,
+            cfg.n_prefill,
+            k_spec,
+            v_spec,
+            token_by_token=cfg.token_by_token,
+        )
         retrieved = needle_retrieved_from_ids(
             model,
             input_ids,
