@@ -34,8 +34,9 @@ def build_longbench_prompt(tokenizer, item: dict, task: str) -> torch.Tensor:
     """Apply the task's LongBench prompt template to the item; return (1, L) ids.
 
     LongBench formats dataset2prompt[task].format(**item); for code tasks the context lives in
-    item['context']. (If the ledger records a build_chat wrapper for Llama-Instruct, apply it
-    here exactly as LongBench does.)
+    item['context']. NO chat/[INST] wrapper: LongBench explicitly skips build_chat for the code
+    tasks (lcc, repobench-p are in its exclusion list) — raw template only, even for Instruct
+    models.
     """
     template = LONGBENCH_TASKS[task]["prompt_template"]
     prompt = template.format(**item)
