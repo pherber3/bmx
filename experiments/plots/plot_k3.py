@@ -20,7 +20,7 @@ def make_figures(df, out_dir: str) -> list[Path]:
     df = df.copy()
     df["bpe_avg"] = (df["bpe_k"] + df["bpe_v"]) / 2
     for _, r in df.iterrows():
-        ax.scatter(r["bpe_avg"], r["ppl"], label=r["arm"])
+        ax.scatter(r["bpe_avg"], r["ppl"])
         ax.annotate(r["arm"], (r["bpe_avg"], r["ppl"]))
     ax.set_xlabel("avg bits/entry (honest)")
     ax.set_ylabel("live-generation perplexity")
@@ -29,6 +29,21 @@ def make_figures(df, out_dir: str) -> list[Path]:
     fig.savefig(p1, dpi=120, bbox_inches="tight")
     plt.close(fig)
     paths.append(p1)
+
+    # Compression by arm: bar chart of compression ratio per arm.
+    if "compression" in df.columns:
+        fig, ax = plt.subplots()
+        arms = df["arm"].values
+        compressions = df["compression"].values
+        ax.bar(range(len(arms)), compressions)
+        ax.set_xticks(range(len(arms)))
+        ax.set_xticklabels(arms)
+        ax.set_ylabel("compression vs fp16 (×)")
+        ax.set_title("K3: KV memory compression by arm")
+        p2 = out / "k3_compression_by_arm.png"
+        fig.savefig(p2, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(p2)
 
     return paths
 

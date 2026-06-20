@@ -56,6 +56,7 @@ def test_plot_k3_makes_pngs(tmp_path):
                 "ppl": 10.0,
                 "n_context": 512,
                 "retrieved": True,
+                "compression": 1.0,
             },
             {
                 "arm": "k2b",
@@ -64,8 +65,10 @@ def test_plot_k3_makes_pngs(tmp_path):
                 "ppl": 10.1,
                 "n_context": 512,
                 "retrieved": True,
+                "compression": 5.3,
             },
         ]
     )
     paths = make_figures(df, str(tmp_path))
-    assert paths and all(p.exists() for p in paths)
+    assert len(paths) == 2
+    assert all(p.exists() for p in paths)
