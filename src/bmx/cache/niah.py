@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 from rouge_score import rouge_scorer
 
-from bmx.cache.needle import _argmax_next_at
+from bmx.cache.needle import needle_retrieved
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
 
@@ -56,10 +56,13 @@ def niah_recall_argmax(
     """True iff the streaming-cache next-token argmax at query_pos equals answer_id.
 
     Offline mechanism gate: finite, deterministic, indexing-correct. Real recall
-    quality is the ROUGE-1 generate path (Task 3), VM only.
+    quality is the ROUGE-1 generate path (Task 3), VM only. Delegates to
+    needle.needle_retrieved (argmax-equals-answer) so the cache-probe lives in one
+    place; query_pos is honored by trimming input_ids to that position.
     """
-    got = _argmax_next_at(model, input_ids, query_pos, k_spec, v_spec, n_prefill)
-    return bool(got == answer_id)
+    return needle_retrieved(
+        model, input_ids[:, : query_pos + 1], answer_id, k_spec, v_spec, n_prefill
+    )
 
 
 # Defaults follow the Fu et al. harness (eval/needle/needle_in_haystack.py); the
@@ -74,7 +77,7 @@ PROMPT_TEMPLATE = (
     "Based on the content of the book, Question: {question}\nAnswer:"
 )
 
-_SCORER = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+_SCORER = rouge_scorer.RougeScorer(["rouge1"], use_stemmer=True)
 
 
 def rouge1_recall(needle_text: str, response_text: str) -> float:
@@ -94,11 +97,11 @@ def _insert_needle_at_sentence_boundary(
         return context_ids + needle_ids
     insertion = int(len(context_ids) * (depth_percent / 100.0))
     period_ids = tokenizer.encode(".", add_special_tokens=False)
-    head = context_ids[:insertion]
-    while head and head[-1] not in period_ids:
+    # Walk back to the nearest sentence boundary; check the index directly rather
+    # than re-slicing the head each step.
+    while insertion > 0 and context_ids[insertion - 1] not in period_ids:
         insertion -= 1
-        head = context_ids[:insertion]
-    return head + needle_ids + context_ids[insertion:]
+    return context_ids[:insertion] + needle_ids + context_ids[insertion:]
 
 
 def build_niah_prompt(

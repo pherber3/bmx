@@ -12,7 +12,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
 
 
 def make_figures(df, out_dir: str) -> list[Path]:
@@ -45,9 +44,13 @@ def make_figures(df, out_dir: str) -> list[Path]:
         depths = sorted(df["depth"].unique())
         for ax, arm in zip(axes[0], arms):
             g = df[df["arm"] == arm]
-            grid = np.full((len(depths), len(lengths)), np.nan)
-            for _, r in g.iterrows():
-                grid[depths.index(r["depth"]), lengths.index(r["length"])] = r["recall"]
+            # Pivot to the (depth × length) grid directly; reindex to the full axes
+            # so missing cells stay NaN (masked), repeated cells average.
+            grid = (
+                g.pivot_table(index="depth", columns="length", values="recall")
+                .reindex(index=depths, columns=lengths)
+                .to_numpy()
+            )
             im = ax.imshow(
                 grid, aspect="auto", vmin=0, vmax=10, origin="lower", cmap="viridis"
             )

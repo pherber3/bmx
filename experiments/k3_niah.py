@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 
 import pandas as pd
+import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
@@ -54,8 +55,6 @@ def _compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, 
     block); then reads the deployable blended-bpe accounting. Comparisons align on this
     measured compression, never a pinned ratio.
     """
-    import torch
-
     cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
     g = torch.Generator().manual_seed(0)
@@ -77,8 +76,6 @@ def run(cfg: Config, model=None, root: str = "results"):
 
         from bmx.cache.haystack import pg_essays_dir, read_pg_corpus
         from bmx.cache.niah import build_niah_prompt, niah_recall_generate
-
-        import torch
 
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, torch_dtype=torch.float16
