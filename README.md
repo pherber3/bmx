@@ -33,9 +33,18 @@ Docs, in order: `2026-06-11-kv-research-plan.md` → `2026-06-11-k1-census-resul
 `2026-06-12-k2c-results.md`. Headline figure:
 `results/k2_cache_arms/k2_headline.png`.
 
-Remaining work is engineering, not science: quantize-on-append cache class,
-32k-context re-check, fused dequant-attention kernel (the Track B byte model
-in `src/bmx/bench/` predicts kernel wins before any CUDA is written).
+**3. Streaming cache (K3, closed positive).** The quantize-on-append cache class is
+built and validated: `StreamingQuantized{Layer,Cache}` streams token-by-token under
+real `generate()` — write-once quantized storage (each token quantized once from its
+pristine source; this fixed a real bug where the value codec's norm exploded 98× under
+naive re-quantization), frozen pre-RoPE subspace, fp16 residual window. Quality holds
+(1.001× fp16 on token-by-token ppl), packed bpe < fp16, all arms (K2b/TurboQuant/KIVI/
+fp16) on one fair code path — `docs/2026-06-19-k3-streaming-cache-results.md`.
+
+Remaining work is engineering, not science: the fused dequant-attention kernel (for the
+literal process-RSS win; the Track B byte model in `src/bmx/bench/` predicts kernel wins
+before any CUDA is written), the authoritative SOTA-model VM run, and a 32k-context
+re-check.
 
 ## Quickstart
 

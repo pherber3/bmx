@@ -48,10 +48,16 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   5.3× vs fp16; bits belong to K; unbiased coding dominated; prefill-frozen
   subspaces stream (0.94 of oracle, no drift) — `docs/2026-06-11-k1-*.md`,
   `docs/2026-06-12-k2*-results.md`.
-- **Open (engineering, not science):** quantize-on-append cache class
-  (wrap/subclass DynamicCache; freeze V at prefill, project appends),
-  32k-context re-check, fused dequant-attention kernel (use the Track B byte
-  model in `src/bmx/bench/` to predict before building).
+- K3 (quantize-on-append cache, closed positive): `StreamingQuantized{Layer,Cache}`
+  (subclass transformers 5.11 `DynamicLayer`/`Cache`) streams token-by-token —
+  write-once quantized storage (each token quantized once from pristine source;
+  fixes the turboquant_mse V re-quant blowup), frozen pre-RoPE subspace, fp16
+  residual window so channel-grouped arms stream. Quality holds (1.001× fp16 tbt),
+  honest packed bpe < fp16, all arms on one fair path — `docs/2026-06-19-k3-*.md`.
+- **Open (engineering, not science):** fused dequant-attention kernel (use the
+  Track B byte model in `src/bmx/bench/` to predict before building) for the literal
+  process-RSS win; the authoritative SOTA-model VM run (real-text + planted needle,
+  `--model-name`); 32k-context re-check.
 
 ## Conventions (everything assumes them)
 
