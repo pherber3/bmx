@@ -14,18 +14,20 @@ import torch
 import torch.nn as nn
 
 
-def rope_cos_sin(config, S: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (cos, sin) tables of shape (S, d_head) for *config* and length *S*.
+def rope_cos_sin(
+    config, S: int, *, start: int = 0, device=None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (cos, sin) tables of shape (S, d_head) for *config*.
+
+    Covers absolute positions [start, start+S). Default start=0 gives the
+    leading S positions; streaming passes start>0 to extend a table by one
+    block without recomputing from 0.
 
     Uses the model family's own rotary-embedding module (LlamaRotaryEmbedding)
-    so rope_scaling variants are inherited from the config rather than
-    re-derived.  Config-only — no weight download.
+    so rope_scaling variants are inherited from the config, not re-derived.
+    Config-only — no weight download.
 
-    Supported families: any config with `rope_parameters` (llama, mistral,
-    qwen, etc. all share the same rotary math).
-
-    Raises:
-        ValueError: if the config has no rotary embedding (e.g. GPT2Config).
+    Raises ValueError if the config has no rotary embedding (e.g. GPT2Config).
     """
     if not hasattr(config, "rope_parameters"):
         raise ValueError(
@@ -37,23 +39,20 @@ def rope_cos_sin(config, S: int) -> tuple[torch.Tensor, torch.Tensor]:
 
     rotary_emb: nn.Module = LlamaRotaryEmbedding(config=config)
     rotary_emb.eval()
+    if device is not None:
+        rotary_emb = rotary_emb.to(device)
 
     d_head = getattr(config, "head_dim", None) or (
         config.hidden_size // config.num_attention_heads
     )
 
-    # Dummy hidden states: shape (1, S, d_head); float32 so forward stays in fp32.
-    dummy_x = torch.zeros(1, S, d_head)
-    position_ids = torch.arange(S, dtype=torch.long).unsqueeze(0)  # (1, S)
+    dummy_x = torch.zeros(1, S, d_head, device=device)  # fp32; forward stays fp32
+    position_ids = torch.arange(start, start + S, dtype=torch.long, device=device)
 
     with torch.no_grad():
-        cos, sin = rotary_emb(dummy_x, position_ids)
+        cos, sin = rotary_emb(dummy_x, position_ids.unsqueeze(0))
 
-    # rotary_emb returns (1, S, d_head); squeeze batch dimension -> (S, d_head)
-    cos = cos.squeeze(0)  # (S, d_head)
-    sin = sin.squeeze(0)  # (S, d_head)
-
-    return cos, sin
+    return cos.squeeze(0), sin.squeeze(0)  # (1, S, d) -> (S, d)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -89,6 +88,10 @@ def apply_rope(
         out = (x * cos) + (rotate_half(x) * sin)
     with cos/sin broadcast over the head dimension.
     """
+    # Move cos/sin to x's device — rope_cos_sin returns CPU tables (cached),
+    # and the streaming _rope_cache also stores CPU; handle both here.
+    cos = cos.to(x.device)
+    sin = sin.to(x.device)
     # cos/sin are (S, d); broadcast to (1, S, d) so they align with (h, S, d).
     cos = cos.unsqueeze(0)  # (1, S, d)
     sin = sin.unsqueeze(0)  # (1, S, d)

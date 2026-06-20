@@ -54,7 +54,7 @@ def _rotate(M: torch.Tensor, seed: int) -> torch.Tensor:
     if is_power_of_2(C):
         return randomized_hadamard(M, seed)
     else:
-        Q = random_orthogonal(C, seed, dtype=M.dtype)
+        Q = random_orthogonal(C, seed, dtype=M.dtype, device=M.device)
         return M @ Q.T
 
 
@@ -65,12 +65,12 @@ def _unrotate(M_rot: torch.Tensor, seed: int) -> torch.Tensor:
         # randomized_hadamard is H @ diag(signs) @ x; inverse is diag(signs) @ H @ x
         # but H^{-1} = H (orthonormal), so: signs * H @ M_rot
         g = torch.Generator().manual_seed(seed)
-        signs = (torch.randint(0, 2, (C,), generator=g) * 2 - 1).to(M_rot.dtype)
+        signs = (torch.randint(0, 2, (C,), generator=g) * 2 - 1).to(M_rot)
         from bmx.quant.hadamard import fwht
 
         return fwht(M_rot) * signs
     else:
-        Q = random_orthogonal(C, seed, dtype=M_rot.dtype)
+        Q = random_orthogonal(C, seed, dtype=M_rot.dtype, device=M_rot.device)
         return M_rot @ Q  # Q^T inverse is Q (orthogonal)
 
 
@@ -186,7 +186,7 @@ def _turboquant_mse(
 
     # Quantize using Lloyd codebook: coords of unit vector ~ N(0, 1/C)
     # so quantize x*sqrt(C) against N(0,1) codebook then divide by sqrt(C)
-    cb = gaussian_codebook(bits)
+    cb = gaussian_codebook(bits).to(M.device)
     sqrt_c = math.sqrt(C)
     M_scaled = M_rot * sqrt_c
 
@@ -243,7 +243,7 @@ def qjl_reconstruct(R: torch.Tensor, seed: int) -> torch.Tensor:
     R_unit = R / r_norms_stored
 
     # One shared sketch for the whole matrix (cached, read-only)
-    G = _qjl_sketch(C, seed).to(R.dtype)
+    G = _qjl_sketch(C, seed).to(R)
 
     # Signs: (S, C) — sign of projection
     signs = torch.sign(R_unit @ G.T)  # (S, C)

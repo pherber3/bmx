@@ -29,7 +29,7 @@ def randomized_hadamard(x: torch.Tensor, seed: int) -> torch.Tensor:
     """H @ diag(signs) @ x rows — the standard randomized Hadamard rotation."""
     d = x.shape[-1]
     g = torch.Generator().manual_seed(seed)
-    signs = (torch.randint(0, 2, (d,), generator=g) * 2 - 1).to(x.dtype)
+    signs = (torch.randint(0, 2, (d,), generator=g) * 2 - 1).to(x)
     return fwht(x * signs)
 
 

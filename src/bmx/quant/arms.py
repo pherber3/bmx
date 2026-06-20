@@ -26,7 +26,7 @@ def total_bits(m: int, p: int, *, bits: int, group_size: int, r: int, k: int) ->
 
 
 def _rotate_rtn(W: torch.Tensor, bits: int, group_size: int, seed: int) -> torch.Tensor:
-    Q = random_orthogonal(W.shape[-1], seed=seed, dtype=W.dtype)
+    Q = random_orthogonal(W.shape[-1], seed=seed, dtype=W.dtype, device=W.device)
     return rtn_quantize(W @ Q.mT, bits, group_size) @ Q
 
 
