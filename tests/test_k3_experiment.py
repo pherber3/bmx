@@ -41,3 +41,31 @@ def test_k3_run_emits_parquet(tmp_path):
         "turboquant_mse",
         "turboquant_prod",
     }
+
+
+def test_plot_k3_makes_pngs(tmp_path):
+    import pandas as pd
+    from experiments.plots.plot_k3 import make_figures
+
+    df = pd.DataFrame(
+        [
+            {
+                "arm": "fp16",
+                "bpe_k": 16.0,
+                "bpe_v": 16.0,
+                "ppl": 10.0,
+                "n_context": 512,
+                "retrieved": True,
+            },
+            {
+                "arm": "k2b",
+                "bpe_k": 3.0,
+                "bpe_v": 2.0,
+                "ppl": 10.1,
+                "n_context": 512,
+                "retrieved": True,
+            },
+        ]
+    )
+    paths = make_figures(df, str(tmp_path))
+    assert paths and all(p.exists() for p in paths)
