@@ -257,7 +257,7 @@ import torch
 
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
-from tests.factories import ids, tiny_llama
+from factories import ids, tiny_llama
 
 
 def _fp16():
@@ -440,7 +440,7 @@ def test_prerope_key_capture_and_rope_at_read():
 
     from bmx.cache.specs import CacheCodecSpec
     from bmx.cache.streaming import StreamingQuantizedCache
-    from tests.factories import ids, tiny_llama
+    from factories import ids, tiny_llama
 
     model = tiny_llama()
     input_ids = ids(vocab=97, seq=40, seed=7)
@@ -474,7 +474,7 @@ def test_quantized_prerope_recon_finite_and_compressed():
 
     from bmx.cache.specs import CacheCodecSpec
     from bmx.cache.streaming import StreamingQuantizedCache
-    from tests.factories import ids, tiny_llama
+    from factories import ids, tiny_llama
 
     model = tiny_llama()
     input_ids = ids(vocab=97, seq=40, seed=8)
@@ -676,7 +676,7 @@ import torch
 
 from bmx.cache.live_eval import live_generation_ppl
 from bmx.cache.specs import CacheCodecSpec
-from tests.factories import ids, tiny_llama
+from factories import ids, tiny_llama
 
 
 def test_fp16_live_ppl_matches_plain_forward():
@@ -820,7 +820,7 @@ def test_memory_report_packed_below_fp16():
     import torch
     from bmx.cache.specs import CacheCodecSpec
     from bmx.cache.streaming import StreamingQuantizedCache
-    from tests.factories import ids, tiny_llama
+    from factories import ids, tiny_llama
 
     model = tiny_llama()
     input_ids = ids(vocab=97, seq=64, seed=21)
@@ -913,7 +913,7 @@ import torch
 
 from bmx.cache.needle import needle_retrieved_from_ids
 from bmx.cache.specs import CacheCodecSpec
-from tests.factories import tiny_llama
+from factories import tiny_llama
 
 
 def test_needle_harness_runs_and_returns_bool():
@@ -1056,7 +1056,7 @@ Thin tyro script sweeping arms, emitting parquet via `artifacts`. Model-agnostic
 import pandas as pd
 
 from experiments.k3_live_generation import Config, run
-from tests.factories import tiny_llama
+from factories import tiny_llama
 
 
 def test_k3_run_emits_parquet(tmp_path):
