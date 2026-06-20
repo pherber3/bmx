@@ -1,9 +1,7 @@
-"""LongBench Code eval: code_sim scorer, dataset loader, task registry.
+"""LongBench Code eval (lcc, repobench-p): code_sim scorer, dataset loader, task registry.
 
-Faithful port of LongBench's Code-category eval (lcc, repobench-p). The scorer matches
-LongBench's metrics.py::code_sim_score exactly; all conventions are recorded verbatim in
-.git/sdd/longbench-conventions.md (the durable ledger). The dataset loader + scoring path are
-VM-only (real model); code_sim is a pure CI-testable function.
+code_sim ports LongBench's metrics.py::code_sim_score. The loader and per-item scorer require
+a real model and dataset (VM only); code_sim and the registry are pure and CI-testable.
 """
 
 from __future__ import annotations
@@ -14,11 +12,8 @@ from fuzzywuzzy import fuzz
 from bmx.cache.niah import generate_through_cache
 from bmx.cache.specs import CacheCodecSpec
 
-# VERBATIM from LongBench's config/dataset2prompt.json + dataset2maxlen.json, recorded in
-# .git/sdd/longbench-conventions.md (the authoritative ledger; the reference clone it was
-# extracted from is transient).
-# NOTE the exact strings: trailing space after "below. ", and repobench-p has {input}, lcc does
-# not. Copy these EXACTLY — do not normalize whitespace.
+# LongBench's prompt templates and max_gen for the code tasks. The templates are exact:
+# trailing space after "below. ", repobench-p uses {input}, lcc does not. Do not normalize.
 LONGBENCH_TASKS: dict[str, dict] = {
     "lcc": {
         "prompt_template": "Please complete the code given below. \n{context}Next line of code:\n",

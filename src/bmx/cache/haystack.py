@@ -1,10 +1,7 @@
 """Haystack filler for the NIAH retrieval metric.
 
-Two regimes (matching the run split):
-  - synthetic_filler: deterministic repeated text, no download — the offline/CI path.
-  - load_pg_corpus: real Paul Graham essays from the HuggingFace dataset
-    ``sgoel9/paul_graham_essays`` — the VM headline path (max comparability to the
-    TurboQuant / Fu et al. setup). Self-downloading; no local clone required.
+synthetic_filler is deterministic repeated text for tests. load_pg_corpus downloads the
+Paul Graham essays from the HuggingFace dataset for the real run.
 """
 
 from __future__ import annotations
@@ -21,11 +18,9 @@ def synthetic_filler(n_repeats: int) -> str:
 
 
 def load_pg_corpus() -> str:
-    """Concatenate the Paul Graham essays from the HF dataset into one filler string.
+    """Concatenate the Paul Graham essays from the HF dataset into one string.
 
-    VM/real path only — downloads ``sgoel9/paul_graham_essays`` (215 essays, ``text``
-    column, ``train`` split) on first call. Lazy-imports ``datasets`` so importing this
-    module never triggers a download (the offline/CI path uses synthetic_filler).
+    ``datasets`` is imported lazily so importing this module triggers no download.
     """
     from datasets import load_dataset
 

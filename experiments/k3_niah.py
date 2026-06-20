@@ -1,18 +1,11 @@
-"""K3-NIAH — long-context needle-in-a-haystack recall under KV compression.
+"""Needle-in-a-haystack recall under KV compression.
 
-Sweeps arms × document-lengths × depths on ONE code path (StreamingQuantizedCache),
-following the TurboQuant / Fu et al. setup: single needle, ROUGE-1 recall, length
-sweep. Reports each arm's honest measured compression (never a pinned ratio).
+Sweeps arms × document-lengths × depths through the StreamingQuantizedCache: a single needle
+at a given depth, scored by ROUGE-1 recall, recording each arm's measured compression.
 
-Real path (model is None, VM run):
-  Loads model + tokenizer + Paul Graham essays, builds RULER-style needle prompts,
-  greedy-generates, scores ROUGE-1 (niah_recall_generate).
-
-Offline-test path (model injected):
-  Synthetic argmax proxy on small lengths (≤64, tiny_llama). recall is the argmax
-  hit ×10 for schema parity. No download, no tokenizer.
-
-Model-agnostic: the SOTA VM run is a --model-name change. Figures: plots/plot_k3_niah.py.
+When `model` is None: loads the model, tokenizer, and Paul Graham haystack, plants the needle,
+generates, and scores ROUGE-1. When `model` is injected (tests): a synthetic argmax proxy at
+small lengths (≤64) — schema and mechanism only, no download.
 """
 
 from __future__ import annotations
@@ -48,12 +41,10 @@ class Config:
 
 
 def _compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, float]:
-    """Honest (bpe_k, bpe_v, compression) for an arm at a given sequence length.
+    """Measured (bpe_k, bpe_v, compression) for an arm at a given sequence length.
 
-    Runs a calibration prefill of `length` tokens through a StreamingQuantizedCache so
-    the codec actually fires (bits_per_entry is nan until a forward pass quantizes a
-    block); then reads the deployable blended-bpe accounting. Comparisons align on this
-    measured compression, never a pinned ratio.
+    Runs a calibration prefill of `length` tokens first: bits_per_entry is nan until a
+    forward pass quantizes a block. Then reads the blended-bpe accounting off the cache.
     """
     cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
@@ -82,7 +73,7 @@ def run(cfg: Config, model=None, root: str = "results"):
         )
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-        haystack = load_pg_corpus()  # HF dataset; no local clone required
+        haystack = load_pg_corpus()
 
     run_dir = create_run("k3_niah", cfg, root=root)
     rows = []

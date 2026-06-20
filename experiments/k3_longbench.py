@@ -1,16 +1,11 @@
-"""K3-LongBench — LongBench Code (lcc, repobench-p) recall under KV compression.
+"""LongBench Code (lcc, repobench-p) recall under KV compression.
 
-Reproduces TurboQuant's Code-column signal: sweeps arms × tasks on ONE code path
-(StreamingQuantizedCache via generate_through_cache), scores LongBench code_sim. Reports each
-arm's honest measured compression (never a pinned ratio).
+Sweeps arms × tasks through the StreamingQuantizedCache and scores LongBench code_sim,
+recording each arm's measured compression.
 
-Real path (model is None, VM run): loads model + tokenizer + THUDM/LongBench, generates through
-the compressed cache, scores code_sim over n_samples (all if None) per task.
-
-Offline-test path (model injected): a tiny synthetic code-ish prompt through tiny_llama;
-code_sim against a known target. Mechanism + parquet schema only; no download, no tokenizer.
-
-Model-agnostic: the SOTA VM run is a --model-name change. Figures: plots/plot_k3_longbench.py.
+When `model` is None: loads the model, tokenizer, and THUDM/LongBench, and scores over
+n_samples items (all if None) per task. When `model` is injected (tests): scores one synthetic
+generation against itself — schema and mechanism only, no download.
 """
 
 from __future__ import annotations
@@ -43,7 +38,7 @@ class Config:
 
 
 class _StubTok:
-    """Offline decode stub: turns ids into a deterministic 'code-ish' string for code_sim."""
+    """Decode stub for the offline path: ids to a deterministic string."""
 
     def decode(self, ids, skip_special_tokens=True):
         return " ".join(str(int(i)) for i in ids.tolist())
@@ -69,40 +64,28 @@ def run(cfg: Config, model=None, root: str = "results"):
 
     run_dir = create_run("k3_longbench", cfg, root=root)
 
-    # Preload each task's dataset ONCE (real path) — it is identical across arms, so
-    # loading inside the arm loop would re-download it len(arms) times.
+    # A task's dataset is identical across arms; load each once.
     task_items = (
         {task: load_longbench_task(task, cfg.n_samples) for task in cfg.tasks}
         if tokenizer is not None
         else None
     )
     score_kind = "code_sim_offline" if tokenizer is None else "code_sim"
-    # `length` (for compression accounting) is constant per arm — offline uses the fixed
-    # 32-token synthetic prompt; the real path uses a representative proxy. See the NOTE.
-    # NOTE: representative length for compression accounting only. Real LongBench code
-    # prompts are far longer (4k–16k), so this proxy UNDER-states compression (the fixed
-    # fp16 recent-window is a larger fraction at short length). It is consistent across
-    # arms, so relative rankings hold; the absolute compression column is a lower bound.
-    # A future pass could thread the true tokenized prompt length through.
+    # `length` is a proxy for the compression calibration. Real prompts are 4k–16k, so it
+    # understates compression; it is equal across arms, so relative rankings are unaffected.
     length = 32 if tokenizer is None else cfg.n_prefill * 2
 
     rows = []
     for arm in cfg.arms:
         k_spec, v_spec = _spec_pair(arm, cfg)
-        # Compression is a property of (codec spec, length) only — hoist out of the task
-        # loop so the calibration forward runs once per arm, not once per (arm, task).
         bpe_k, bpe_v, compression = _compression_for(model, k_spec, v_spec, length)
         for task in cfg.tasks:
             if tokenizer is None:
-                # Offline mechanism: one synthetic prompt through the shared generate path.
+                # Offline: score one synthetic generation against itself; mechanism only.
                 g = torch.Generator().manual_seed(cfg.seed)
                 prompt_ids = torch.randint(
                     0, model.config.vocab_size, (1, length), generator=g
                 )
-                # Mechanism/schema only: a few new tokens suffice (and stay within
-                # tiny_llama's max_position_embeddings=64). The real max_gen is used on
-                # the VM path; here the response length is irrelevant — we score it
-                # against itself.
                 resp = generate_through_cache(
                     model,
                     _StubTok(),
@@ -112,7 +95,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                     v_spec,
                     max_new_tokens=4,
                 )
-                score = code_sim(resp, resp)  # identical => 1.0; mechanism/schema only
+                score = code_sim(resp, resp)
                 n_used = 1
             else:
                 items = task_items[task]

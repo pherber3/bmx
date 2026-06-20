@@ -1,10 +1,7 @@
 """NIAH recall metric: argmax proxy (CI) + ROUGE-1 generate (headline).
 
-Mirrors needle.py's proxy/real split. The argmax proxy is the offline mechanism
-gate (tokenizer-free, ≤64 tokens for tiny_llama). The generate path is the headline
-recall (ROUGE-1 vs the needle sentence), VM/real-model only — added in Task 3.
-
-All arms route through the same StreamingQuantizedCache path used by the ppl sweep.
+The argmax proxy is the offline mechanism gate (tokenizer-free, ≤64 tokens for tiny_llama).
+The generate path scores ROUGE-1 against the needle sentence and needs a real model.
 """
 
 from __future__ import annotations
@@ -55,18 +52,15 @@ def niah_recall_argmax(
 ) -> bool:
     """True iff the streaming-cache next-token argmax at query_pos equals answer_id.
 
-    Offline mechanism gate: finite, deterministic, indexing-correct. Real recall
-    quality is the ROUGE-1 generate path (Task 3), VM only. Delegates to
-    needle.needle_retrieved (argmax-equals-answer) so the cache-probe lives in one
-    place; query_pos is honored by trimming input_ids to that position.
+    Delegates to needle.needle_retrieved by trimming input_ids to query_pos. This is the
+    offline mechanism gate (deterministic, indexing-correct), not a recall-quality measure.
     """
     return needle_retrieved(
         model, input_ids[:, : query_pos + 1], answer_id, k_spec, v_spec, n_prefill
     )
 
 
-# Defaults follow the Fu et al. harness (eval/needle/needle_in_haystack.py); the
-# Task 0 ledger is the source of truth if the vault refined these.
+# Default needle/question from the Fu et al. NIAH harness.
 NEEDLE_TEXT = (
     "\nThe best thing to do in San Francisco is eat a sandwich and sit in "
     "Dolores Park on a sunny day.\n"
@@ -145,14 +139,10 @@ def generate_through_cache(
 ) -> str:
     """Prefill prompt_ids into a StreamingQuantizedCache, greedy-generate, return the answer.
 
-    The shared headline generate path for every metric that scores a generation through the
-    compressed cache (NIAH ROUGE-1, LongBench code_sim, ...). One fair code path.
-
-    Continuation-only contract (mirrors needle.py:21-22):
-      Step 1 fills cache positions [0, n_prefill) via a quantize-on-append forward.
-      Step 2 feeds ONLY prompt_ids[:, n_prefill:] to generate(); HF returns the supplied
-      continuation followed by the newly-decoded tokens, so the new tokens start at index
-      (L - n_prefill) in out[0]. Decoding out[0, L - n_prefill :] yields exactly the answer.
+    The prefill forward fills cache positions [0, n_prefill); generate() is fed only the
+    continuation prompt_ids[:, n_prefill:], so it must not re-see the prefill. HF returns the
+    supplied continuation followed by the new tokens, so the answer is out[0, L - n_prefill:].
+    `strip` removes leading/trailing whitespace (off for whitespace-sensitive scorers).
     """
     L = prompt_ids.shape[1]
     cont_len = L - n_prefill
