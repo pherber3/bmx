@@ -1,5 +1,6 @@
 """StreamingQuantizedCache: plumbing, quality, and memory gates (tiny_llama)."""
 
+import pytest
 import torch
 
 from bmx.cache.specs import CacheCodecSpec
@@ -324,10 +325,13 @@ def test_each_token_quantized_once():
         layer = cache.layers[0]
         old_committed = layer._committed_S_q
         if old_committed == 0:
-            # No flush happened yet; skip (no prefix to freeze-check).
-            return
-        # Save a copy of the frozen prefix.
+            # No flush happened yet — skip loudly so a grid change can't make this
+            # invariant check vacuously pass.
+            pytest.skip("no flush occurred; nothing committed to freeze-check")
+        # Save copies of the frozen prefix (both K and V — V's write-once is the
+        # C1-critical one since turboquant_mse is non-idempotent).
         prefix_k_before = layer._q_prefix_k.clone()
+        prefix_v_before = layer._q_prefix_v.clone()
 
         # Run more decode steps to trigger another flush.
         with torch.no_grad():
@@ -336,8 +340,12 @@ def test_each_token_quantized_once():
 
         # The portion that was committed before the extra steps must be unchanged.
         prefix_k_after = layer._q_prefix_k
+        prefix_v_after = layer._q_prefix_v
         assert torch.equal(prefix_k_before, prefix_k_after[:, :old_committed, :]), (
-            "Committed prefix changed — write-once not enforced"
+            "Committed K prefix changed — write-once not enforced"
+        )
+        assert torch.equal(prefix_v_before, prefix_v_after[:, :old_committed, :]), (
+            "Committed V prefix changed — write-once not enforced"
         )
     finally:
         cache.detach()
@@ -405,8 +413,9 @@ def test_frozen_subspace_not_refit():
 
         layer = cache.layers[0]
         if layer._frozen_svd is None:
-            # Frozen SVD not implemented — skip (acceptable fallback per brief).
-            return
+            # Frozen SVD not implemented — skip loudly (acceptable fallback per
+            # brief) so the invariant check can't pass vacuously.
+            pytest.skip("frozen SVD not set; nothing to check")
         _, V_frozen_first = layer._frozen_svd
 
         with torch.no_grad():

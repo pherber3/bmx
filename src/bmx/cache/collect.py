@@ -59,7 +59,7 @@ def _get_kv_layer(past_key_values, i: int):
 def _reshape_heads(out: torch.Tensor, n_head: int, d: int) -> torch.Tensor:
     """(1, S, n_head*d) projection output -> (n_head, S, d), fp16 contiguous."""
     S = out.shape[1]
-    heads = out.view(1, S, n_head, d).permute(0, 2, 1, 3).squeeze(0)
+    heads = out.reshape(1, S, n_head, d).permute(0, 2, 1, 3).squeeze(0)
     return heads.contiguous().to(torch.float16)
 
 

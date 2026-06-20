@@ -1,7 +1,13 @@
 import pytest
 import torch
 
-from bmx.decomp.base import FitResult, available_methods, get_method, register
+from bmx.decomp.base import (
+    FitResult,
+    _REGISTRY,
+    available_methods,
+    get_method,
+    register,
+)
 
 
 class _DummyFit(FitResult):
@@ -21,10 +27,13 @@ def test_registry_roundtrip():
     def fit_dummy(T, rank):
         return _DummyFit(T)
 
-    assert "dummy" in available_methods()
-    fit = get_method("dummy")(torch.ones(2, 2, 2), rank=1)
-    assert fit.param_count() == 7
-    assert fit.loss_history[-1] == 0.5
+    try:
+        assert "dummy" in available_methods()
+        fit = get_method("dummy")(torch.ones(2, 2, 2), rank=1)
+        assert fit.param_count() == 7
+        assert fit.loss_history[-1] == 0.5
+    finally:
+        _REGISTRY.pop("dummy", None)
 
 
 def test_relative_error():

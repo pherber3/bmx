@@ -8,7 +8,7 @@ import dataclasses
 
 import tyro
 
-from a2_matched_param import Config, main
+from experiments.a2_matched_param import Config, main
 
 
 @dataclasses.dataclass

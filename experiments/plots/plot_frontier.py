@@ -35,9 +35,10 @@ def classify(row) -> str:
 
 
 def main(cfg: Config) -> None:
+    # newest run only; blind concat double-counts reruns (see CLAUDE.md pitfalls)
     runs = sorted(Path(cfg.root).glob("*/metrics.parquet"))
     assert runs, f"no metrics.parquet under {cfg.root}"
-    df = pd.concat([pd.read_parquet(p) for p in runs], ignore_index=True)
+    df = pd.read_parquet(runs[-1])  # timestamps sort lexically
     df["d_h"] = 2 * df.m * df.p / (df.m + df.p)
     df["cls"] = df.apply(classify, axis=1)
 

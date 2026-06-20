@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from bmx.quant.breakeven import breakeven_row
@@ -35,4 +36,6 @@ def test_margin_formula_hand_check():
     # against the analytic r=1 value only when r=1 is the argmax
     if bk["lr_best_r"] == 1:
         assert abs(bk["lr_margin_bits"] - (saved1 - cost1)) < 1e-9
-    assert abs(bk["lr_eps"] - eps1) < 1e-9 or bk["lr_best_r"] != 1
+    if bk["lr_best_r"] != 1:
+        pytest.skip("argmax did not pick r=1; eps invariant only applies at r=1")
+    assert abs(bk["lr_eps"] - eps1) < 1e-9

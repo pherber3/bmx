@@ -122,7 +122,7 @@ def main(cfg: Config) -> None:
             hf_config = AutoConfig.from_pretrained(cfg.model_name)
             rope_ready = True
             print(f"RoPE config loaded from {cfg.model_name}", flush=True)
-        except Exception as e:
+        except ValueError as e:
             print(
                 f"WARNING: could not load RoPE config for {cfg.model_name}: {e}",
                 flush=True,
