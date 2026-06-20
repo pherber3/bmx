@@ -1,4 +1,4 @@
-from bmx.cache.haystack import synthetic_filler, pg_essays_dir, read_pg_corpus
+from bmx.cache.haystack import PG_ESSAYS_DATASET, load_pg_corpus, synthetic_filler
 
 
 def test_synthetic_filler_is_deterministic_and_scales():
@@ -9,14 +9,26 @@ def test_synthetic_filler_is_deterministic_and_scales():
     assert isinstance(a, str) and len(a) > 0
 
 
-def test_pg_essays_dir_returns_path_or_none():
-    d = pg_essays_dir()
-    # In this repo the clone is present; if absent (CI elsewhere) None is allowed.
-    assert d is None or (d.is_dir() and any(d.glob("*.txt")))
+def test_pg_essays_dataset_id():
+    # The VM headline path pulls the real corpus from this HF dataset (no local clone).
+    assert PG_ESSAYS_DATASET == "sgoel9/paul_graham_essays"
 
 
-def test_read_pg_corpus_concatenates(tmp_path):
-    (tmp_path / "a.txt").write_text("alpha ")
-    (tmp_path / "b.txt").write_text("beta")
-    corpus = read_pg_corpus(tmp_path)
-    assert "alpha" in corpus and "beta" in corpus
+def test_load_pg_corpus_lazy_imports_datasets(monkeypatch):
+    # load_pg_corpus must lazy-import `datasets` inside the function so importing the
+    # module (and the offline/CI path) never triggers a download. Stub load_dataset to
+    # prove the wiring without hitting the network.
+    import datasets
+
+    class _FakeDS:
+        def __getitem__(self, col):
+            assert col == "text"
+            return ["essay one", "", "essay two"]
+
+    monkeypatch.setattr(
+        datasets, "load_dataset", lambda name, split: _FakeDS(), raising=True
+    )
+    corpus = load_pg_corpus()
+    assert "essay one" in corpus and "essay two" in corpus
+    # empty entries are dropped, real ones joined.
+    assert corpus == "essay one\nessay two"

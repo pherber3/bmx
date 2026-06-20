@@ -1,46 +1,35 @@
 """Haystack filler for the NIAH retrieval metric.
 
 Two regimes (matching the run split):
-  - synthetic_filler: deterministic repeated text, no files — the offline/CI path.
-  - Paul Graham essays: real filler from the local Fu et al. clone — the VM headline
-    path (max comparability to the TurboQuant / Fu et al. setup).
+  - synthetic_filler: deterministic repeated text, no download — the offline/CI path.
+  - load_pg_corpus: real Paul Graham essays from the HuggingFace dataset
+    ``sgoel9/paul_graham_essays`` — the VM headline path (max comparability to the
+    TurboQuant / Fu et al. setup). Self-downloading; no local clone required.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 _FILLER_SENTENCE = "The grass was green and the sky was blue and the day was calm. "
+
+PG_ESSAYS_DATASET = "sgoel9/paul_graham_essays"
 
 
 def synthetic_filler(n_repeats: int) -> str:
-    """Deterministic repeated filler (no files). Used by the offline/CI path."""
+    """Deterministic repeated filler (no download). Used by the offline/CI path."""
     assert n_repeats > 0, "n_repeats must be positive"
     return _FILLER_SENTENCE * n_repeats
 
 
-def pg_essays_dir() -> Path | None:
-    """Path to the local Paul Graham essays dir, or None if the clone is absent.
+def load_pg_corpus() -> str:
+    """Concatenate the Paul Graham essays from the HF dataset into one filler string.
 
-    The Fu et al. repo is cloned at the bmx repo root as a local reference (not
-    vendored). Resolve relative to this file: src/bmx/cache/haystack.py -> repo root.
+    VM/real path only — downloads ``sgoel9/paul_graham_essays`` (215 essays, ``text``
+    column, ``train`` split) on first call. Lazy-imports ``datasets`` so importing this
+    module never triggers a download (the offline/CI path uses synthetic_filler).
     """
-    repo_root = Path(__file__).resolve().parents[3]
-    d = (
-        repo_root
-        / "Long-Context-Data-Engineering"
-        / "eval"
-        / "needle"
-        / "PaulGrahamEssays"
-    )
-    return d if d.is_dir() and any(d.glob("*.txt")) else None
+    from datasets import load_dataset
 
-
-def read_pg_corpus(essays_dir: Path) -> str:
-    """Concatenate all *.txt files in essays_dir into one filler string."""
-    parts = [
-        p.read_text(encoding="utf-8", errors="ignore")
-        for p in sorted(essays_dir.glob("*.txt"))
-    ]
-    assert parts, f"no *.txt files in {essays_dir}"
-    return "\n".join(parts)
+    ds = load_dataset(PG_ESSAYS_DATASET, split="train")
+    texts = [t for t in ds["text"] if t]
+    assert texts, f"no essay text in {PG_ESSAYS_DATASET}"
+    return "\n".join(texts)

@@ -31,8 +31,10 @@ uv run python experiments/k3_niah.py \
 # extensible toward 104k via --lengths; validate on the 8B first, then a 27-31B SOTA model.
 ```
 
-Needs the Paul Graham essays present (the Fu et al. clone at the repo root
-`Long-Context-Data-Engineering/` — gitignored, not vendored; re-clone on the VM if absent).
+**No git clone required on the VM.** The Paul Graham haystack now self-downloads from the
+HuggingFace dataset `sgoel9/paul_graham_essays` via `haystack.load_pg_corpus()` (lazy
+`load_dataset`, 215 essays, `text` column). Same self-download path as LongBench
+(`THUDM/LongBench`) — both metrics need only `uv` deps + HF dataset access, no repo clones.
 Figures: `experiments/plots/plot_k3_niah.py::make_figures(df, out_dir)` over the emitted
 parquet.
 

@@ -74,7 +74,7 @@ def run(cfg: Config, model=None, root: str = "results"):
         # Real run (VM): model + tokenizer + Paul Graham essays.
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from bmx.cache.haystack import pg_essays_dir, read_pg_corpus
+        from bmx.cache.haystack import load_pg_corpus
         from bmx.cache.niah import build_niah_prompt, niah_recall_generate
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -82,11 +82,7 @@ def run(cfg: Config, model=None, root: str = "results"):
         )
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-        essays = pg_essays_dir()
-        assert essays is not None, (
-            "Paul Graham essays not found; clone Fu et al. repo at repo root"
-        )
-        haystack = read_pg_corpus(essays)
+        haystack = load_pg_corpus()  # HF dataset; no local clone required
 
     run_dir = create_run("k3_niah", cfg, root=root)
     rows = []
