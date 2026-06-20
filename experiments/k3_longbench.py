@@ -22,7 +22,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.longbench import LONGBENCH_TASKS, code_sim
+from bmx.cache.longbench import code_sim
 from bmx.cache.niah import generate_through_cache
 from experiments.k3_live_generation import _spec_pair
 from experiments.k3_niah import _compression_for
@@ -78,6 +78,10 @@ def run(cfg: Config, model=None, root: str = "results"):
                 prompt_ids = torch.randint(
                     0, model.config.vocab_size, (1, 32), generator=g
                 )
+                # Mechanism/schema only: a few new tokens suffice (and stay within
+                # tiny_llama's max_position_embeddings=64). The real max_gen is used on
+                # the VM path; here the response length is irrelevant — we score it
+                # against itself.
                 resp = generate_through_cache(
                     model,
                     _StubTok(),
@@ -85,9 +89,9 @@ def run(cfg: Config, model=None, root: str = "results"):
                     cfg.n_prefill,
                     k_spec,
                     v_spec,
-                    max_new_tokens=LONGBENCH_TASKS[task]["max_gen"],
+                    max_new_tokens=4,
                 )
-                score = code_sim(resp, resp)  # identical => 100; mechanism/schema only
+                score = code_sim(resp, resp)  # identical => 1.0; mechanism/schema only
                 n_used = 1
                 score_kind = "code_sim_offline"
                 length = prompt_ids.shape[1]
@@ -102,9 +106,13 @@ def run(cfg: Config, model=None, root: str = "results"):
                 score = sum(scores) / len(scores) if scores else float("nan")
                 n_used = len(items)
                 score_kind = "code_sim"
-                length = (
-                    cfg.n_prefill * 2
-                )  # representative length for compression accounting
+                # NOTE: representative length for compression accounting only. Real
+                # LongBench code prompts are far longer (4k–16k), so this proxy
+                # UNDER-states compression (the fixed fp16 recent-window is a larger
+                # fraction at short length). It is consistent across arms, so relative
+                # rankings hold; the absolute compression column is a lower bound. A
+                # future pass could thread the true tokenized prompt length through.
+                length = cfg.n_prefill * 2
 
             bpe_k, bpe_v, compression = _compression_for(model, k_spec, v_spec, length)
             rows.append(
