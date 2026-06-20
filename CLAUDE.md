@@ -54,6 +54,13 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   fixes the turboquant_mse V re-quant blowup), frozen pre-RoPE subspace, fp16
   residual window so channel-grouped arms stream. Quality holds (1.001× fp16 tbt),
   honest packed bpe < fp16, all arms on one fair path — `docs/2026-06-19-k3-*.md`.
+- NIAH retrieval metric (task metric #0, retrieval half — harness built, awaiting
+  VM run): ROUGE-1 needle-recall under compression on the StreamingQuantizedCache
+  path (Fu et al. / TurboQuant setup); offline synthetic-argmax mechanism gate +
+  real PG-essay generate headline (`experiments/k3_niah.py --model-name`); honest
+  per-arm measured compression vs the 4× line. Spec/plan:
+  `docs/superpowers/{specs,plans}/2026-06-20-niah-*`; VM handoff:
+  `docs/2026-06-20-niah-plan-state.md`. Code-gen pass@1 = deferred second half.
 - **Open (engineering, not science):** fused dequant-attention kernel (use the
   Track B byte model in `src/bmx/bench/` to predict before building) for the literal
   process-RSS win; the authoritative SOTA-model VM run (real-text + planted needle,
