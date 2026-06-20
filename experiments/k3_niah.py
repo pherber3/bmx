@@ -46,18 +46,25 @@ class Config:
     max_new_tokens: int = 50
 
 
-def _compression_for(
-    model_config, k_spec, v_spec, length: int
-) -> tuple[float, float, float]:
-    """Honest (bpe_k, bpe_v, compression) for an arm at a given length.
+def _compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, float]:
+    """Honest (bpe_k, bpe_v, compression) for an arm at a given sequence length.
 
-    Builds a StreamingQuantizedCache only to read its memory_report accounting; this
-    matches the deployable blended-bpe number used by the ppl sweep.
+    Runs a calibration prefill of `length` tokens through a StreamingQuantizedCache so
+    the codec actually fires (bits_per_entry is nan until a forward pass quantizes a
+    block); then reads the deployable blended-bpe accounting. Comparisons align on this
+    measured compression, never a pinned ratio.
     """
-    cache = StreamingQuantizedCache(model_config, k_spec=k_spec, v_spec=v_spec)
-    # bits_per_entry reads the codec spec deterministically; memory_report is exact at length.
-    mem = cache.memory_report(seq_len=length)
+    import torch
+
+    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache.attach(model)
+    g = torch.Generator().manual_seed(0)
+    ids = torch.randint(0, model.config.vocab_size, (1, length), generator=g)
+    with cache:
+        with torch.no_grad():
+            model(ids, past_key_values=cache, use_cache=True)
     bpe_k, bpe_v = cache.bits_per_entry()
+    mem = cache.memory_report(seq_len=length)
     return bpe_k, bpe_v, mem["compression"]
 
 
@@ -89,9 +96,7 @@ def run(cfg: Config, model=None, root: str = "results"):
     for arm in cfg.arms:
         k_spec, v_spec = _spec_pair(arm, cfg)
         for length in cfg.lengths:
-            bpe_k, bpe_v, compression = _compression_for(
-                model.config, k_spec, v_spec, length
-            )
+            bpe_k, bpe_v, compression = _compression_for(model, k_spec, v_spec, length)
             for depth in cfg.depths:
                 if tokenizer is None:
                     # Offline: synthetic argmax proxy at this (small) length.
