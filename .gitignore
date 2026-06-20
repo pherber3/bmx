@@ -10,5 +10,6 @@ results/**/*.pt
 hf_cache/
 # raw KV-cache dumps (data, not metrics)
 results/cache/
-# local reference clone (Fu et al. NIAH harness) — referenced, not vendored
+# local reference clones (NIAH + LongBench harnesses) — referenced, not vendored
 /Long-Context-Data-Engineering/
+/LongBench/
