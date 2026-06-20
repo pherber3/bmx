@@ -1,6 +1,13 @@
-"""k3 experiment emits a parquet with the expected schema (tiny_llama, offline)."""
+"""k3 experiment emits a parquet with the expected schema (tiny_llama, offline).
+
+The real-text path (load_eval_tokens) and real-needle path (build_needle_ids) are
+exercised ONLY on the VM/real run, NOT in CI — they download wikitext-2 and model
+weights.  This test exercises the offline mechanics only: it injects both a tiny
+model and synthetic input_ids so run() never calls load_eval_tokens or the tokenizer.
+"""
 
 import pandas as pd
+import torch
 
 from experiments.k3_live_generation import Config, run
 from factories import tiny_llama
@@ -18,7 +25,13 @@ def test_k3_run_emits_parquet(tmp_path):
     cfg = Config(
         arms=("fp16", "k2b", "kivi"), n_prefill=16, n_context=32, rank=4, group=16
     )
-    run_dir = run(cfg, model=model, root=str(tmp_path))
+    # Provide synthetic input_ids so run() never calls load_eval_tokens (no download).
+    # Both model and input_ids are injected → fully offline, fast.
+    g = torch.Generator().manual_seed(cfg.seq_seed)
+    input_ids = torch.randint(
+        0, model.config.vocab_size, (1, cfg.n_context), generator=g
+    )
+    run_dir = run(cfg, model=model, input_ids=input_ids, root=str(tmp_path))
     df = pd.read_parquet(run_dir / "metrics.parquet")
     for col in (
         "arm",

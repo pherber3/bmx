@@ -1,8 +1,21 @@
 """K3 — live-generation KV-compression verdict: K2b vs TurboQuant vs KIVI vs fp16.
 
 Sweeps arms on one code path (StreamingQuantizedCache), measuring live-generation
-perplexity, honest bpe, and a retrieval-fidelity proxy. Model-agnostic: the SOTA
-VM run is a --model-name change. Figures read the parquet (plots/plot_k3.py).
+perplexity on real wikitext-2 text (token-by-token honest streaming regime), honest
+bpe, a tokenizer-free retrieval-fidelity proxy (``retrieved``), and a real
+planted-needle retrieval score (``needle_real``).
+
+Real-text path (model is None, real run on VM):
+  Loads wikitext-2 test split via load_eval_tokens → real per-token NLL →
+  meaningful live-generation perplexity.  Also builds a planted-needle prompt
+  (build_needle_ids) and measures whether each arm still retrieves the fact.
+
+Offline-test path (model injected by the test, input_ids provided):
+  Uses synthetic random ids.  No download, no tokenizer.  Only exercises the
+  parquet schema and codec mechanics.  needle_real is not computed in this path.
+
+Model-agnostic: the SOTA VM run is a --model-name change.  Figures read the
+parquet (plots/plot_k3.py).
 """
 
 from __future__ import annotations
@@ -15,7 +28,11 @@ import tyro
 
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.live_eval import live_generation_ppl
-from bmx.cache.needle import needle_retrieved_from_ids
+from bmx.cache.needle import (
+    build_needle_ids,
+    needle_retrieved,
+    needle_retrieved_from_ids,
+)
 from bmx.cache.specs import CacheCodecSpec
 
 
@@ -29,6 +46,8 @@ class Config:
     group: int = 64
     seed: int = 0
     seq_seed: int = 42
+    needle_depth: float = 0.5
+    """Fractional depth [0, 1] at which the needle is planted in the haystack."""
     token_by_token: bool = True
     """Score the continuation one token at a time (honest streaming regime).
     Set to False to use the fast batched path (equivalent to old quantized-prefill
@@ -68,17 +87,42 @@ def _make_ids(cfg: Config, vocab: int):
     return torch.randint(0, vocab, (1, cfg.n_context), generator=g)
 
 
-def run(cfg: Config, model=None, root: str = "results"):
+def run(cfg: Config, model=None, input_ids=None, root: str = "results"):
+    # --- Model and tokenizer loading ---
+    # When model is None (real run on VM): load model + tokenizer + real text.
+    # When model is injected (offline test): use synthetic ids, skip downloads.
+    tokenizer = None
+    needle_ids = None
+    answer_id = None
+
     if model is None:
-        from transformers import AutoModelForCausalLM
+        # Real run: download model, tokenizer, and wikitext-2 real text.
+        # This path is exercised only on the VM/real run, NOT in CI.
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from bmx.eval.layer_swap import load_eval_tokens
 
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, torch_dtype=torch.float16
         )
         model.eval()
 
-    vocab = model.config.vocab_size
-    input_ids = _make_ids(cfg, vocab)
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+
+        # Real text: wikitext-2 test split → meaningful live-generation perplexity.
+        toks = load_eval_tokens(cfg.model_name, n_tokens=cfg.n_context)
+        input_ids = toks[: cfg.n_context].unsqueeze(0)  # (1, n_context)
+
+        # Real planted needle for retrieval scoring.
+        needle_ids, answer_id = build_needle_ids(
+            tokenizer, n_context=cfg.n_context, depth_frac=cfg.needle_depth
+        )
+
+    if input_ids is None:
+        # Offline test supplied a model but no input_ids: use synthetic ids.
+        vocab = model.config.vocab_size
+        input_ids = _make_ids(cfg, vocab)
+
     run_dir = create_run("k3_live_generation", cfg, root=root)
 
     rows = []
@@ -92,6 +136,7 @@ def run(cfg: Config, model=None, root: str = "results"):
             v_spec,
             token_by_token=cfg.token_by_token,
         )
+        # Tokenizer-free retrieval proxy: argmax agreement vs fp16 on the same ids.
         retrieved = needle_retrieved_from_ids(
             model,
             input_ids,
@@ -100,6 +145,15 @@ def run(cfg: Config, model=None, root: str = "results"):
             k_spec=k_spec,
             v_spec=v_spec,
         )
+        # Real planted-needle retrieval (real run only; None in offline test).
+        if needle_ids is not None and answer_id is not None:
+            needle_real = needle_retrieved(
+                model, needle_ids, answer_id, k_spec, v_spec, cfg.n_prefill
+            )
+        else:
+            # Offline test: no tokenizer / needle prompt — skip real needle.
+            needle_real = None
+
         rows.append(
             {
                 "arm": arm,
@@ -113,6 +167,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                 "n_prefill": cfg.n_prefill,
                 "n_context": cfg.n_context,
                 "retrieved": retrieved,
+                "needle_real": needle_real,
             }
         )
 

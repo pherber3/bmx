@@ -132,7 +132,7 @@ def test_token_by_token_k2b_quality_holds():
         input_ids,
         n_prefill=16,
         k_spec=CacheCodecSpec(
-            arm="lowrank_rtn_channel", bits=3, rank=4, group=8, pre_rope=True
+            arm="lowrank_rtn_channel", bits=3, rank=4, group=16, pre_rope=True
         ),
         v_spec=CacheCodecSpec(arm="turboquant_mse", bits=2),
         recent_window=8,
