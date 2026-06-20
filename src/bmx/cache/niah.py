@@ -133,6 +133,43 @@ def build_niah_prompt(
     return tokenizer(prompt, return_tensors="pt").input_ids
 
 
+def generate_through_cache(
+    model,
+    tokenizer,
+    prompt_ids: torch.Tensor,
+    n_prefill: int,
+    k_spec: CacheCodecSpec,
+    v_spec: CacheCodecSpec,
+    max_new_tokens: int,
+) -> str:
+    """Prefill prompt_ids into a StreamingQuantizedCache, greedy-generate, return the answer.
+
+    The shared headline generate path for every metric that scores a generation through the
+    compressed cache (NIAH ROUGE-1, LongBench code_sim, ...). One fair code path.
+
+    Continuation-only contract (mirrors needle.py:21-22):
+      Step 1 fills cache positions [0, n_prefill) via a quantize-on-append forward.
+      Step 2 feeds ONLY prompt_ids[:, n_prefill:] to generate(); HF returns the supplied
+      continuation followed by the newly-decoded tokens, so the new tokens start at index
+      (L - n_prefill) in out[0]. Decoding out[0, L - n_prefill :] yields exactly the answer.
+    """
+    L = prompt_ids.shape[1]
+    cont_len = L - n_prefill
+    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(prompt_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
+            out = model.generate(
+                prompt_ids[:, n_prefill:],
+                past_key_values=cache,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+            )
+    return tokenizer.decode(out[0, cont_len:], skip_special_tokens=True).strip()
+
+
 def niah_recall_generate(
     model,
     tokenizer,
@@ -145,38 +182,10 @@ def niah_recall_generate(
 ) -> float:
     """Prefill the prompt into the streaming cache, greedy-generate, score ROUGE-1.
 
-    Headline recall (VM/real model). n_prefill tokens are quantized on-append; the
-    remaining prompt + generation attend to the compressed cache.
-
-    Continuation-only contract (mirrors needle.py:21-22):
-      - Step 1: model(prompt_ids[:, :n_prefill], ...)  — fills cache positions [0, n_prefill)
-      - Step 2: model.generate(prompt_ids[:, n_prefill:], ...)  — feeds ONLY the
-        continuation; HuggingFace generate() returns the supplied input tokens followed
-        by the newly-decoded tokens.
-
-    Shape-offset reasoning:
-      Let L = prompt_ids.shape[1].
-      Continuation length = L - n_prefill.
-      generate() output shape: (1, (L - n_prefill) + max_new_tokens_actual).
-      The newly generated tokens start at index (L - n_prefill) in out[0].
-      Decoding out[0, L - n_prefill :] extracts exactly the model's answer.
+    Headline recall (VM/real model). Now a thin wrapper over generate_through_cache so the
+    generate path lives in one place across metrics.
     """
-    L = prompt_ids.shape[1]
-    cont_len = L - n_prefill  # length of the slice fed to generate()
-    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
-    cache.attach(model)
-    with cache:
-        with torch.no_grad():
-            # Step 1: quantize-on-append prefill of the leading n_prefill tokens.
-            model(prompt_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
-            # Step 2: feed ONLY the continuation so the cache is not double-prefilled.
-            out = model.generate(
-                prompt_ids[:, n_prefill:],
-                past_key_values=cache,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-            )
-    # out[0] = [continuation tokens (cont_len)] + [new tokens]; skip the continuation.
-    response = tokenizer.decode(out[0, cont_len:], skip_special_tokens=True).strip()
+    response = generate_through_cache(
+        model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_new_tokens
+    )
     return rouge1_recall(needle_text, response)

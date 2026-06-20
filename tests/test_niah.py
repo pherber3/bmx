@@ -1,4 +1,9 @@
-from bmx.cache.niah import build_niah_ids_synthetic, niah_recall_argmax, rouge1_recall
+from bmx.cache.niah import (
+    build_niah_ids_synthetic,
+    generate_through_cache,
+    niah_recall_argmax,
+    rouge1_recall,
+)
 from bmx.cache.specs import CacheCodecSpec
 from factories import tiny_llama
 
@@ -37,3 +42,28 @@ def test_rouge1_recall_partial_is_graded():
     partial = "the magic number is"
     score = rouge1_recall(needle, partial)
     assert 0.0 < score < 10.0  # graded, not binary
+
+
+def test_generate_through_cache_returns_str(tmp_path):
+    import torch
+    from bmx.cache.specs import CacheCodecSpec
+    from factories import tiny_llama
+
+    class _StubTokenizer:
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(map(str, ids.tolist()))
+
+    model = tiny_llama()
+    g = torch.Generator().manual_seed(0)
+    prompt_ids = torch.randint(0, 97, (1, 24), generator=g)
+    fp16 = CacheCodecSpec(arm="fp16")
+    out = generate_through_cache(
+        model,
+        tokenizer=_StubTokenizer(),
+        prompt_ids=prompt_ids,
+        n_prefill=12,
+        k_spec=fp16,
+        v_spec=fp16,
+        max_new_tokens=4,
+    )
+    assert isinstance(out, str)
