@@ -117,6 +117,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         answer_id=cfg.answer_id,
                     )
                     recall = 10.0 if hit else 0.0
+                    recall_kind = "argmax_proxy"
                 else:
                     # Real: ROUGE-1 generate recall.
                     prompt_ids = build_niah_prompt(
@@ -134,12 +135,14 @@ def run(cfg: Config, model=None, root: str = "results"):
                         v_spec,
                         max_new_tokens=cfg.max_new_tokens,
                     )
+                    recall_kind = "rouge1"
                 rows.append(
                     {
                         "arm": arm,
                         "length": length,
                         "depth": depth,
                         "recall": recall,
+                        "recall_kind": recall_kind,
                         "bpe_k": bpe_k,
                         "bpe_v": bpe_v,
                         "compression": compression,

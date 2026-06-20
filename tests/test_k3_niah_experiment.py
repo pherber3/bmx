@@ -28,6 +28,7 @@ def test_k3_niah_run_emits_parquet(tmp_path):
         "bpe_v",
         "compression",
         "n_prefill",
+        "recall_kind",
     ):
         assert col in df.columns, f"missing column: {col}"
     # 2 arms × 2 lengths × 2 depths = 8 rows.
@@ -39,6 +40,8 @@ def test_k3_niah_run_emits_parquet(tmp_path):
         "turboquant_mse",
         "turboquant_prod",
     }
+    # Offline run uses the argmax proxy mechanism.
+    assert set(df["recall_kind"]) == {"argmax_proxy"}
 
 
 def test_plot_k3_niah_makes_pngs(tmp_path):
