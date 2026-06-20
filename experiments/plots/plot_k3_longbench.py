@@ -25,10 +25,10 @@ def make_figures(df, out_dir: str) -> list[Path]:
     fig, ax = plt.subplots(figsize=(8, 5))
     for i, arm in enumerate(arms):
         g = df[df["arm"] == arm]
-        means = [
-            g[g["task"] == t]["code_sim"].mean() if not g[g["task"] == t].empty else 0.0
-            for t in tasks
-        ]
+        means = []
+        for t in tasks:
+            sub = g[g["task"] == t]
+            means.append(sub["code_sim"].mean() if not sub.empty else 0.0)
         comp = g["compression"].iloc[0] if not g.empty else 1.0
         offs = [xi + i * width for xi in x]
         ax.bar(offs, means, width=width, label=f"{arm} ({comp:.1f}×)")

@@ -1,3 +1,5 @@
+import torch
+
 from bmx.cache.niah import (
     build_niah_ids_synthetic,
     generate_through_cache,
@@ -6,6 +8,15 @@ from bmx.cache.niah import (
 )
 from bmx.cache.specs import CacheCodecSpec
 from factories import tiny_llama
+
+_INDENTED = "        return x"
+
+
+class _IndentedStubTokenizer:
+    """Always decodes to an indented string regardless of token ids (strip tests)."""
+
+    def decode(self, ids, skip_special_tokens=True):
+        return _INDENTED
 
 
 def test_build_niah_ids_shape_and_plant():
@@ -79,18 +90,6 @@ def test_generate_through_cache_strip_false_preserves_leading_whitespace():
     which systematically depresses code_sim on indented completions (the common case for
     lcc/repobench-p). Measured: indent=8 → LongBench 1.000 vs our-stripped 0.820.
     """
-    import torch
-    from bmx.cache.specs import CacheCodecSpec
-    from factories import tiny_llama
-
-    INDENTED = "        return x"
-
-    class _IndentedStubTokenizer:
-        """Always decodes to an indented string regardless of token ids."""
-
-        def decode(self, ids, skip_special_tokens=True):
-            return INDENTED
-
     model = tiny_llama()
     g = torch.Generator().manual_seed(1)
     prompt_ids = torch.randint(0, 97, (1, 24), generator=g)
@@ -113,16 +112,6 @@ def test_generate_through_cache_strip_false_preserves_leading_whitespace():
 
 def test_generate_through_cache_strip_true_removes_leading_whitespace():
     """strip=True (default) must strip leading spaces — NIAH ROUGE-1 path is unchanged."""
-    import torch
-    from bmx.cache.specs import CacheCodecSpec
-    from factories import tiny_llama
-
-    INDENTED = "        return x"
-
-    class _IndentedStubTokenizer:
-        def decode(self, ids, skip_special_tokens=True):
-            return INDENTED
-
     model = tiny_llama()
     g = torch.Generator().manual_seed(2)
     prompt_ids = torch.randint(0, 97, (1, 24), generator=g)

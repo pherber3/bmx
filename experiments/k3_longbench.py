@@ -68,15 +68,36 @@ def run(cfg: Config, model=None, root: str = "results"):
         )
 
     run_dir = create_run("k3_longbench", cfg, root=root)
+
+    # Preload each task's dataset ONCE (real path) — it is identical across arms, so
+    # loading inside the arm loop would re-download it len(arms) times.
+    task_items = (
+        {task: load_longbench_task(task, cfg.n_samples) for task in cfg.tasks}
+        if tokenizer is not None
+        else None
+    )
+    score_kind = "code_sim_offline" if tokenizer is None else "code_sim"
+    # `length` (for compression accounting) is constant per arm — offline uses the fixed
+    # 32-token synthetic prompt; the real path uses a representative proxy. See the NOTE.
+    # NOTE: representative length for compression accounting only. Real LongBench code
+    # prompts are far longer (4k–16k), so this proxy UNDER-states compression (the fixed
+    # fp16 recent-window is a larger fraction at short length). It is consistent across
+    # arms, so relative rankings hold; the absolute compression column is a lower bound.
+    # A future pass could thread the true tokenized prompt length through.
+    length = 32 if tokenizer is None else cfg.n_prefill * 2
+
     rows = []
     for arm in cfg.arms:
         k_spec, v_spec = _spec_pair(arm, cfg)
+        # Compression is a property of (codec spec, length) only — hoist out of the task
+        # loop so the calibration forward runs once per arm, not once per (arm, task).
+        bpe_k, bpe_v, compression = _compression_for(model, k_spec, v_spec, length)
         for task in cfg.tasks:
             if tokenizer is None:
                 # Offline mechanism: one synthetic prompt through the shared generate path.
                 g = torch.Generator().manual_seed(cfg.seed)
                 prompt_ids = torch.randint(
-                    0, model.config.vocab_size, (1, 32), generator=g
+                    0, model.config.vocab_size, (1, length), generator=g
                 )
                 # Mechanism/schema only: a few new tokens suffice (and stay within
                 # tiny_llama's max_position_embeddings=64). The real max_gen is used on
@@ -93,10 +114,8 @@ def run(cfg: Config, model=None, root: str = "results"):
                 )
                 score = code_sim(resp, resp)  # identical => 1.0; mechanism/schema only
                 n_used = 1
-                score_kind = "code_sim_offline"
-                length = prompt_ids.shape[1]
             else:
-                items = load_longbench_task(task, cfg.n_samples)
+                items = task_items[task]
                 scores = [
                     longbench_code_score(
                         model, tokenizer, it, task, cfg.n_prefill, k_spec, v_spec
@@ -105,16 +124,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                 ]
                 score = sum(scores) / len(scores) if scores else float("nan")
                 n_used = len(items)
-                score_kind = "code_sim"
-                # NOTE: representative length for compression accounting only. Real
-                # LongBench code prompts are far longer (4k–16k), so this proxy
-                # UNDER-states compression (the fixed fp16 recent-window is a larger
-                # fraction at short length). It is consistent across arms, so relative
-                # rankings hold; the absolute compression column is a lower bound. A
-                # future pass could thread the true tokenized prompt length through.
-                length = cfg.n_prefill * 2
 
-            bpe_k, bpe_v, compression = _compression_for(model, k_spec, v_spec, length)
             rows.append(
                 {
                     "arm": arm,
