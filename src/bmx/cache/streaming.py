@@ -13,6 +13,22 @@ Lands in two stages:
     and generation vs a plain default cache.
   Stage B (this commit): the quantize-on-append path — pre-RoPE K capture + frozen
     subspace, RoPE-at-read, codec-driven _quantize/_dequantize.
+
+Write-once semantics (Task 10 / C1 fix):
+  Each token's K/V is quantized EXACTLY ONCE at write time from its pristine fp16
+  source, and the dequantised result is frozen in _q_prefix_k/_q_prefix_v.
+  Re-quantising a dequantised value is the bug (turboquant_mse is non-idempotent:
+  per-token norm rescale compounds => V norm explodes over decode steps).
+
+Frozen subspace (Task 10 / I1 fix):
+  For lowrank_rtn_channel K, the channel subspace V is fitted at the FIRST flush
+  and reused for all subsequent blocks (_frozen_svd). Per-block Us is computed as
+  M_block @ V_frozen (projection onto the frozen subspace).
+
+C3 memory fix:
+  After committing a pre-RoPE block to _q_prefix_k, the corresponding columns of
+  _k_pre are no longer needed (write-once!). We prune _k_pre to keep only the
+  un-flushed tail, tracking the offset (_k_pre_offset) so indexing stays correct.
 """
 
 from __future__ import annotations
@@ -20,10 +36,11 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import Cache, DynamicLayer
 
-from bmx.cache.codecs import S_DIVISIBILITY_ARMS, quantize_kv_layout
-from bmx.cache.collect import _reshape_heads
+from bmx.cache.codecs import S_DIVISIBILITY_ARMS, quantize_cache, quantize_kv_layout
+from bmx.cache.collect import _reshape_heads, from_matrix, to_matrix
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
+from bmx.decomp.lrs import truncated_svd
 
 
 class StreamingQuantizedLayer(DynamicLayer):
@@ -46,7 +63,30 @@ class StreamingQuantizedLayer(DynamicLayer):
         self.model_config = model_config
         self.recent_window = recent_window
         # Pre-RoPE key capture buffer: accumulated by stash_pre_rope, consumed in update.
+        # _k_pre_offset tracks the absolute sequence position of _k_pre[:, 0, :].
+        # After commits, _k_pre is pruned to remove already-committed positions.
         self._k_pre: torch.Tensor | None = None
+        self._k_pre_offset: int = 0  # absolute position of _k_pre[0] along seq dim
+
+        # Write-once prefix state (Task 10 / C1 fix).
+        # _q_prefix_k/v: frozen dequantized prefix (h, committed_S_q, d); fp16.
+        # _committed_S_q: monotonically growing count of quantized tokens.
+        self._q_prefix_k: torch.Tensor | None = None
+        self._q_prefix_v: torch.Tensor | None = None
+        self._committed_S_q: int = 0
+
+        # Frozen subspace (Task 10 / I1 fix): (Us, V) from truncated_svd at first flush.
+        # Only used for lowrank_rtn_channel K with pre_rope.
+        # V is the (C, rank) channel subspace — frozen across all blocks.
+        self._frozen_svd: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        # Honest bpe accounting: track total quantized bits + entries separately
+        # for K and V so blended bpe stays correct as the prefix grows.
+        self._quant_bits_k: float = 0.0
+        self._quant_entries_k: int = 0
+        self._quant_bits_v: float = 0.0
+        self._quant_entries_v: int = 0
+
         self.bpe_k = float("nan")
         self.bpe_v = float("nan")
         self._h_kv = getattr(
@@ -80,6 +120,75 @@ class StreamingQuantizedLayer(DynamicLayer):
         """(h,S,d) fp32 -> (dequantized (h,S,d) fp32, bpe). fp16 spec is identity."""
         return quantize_kv_layout(kv_fp32, spec)
 
+    def _quantize_k_block_pre_rope(
+        self,
+        k_block_pre: torch.Tensor,
+        committed: int,
+        new_committed: int,
+    ) -> tuple[torch.Tensor, float]:
+        """Quantize a pre-RoPE key block and apply RoPE at its TRUE positions.
+
+        Parameters
+        ----------
+        k_block_pre : (h_kv, block_len, d) fp32  — pristine pre-RoPE source
+        committed    : absolute start position of this block in the sequence
+        new_committed: absolute end position (exclusive) of this block
+
+        Returns (k_block_post_rope, codec_bpe) — (h_kv, block_len, d) fp32
+        """
+        spec = self.k_spec
+        h = k_block_pre.shape[0]
+        block_len = k_block_pre.shape[1]
+
+        if spec.arm == "fp16":
+            # fp16 arm: no quantization; just apply RoPE at the correct positions.
+            k_hat_pre = k_block_pre
+            codec_bpe = 16.0
+        elif spec.arm == "lowrank_rtn_channel":
+            # Special path: frozen subspace across blocks (I1 fix).
+            M = to_matrix(k_block_pre)  # (block_len, h*d) fp32
+            if self._frozen_svd is None:
+                # First flush: fit the SVD and freeze V.
+                rank = spec.rank
+                Us, V = truncated_svd(M, rank)  # Us:(block_len, r), V:(C, r)
+                self._frozen_svd = (Us, V)
+            else:
+                # Later flushes: project onto the frozen subspace.
+                _, V = self._frozen_svd
+                rank = V.shape[1]
+                # Ensure rank doesn't exceed block dimensions (guard for tiny blocks).
+                effective_rank = min(rank, block_len, V.shape[0])
+                if effective_rank < rank:
+                    # Block too small; fall back to fresh truncated_svd.
+                    Us, V = truncated_svd(M, effective_rank)
+                else:
+                    # Us_block = M @ V_frozen  (projects rows of M onto frozen subspace)
+                    Us = M @ V  # (block_len, rank)
+            M_hat, codec_bpe = quantize_cache(
+                spec.arm,
+                M,
+                bits=spec.bits,
+                group=spec.group,
+                rank=spec.rank,
+                svd_factors=(Us, self._frozen_svd[1] if self._frozen_svd else V),
+            )
+            k_hat_pre = from_matrix(M_hat, h)  # (h_kv, block_len, d)
+        else:
+            # General path (rtn_channel, rtn_token, rotate_rtn_token, turboquant_*).
+            k_hat_pre, codec_bpe = self._quantize_matrix(k_block_pre, spec)
+
+        # Apply RoPE at the correct absolute positions [committed, new_committed).
+        if new_committed not in self._rope_cache:
+            self._rope_cache[new_committed] = rope_cos_sin(
+                self.model_config, new_committed
+            )
+        cos_full, sin_full = self._rope_cache[new_committed]
+        cos = cos_full[committed:new_committed].float()  # (block_len, d)
+        sin = sin_full[committed:new_committed].float()  # (block_len, d)
+        k_block_post = apply_rope(k_hat_pre.float(), cos, sin)  # (h_kv, block_len, d)
+
+        return k_block_post, codec_bpe
+
     def _group_size(self) -> int:
         """Binding group size for S-alignment.
 
@@ -104,54 +213,150 @@ class StreamingQuantizedLayer(DynamicLayer):
         W = self.recent_window
         g = self._g
 
-        # Compute the quantized-prefix length: largest multiple of g that leaves
+        # Compute the new committed length: largest multiple of g that leaves
         # at least W recent tokens in the fp16 window.
-        S_q = ((S - W) // g) * g if S > W else 0
+        new_S_q = ((S - W) // g) * g if S > W else 0
 
-        if S_q <= 0:
-            # Nothing to quantize yet — whole cache stays fp16 this call.
-            self.keys = keys  # (1, h_kv, S, d) already from DynamicLayer
-            self.values = values
+        if new_S_q <= 0:
+            # Nothing to quantize yet — whole cache stays fp16 this step.
+            # Reassemble from (potentially empty) prefix + full fp16 slab.
+            # When _committed_S_q == 0, prefix is empty and we just use the full slab.
+            if self._q_prefix_k is None:
+                self.keys = keys
+                self.values = values
+            else:
+                # Prefix exists but no new flush; tail = everything after committed.
+                k_tail = keys.squeeze(0)[..., self._committed_S_q :, :]
+                v_tail = values.squeeze(0)[..., self._committed_S_q :, :]
+                k_hat = torch.cat([self._q_prefix_k, k_tail.to(cache_dtype)], dim=-2)
+                v_hat = torch.cat([self._q_prefix_v, v_tail.to(cache_dtype)], dim=-2)
+                self.keys = k_hat.unsqueeze(0)
+                self.values = v_hat.unsqueeze(0)
             self.bpe_k = 16.0
             self.bpe_v = 16.0
             return self.keys, self.values
 
-        # --- Quantize the prefix [:S_q] ---
+        if new_S_q <= self._committed_S_q:
+            # No new block to flush — prefix is unchanged. Just reassemble.
+            k_tail = keys.squeeze(0)[
+                ..., self._committed_S_q :, :
+            ]  # (h_kv, tail_len, d)
+            v_tail = values.squeeze(0)[..., self._committed_S_q :, :]
+            if self._q_prefix_k is not None:
+                k_hat = torch.cat([self._q_prefix_k, k_tail.to(cache_dtype)], dim=-2)
+                v_hat = torch.cat([self._q_prefix_v, v_tail.to(cache_dtype)], dim=-2)
+                self.keys = k_hat.unsqueeze(0)
+                self.values = v_hat.unsqueeze(0)
+            else:
+                self.keys = keys
+                self.values = values
+            # Recompute blended bpe from accumulated counts.
+            tail_len = S - self._committed_S_q
+            total_entries = S * self._h_kv * self._d_head
+            if total_entries > 0:
+                self.bpe_k = (
+                    self._quant_bits_k + tail_len * self._h_kv * self._d_head * 16.0
+                ) / total_entries
+                self.bpe_v = (
+                    self._quant_bits_v + tail_len * self._h_kv * self._d_head * 16.0
+                ) / total_entries
+            return self.keys, self.values
 
-        # Keys prefix: use pre-RoPE source when captured, then re-apply RoPE.
+        # --- A new block [_committed_S_q : new_S_q] is ready to flush. ---
+        # Quantize it ONCE, from pristine source, and append to the frozen prefix.
+
+        block_start = self._committed_S_q
+        block_end = new_S_q
+        block_len = block_end - block_start
+
+        # --- Quantize K block ---
         if self.k_spec.pre_rope:
             assert self._k_pre is not None, (
                 "k_spec.pre_rope=True but no captured pre-RoPE keys; "
                 "call cache.attach(model) before prefill"
             )
-            k_pre_prefix = self._k_pre[:, :S_q, :].float()  # (h_kv, S_q, d)
-            k_hat_pre, codec_bpe_k = self._quantize_matrix(k_pre_prefix, self.k_spec)
-            if S_q not in self._rope_cache:
-                self._rope_cache[S_q] = rope_cos_sin(self.model_config, S_q)
-            cos, sin = self._rope_cache[S_q]
-            k_prefix = apply_rope(k_hat_pre, cos.float(), sin.float())  # post-RoPE
+            # _k_pre is indexed from _k_pre_offset in absolute positions.
+            # Absolute positions [block_start, block_end) -> local indices:
+            local_start = block_start - self._k_pre_offset
+            local_end = block_end - self._k_pre_offset
+            k_block_pre = self._k_pre[
+                :, local_start:local_end, :
+            ].float()  # (h_kv, block_len, d)
+            k_block_post, codec_bpe_k = self._quantize_k_block_pre_rope(
+                k_block_pre, block_start, block_end
+            )
+            k_block_post = k_block_post.to(cache_dtype)
         else:
-            k_prefix_fp32 = keys.squeeze(0)[..., :S_q, :].float()  # (h_kv, S_q, d)
-            k_prefix, codec_bpe_k = self._quantize_matrix(k_prefix_fp32, self.k_spec)
+            # Post-RoPE keys: the block is already RoPE'd at its correct positions
+            # inside `keys` from super().update. The block at [block_start:block_end]
+            # is pristine because it was in the fp16 tail until now.
+            k_block_fp32 = keys.squeeze(0)[..., block_start:block_end, :].float()
+            k_block_post_raw, codec_bpe_k = self._quantize_matrix(
+                k_block_fp32, self.k_spec
+            )
+            k_block_post = k_block_post_raw.to(cache_dtype)
 
-        # Values prefix.
-        v_prefix_fp32 = values.squeeze(0)[..., :S_q, :].float()  # (h_kv, S_q, d)
-        v_prefix, codec_bpe_v = self._quantize_matrix(v_prefix_fp32, self.v_spec)
+        # --- Quantize V block ---
+        # values from super().update() accumulates pristine fp16 from DynamicLayer.
+        # The block [block_start:block_end] was in the fp16 tail last step, so it
+        # is pristine fp16 (never quantized). Quantize it exactly once now.
+        v_block_fp32 = values.squeeze(0)[..., block_start:block_end, :].float()
+        v_block_raw, codec_bpe_v = self._quantize_matrix(v_block_fp32, self.v_spec)
+        v_block = v_block_raw.to(cache_dtype)
 
-        # --- fp16 tail [S_q:] — already post-RoPE from DynamicLayer ---
-        # For keys: `keys` (from super().update) is already post-RoPE; just slice.
-        k_tail = keys.squeeze(0)[..., S_q:, :]  # (h_kv, S-S_q, d) fp16
-        v_tail = values.squeeze(0)[..., S_q:, :]  # (h_kv, S-S_q, d) fp16
+        # --- Append new block to frozen prefix ---
+        if self._q_prefix_k is None:
+            self._q_prefix_k = k_block_post
+            self._q_prefix_v = v_block
+        else:
+            self._q_prefix_k = torch.cat([self._q_prefix_k, k_block_post], dim=-2)
+            self._q_prefix_v = torch.cat([self._q_prefix_v, v_block], dim=-2)
 
-        # --- Reassemble: concat along seq dim (dim=-2) ---
-        k_hat = torch.cat([k_prefix.to(cache_dtype), k_tail], dim=-2)  # (h_kv, S, d)
-        v_hat = torch.cat([v_prefix.to(cache_dtype), v_tail], dim=-2)  # (h_kv, S, d)
+        # --- Accumulate honest bits ---
+        block_entries = block_len * self._h_kv * self._d_head
+        self._quant_bits_k += codec_bpe_k * block_entries
+        self._quant_entries_k += block_entries
+        self._quant_bits_v += codec_bpe_v * block_entries
+        self._quant_entries_v += block_entries
 
-        # Blended bpe: quantized prefix costs codec_bpe; fp16 tail costs 16.
-        self.bpe_k = (S_q * codec_bpe_k + (S - S_q) * 16.0) / S
-        self.bpe_v = (S_q * codec_bpe_v + (S - S_q) * 16.0) / S
+        # --- Update committed counter ---
+        self._committed_S_q = new_S_q
 
-        # Persist the dequantized + fp16-tail slab as the layer's stored cache.
+        # --- C3: Prune _k_pre to free already-committed positions ---
+        # After committing up to new_S_q, positions [_k_pre_offset, new_S_q) are
+        # no longer needed. Prune _k_pre to start at new_S_q.
+        if self._k_pre is not None and self.k_spec.pre_rope:
+            prune_local_end = new_S_q - self._k_pre_offset
+            if prune_local_end > 0 and prune_local_end <= self._k_pre.shape[1]:
+                self._k_pre = self._k_pre[:, prune_local_end:, :].contiguous()
+                self._k_pre_offset = new_S_q
+            elif prune_local_end >= self._k_pre.shape[1]:
+                # All pre-RoPE data committed; keep empty (None) to signal no tail.
+                self._k_pre = None
+                self._k_pre_offset = new_S_q
+
+        # --- fp16 tail [new_S_q:S] (pristine, from DynamicLayer) ---
+        k_tail = keys.squeeze(0)[..., new_S_q:, :]  # (h_kv, tail_len, d) fp16
+        v_tail = values.squeeze(0)[..., new_S_q:, :]  # (h_kv, tail_len, d) fp16
+
+        # --- Reassemble: frozen prefix + fp16 tail ---
+        k_hat = torch.cat([self._q_prefix_k, k_tail.to(cache_dtype)], dim=-2)
+        v_hat = torch.cat([self._q_prefix_v, v_tail.to(cache_dtype)], dim=-2)
+
+        # --- Blended bpe: quantized prefix costs codec_bpe; fp16 tail costs 16 ---
+        tail_len = S - new_S_q
+        total_entries = S * self._h_kv * self._d_head
+        self.bpe_k = (
+            self._quant_bits_k + tail_len * self._h_kv * self._d_head * 16.0
+        ) / total_entries
+        self.bpe_v = (
+            self._quant_bits_v + tail_len * self._h_kv * self._d_head * 16.0
+        ) / total_entries
+
+        # Persist the reassembled slab as the layer's stored cache.
+        # NOTE: self.keys/self.values is what DynamicLayer uses as the base for
+        # the next step's cat. The tail (fp16) region is pristine, so next step
+        # DynamicLayer appends new_token to this slab and the new tail stays pristine.
         self.keys = k_hat.unsqueeze(0)  # (1, h_kv, S, d)
         self.values = v_hat.unsqueeze(0)  # (1, h_kv, S, d)
         return self.keys, self.values

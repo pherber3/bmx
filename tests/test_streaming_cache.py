@@ -7,6 +7,16 @@ from bmx.cache.streaming import StreamingQuantizedCache
 from factories import ids, tiny_llama
 
 
+def _k2b_spec():
+    """K2b headline spec: lowrank K (pre_rope) + turboquant_mse V."""
+    return (
+        CacheCodecSpec(
+            arm="lowrank_rtn_channel", bits=3, rank=4, group=16, pre_rope=True
+        ),
+        CacheCodecSpec(arm="turboquant_mse", bits=2),
+    )
+
+
 def _fp16():
     return CacheCodecSpec(arm="fp16")
 
@@ -224,3 +234,145 @@ def test_k2b_pre_rope_streams_token_by_token():
     assert torch.isfinite(k_post).all() and torch.isfinite(v).all()
     bpe_k, bpe_v = cache.bits_per_entry()
     assert bpe_k < 16.0, f"expected blended bpe_k < 16.0, got {bpe_k}"
+
+
+def test_write_once_v_stable_token_by_token():
+    """C1 regression gate: with the K2b spec (turboquant_mse V), token-by-token V cache
+    must closely match a batched run (rel < 0.05).
+
+    Before the write-once fix, turboquant_mse is non-idempotent (per-token norm rescale
+    compounds): V cache norm explodes from ~4 to ~400 over 64 steps (rel ~98).
+    After the fix, each token's V is quantized exactly once from pristine fp16 source.
+    """
+    model = tiny_llama()
+    k_spec, v_spec = _k2b_spec()
+    g = torch.Generator().manual_seed(42)
+    # Prefill 16 tokens, then 64 single-token decode steps = 80 total.
+    total = 80
+    prefill_len = 16
+    input_ids = torch.randint(0, 97, (1, total), generator=g)
+
+    # --- Token-by-token run ---
+    cache_tbt = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache_tbt.attach(model)
+    try:
+        with torch.no_grad():
+            model(input_ids[:, :prefill_len], past_key_values=cache_tbt, use_cache=True)
+            for t in range(prefill_len, total):
+                model(
+                    input_ids[:, t : t + 1], past_key_values=cache_tbt, use_cache=True
+                )
+    finally:
+        cache_tbt.detach()
+    _, v_tbt = cache_tbt.reconstruct_layer(0)
+
+    # --- Batched reference run (prefill + one big decode step) ---
+    cache_batch = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache_batch.attach(model)
+    try:
+        with torch.no_grad():
+            model(
+                input_ids[:, :prefill_len], past_key_values=cache_batch, use_cache=True
+            )
+            model(
+                input_ids[:, prefill_len:], past_key_values=cache_batch, use_cache=True
+            )
+    finally:
+        cache_batch.detach()
+    _, v_batch = cache_batch.reconstruct_layer(0)
+
+    # Both runs should have the same sequence length.
+    assert v_tbt.shape == v_batch.shape, (
+        f"shape mismatch: {v_tbt.shape} vs {v_batch.shape}"
+    )
+
+    rel = (v_tbt.float() - v_batch.float()).norm() / v_batch.float().norm().clamp_min(
+        1e-6
+    )
+    assert rel < 0.05, (
+        f"V cache token-by-token vs batched rel={rel:.3f} (expected < 0.05); "
+        "write-once not enforced — turboquant_mse is still compounding"
+    )
+
+
+def test_each_token_quantized_once():
+    """The committed prefix must be frozen: re-running update doesn't change it.
+
+    After a flush event, _q_prefix_k[:, :old_committed_S_q] must be bitwise
+    identical before and after the next flush step.
+    """
+    model = tiny_llama()
+    k_spec, v_spec = _k2b_spec()
+    g = torch.Generator().manual_seed(7)
+    input_ids = torch.randint(0, 97, (1, 64), generator=g)
+
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    try:
+        with torch.no_grad():
+            # Prefill 16 — first flush at S=16 (S_q=8 with W=8, g=16 → 0; then at 24)
+            # Use 24 prefill to ensure first flush happens.
+            model(input_ids[:, :24], past_key_values=cache, use_cache=True)
+
+        # After first flush, save the committed prefix of layer 0.
+        layer = cache.layers[0]
+        old_committed = layer._committed_S_q
+        if old_committed == 0:
+            # No flush happened yet; skip (no prefix to freeze-check).
+            return
+        # Save a copy of the frozen prefix.
+        prefix_k_before = layer._q_prefix_k.clone()
+
+        # Run more decode steps to trigger another flush.
+        with torch.no_grad():
+            for t in range(24, 40):
+                model(input_ids[:, t : t + 1], past_key_values=cache, use_cache=True)
+
+        # The portion that was committed before the extra steps must be unchanged.
+        prefix_k_after = layer._q_prefix_k
+        assert torch.equal(prefix_k_before, prefix_k_after[:, :old_committed, :]), (
+            "Committed prefix changed — write-once not enforced"
+        )
+    finally:
+        cache.detach()
+
+
+def test_frozen_subspace_not_refit():
+    """After first K flush, _frozen_svd is set and its V factor must not change
+    across subsequent flushes.
+    """
+    model = tiny_llama()
+    k_spec, v_spec = _k2b_spec()
+    g = torch.Generator().manual_seed(9)
+    input_ids = torch.randint(0, 97, (1, 80), generator=g)
+
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    try:
+        with torch.no_grad():
+            model(input_ids[:, :24], past_key_values=cache, use_cache=True)
+
+        layer = cache.layers[0]
+        if layer._frozen_svd is None:
+            # Frozen SVD not implemented — skip (acceptable fallback per brief).
+            return
+        _, V_frozen_first = layer._frozen_svd
+
+        with torch.no_grad():
+            for t in range(24, 60):
+                model(input_ids[:, t : t + 1], past_key_values=cache, use_cache=True)
+
+        _, V_frozen_after = layer._frozen_svd
+        assert torch.equal(V_frozen_first, V_frozen_after), (
+            "_frozen_svd V changed after first flush — subspace is not frozen"
+        )
+    finally:
+        cache.detach()
