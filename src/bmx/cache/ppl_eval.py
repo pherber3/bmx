@@ -37,8 +37,8 @@ import dataclasses
 
 import torch
 
-from bmx.cache.codecs import CACHE_ARMS, quantize_cache
-from bmx.cache.collect import _register_hooks, from_matrix, to_matrix
+from bmx.cache.codecs import quantize_kv_layout
+from bmx.cache.collect import _register_hooks
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec  # re-export; was defined here
 
@@ -97,24 +97,7 @@ def _quantize_kv(
     ``kv_fp`` is expected to be fp32.  For ``arm="fp16"``, returns the input
     unchanged and ``bpe=16.0``.
     """
-    h = kv_fp.shape[0]
-    if spec.arm == "fp16":
-        return kv_fp, 16.0
-
-    assert spec.arm in CACHE_ARMS, (
-        f"unknown arm {spec.arm!r}; use one of {CACHE_ARMS} or 'fp16'"
-    )
-    M = to_matrix(kv_fp)  # (S, h*d)
-    M_hat, bpe = quantize_cache(
-        spec.arm,
-        M,
-        bits=spec.bits,
-        seed=spec.seed,
-        group=spec.group,
-        rank=spec.rank,
-    )
-    kv_hat = from_matrix(M_hat, h)
-    return kv_hat, bpe
+    return quantize_kv_layout(kv_fp, spec)
 
 
 def quantized_prefill_ppl(

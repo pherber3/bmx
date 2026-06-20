@@ -39,6 +39,9 @@ CACHE_ARMS = (
     "lowrank_rtn_channel",
 )
 
+# Arms whose codec asserts S % group == 0 (used by streaming.py for alignment).
+S_DIVISIBILITY_ARMS = frozenset({"rtn_channel", "lowrank_rtn_channel"})
+
 
 # ---------------------------------------------------------------------------
 # Helper: rotation / unrotation over the channel dim
@@ -380,3 +383,42 @@ def quantize_cache(
         return _turboquant_prod(M, bits, seed)
     else:  # lowrank_rtn_channel — guarded by the CACHE_ARMS assert above
         return _lowrank_rtn_channel(M, bits, group, rank, svd_factors=svd_factors)
+
+
+# ---------------------------------------------------------------------------
+# Shared layout helper (used by ppl_eval and streaming)
+# ---------------------------------------------------------------------------
+
+
+def quantize_kv_layout(
+    kv_fp: torch.Tensor,
+    spec,  # CacheCodecSpec; avoid circular import — duck-typed on .arm/.bits/etc.
+) -> tuple[torch.Tensor, float]:
+    """Quantize an (h, S, d) tensor using the matrix layout convention.
+
+    Returns ``(kv_hat, bpe)`` where ``kv_hat`` is the dequantized fp32 result
+    with the same shape as *kv_fp*.  For ``arm="fp16"``, returns the input
+    unchanged with ``bpe=16.0``.  Raises ``AssertionError`` for unknown arms.
+    """
+    from bmx.cache.collect import (
+        from_matrix,
+        to_matrix,
+    )  # local to avoid top-level cycle
+
+    h = kv_fp.shape[0]
+    if spec.arm == "fp16":
+        return kv_fp, 16.0
+
+    assert spec.arm in CACHE_ARMS, (
+        f"unknown arm {spec.arm!r}; use one of {CACHE_ARMS} or 'fp16'"
+    )
+    M = to_matrix(kv_fp)  # (S, h*d)
+    M_hat, bpe = quantize_cache(
+        spec.arm,
+        M,
+        bits=spec.bits,
+        seed=spec.seed,
+        group=spec.group,
+        rank=spec.rank,
+    )
+    return from_matrix(M_hat, h), bpe

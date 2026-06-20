@@ -20,8 +20,8 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import Cache, DynamicLayer
 
-from bmx.cache.codecs import quantize_cache
-from bmx.cache.collect import _reshape_heads, from_matrix, to_matrix
+from bmx.cache.codecs import S_DIVISIBILITY_ARMS, quantize_kv_layout
+from bmx.cache.collect import _reshape_heads
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 
@@ -56,9 +56,14 @@ class StreamingQuantizedLayer(DynamicLayer):
             getattr(model_config, "head_dim", None)
             or model_config.hidden_size // model_config.num_attention_heads
         )
+        # Precomputed per-instance constants (avoid re-evaluating each update step).
+        self._passthrough = k_spec.arm == "fp16" and v_spec.arm == "fp16"
+        self._g = k_spec.group if k_spec.arm in S_DIVISIBILITY_ARMS else 1
+        # RoPE cos/sin cache: keyed by S_q; avoids constructing nn.Module each step.
+        self._rope_cache: dict[int, tuple] = {}
 
     def _is_passthrough(self) -> bool:
-        return self.k_spec.arm == "fp16" and self.v_spec.arm == "fp16"
+        return self._passthrough
 
     def stash_pre_rope(self, out: torch.Tensor):
         """Called by the cache's k_proj hook: append a captured pre-RoPE block.
@@ -73,18 +78,7 @@ class StreamingQuantizedLayer(DynamicLayer):
 
     def _quantize_matrix(self, kv_fp32: torch.Tensor, spec: CacheCodecSpec):
         """(h,S,d) fp32 -> (dequantized (h,S,d) fp32, bpe). fp16 spec is identity."""
-        if spec.arm == "fp16":
-            return kv_fp32, 16.0
-        h = kv_fp32.shape[0]
-        M_hat, bpe = quantize_cache(
-            spec.arm,
-            to_matrix(kv_fp32),
-            bits=spec.bits,
-            seed=spec.seed,
-            group=spec.group,
-            rank=spec.rank,
-        )
-        return from_matrix(M_hat, h), bpe
+        return quantize_kv_layout(kv_fp32, spec)
 
     def _group_size(self) -> int:
         """Binding group size for S-alignment.
@@ -93,16 +87,14 @@ class StreamingQuantizedLayer(DynamicLayer):
         All other arms have no S-divisibility constraint, so g=1 (quantize
         everything except the fp16 window without any alignment restriction).
         """
-        if self.k_spec.arm in ("rtn_channel", "lowrank_rtn_channel"):
-            return self.k_spec.group
-        return 1
+        return self._g
 
     def update(self, key_states, value_states, *args, **kwargs):
         # Let DynamicLayer concat + return the full (post-RoPE) keys/values.
         keys, values = super().update(key_states, value_states, *args, **kwargs)
 
         # Passthrough: no pre_rope flag and fp16 arms — skip codec entirely.
-        if self._is_passthrough() and not self.k_spec.pre_rope:
+        if self._passthrough and not self.k_spec.pre_rope:
             self.bpe_k = 16.0
             self.bpe_v = 16.0
             return keys, values
@@ -110,7 +102,7 @@ class StreamingQuantizedLayer(DynamicLayer):
         cache_dtype = keys.dtype
         S = keys.shape[2]  # (1, h_kv, S, d)
         W = self.recent_window
-        g = self._group_size()
+        g = self._g
 
         # Compute the quantized-prefix length: largest multiple of g that leaves
         # at least W recent tokens in the fp16 window.
@@ -134,7 +126,9 @@ class StreamingQuantizedLayer(DynamicLayer):
             )
             k_pre_prefix = self._k_pre[:, :S_q, :].float()  # (h_kv, S_q, d)
             k_hat_pre, codec_bpe_k = self._quantize_matrix(k_pre_prefix, self.k_spec)
-            cos, sin = rope_cos_sin(self.model_config, S_q)
+            if S_q not in self._rope_cache:
+                self._rope_cache[S_q] = rope_cos_sin(self.model_config, S_q)
+            cos, sin = self._rope_cache[S_q]
             k_prefix = apply_rope(k_hat_pre, cos.float(), sin.float())  # post-RoPE
         else:
             k_prefix_fp32 = keys.squeeze(0)[..., :S_q, :].float()  # (h_kv, S_q, d)

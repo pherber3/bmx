@@ -61,16 +61,12 @@ def live_generation_ppl(
         recent_window=recent_window,
     )
     cache.attach(model)  # pre-RoPE capture; no-op when k_spec.pre_rope is False
-    try:
+    with cache:
         with torch.no_grad():
             model(input_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
-
-        cont_ids = input_ids[:, n_prefill:]
-        n_eval = cont_ids.shape[1] - 1
-        with torch.no_grad():
+            cont_ids = input_ids[:, n_prefill:]
+            n_eval = cont_ids.shape[1] - 1
             out = model(cont_ids, past_key_values=cache, labels=cont_ids)
-    finally:
-        cache.detach()
 
     bpe_k, bpe_v = cache.bits_per_entry()
     mem = cache.memory_report(seq_len=input_ids.shape[1])

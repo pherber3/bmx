@@ -16,12 +16,10 @@ from bmx.cache.streaming import StreamingQuantizedCache
 def _argmax_next_at(model, input_ids, query_pos, k_spec, v_spec, n_prefill):
     cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
-    try:
+    with cache:
         with torch.no_grad():
             model(input_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
             out = model(input_ids[:, n_prefill : query_pos + 1], past_key_values=cache)
-    finally:
-        cache.detach()
     return out.logits[0, -1].argmax().item()
 
 
@@ -72,12 +70,6 @@ def needle_retrieved(
     model, input_ids, answer_token_id, k_spec, v_spec, n_prefill
 ) -> bool:
     """True if the model's next-token argmax at the end equals answer_token_id."""
-    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
-    cache.attach(model)
-    try:
-        with torch.no_grad():
-            model(input_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
-            out = model(input_ids[:, n_prefill:], past_key_values=cache)
-    finally:
-        cache.detach()
-    return bool(out.logits[0, -1].argmax().item() == answer_token_id)
+    last_pos = input_ids.shape[1] - 1
+    predicted = _argmax_next_at(model, input_ids, last_pos, k_spec, v_spec, n_prefill)
+    return bool(predicted == answer_token_id)
