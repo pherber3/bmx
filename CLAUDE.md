@@ -60,7 +60,16 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   real PG-essay generate headline (`experiments/k3_niah.py --model-name`); honest
   per-arm measured compression vs the 4× line. Spec/plan:
   `docs/superpowers/{specs,plans}/2026-06-20-niah-*`; VM handoff:
-  `docs/2026-06-20-niah-plan-state.md`. Code-gen pass@1 = deferred second half.
+  `docs/2026-06-20-niah-plan-state.md`.
+- LongBench Code eval (task metric #0, coding half — harness built, awaiting VM run):
+  TurboQuant Table-1 Code signal (`lcc` + `repobench-p`) via LongBench's exact
+  `code_sim` edit-similarity (fuzzywuzzy, range 0–1) on the SAME StreamingQuantizedCache
+  path — NIAH + LongBench now share `generate_through_cache`. Offline synthetic
+  mechanism gate + real full-set headline (`experiments/k3_longbench.py --model-name`,
+  `n_samples=None` = full 500+500). Spec/plan:
+  `docs/superpowers/{specs,plans}/2026-06-20-longbench-*`; VM handoff:
+  `docs/2026-06-20-longbench-plan-state.md`. (HumanEval pass@1 NOT pursued — the paper
+  used LongBench Code; that closes the coding-task question.)
 - **Open (engineering, not science):** fused dequant-attention kernel (use the
   Track B byte model in `src/bmx/bench/` to predict before building) for the literal
   process-RSS win; the authoritative SOTA-model VM run (real-text + planted needle,
