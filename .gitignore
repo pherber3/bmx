@@ -7,6 +7,7 @@ __pycache__/
 results/**/*.safetensors
 results/**/*.bin
 results/**/*.pt
+results/**/*.npz
 hf_cache/
 # raw KV-cache dumps (data, not metrics)
 results/cache/
