@@ -144,22 +144,36 @@ def niah_recall_generate(
 
     Headline recall (VM/real model). n_prefill tokens are quantized on-append; the
     remaining prompt + generation attend to the compressed cache.
+
+    Continuation-only contract (mirrors needle.py:21-22):
+      - Step 1: model(prompt_ids[:, :n_prefill], ...)  — fills cache positions [0, n_prefill)
+      - Step 2: model.generate(prompt_ids[:, n_prefill:], ...)  — feeds ONLY the
+        continuation; HuggingFace generate() returns the supplied input tokens followed
+        by the newly-decoded tokens.
+
+    Shape-offset reasoning:
+      Let L = prompt_ids.shape[1].
+      Continuation length = L - n_prefill.
+      generate() output shape: (1, (L - n_prefill) + max_new_tokens_actual).
+      The newly generated tokens start at index (L - n_prefill) in out[0].
+      Decoding out[0, L - n_prefill :] extracts exactly the model's answer.
     """
+    L = prompt_ids.shape[1]
+    cont_len = L - n_prefill  # length of the slice fed to generate()
     cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
     with cache:
         with torch.no_grad():
-            # Prefill the leading n_prefill tokens into the streaming cache, then let
-            # generate() consume the rest of the prompt + decode the answer.
+            # Step 1: quantize-on-append prefill of the leading n_prefill tokens.
             model(prompt_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
+            # Step 2: feed ONLY the continuation so the cache is not double-prefilled.
             out = model.generate(
-                prompt_ids,
+                prompt_ids[:, n_prefill:],
                 past_key_values=cache,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 num_beams=1,
             )
-    response = tokenizer.decode(
-        out[0, prompt_ids.shape[1] :], skip_special_tokens=True
-    ).strip()
+    # out[0] = [continuation tokens (cont_len)] + [new tokens]; skip the continuation.
+    response = tokenizer.decode(out[0, cont_len:], skip_special_tokens=True).strip()
     return rouge1_recall(needle_text, response)
