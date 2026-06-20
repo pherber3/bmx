@@ -28,11 +28,25 @@ fair code path. Quality holds (1.001× fp16 tbt-ppl).
 
 ## Open work, in priority order (engineering, not science)
 
+0. **NEXT DIRECTION (decided, needs its own brainstorm before code): a coding /
+   long-context TASK metric, not just perplexity.** Target audience = people running
+   local models for coding (Qwen3-27B / Gemma-31B class). Perplexity-within-1% says the
+   *distribution* held; it does NOT say the model still writes correct code or retrieves
+   from 8k-token pasted context under compression — those can diverge. Add a task metric:
+   e.g. HumanEval-style pass@1 under the compressed cache, or long-context code
+   retrieval. **This is new harness work — brainstorm it (intent/metric/baseline-fairness)
+   before building, exactly like K3.** The trap to avoid: a task so easy it can't
+   distinguish arms (everything passes) or so hard the base model fails anyway (nothing to
+   measure) — the metric must have headroom where compression could plausibly break it,
+   and must run the SAME arms on the SAME one fair code path the ppl sweep uses. Validate
+   on an 8B first, then the 27-31B authoritative run.
+
 1. **Authoritative SOTA-model VM run.** The experiment (`experiments/k3_live_generation.py`)
    is model-agnostic — `--model-name` is the only knob. Run on Llama-3.2-1B (or a
    Qwen3/Gemma-class SOTA model) on the NVIDIA VM with real wikitext + planted needle
-   (already wired). Produces the headline K2b-vs-TurboQuant-vs-KIVI numbers. This is the
-   first thing to do — the branch makes it *trustworthy*; it doesn't *execute* it (no
+   (already wired). Produces the headline K2b-vs-TurboQuant-vs-KIVI numbers — but per #0,
+   pair it with a task metric to make it land for the coding audience. The branch makes
+   this run *trustworthy*; it doesn't *execute* it (no
    CUDA on the 7900 XTX).
 2. **Fused dequant-attention kernel** for the literal process-RSS 5×. `reconstruct_layer`
    currently materializes the dequant slab for the model to read (Stage-B contract).
