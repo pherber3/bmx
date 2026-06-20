@@ -80,12 +80,11 @@ class StreamingQuantizedLayer(DynamicLayer):
         # V is the (C, rank) channel subspace — frozen across all blocks.
         self._frozen_svd: tuple[torch.Tensor, torch.Tensor] | None = None
 
-        # Honest bpe accounting: track total quantized bits + entries separately
-        # for K and V so blended bpe stays correct as the prefix grows.
+        # Honest bpe accounting: track total quantized bits for K and V so blended
+        # bpe stays correct as the prefix grows. (entries are recomputed from
+        # tail_len / total_entries each step — no separate counter needed.)
         self._quant_bits_k: float = 0.0
-        self._quant_entries_k: int = 0
         self._quant_bits_v: float = 0.0
-        self._quant_entries_v: int = 0
 
         self.bpe_k = float("nan")
         self.bpe_v = float("nan")
@@ -138,7 +137,6 @@ class StreamingQuantizedLayer(DynamicLayer):
         """
         spec = self.k_spec
         h = k_block_pre.shape[0]
-        block_len = k_block_pre.shape[1]
 
         if spec.arm == "fp16":
             # fp16 arm: no quantization; just apply RoPE at the correct positions.
@@ -154,23 +152,22 @@ class StreamingQuantizedLayer(DynamicLayer):
                 self._frozen_svd = (Us, V)
             else:
                 # Later flushes: project onto the frozen subspace.
-                _, V = self._frozen_svd
-                rank = V.shape[1]
-                # Ensure rank doesn't exceed block dimensions (guard for tiny blocks).
-                effective_rank = min(rank, block_len, V.shape[0])
-                if effective_rank < rank:
-                    # Block too small; fall back to fresh truncated_svd.
-                    Us, V = truncated_svd(M, effective_rank)
-                else:
-                    # Us_block = M @ V_frozen  (projects rows of M onto frozen subspace)
-                    Us = M @ V  # (block_len, rank)
+                # S-divisibility (lowrank_rtn_channel requires S % group == 0, group >= rank)
+                # guarantees block_len >= rank; assert here to document the invariant.
+                _, V_frozen = self._frozen_svd
+                assert M.shape[0] >= V_frozen.shape[1], (
+                    f"block_len={M.shape[0]} < rank={V_frozen.shape[1]}; "
+                    "S-divisibility by group (>= rank) must hold"
+                )
+                # Us_block = M @ V_frozen  (project block rows onto frozen channel subspace)
+                Us = M @ V_frozen  # (block_len, rank)
             M_hat, codec_bpe = quantize_cache(
                 spec.arm,
                 M,
                 bits=spec.bits,
                 group=spec.group,
                 rank=spec.rank,
-                svd_factors=(Us, self._frozen_svd[1] if self._frozen_svd else V),
+                svd_factors=(Us, self._frozen_svd[1]),
             )
             k_hat_pre = from_matrix(M_hat, h)  # (h_kv, block_len, d)
         else:
@@ -315,9 +312,7 @@ class StreamingQuantizedLayer(DynamicLayer):
         # --- Accumulate honest bits ---
         block_entries = block_len * self._h_kv * self._d_head
         self._quant_bits_k += codec_bpe_k * block_entries
-        self._quant_entries_k += block_entries
         self._quant_bits_v += codec_bpe_v * block_entries
-        self._quant_entries_v += block_entries
 
         # --- Update committed counter ---
         self._committed_S_q = new_S_q

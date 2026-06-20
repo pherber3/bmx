@@ -343,6 +343,49 @@ def test_each_token_quantized_once():
         cache.detach()
 
 
+def test_multiblock_k_rope_positions_correct():
+    # Multi-block streaming with fp16+pre_rope K: the 2nd/3rd quantized blocks must
+    # get RoPE at their TRUE absolute positions (committed..new), not 0..block_len.
+    # committed_S_q > 0 for later blocks, so a position-offset bug (which the single-
+    # block rel<1e-2 test cannot see) shows up here. fp16 codec => lossless, so any
+    # deviation is a RoPE-position error, not quant error.
+    model = tiny_llama()
+    input_ids = ids(vocab=97, seq=60, seed=9)
+
+    # Stream token-by-token with a small window so multiple blocks flush (positions
+    # 16+, 32+, ... get committed at nonzero offsets).
+    cache = StreamingQuantizedCache(
+        model.config,
+        k_spec=CacheCodecSpec(arm="fp16", pre_rope=True),
+        v_spec=CacheCodecSpec(arm="fp16"),
+        recent_window=8,
+    )
+    cache.attach(model)
+    with torch.no_grad():
+        model(input_ids[:, :16], past_key_values=cache, use_cache=True)
+        for t in range(16, 60):
+            model(input_ids[:, t : t + 1], past_key_values=cache, use_cache=True)
+    cache.detach()
+    k_post, _ = cache.reconstruct_layer(0)
+
+    # True post-RoPE keys from a plain default cache over the same full sequence.
+    ref = StreamingQuantizedCache(
+        model.config,
+        k_spec=CacheCodecSpec(arm="fp16"),
+        v_spec=CacheCodecSpec(arm="fp16"),
+    )
+    with torch.no_grad():
+        model(input_ids, past_key_values=ref, use_cache=True)
+    k_true = ref.layers[0].keys
+
+    rel = (k_post.float() - k_true.float()).norm() / k_true.float().norm().clamp_min(
+        1e-6
+    )
+    assert rel < 1e-2, (
+        f"multi-block K RoPE positions wrong: rel={rel} (position offset bug?)"
+    )
+
+
 def test_frozen_subspace_not_refit():
     """After first K flush, _frozen_svd is set and its V factor must not change
     across subsequent flushes.
