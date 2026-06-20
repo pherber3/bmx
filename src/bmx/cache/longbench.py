@@ -1,9 +1,9 @@
 """LongBench Code eval: code_sim scorer, dataset loader, task registry.
 
 Faithful port of LongBench's Code-category eval (lcc, repobench-p). The scorer matches
-LongBench's metrics.py::code_sim_score exactly (verified in .git/sdd/longbench-conventions.md
-against the local clone). The dataset loader + scoring path are VM-only (real model); code_sim
-is a pure CI-testable function.
+LongBench's metrics.py::code_sim_score exactly; all conventions are recorded verbatim in
+.git/sdd/longbench-conventions.md (the durable ledger). The dataset loader + scoring path are
+VM-only (real model); code_sim is a pure CI-testable function.
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ from fuzzywuzzy import fuzz
 from bmx.cache.niah import generate_through_cache
 from bmx.cache.specs import CacheCodecSpec
 
-# VERBATIM from LongBench config (verified in .git/sdd/longbench-conventions.md against the
-# local clone LongBench/LongBench/config/dataset2prompt.json + dataset2maxlen.json).
+# VERBATIM from LongBench's config/dataset2prompt.json + dataset2maxlen.json, recorded in
+# .git/sdd/longbench-conventions.md (the authoritative ledger; the reference clone it was
+# extracted from is transient).
 # NOTE the exact strings: trailing space after "below. ", and repobench-p has {input}, lcc does
 # not. Copy these EXACTLY — do not normalize whitespace.
 LONGBENCH_TASKS: dict[str, dict] = {
