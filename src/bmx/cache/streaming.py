@@ -86,6 +86,17 @@ class StreamingQuantizedLayer(DynamicLayer):
         )
         return from_matrix(M_hat, h), bpe
 
+    def _group_size(self) -> int:
+        """Binding group size for S-alignment.
+
+        Only rtn_channel and lowrank_rtn_channel assert S % group == 0.
+        All other arms have no S-divisibility constraint, so g=1 (quantize
+        everything except the fp16 window without any alignment restriction).
+        """
+        if self.k_spec.arm in ("rtn_channel", "lowrank_rtn_channel"):
+            return self.k_spec.group
+        return 1
+
     def update(self, key_states, value_states, *args, **kwargs):
         # Let DynamicLayer concat + return the full (post-RoPE) keys/values.
         keys, values = super().update(key_states, value_states, *args, **kwargs)
@@ -98,31 +109,57 @@ class StreamingQuantizedLayer(DynamicLayer):
 
         cache_dtype = keys.dtype
         S = keys.shape[2]  # (1, h_kv, S, d)
+        W = self.recent_window
+        g = self._group_size()
 
-        # Keys: pre-RoPE source when captured, RoPE re-applied at read; else post-RoPE.
+        # Compute the quantized-prefix length: largest multiple of g that leaves
+        # at least W recent tokens in the fp16 window.
+        S_q = ((S - W) // g) * g if S > W else 0
+
+        if S_q <= 0:
+            # Nothing to quantize yet — whole cache stays fp16 this call.
+            self.keys = keys  # (1, h_kv, S, d) already from DynamicLayer
+            self.values = values
+            self.bpe_k = 16.0
+            self.bpe_v = 16.0
+            return self.keys, self.values
+
+        # --- Quantize the prefix [:S_q] ---
+
+        # Keys prefix: use pre-RoPE source when captured, then re-apply RoPE.
         if self.k_spec.pre_rope:
             assert self._k_pre is not None, (
                 "k_spec.pre_rope=True but no captured pre-RoPE keys; "
                 "call cache.attach(model) before prefill"
             )
-            k_src = self._k_pre[:, :S, :].float()  # (h_kv, S, d) pre-RoPE
-            k_hat_pre, self.bpe_k = self._quantize_matrix(k_src, self.k_spec)
-            cos, sin = rope_cos_sin(self.model_config, S)
-            k_hat = apply_rope(k_hat_pre, cos.float(), sin.float())  # post-RoPE
+            k_pre_prefix = self._k_pre[:, :S_q, :].float()  # (h_kv, S_q, d)
+            k_hat_pre, codec_bpe_k = self._quantize_matrix(k_pre_prefix, self.k_spec)
+            cos, sin = rope_cos_sin(self.model_config, S_q)
+            k_prefix = apply_rope(k_hat_pre, cos.float(), sin.float())  # post-RoPE
         else:
-            k_hat, self.bpe_k = self._quantize_matrix(
-                keys.squeeze(0).float(), self.k_spec
-            )
+            k_prefix_fp32 = keys.squeeze(0)[..., :S_q, :].float()  # (h_kv, S_q, d)
+            k_prefix, codec_bpe_k = self._quantize_matrix(k_prefix_fp32, self.k_spec)
 
-        v_hat, self.bpe_v = self._quantize_matrix(
-            values.squeeze(0).float(), self.v_spec
-        )
+        # Values prefix.
+        v_prefix_fp32 = values.squeeze(0)[..., :S_q, :].float()  # (h_kv, S_q, d)
+        v_prefix, codec_bpe_v = self._quantize_matrix(v_prefix_fp32, self.v_spec)
 
-        # Persist the dequantized slab as the layer's stored cache. The bpe fields
-        # record the honest compressed cost; the stored tensor is the dequant approx
-        # (Stage B: packed-byte storage is the perf refinement, out of scope here).
-        self.keys = k_hat.to(cache_dtype).unsqueeze(0)  # (1, h_kv, S, d)
-        self.values = v_hat.to(cache_dtype).unsqueeze(0)  # (1, h_kv, S, d)
+        # --- fp16 tail [S_q:] — already post-RoPE from DynamicLayer ---
+        # For keys: `keys` (from super().update) is already post-RoPE; just slice.
+        k_tail = keys.squeeze(0)[..., S_q:, :]  # (h_kv, S-S_q, d) fp16
+        v_tail = values.squeeze(0)[..., S_q:, :]  # (h_kv, S-S_q, d) fp16
+
+        # --- Reassemble: concat along seq dim (dim=-2) ---
+        k_hat = torch.cat([k_prefix.to(cache_dtype), k_tail], dim=-2)  # (h_kv, S, d)
+        v_hat = torch.cat([v_prefix.to(cache_dtype), v_tail], dim=-2)  # (h_kv, S, d)
+
+        # Blended bpe: quantized prefix costs codec_bpe; fp16 tail costs 16.
+        self.bpe_k = (S_q * codec_bpe_k + (S - S_q) * 16.0) / S
+        self.bpe_v = (S_q * codec_bpe_v + (S - S_q) * 16.0) / S
+
+        # Persist the dequantized + fp16-tail slab as the layer's stored cache.
+        self.keys = k_hat.unsqueeze(0)  # (1, h_kv, S, d)
+        self.values = v_hat.unsqueeze(0)  # (1, h_kv, S, d)
         return self.keys, self.values
 
 

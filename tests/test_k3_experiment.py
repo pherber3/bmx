@@ -20,8 +20,20 @@ def test_k3_run_emits_parquet(tmp_path):
     )
     run_dir = run(cfg, model=model, root=str(tmp_path))
     df = pd.read_parquet(run_dir / "metrics.parquet")
-    for col in ("arm", "bpe_k", "bpe_v", "ppl", "n_eval"):
-        assert col in df.columns
+    for col in (
+        "arm",
+        "bpe_k",
+        "bpe_v",
+        "ppl",
+        "n_eval",
+        "packed_bytes",
+        "fp16_bytes",
+        "compression",
+        "n_prefill",
+        "n_context",
+        "retrieved",
+    ):
+        assert col in df.columns, f"missing column: {col}"
     assert set(df["arm"]) <= {
         "fp16",
         "k2b",

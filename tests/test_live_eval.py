@@ -24,8 +24,12 @@ def test_fp16_live_ppl_matches_plain_forward():
 
 
 def test_quantized_live_ppl_finite_and_higher_than_fp16():
+    # seq=64 with recent_window=32 (default): after the 16-token prefill and 48-token
+    # continuation (sent as one batch, S=64), S_q = ((64-32)//16)*16 = 32 tokens get
+    # quantized, blended bpe < 16.  seq=32 was too short — max S=32 == W, so S_q=0
+    # and everything stayed fp16 (the window eclipsed all tokens).
     model = tiny_llama()
-    input_ids = ids(vocab=97, seq=32, seed=12)
+    input_ids = ids(vocab=97, seq=64, seed=12)
     live_generation_ppl(
         model,
         input_ids,
@@ -43,4 +47,4 @@ def test_quantized_live_ppl_finite_and_higher_than_fp16():
         v_spec=CacheCodecSpec(arm="rtn_token", bits=2, group=16),
     )
     assert math.isfinite(quant["ppl"])
-    assert quant["bpe_k"] < 16.0  # honestly compressed
+    assert quant["bpe_k"] < 16.0  # honestly compressed (blended bpe with window)
