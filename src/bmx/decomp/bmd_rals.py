@@ -63,6 +63,7 @@ def _solve_middle(T, F1, F3, lam: float, auto_ridge: bool):
     return sol.reshape(m, p, ell)
 
 
+@torch.no_grad()
 def _run_als(
     T: torch.Tensor,
     A: torch.Tensor,

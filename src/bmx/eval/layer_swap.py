@@ -6,6 +6,8 @@ quantization. set_weight/perplexity are offline-testable; the
 swap_and_perplexity convenience wrapper downloads GPT-2 + WikiText.
 """
 
+import math
+
 import torch
 
 from bmx.decomp.base import FitResult
@@ -35,10 +37,12 @@ def perplexity(model, input_ids: torch.Tensor, block: int = 512) -> float:
     blocks = input_ids[:n].view(-1, block)
     # equal-sized blocks: the mean of per-block mean-NLLs (each over block-1
     # shifted positions) IS the per-token mean-NLL
-    nll = sum(
-        model(row.unsqueeze(0), labels=row.unsqueeze(0)).loss.item() for row in blocks
-    ) / len(blocks)
-    return float(torch.exp(torch.tensor(nll)))
+    device = next(model.parameters()).device
+    nll_acc = torch.zeros((), dtype=torch.float64, device=device)
+    for row in blocks:
+        nll_acc += model(row.unsqueeze(0), labels=row.unsqueeze(0)).loss.double()
+    nll = (nll_acc / len(blocks)).item()
+    return math.exp(nll)
 
 
 def load_eval_tokens(

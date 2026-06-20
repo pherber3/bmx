@@ -98,11 +98,10 @@ class StreamingQuantizedLayer(DynamicLayer):
         # Precomputed per-instance constants (avoid re-evaluating each update step).
         self._passthrough = k_spec.arm == "fp16" and v_spec.arm == "fp16"
         self._g = k_spec.group if k_spec.arm in S_DIVISIBILITY_ARMS else 1
-        # RoPE cos/sin cache: keyed by S_q; avoids constructing nn.Module each step.
-        self._rope_cache: dict[int, tuple] = {}
-
-    def _is_passthrough(self) -> bool:
-        return self._passthrough
+        # RoPE cos/sin: one growing (max_S, d_head) table, extended per flush block
+        # (covered length is self._rope_cos.shape[0]).
+        self._rope_cos: torch.Tensor | None = None
+        self._rope_sin: torch.Tensor | None = None
 
     def stash_pre_rope(self, out: torch.Tensor):
         """Called by the cache's k_proj hook: append a captured pre-RoPE block.
@@ -174,14 +173,23 @@ class StreamingQuantizedLayer(DynamicLayer):
             # General path (rtn_channel, rtn_token, rotate_rtn_token, turboquant_*).
             k_hat_pre, codec_bpe = self._quantize_matrix(k_block_pre, spec)
 
-        # Apply RoPE at the correct absolute positions [committed, new_committed).
-        if new_committed not in self._rope_cache:
-            self._rope_cache[new_committed] = rope_cos_sin(
-                self.model_config, new_committed
+        # Extend the growing RoPE table to cover [covered, new_committed), then
+        # slice this block's positions [committed, new_committed).
+        covered = 0 if self._rope_cos is None else self._rope_cos.shape[0]
+        if new_committed > covered:
+            new_cos, new_sin = rope_cos_sin(
+                self.model_config,
+                new_committed - covered,
+                start=covered,
+                device=k_block_pre.device,
             )
-        cos_full, sin_full = self._rope_cache[new_committed]
-        cos = cos_full[committed:new_committed].float()  # (block_len, d)
-        sin = sin_full[committed:new_committed].float()  # (block_len, d)
+            if self._rope_cos is None:
+                self._rope_cos, self._rope_sin = new_cos, new_sin
+            else:
+                self._rope_cos = torch.cat([self._rope_cos, new_cos], dim=0)
+                self._rope_sin = torch.cat([self._rope_sin, new_sin], dim=0)
+        cos = self._rope_cos[committed:new_committed].float()  # (block_len, d)
+        sin = self._rope_sin[committed:new_committed].float()  # (block_len, d)
         k_block_post = apply_rope(k_hat_pre.float(), cos, sin)  # (h_kv, block_len, d)
 
         return k_block_post, codec_bpe

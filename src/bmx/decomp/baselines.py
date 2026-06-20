@@ -56,6 +56,7 @@ class DenseFit(FitResult):
 
 
 @register("cp")
+@torch.no_grad()
 def fit_cp(T: torch.Tensor, rank: int, *, n_iter_max: int = 500, seed: int = 0):
     m, p, n = T.shape
     r = int(rank)
@@ -67,6 +68,7 @@ def fit_cp(T: torch.Tensor, rank: int, *, n_iter_max: int = 500, seed: int = 0):
 
 
 @register("tucker")
+@torch.no_grad()
 def fit_tucker(T: torch.Tensor, rank, *, n_iter_max: int = 200, seed: int = 0):
     m, p, n = T.shape
     R1, R2, R3 = (int(x) for x in rank)
@@ -84,6 +86,7 @@ def fit_tucker(T: torch.Tensor, rank, *, n_iter_max: int = 200, seed: int = 0):
 
 
 @register("shared_tucker")
+@torch.no_grad()
 def fit_shared_tucker(T: torch.Tensor, rank, *, n_iter_max: int = 200):
     """Tucker with mode-3 factor pinned to identity: shared U1, U2; per-slice cores."""
     m, p, n = T.shape

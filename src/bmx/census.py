@@ -54,7 +54,8 @@ def pairwise_similarities(S: torch.Tensor, top_r: int = 32) -> dict[str, torch.T
 
     r = min(top_r, p, d)
     Vh = torch.linalg.svd(S, full_matrices=False).Vh[:, :r, :]  # (E, r, d)
-    M = Vh.reshape(E * r, d) @ Vh.reshape(E * r, d).T
+    Vh_flat = Vh.reshape(E * r, d)
+    M = Vh_flat @ Vh_flat.T
     sub = M.reshape(E, r, E, r).pow(2).sum(dim=(1, 3)) / r
 
     return {"cos": cos, "cka": cka, "sub": sub}
