@@ -1,4 +1,4 @@
-from bmx.cache.niah import build_niah_ids_synthetic, niah_recall_argmax
+from bmx.cache.niah import build_niah_ids_synthetic, niah_recall_argmax, rouge1_recall
 from bmx.cache.specs import CacheCodecSpec
 from factories import tiny_llama
 
@@ -22,3 +22,18 @@ def test_niah_recall_argmax_returns_bool_fp16():
         model, ids, query_pos=39, n_prefill=20, k_spec=fp16, v_spec=fp16, answer_id=7
     )
     assert isinstance(got, bool)
+
+
+def test_rouge1_recall_perfect_and_zero():
+    needle = "The best thing to do in San Francisco is eat a sandwich in Dolores Park."
+    assert rouge1_recall(needle, needle) == 10.0  # identical => fmeasure 1.0 * 10
+    assert (
+        rouge1_recall(needle, "completely unrelated zzz qqq") < 2.0
+    )  # near-zero overlap
+
+
+def test_rouge1_recall_partial_is_graded():
+    needle = "the magic number is one two three four"
+    partial = "the magic number is"
+    score = rouge1_recall(needle, partial)
+    assert 0.0 < score < 10.0  # graded, not binary

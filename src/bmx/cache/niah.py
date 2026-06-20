@@ -10,9 +10,11 @@ All arms route through the same StreamingQuantizedCache path used by the ppl swe
 from __future__ import annotations
 
 import torch
+from rouge_score import rouge_scorer
 
 from bmx.cache.needle import _argmax_next_at
 from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.streaming import StreamingQuantizedCache
 
 
 def build_niah_ids_synthetic(
@@ -58,3 +60,106 @@ def niah_recall_argmax(
     """
     got = _argmax_next_at(model, input_ids, query_pos, k_spec, v_spec, n_prefill)
     return bool(got == answer_id)
+
+
+# Defaults follow the Fu et al. harness (eval/needle/needle_in_haystack.py); the
+# Task 0 ledger is the source of truth if the vault refined these.
+NEEDLE_TEXT = (
+    "\nThe best thing to do in San Francisco is eat a sandwich and sit in "
+    "Dolores Park on a sunny day.\n"
+)
+QUESTION_TEXT = "What is the best thing to do in San Francisco?"
+PROMPT_TEMPLATE = (
+    "This is a very long story book: <book> {context} </book>.\n"
+    "Based on the content of the book, Question: {question}\nAnswer:"
+)
+
+_SCORER = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+
+
+def rouge1_recall(needle_text: str, response_text: str) -> float:
+    """ROUGE-1 F-measure ×10 (0–10) of the needle vs the response — the headline scorer.
+
+    Matches the Fu et al. metric (needle_in_haystack.py:265). Pure function; the
+    streaming-cache generate path feeds the model response in.
+    """
+    return _SCORER.score(needle_text, response_text)["rouge1"].fmeasure * 10.0
+
+
+def _insert_needle_at_sentence_boundary(
+    tokenizer, context_ids: list[int], needle_ids: list[int], depth_percent: float
+) -> list[int]:
+    """Insert needle_ids into context_ids at depth_percent, snapped back to a period."""
+    if depth_percent >= 100:
+        return context_ids + needle_ids
+    insertion = int(len(context_ids) * (depth_percent / 100.0))
+    period_ids = tokenizer.encode(".", add_special_tokens=False)
+    head = context_ids[:insertion]
+    while head and head[-1] not in period_ids:
+        insertion -= 1
+        head = context_ids[:insertion]
+    return head + needle_ids + context_ids[insertion:]
+
+
+def build_niah_prompt(
+    tokenizer,
+    context_length: int,
+    depth_percent: float,
+    *,
+    haystack: str,
+    needle_text: str = NEEDLE_TEXT,
+    question_text: str = QUESTION_TEXT,
+    buffer: int = 200,
+) -> torch.Tensor:
+    """RULER-style NIAH prompt ids (real-tokenizer path; VM only).
+
+    Trims ``haystack`` to ``context_length - buffer`` tokens, inserts ``needle_text``
+    at ``depth_percent`` snapped to a sentence boundary, wraps in PROMPT_TEMPLATE +
+    question. Returns (1, L).
+    """
+    needle_ids = tokenizer.encode(needle_text, add_special_tokens=False)
+    ctx_ids = tokenizer.encode(haystack, add_special_tokens=False)
+    budget = context_length - buffer
+    if len(ctx_ids) + len(needle_ids) > budget:
+        ctx_ids = ctx_ids[: budget - len(needle_ids)]
+    woven = _insert_needle_at_sentence_boundary(
+        tokenizer, ctx_ids, needle_ids, depth_percent
+    )
+    context = tokenizer.decode(woven)
+    prompt = PROMPT_TEMPLATE.format(context=context, question=question_text)
+    return tokenizer(prompt, return_tensors="pt").input_ids
+
+
+def niah_recall_generate(
+    model,
+    tokenizer,
+    prompt_ids: torch.Tensor,
+    n_prefill: int,
+    k_spec: CacheCodecSpec,
+    v_spec: CacheCodecSpec,
+    needle_text: str = NEEDLE_TEXT,
+    max_new_tokens: int = 50,
+) -> float:
+    """Prefill the prompt into the streaming cache, greedy-generate, score ROUGE-1.
+
+    Headline recall (VM/real model). n_prefill tokens are quantized on-append; the
+    remaining prompt + generation attend to the compressed cache.
+    """
+    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            # Prefill the leading n_prefill tokens into the streaming cache, then let
+            # generate() consume the rest of the prompt + decode the answer.
+            model(prompt_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
+            out = model.generate(
+                prompt_ids,
+                past_key_values=cache,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+            )
+    response = tokenizer.decode(
+        out[0, prompt_ids.shape[1] :], skip_special_tokens=True
+    ).strip()
+    return rouge1_recall(needle_text, response)
