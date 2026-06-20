@@ -68,7 +68,7 @@ def longbench_code_score(
     prompt_ids = build_longbench_prompt(tokenizer, item, task)
     max_gen = LONGBENCH_TASKS[task]["max_gen"]
     response = generate_through_cache(
-        model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_gen
+        model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_gen, strip=False
     )
     ground_truth = item["answers"][0]
     return code_sim(response, ground_truth)

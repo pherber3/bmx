@@ -67,3 +67,77 @@ def test_generate_through_cache_returns_str(tmp_path):
         max_new_tokens=4,
     )
     assert isinstance(out, str)
+
+
+# --- Regression: I1 strip=False preserves leading indentation for LongBench code_sim ---
+
+
+def test_generate_through_cache_strip_false_preserves_leading_whitespace():
+    """strip=False must NOT remove leading spaces — required for LongBench code_sim fidelity.
+
+    code_sim is whitespace-sensitive on indentation; .strip() removes it before scoring,
+    which systematically depresses code_sim on indented completions (the common case for
+    lcc/repobench-p). Measured: indent=8 → LongBench 1.000 vs our-stripped 0.820.
+    """
+    import torch
+    from bmx.cache.specs import CacheCodecSpec
+    from factories import tiny_llama
+
+    INDENTED = "        return x"
+
+    class _IndentedStubTokenizer:
+        """Always decodes to an indented string regardless of token ids."""
+
+        def decode(self, ids, skip_special_tokens=True):
+            return INDENTED
+
+    model = tiny_llama()
+    g = torch.Generator().manual_seed(1)
+    prompt_ids = torch.randint(0, 97, (1, 24), generator=g)
+    fp16 = CacheCodecSpec(arm="fp16")
+
+    result = generate_through_cache(
+        model,
+        tokenizer=_IndentedStubTokenizer(),
+        prompt_ids=prompt_ids,
+        n_prefill=12,
+        k_spec=fp16,
+        v_spec=fp16,
+        max_new_tokens=4,
+        strip=False,
+    )
+    assert result.startswith("    "), (
+        f"strip=False must preserve leading whitespace; got {result!r}"
+    )
+
+
+def test_generate_through_cache_strip_true_removes_leading_whitespace():
+    """strip=True (default) must strip leading spaces — NIAH ROUGE-1 path is unchanged."""
+    import torch
+    from bmx.cache.specs import CacheCodecSpec
+    from factories import tiny_llama
+
+    INDENTED = "        return x"
+
+    class _IndentedStubTokenizer:
+        def decode(self, ids, skip_special_tokens=True):
+            return INDENTED
+
+    model = tiny_llama()
+    g = torch.Generator().manual_seed(2)
+    prompt_ids = torch.randint(0, 97, (1, 24), generator=g)
+    fp16 = CacheCodecSpec(arm="fp16")
+
+    result = generate_through_cache(
+        model,
+        tokenizer=_IndentedStubTokenizer(),
+        prompt_ids=prompt_ids,
+        n_prefill=12,
+        k_spec=fp16,
+        v_spec=fp16,
+        max_new_tokens=4,
+        strip=True,
+    )
+    assert not result.startswith(" "), (
+        f"strip=True must remove leading whitespace; got {result!r}"
+    )

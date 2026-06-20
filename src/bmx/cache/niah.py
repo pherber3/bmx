@@ -141,6 +141,7 @@ def generate_through_cache(
     k_spec: CacheCodecSpec,
     v_spec: CacheCodecSpec,
     max_new_tokens: int,
+    strip: bool = True,
 ) -> str:
     """Prefill prompt_ids into a StreamingQuantizedCache, greedy-generate, return the answer.
 
@@ -167,7 +168,8 @@ def generate_through_cache(
                 do_sample=False,
                 num_beams=1,
             )
-    return tokenizer.decode(out[0, cont_len:], skip_special_tokens=True).strip()
+    text = tokenizer.decode(out[0, cont_len:], skip_special_tokens=True)
+    return text.strip() if strip else text
 
 
 def niah_recall_generate(

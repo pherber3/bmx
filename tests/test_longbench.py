@@ -47,3 +47,29 @@ def test_build_longbench_prompt_shapes():
     }
     ids = build_longbench_prompt(StubTok(), item, "lcc")
     assert ids.shape[0] == 1 and ids.shape[1] > 0
+
+
+# --- Regression I1: LongBench code_sim indentation fidelity ---
+
+
+def test_code_sim_indented_prediction_scores_one():
+    """An indented prediction identical to an indented ground truth must score 1.0.
+
+    Pins that code_sim is whitespace-preserving for indented lines (which are the common
+    case for lcc / repobench-p completions).
+    """
+    gt = "        return result"
+    assert code_sim(gt, gt) == 1.0
+
+
+def test_code_sim_stripped_indented_scores_less_than_one():
+    """A prediction whose leading indent was stripped must score < 1.0 vs the indented gt.
+
+    This documents WHY generate_through_cache must pass strip=False for the LongBench path:
+    .strip() on an 8-space-indented completion removes the indent before code_sim sees it,
+    producing a score < 1.0 even when the content is otherwise identical.
+    Measured regression: indent=8 → LongBench 1.000 vs stripped 0.820.
+    """
+    gt = "        return result"
+    stripped_pred = gt.strip()  # simulates what .strip() in generate_through_cache did
+    assert code_sim(stripped_pred, gt) < 1.0
