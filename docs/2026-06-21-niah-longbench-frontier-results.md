@@ -147,18 +147,35 @@ long-context robustness, holds. The new decode path is bit-identical to the old 
 for fp16 and drifts only at quant-noise level for codec arms — a property of *which tokens land in
 a quantized block at flush time*, not a bug.)
 
-## 128k is reachable — the OOM was throwaway logits, not the cache
+## 128k — feasible per-arm fresh, but at the GPU's hard memory ceiling
 
-An earlier pass wrongly recorded 128k as infeasible. The memory decomposition is decisive:
-weights 14.9 GB + full-fp16 KV 16 GB + **`lm_head` logits over all 131072 positions 62.6 GB
-(fp32)** + activations. The cache was never the problem — the all-position logit tensor was. We
-only read the *last* position's logit (to seed decoding), so `logits_to_keep=1` (commit
-`842a63b`) never builds it. Peak drops to **45–66 GB** and **128k runs** (k2b=10.0 retrieves the
-needle, beating fp16=9.52 in the direct test; full solo sweep recorded separately). Two
-operational notes that cost several lost runs: long-context must run **solo** (fragmentation from
-prior smaller-length cells in the same process tips 128k over), and the codec arms show a higher
-*peak* than fp16 — that is transient quantizer scratch (Hadamard/SVD/Lloyd/QJL working tensors),
-**not** resident footprint; the deployable size is the bpe/compression column (5–7× smaller).
+An earlier pass wrongly recorded 128k as flatly infeasible; the truth is more nuanced. First, the
+real OOM cause was **not the cache** — the memory decomposition is weights 14.9 GB + full-fp16 KV
+16 GB + **`lm_head` logits over all 131072 positions 62.6 GB (fp32)** + activations. We only read
+the *last* position's logit, so `logits_to_keep=1` (commit `842a63b`) never builds the
+all-position tensor. That fix is necessary and correct.
+
+But even with it, **128k sits right at the 94.5 GB GH200 ceiling.** Measured single-generation
+peaks at 128k (~130909 real tokens): fp16 **92.2 GB (fits, recall 9.5)**; k2b / k2b_k2r8 /
+turboquant_mse all **OOM at 99–100 GB** when run sequentially in one process — the codec arms'
+transient quantizer scratch (Hadamard/SVD/Lloyd/QJL working tensors) plus cross-arm fragmentation
+pushes ~7 GB past the ceiling. In a **completely fresh process per arm**, the codec arms *do* fit
+(an isolated earlier run measured k2b peak 65.7 GB → recall **10.0**, k2b_k2r8 6.19, turboquant_mse
+6.67, all beating/around fp16's 9.52). So the honest status:
+
+| 128k NIAH (recall_full, depth 0.5, fresh-process per arm) | recall | peak |
+|---|---|---|
+| fp16 | 9.52 | 92 GB |
+| **k2b (3-bit K)** | **10.0** | 66 GB (fresh) |
+| k2b_k2r8 (2-bit K) | 6.19 | 66 GB (fresh) |
+| turboquant_mse | 6.67 | 62 GB (fresh) |
+
+The **3-bit-key robustness extends to 128k** (k2b 10.0 ≥ fp16 9.52; 2-bit k2b_k2r8 degrades to
+6.19) — the tradeoff holds at maximum context. A *batched* 128k sweep (all arms one process) is
+**not feasible on this GPU**: it needs the fused dequant-attention kernel (deferred engineering
+item) to cut the transient scratch, or a larger GPU. Two operational notes: long-context must run
+**solo** (no co-residency), and the codec arms' higher *peak* is transient compute scratch, **not**
+resident footprint — the deployable size is the bpe/compression column (5–7× smaller).
 
 ## Cross-model generalization — both current-gen models are non-standard-attention (out of scope)
 
