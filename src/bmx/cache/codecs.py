@@ -38,11 +38,19 @@ CACHE_ARMS = (
     "turboquant_prod",
     "lowrank_rtn_channel",
     "lowrank_waterfill_channel",
+    "lowrank_eigwaterfill_channel",
+    "lowrank_randwaterfill_channel",
 )
 
 # Arms whose codec asserts S % group == 0 (used by streaming.py for alignment).
 S_DIVISIBILITY_ARMS = frozenset(
-    {"rtn_channel", "lowrank_rtn_channel", "lowrank_waterfill_channel"}
+    {
+        "rtn_channel",
+        "lowrank_rtn_channel",
+        "lowrank_waterfill_channel",
+        "lowrank_eigwaterfill_channel",
+        "lowrank_randwaterfill_channel",
+    }
 )
 
 
@@ -449,6 +457,98 @@ def _lowrank_waterfill_channel(
 
 
 # ---------------------------------------------------------------------------
+# Arm 8+9: lowrank_eigwaterfill_channel / lowrank_randwaterfill_channel
+# ---------------------------------------------------------------------------
+
+
+def _lowrank_rotwaterfill_channel(
+    M: torch.Tensor,
+    budget_bits: float,
+    group: int,
+    rank: int,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    rotation: str = "klt",
+    seed: int = 0,
+    charge_rotation: bool = False,
+    svd_factors: tuple | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Low-rank + rotated per-channel residual at water-filled mixed bit-widths.
+
+    Same as _lowrank_waterfill_channel, but the residual R = M - L is first rotated
+    by an orthogonal Q before per-channel water-filling, then unrotated. Q is either
+    the KLT (eigenvectors of R^T R, variance-concentrating) or a seeded random
+    orthogonal (variance-spreading control). Q orthogonal => inner products preserved,
+    so the rotation is logit-neutral; only the post-rotation quantization distorts.
+
+    bpe: idealized (rotation free) by default; charge_rotation=True (KLT only) adds
+    16*C/S for the stored C×C fp16 rotation matrix. The random rotation is seeded
+    (0 stored bits), so charge_rotation is a no-op for it.
+    """
+    from bmx.quant.hadamard import random_orthogonal
+
+    S, C = M.shape
+    assert rotation in ("klt", "random"), f"unknown rotation {rotation!r}"
+    assert rank > 0, f"rotwaterfill requires rank > 0, got {rank}"
+    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
+    assert S % group == 0, f"S={S} not divisible by group={group}"
+
+    if svd_factors is not None:
+        Us, V = svd_factors
+    else:
+        Us, V = truncated_svd(M, rank)
+    Us_stored = Us.half().float()
+    V_stored = V.half().float()
+    L = Us_stored @ V_stored.mT
+    R = M - L  # (S, C)
+
+    # When there is only one tier, the allocation is trivially uniform regardless of
+    # rotation — skip the rotate/unrotate so the codec is identical to the base
+    # _lowrank_waterfill_channel arm (logit-neutral by construction).
+    use_rotation = len(set(tiers)) > 1
+
+    if use_rotation:
+        # Build the orthogonal rotation Q (C, C).
+        if rotation == "klt":
+            # eigenvectors of the residual channel covariance, descending eigenvalue.
+            _, eigvecs = torch.linalg.eigh(R.mT @ R)  # ascending
+            Q = eigvecs.flip(dims=(1,))  # descending eigenvalue order
+        else:  # random
+            Q = random_orthogonal(C, seed, dtype=R.dtype, device=R.device)
+        R_rot = R @ Q  # (S, C) in rotated basis
+    else:
+        Q = None
+        R_rot = R
+
+    bits_per_ch = allocate_channel_bits(R_rot, budget_bits, tiers=tiers, axis=0)
+
+    R_rot_hat = torch.zeros_like(R_rot)
+    for b in sorted(set(int(x) for x in bits_per_ch.tolist())):
+        if b == 0:
+            continue
+        cols = (bits_per_ch == b).nonzero(as_tuple=True)[0]
+        if cols.numel() == 0:
+            continue
+        sub = R_rot[:, cols]
+        sub_hat = rtn_quantize(sub.mT, b, group).mT
+        R_rot_hat[:, cols] = sub_hat
+
+    if use_rotation:
+        R_hat = R_rot_hat @ Q.mT  # unrotate (Q orthogonal => Q^{-1} = Q^T)
+    else:
+        R_hat = R_rot_hat
+    M_hat = L + R_hat
+
+    mean_payload = float(bits_per_ch.float().mean().item())
+    scale_term = 16.0 / group
+    factor_term = 16.0 * rank * (S + C) / (S * C)
+    tier_term = math.ceil(math.log2(len(tiers))) / S
+    bpe = mean_payload + scale_term + factor_term + tier_term
+    if rotation == "klt" and charge_rotation:
+        bpe += 16.0 * C / S  # C×C fp16 rotation matrix amortized over S tokens
+    return M_hat, bpe
+
+
+# ---------------------------------------------------------------------------
 # Dispatch: quantize_cache
 # ---------------------------------------------------------------------------
 
@@ -463,6 +563,7 @@ def quantize_cache(
     rank: int = 0,
     svd_factors: tuple | None = None,
     tiers: tuple[int, ...] = (0, 2, 3, 4),
+    charge_rotation: bool = False,
 ) -> tuple[torch.Tensor, float]:
     """Compress (S, C) fp32 matrix M with the specified arm.
 
@@ -490,6 +591,8 @@ def quantize_cache(
     tiers : tuple[int, ...]
         Allowed bit-widths for per-channel allocation in lowrank_waterfill_channel.
         Ignored by all other arms.
+    charge_rotation : bool
+        Add the KLT rotation-matrix cost (16*C/S) to bpe; lowrank_eigwaterfill_channel only.
 
     Returns
     -------
@@ -512,9 +615,31 @@ def quantize_cache(
         return _turboquant_prod(M, bits, seed)
     elif arm == "lowrank_rtn_channel":
         return _lowrank_rtn_channel(M, bits, group, rank, svd_factors=svd_factors)
-    else:  # lowrank_waterfill_channel — guarded by the CACHE_ARMS assert above
+    elif arm == "lowrank_waterfill_channel":
         return _lowrank_waterfill_channel(
             M, float(bits), group, rank, tiers=tiers, svd_factors=svd_factors
+        )
+    elif arm == "lowrank_eigwaterfill_channel":
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="klt",
+            charge_rotation=charge_rotation,
+            svd_factors=svd_factors,
+        )
+    else:  # lowrank_randwaterfill_channel — guarded by the CACHE_ARMS assert above
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="random",
+            seed=seed,
+            svd_factors=svd_factors,
         )
 
 

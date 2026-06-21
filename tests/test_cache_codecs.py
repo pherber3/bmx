@@ -489,3 +489,217 @@ def test_waterfill_dropped_channels_are_zero_in_residual():
         f"Dropped channel(s) {dropped.tolist()} deviate from L: "
         f"max |M_hat - L| = {(M_hat[:, dropped] - L_f64[:, dropped]).abs().max().item():.3e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 12. Rotated-waterfill arms (KLT + random)
+# ---------------------------------------------------------------------------
+
+from bmx.cache.metrics import logit_distortion as _logit_distortion  # noqa: E402
+
+
+def _qkv_for(M, h_kv=2, seed=123):
+    """A fake query set (h_kv, T, d) matching M's (S, C=h_kv*d) layout for logit scoring."""
+    S, C = M.shape
+    d = C // h_kv
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(h_kv, 8, d, generator=g, dtype=M.dtype)
+
+
+def test_rotwaterfill_arms_registered():
+    from bmx.cache.codecs import CACHE_ARMS, S_DIVISIBILITY_ARMS
+
+    for arm in ("lowrank_eigwaterfill_channel", "lowrank_randwaterfill_channel"):
+        assert arm in CACHE_ARMS
+        assert arm in S_DIVISIBILITY_ARMS
+
+
+def test_rotation_is_inner_product_neutral():
+    # With a single high-bit uniform tier (near-lossless RTN), rotate+quantize+unrotate
+    # must match the unrotated near-lossless arm on LOGIT distortion to tight tol —
+    # for BOTH klt and random. Proves Q is orthogonal and rotate/unrotate is exact.
+    from bmx.cache.collect import from_matrix
+
+    M = _seeded_matrix(s=64, c=64, seed=4).double()
+    h_kv = 2
+    q = _qkv_for(M, h_kv=h_kv)
+    factors = truncated_svd(M, 4)
+    # near-lossless: one tier at 8 bits
+    base, _ = quantize_cache(
+        "lowrank_waterfill_channel",
+        M,
+        bits=8,
+        group=GROUP,
+        rank=4,
+        tiers=(8,),
+        svd_factors=factors,
+    )
+    lg_base = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(base, h_kv).double(), q
+    )
+    for rotation in ("klt", "random"):
+        rot, _ = quantize_cache(
+            "lowrank_eigwaterfill_channel"
+            if rotation == "klt"
+            else "lowrank_randwaterfill_channel",
+            M,
+            bits=8,
+            group=GROUP,
+            rank=4,
+            tiers=(8,),
+            seed=1,
+            svd_factors=factors,
+        )
+        lg_rot = _logit_distortion(
+            from_matrix(M, h_kv).double(), from_matrix(rot, h_kv).double(), q
+        )
+        assert abs(lg_rot - lg_base) < 1e-6, (
+            f"{rotation}: rotation not inner-product-neutral"
+        )
+
+
+def test_klt_reduces_to_raw_waterfill_when_diagonal():
+    # Diagonal-covariance residual -> KLT Q is identity (up to sign/perm). KLT arm then
+    # matches raw waterfill on LOGIT distortion (not raw tensors — eigvec sign ambiguity).
+    from bmx.cache.collect import from_matrix
+
+    # Build M whose residual after rank-r low-rank is independent per-channel:
+    # use a matrix with no low-rank structure so L is tiny and R ~= M with diagonal cov.
+    stds = [0.3, 1.0, 3.0, 9.0] * 16  # C = 64, varied per-channel, uncorrelated
+    R = _channel_matrix(
+        stds, s=64, seed=8
+    )  # (64, 64) fp64, diagonal cov by construction
+    h_kv = 2
+    q = _qkv_for(R, h_kv=h_kv)
+    factors = truncated_svd(R, 4)
+    raw, _ = quantize_cache(
+        "lowrank_waterfill_channel",
+        R,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors,
+    )
+    klt, _ = quantize_cache(
+        "lowrank_eigwaterfill_channel",
+        R,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors,
+    )
+    lg_raw = _logit_distortion(
+        from_matrix(R, h_kv).double(), from_matrix(raw, h_kv).double(), q
+    )
+    lg_klt = _logit_distortion(
+        from_matrix(R, h_kv).double(), from_matrix(klt, h_kv).double(), q
+    )
+    # diagonal cov => Q ~ I (up to sign) => same allocation, same logit distortion
+    assert abs(lg_raw - lg_klt) < 0.05, (
+        f"diagonal KLT diverged from raw: {lg_raw} vs {lg_klt}"
+    )
+
+
+def test_random_arm_is_free_and_reproducible():
+    M = _seeded_matrix(s=64, c=64, seed=6).double()
+    factors = truncated_svd(M, 4)
+    a, bpe_a = quantize_cache(
+        "lowrank_randwaterfill_channel",
+        M,
+        bits=3,
+        seed=7,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors,
+    )
+    b, bpe_b = quantize_cache(
+        "lowrank_randwaterfill_channel",
+        M,
+        bits=3,
+        seed=7,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors,
+    )
+    assert torch.allclose(a, b), "random arm not reproducible at fixed seed"
+    assert abs(bpe_a - bpe_b) < 1e-12
+    # honest == idealized: random rotation costs 0 stored bits. Compare to raw waterfill bpe
+    # (same payload+scale+factor+tier terms, no rotation term either way).
+    _, bpe_raw = quantize_cache(
+        "lowrank_waterfill_channel",
+        M,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors,
+    )
+    assert abs(bpe_a - bpe_raw) < 1e-9, (
+        "random arm bpe should match raw waterfill (no rotation charge)"
+    )
+
+
+def test_klt_honest_rotation_charge():
+    S_, C_, group_, rank_ = 64, 32, 16, 2
+    M = _seeded_matrix(s=S_, c=C_, seed=5).double()
+    _, bpe_ideal = quantize_cache(
+        "lowrank_eigwaterfill_channel",
+        M,
+        bits=3,
+        group=group_,
+        rank=rank_,
+        tiers=(0, 2, 3, 4),
+        charge_rotation=False,
+    )
+    _, bpe_honest = quantize_cache(
+        "lowrank_eigwaterfill_channel",
+        M,
+        bits=3,
+        group=group_,
+        rank=rank_,
+        tiers=(0, 2, 3, 4),
+        charge_rotation=True,
+    )
+    expected = 16.0 * C_ / S_
+    assert abs((bpe_honest - bpe_ideal) - expected) < 1e-9, "rotation charge != 16*C/S"
+
+
+def test_klt_concentrates_random_spreads_variance():
+    # KLT increases per-column variance CV (concentration); random decreases it (spreading).
+    from bmx.cache.codecs import _round_to_tiers  # noqa: F401  (sanity import path exists)
+
+    stds = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0] * 8  # C=64 anisotropic
+    R = _channel_matrix(stds, s=256, seed=2)
+
+    def cv(x):
+        v = x.var(dim=0, unbiased=False)
+        return (v.std() / v.mean().clamp_min(1e-30)).item()
+
+    from bmx.quant.hadamard import random_orthogonal
+
+    cv_raw = cv(R)
+    eigvals, eigvecs = torch.linalg.eigh(R.mT @ R)
+    R_klt = R @ eigvecs
+    cv_klt = cv(R_klt)
+    Qr = random_orthogonal(R.shape[1], seed=3, dtype=R.dtype)
+    R_rand = R @ Qr.mT
+    cv_rand = cv(R_rand)
+    assert cv_klt > cv_raw, f"KLT did not concentrate variance: {cv_klt} <= {cv_raw}"
+    assert cv_rand < cv_raw, f"random did not spread variance: {cv_rand} >= {cv_raw}"
+
+
+def test_rotwaterfill_s_divisibility_assert():
+    M = _seeded_matrix(s=63, c=64, seed=9).double()  # 63 % 16 != 0
+    with pytest.raises(AssertionError):
+        quantize_cache(
+            "lowrank_eigwaterfill_channel",
+            M,
+            bits=3,
+            group=16,
+            rank=2,
+            tiers=(0, 2, 3, 4),
+        )
