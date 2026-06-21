@@ -1,0 +1,35 @@
+{
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "device": "cuda",
+  "arms": [
+    "fp16",
+    "k2b",
+    "k2b_k2r8",
+    "k2b_k2r16",
+    "turboquant_mse",
+    "turboquant_prod",
+    "kivi"
+  ],
+  "lengths": [
+    4096,
+    8192,
+    16384,
+    32768,
+    65536
+  ],
+  "depths": [
+    0.1,
+    0.25,
+    0.4,
+    0.5,
+    0.6,
+    0.75,
+    0.9
+  ],
+  "n_prefill": 128,
+  "rank": 16,
+  "group": 64,
+  "seed": 0,
+  "answer_id": 7,
+  "max_new_tokens": 50
+}
