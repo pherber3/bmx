@@ -129,20 +129,32 @@ hardest (4.15, worst arm). The key-bits ↔ context tradeoff now holds across 24
   forward; co-resident with another 8B job it OOMs. Fix is serialization (run long-context
   solo), not a code change. Three co-resident runs were lost to this before serializing.
 
-## Cross-model generalization — one arch supported, one out of scope
+## Cross-model generalization — both current-gen models are non-standard-attention (out of scope)
 
 The multimodal-config port (`resolve_text_config` / `resolve_decoder_layers` /
 `resolve_vocab_size` in `streaming.py`) lets the cache read head geometry + vocab from
-`config.text_config` for `*ForConditionalGeneration` models. Outcome:
+`config.text_config` for `*ForConditionalGeneration` models. But both modern models tried turned
+out to use attention mechanisms `StreamingQuantizedCache` (uniform global softmax attention) does
+not model. This is itself a finding: the current SOTA-open frontier has moved off the uniform-
+global-attention design `StreamingQuantizedCache` assumes.
 
-- **Qwen3.6-27B — out of scope (not a bug).** It is a **hybrid linear-attention** model: some
-  layers use linear attention, and the forward calls `has_previous_state()` expecting
-  LinearAttention cache layers, which `StreamingQuantizedCache` (standard-attention only) does
-  not provide. KV-cache compression as framed here does not apply to linear-attention layers
-  (no growing softmax-KV cache to compress). Supporting it is a separate project.
-- **Gemma-4-31B — fixed.** First attempt failed on a missed `vocab_size` nesting
-  (`'Gemma4Config' has no attribute 'vocab_size'`); `resolve_vocab_size` closes that gap. The
-  frontier sweep is the remaining run.
+- **Qwen3.6-27B — hybrid linear attention.** Some layers use linear attention; the forward calls
+  `has_previous_state()` expecting LinearAttention cache layers we don't provide. KV-cache
+  compression as framed here doesn't apply to linear-attention layers (no growing softmax-KV
+  cache to compress).
+- **Gemma-4-31B — alternating sliding/full attention + per-type partial RoPE.** Got past the
+  config-nesting + `vocab_size` fixes (those work), then hit `KeyError: 'rope_type'`:
+  Gemma4's `rope_parameters` is keyed by attention type — `{full_attention: {rope_type:
+  proportional, partial_rotary_factor: 0.25, theta: 1e6}, sliding_attention: {rope_type: default,
+  theta: 1e4}}` — and `layer_types` is a 5-sliding : 1-full pattern across 60 layers. Two
+  incompatibilities: (a) per-layer-type RoPE with a 0.25 partial-rotary factor (our `rope_cos_sin`
+  builds one flat RoPE table); (b) sliding-window layers have a *windowed* KV cache, a different
+  compression contract than the full cache we stream. A faithful port is substantial, not a patch.
+
+**Conclusion:** the Llama-3.1-8B result stands as the single-model verdict. Generalizing to the
+2026 open frontier (Gemma4, Qwen3.6) requires per-layer-type RoPE + sliding-window cache support —
+a real engineering project, scoped but not done here. Both attempts are honest negatives, not
+result-invalidating: they say the cache needs new layer kinds, not that k2b is wrong.
 
 ## Bottom line
 
