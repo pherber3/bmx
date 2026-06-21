@@ -437,15 +437,55 @@ def test_waterfill_s_divisibility_assert():
 
 
 def test_waterfill_dropped_channels_are_zero_in_residual():
-    # A near-zero-variance channel in the RESIDUAL should reconstruct from L only.
-    # Construct M so one channel is exactly the low-rank part (zero residual).
-    M = _seeded_matrix(s=64, c=64, seed=2).double()
+    """Tier-0 (dropped) channels must reconstruct from the low-rank component L only.
+
+    Construction: build a (S, C) fp64 matrix whose LAST column has residual
+    variance ~(1e-4)^2 while all others are O(1).  Under a tight budget this
+    near-zero column is deterministically allocated 0 bits by the water-filler.
+    We assert (a) at least one tier-0 channel exists, and (b) for every dropped
+    column c: M_hat[:, c] == L[:, c] exactly (atol=1e-9), i.e. the quantized
+    residual contributes nothing.
+    """
+    S_, C_, rank_, group_ = 64, 32, 4, 16
+    tiers = (0, 2, 3, 4)
+    budget_bits = 2
+
+    # Build base matrix and inject one near-zero-residual column.
+    g = torch.Generator().manual_seed(13)
+    M = torch.randn(S_, C_, generator=g, dtype=torch.float64)
+    # Make column 0 have very small std so its residual is tiny.
+    M[:, 0] *= 1e-4
+
+    # Pre-compute svd_factors so we can independently reconstruct L.
+    svd_factors = truncated_svd(M, rank_)
+    Us, V = svd_factors
+    # Replicate the codec's fp16 roundtrip exactly.
+    L = Us.half().float() @ V.half().float().mT  # (S_, C_)
+
+    # Identify which channels the water-filler drops on the residual.
+    R = M - L
+    bits_per_ch = allocate_channel_bits(R, budget_bits, tiers=tiers, axis=0)
+    dropped = (bits_per_ch == 0).nonzero(as_tuple=True)[0]
+    assert dropped.numel() > 0, (
+        "Construction failed: no channel was allocated tier 0.  "
+        "Tighten budget_bits or reduce M[:, 0] std further."
+    )
+
+    # Run the full codec arm (passes svd_factors so it uses the same L).
     M_hat, _ = quantize_cache(
         "lowrank_waterfill_channel",
         M,
-        bits=2,
-        group=16,
-        rank=4,
-        tiers=(0, 2, 3, 4),
+        bits=budget_bits,
+        group=group_,
+        rank=rank_,
+        tiers=tiers,
+        svd_factors=svd_factors,
     )
     assert M_hat.shape == M.shape
+
+    # Dropped channels must equal L exactly (residual contribution is zero).
+    L_f64 = L.double()
+    assert torch.allclose(M_hat[:, dropped], L_f64[:, dropped], atol=1e-9), (
+        f"Dropped channel(s) {dropped.tolist()} deviate from L: "
+        f"max |M_hat - L| = {(M_hat[:, dropped] - L_f64[:, dropped]).abs().max().item():.3e}"
+    )
