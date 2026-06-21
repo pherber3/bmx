@@ -73,21 +73,37 @@ def run(cfg: Config, model=None, root: str = "results"):
         else None
     )
     score_kind = "code_sim_offline" if tokenizer is None else "code_sim"
-    # `length` is a proxy for the compression calibration. Real prompts are 4k–16k, so it
-    # understates compression; it is equal across arms, so relative rankings are unaffected.
-    length = 32 if tokenizer is None else cfg.n_prefill * 2
+    # Compression-calibration length. Real LongBench code prompts are 4k–16k tokens; calibrate
+    # at the MEDIAN tokenized prompt length per task so the compression column is honest (a
+    # short fixed proxy understates it badly — the fp16 recent-window is a larger fraction at
+    # short length). Offline path has no tokenizer: keep the tiny synthetic length.
+    from bmx.cache.longbench import build_longbench_prompt
+
+    def _calib_length(task: str) -> int:
+        if tokenizer is None:
+            return 32
+        lens = sorted(
+            build_longbench_prompt(tokenizer, it, task).shape[1]
+            for it in task_items[task]
+        )
+        return lens[len(lens) // 2]  # median; equal across arms, so rankings unaffected
+
+    # Per-task calibration length (depends only on the task's prompts, not the arm).
+    calib_length = {task: _calib_length(task) for task in cfg.tasks}
 
     rows = []
     for arm in cfg.arms:
         k_spec, v_spec = _spec_pair(arm, cfg)
-        bpe_k, bpe_v, compression = compression_for(model, k_spec, v_spec, length)
         for task in cfg.tasks:
+            bpe_k, bpe_v, compression = compression_for(
+                model, k_spec, v_spec, calib_length[task]
+            )
             if tokenizer is None:
                 # Offline: score one synthetic generation against itself; mechanism only.
                 # Generate on CPU (seeded Generator is CPU-only), move to model's device.
                 g = torch.Generator().manual_seed(cfg.seed)
                 prompt_ids = torch.randint(
-                    0, model.config.vocab_size, (1, length), generator=g
+                    0, model.config.vocab_size, (1, calib_length[task]), generator=g
                 ).to(model.device)
                 resp = generate_through_cache(
                     model,
