@@ -27,8 +27,15 @@ def make_figures(df, out_dir: str) -> list[Path]:
     fig, ax = plt.subplots(figsize=(7, 5))
     for arm, g in df.groupby("arm"):
         gl = g.groupby("length")[metric].mean().sort_index()
-        comp = g["compression"].iloc[0]
-        ax.plot(gl.index, gl.values, marker="o", label=f"{arm} ({comp:.1f}×)")
+        first = g.sort_values("length").iloc[0]
+        comp = first["compression"]
+        first_len = int(first["length"])
+        ax.plot(
+            gl.index,
+            gl.values,
+            marker="o",
+            label=f"{arm} ({comp:.1f}× @{first_len})",
+        )
     ax.set_xlabel("context length (tokens)")
     ax.set_ylabel("ROUGE-1 recall ×10 (mean over depth)")
     ax.set_title("NIAH recall vs length under KV compression")

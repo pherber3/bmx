@@ -37,6 +37,27 @@ from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
 
 
+def compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, float]:
+    """Measured (bpe_k, bpe_v, compression) for an arm at a given sequence length.
+
+    Runs a calibration prefill of `length` tokens first: bits_per_entry is nan until a
+    forward pass quantizes a block. Then reads the blended-bpe accounting off the cache.
+    """
+    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache.attach(model)
+    g = torch.Generator().manual_seed(0)
+    # Generate on CPU (seeded Generator is CPU-only), then move to the model's device.
+    ids = torch.randint(0, model.config.vocab_size, (1, length), generator=g).to(
+        model.device
+    )
+    with cache:
+        with torch.no_grad():
+            model(ids, past_key_values=cache, use_cache=True)
+    bpe_k, bpe_v = cache.bits_per_entry()
+    mem = cache.memory_report(seq_len=length)
+    return bpe_k, bpe_v, mem["compression"]
+
+
 def live_generation_ppl(
     model,
     input_ids: torch.Tensor,

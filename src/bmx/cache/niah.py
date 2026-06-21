@@ -157,6 +157,9 @@ def generate_through_cache(
     """
     L = prompt_ids.shape[1]
     cont_len = L - n_prefill
+    assert cont_len > 0, (
+        f"n_prefill={n_prefill} >= prompt length {L}; nothing to generate"
+    )
     cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
     with cache:
