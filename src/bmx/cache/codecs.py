@@ -75,6 +75,64 @@ def _unrotate(M_rot: torch.Tensor, seed: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Reverse water-filling per-channel bit allocator
+# ---------------------------------------------------------------------------
+
+
+def _round_to_tiers(b: torch.Tensor, tiers_t: torch.Tensor) -> torch.Tensor:
+    """Round each continuous bit-rate to the nearest value in tiers_t (1-D sorted)."""
+    # |b - tier| argmin over the tier axis
+    diffs = (b.unsqueeze(-1) - tiers_t).abs()  # (C, n_tiers)
+    idx = diffs.argmin(dim=-1)
+    return tiers_t[idx]
+
+
+def allocate_channel_bits(
+    R: torch.Tensor,
+    budget_bits: float,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    *,
+    axis: int = 0,
+    n_search: int = 40,
+) -> torch.Tensor:
+    """Reverse-water-filling per-channel bit allocation (Cover-Thomas Thm 13.3.3).
+
+    Per-channel variance var_c (over `axis`); continuous rate
+    b_c = max(0, 0.5*log2(var_c / kappa)); kappa bisected so the tier-rounded
+    mean lands at-or-just-below budget_bits. Deterministic.
+
+    Returns (C,) int64 bit-widths, each a member of `tiers`.
+    """
+    assert R.dim() == 2, f"R must be 2-D (S, C); got {tuple(R.shape)}"
+    var = R.var(dim=axis, unbiased=False).double().clamp_min(1e-30)  # (C,)
+    tiers_t = torch.tensor(sorted(tiers), dtype=torch.float64, device=R.device)
+
+    def rounded_mean(kappa: float) -> tuple[torch.Tensor, float]:
+        b_cont = (0.5 * torch.log2(var / kappa)).clamp_min(0.0)
+        b_round = _round_to_tiers(b_cont, tiers_t)
+        return b_round, b_round.mean().item()
+
+    # Bracket kappa in log space: smaller kappa => more bits.
+    lo_k = float(var.min().item()) * 1e-6  # high-bit end
+    hi_k = float(var.max().item()) * 1e6  # zero-bit end
+    lo = math.log(lo_k)
+    hi = math.log(hi_k)
+
+    # Bisect for the smallest kappa whose rounded mean <= budget (monotone:
+    # mean is non-increasing in kappa). Keep the best feasible candidate.
+    best = _round_to_tiers((0.5 * torch.log2(var / hi_k)).clamp_min(0.0), tiers_t)
+    for _ in range(n_search):
+        mid = 0.5 * (lo + hi)
+        b_round, m = rounded_mean(math.exp(mid))
+        if m <= budget_bits + 1e-12:
+            best = b_round  # feasible (not over budget); try for more bits
+            hi = mid  # decrease kappa
+        else:
+            lo = mid  # over budget; raise kappa
+    return best.to(torch.int64)
+
+
+# ---------------------------------------------------------------------------
 # Gaussian Lloyd-Max codebook (cached)
 # ---------------------------------------------------------------------------
 

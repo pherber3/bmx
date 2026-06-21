@@ -7,6 +7,7 @@ import torch
 
 from bmx.cache.codecs import (
     CACHE_ARMS,
+    allocate_channel_bits,
     gaussian_codebook,
     qjl_reconstruct,
     quantize_cache,
@@ -296,3 +297,71 @@ class TestSvdFactorsEquivalence:
         assert math.isclose(bpe_default, bpe_passed, rel_tol=1e-9), (
             f"bpe mismatch: {bpe_default} vs {bpe_passed}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 10. allocate_channel_bits — reverse water-filling per-channel allocator
+# ---------------------------------------------------------------------------
+
+
+def _channel_matrix(per_channel_std, s=256, seed=11):
+    """(s, C) matrix whose column c has std per_channel_std[c]."""
+    g = torch.Generator().manual_seed(seed)
+    C = len(per_channel_std)
+    base = torch.randn(s, C, generator=g, dtype=torch.float64)
+    return base * torch.tensor(per_channel_std, dtype=torch.float64)
+
+
+def test_allocate_monotone_in_variance():
+    # increasing per-channel std -> rounded bits non-decreasing
+    stds = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+    R = _channel_matrix(stds)
+    bits = allocate_channel_bits(R, budget_bits=3.0)
+    bits_list = bits.tolist()
+    assert bits_list == sorted(bits_list), f"not monotone: {bits_list}"
+
+
+def test_allocate_realized_mean_near_budget():
+    stds = [0.05, 0.2, 0.5, 1.0, 2.0, 5.0, 20.0, 100.0]
+    R = _channel_matrix(stds)
+    for budget in (2.0, 3.0, 3.5):
+        bits = allocate_channel_bits(R, budget_bits=budget)
+        realized = bits.float().mean().item()
+        # tier-rounding can only land at-or-below; never overshoot the budget
+        assert realized <= budget + 1e-9, f"overshoot: {realized} > {budget}"
+        assert realized >= budget - 1.0, f"too far under: {realized} << {budget}"
+
+
+def test_allocate_drops_low_variance_channels_when_tight():
+    # one giant channel + many tiny ones, tight budget -> tiny ones dropped to 0
+    stds = [1000.0] + [0.001] * 20
+    R = _channel_matrix(stds)
+    bits = allocate_channel_bits(R, budget_bits=1.0)
+    assert bits[0].item() > 0
+    assert (bits[1:] == 0).any(), (
+        "expected some low-variance channels dropped to tier 0"
+    )
+
+
+def test_allocate_isotropic_is_uniform():
+    # equal variance -> all channels same tier (degenerate water-fill)
+    stds = [1.0] * 12
+    R = _channel_matrix(stds)
+    bits = allocate_channel_bits(R, budget_bits=3.0)
+    assert len(set(bits.tolist())) == 1, f"isotropic not uniform: {bits.tolist()}"
+
+
+def test_allocate_deterministic():
+    stds = [0.1, 1.0, 10.0, 100.0]
+    R = _channel_matrix(stds)
+    a = allocate_channel_bits(R, budget_bits=3.0)
+    b = allocate_channel_bits(R, budget_bits=3.0)
+    assert torch.equal(a, b)
+
+
+def test_allocate_returns_only_tier_values():
+    stds = [0.1, 1.0, 10.0, 100.0, 1000.0]
+    R = _channel_matrix(stds)
+    tiers = (0, 2, 3, 4)
+    bits = allocate_channel_bits(R, budget_bits=3.0, tiers=tiers)
+    assert set(bits.tolist()).issubset(set(tiers))
