@@ -6,8 +6,9 @@ on the key residual won 2.24× on logit but is KILLED-HONEST (the C×C matrix co
 win to beat uniform at HONEST bpe** — read as a logit-vs-honest-bpe **Pareto
 frontier** against a uniform bit-sweep. Arms: top-k truncated KLT (k∈{32,64,128}),
 block-diagonal per-head KLT, frozen-prefill full KLT, oracle (refit control). Runs:
-`results/k2_waterfill/20260621-175904-6027e56` (llama, post-RoPE) + the gpt2 run in
-the same root. rank=16, group=64, tiers=(0,2,3,4), budget 3.0, prefill_fit_len=512.
+`results/k2_waterfill/20260621-175904-6027e56` (llama, post-RoPE) and
+`results/k2_waterfill/20260621-175657-de07b6d` (gpt2). rank=16, group=64,
+tiers=(0,2,3,4), budget 3.0, prefill_fit_len=512.
 
 ## Headline: NO structured rotation beats uniform at matched bpe — killed
 
