@@ -27,8 +27,8 @@ def test_stable_rank_helper():
     assert sr_r1 < 2.0
 
 
-def test_experiment_smoke(tmp_path):
-    # Build a tiny synthetic cache file with the layer-key convention and run main.
+def _build_synthetic_cache(tmp_path: Path) -> Path:
+    """Write a tiny 2-layer synthetic cache and return its path."""
     from safetensors.torch import save_file
 
     h_kv, S, d = 2, 64, 8  # C = 16
@@ -41,6 +41,12 @@ def test_experiment_smoke(tmp_path):
         tensors[f"layer{i}.q"] = torch.randn(h_kv, S, d, generator=g).half()
     cache_path = tmp_path / "synthetic.safetensors"
     save_file(tensors, str(cache_path))
+    return cache_path
+
+
+def test_experiment_smoke(tmp_path):
+    # Build a tiny synthetic cache file with the layer-key convention and run main.
+    cache_path = _build_synthetic_cache(tmp_path)
 
     cfg = k2_waterfill.Config(
         cache_path=str(cache_path),
@@ -67,3 +73,30 @@ def test_experiment_smoke(tmp_path):
         assert abs(bpe_uni - bpe_wf) < 0.05, (
             f"bpe mismatch L{layer}: {bpe_uni} vs {bpe_wf}"
         )
+
+
+def test_default_root_no_out_root(tmp_path, monkeypatch):
+    """Regression: out_root='' must not crash (was passing None to Path())."""
+    # Redirect cwd to tmp_path so create_run's default 'results' root lands there.
+    monkeypatch.chdir(tmp_path)
+    cache_path = _build_synthetic_cache(tmp_path)
+
+    cfg = k2_waterfill.Config(
+        cache_path=str(cache_path),
+        model_label="synthetic",
+        model_name="",
+        budget_bits=3.0,
+        group=16,
+        rank=4,
+        # out_root intentionally left as "" (the default) to exercise the default path
+    )
+    df = k2_waterfill.main(cfg)
+    assert len(df) == 3 * 2, "expected 3 arms × 2 layers"
+    assert set(df["arm"].unique()) == {
+        "lowrank_rtn_channel",
+        "lowrank_waterfill_channel",
+        "outlier_two_tier",
+    }
+    # run dir must be under tmp_path, not the real repo results/
+    results_dir = tmp_path / "results" / "k2_waterfill"
+    assert results_dir.exists(), f"expected run dir under tmp_path: {results_dir}"

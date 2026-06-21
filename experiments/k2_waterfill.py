@@ -89,7 +89,11 @@ def _outlier_two_tier(
 
 
 def main(cfg: Config) -> pd.DataFrame:
-    run = create_run("k2_waterfill", cfg, root=cfg.out_root or None)
+    run = (
+        create_run("k2_waterfill", cfg, root=cfg.out_root)
+        if cfg.out_root
+        else create_run("k2_waterfill", cfg)
+    )
 
     cache = load_cache(cfg.cache_path)
     layer_keys: dict[int, dict[str, torch.Tensor]] = {}
