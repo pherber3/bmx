@@ -37,10 +37,29 @@ CACHE_ARMS = (
     "turboquant_mse",
     "turboquant_prod",
     "lowrank_rtn_channel",
+    "lowrank_waterfill_channel",
+    "lowrank_eigwaterfill_channel",
+    "lowrank_randwaterfill_channel",
+    "lowrank_topkwaterfill_channel",
+    "lowrank_blockdiagwaterfill_channel",
+    "lowrank_frozenwaterfill_channel",
+    "lowrank_oraclewaterfill_channel",
 )
 
 # Arms whose codec asserts S % group == 0 (used by streaming.py for alignment).
-S_DIVISIBILITY_ARMS = frozenset({"rtn_channel", "lowrank_rtn_channel"})
+S_DIVISIBILITY_ARMS = frozenset(
+    {
+        "rtn_channel",
+        "lowrank_rtn_channel",
+        "lowrank_waterfill_channel",
+        "lowrank_eigwaterfill_channel",
+        "lowrank_randwaterfill_channel",
+        "lowrank_topkwaterfill_channel",
+        "lowrank_blockdiagwaterfill_channel",
+        "lowrank_frozenwaterfill_channel",
+        "lowrank_oraclewaterfill_channel",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +91,64 @@ def _unrotate(M_rot: torch.Tensor, seed: int) -> torch.Tensor:
     else:
         Q = random_orthogonal(C, seed, dtype=M_rot.dtype, device=M_rot.device)
         return M_rot @ Q  # Q^T inverse is Q (orthogonal)
+
+
+# ---------------------------------------------------------------------------
+# Reverse water-filling per-channel bit allocator
+# ---------------------------------------------------------------------------
+
+
+def _round_to_tiers(b: torch.Tensor, tiers_t: torch.Tensor) -> torch.Tensor:
+    """Round each continuous bit-rate to the nearest value in tiers_t (1-D sorted)."""
+    # |b - tier| argmin over the tier axis
+    diffs = (b.unsqueeze(-1) - tiers_t).abs()  # (C, n_tiers)
+    idx = diffs.argmin(dim=-1)
+    return tiers_t[idx]
+
+
+def allocate_channel_bits(
+    R: torch.Tensor,
+    budget_bits: float,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    *,
+    axis: int = 0,
+    n_search: int = 40,
+) -> torch.Tensor:
+    """Reverse-water-filling per-channel bit allocation (Cover-Thomas Thm 13.3.3).
+
+    Per-channel variance var_c (over `axis`); continuous rate
+    b_c = max(0, 0.5*log2(var_c / kappa)); kappa bisected so the tier-rounded
+    mean lands at-or-just-below budget_bits. Deterministic.
+
+    Returns (C,) int64 bit-widths, each a member of `tiers`.
+    """
+    assert R.dim() == 2, f"R must be 2-D (S, C); got {tuple(R.shape)}"
+    var = R.var(dim=axis, unbiased=False).double().clamp_min(1e-30)  # (C,)
+    tiers_t = torch.tensor(sorted(tiers), dtype=torch.float64, device=R.device)
+
+    def rounded_mean(kappa: float) -> tuple[torch.Tensor, float]:
+        b_cont = (0.5 * torch.log2(var / kappa)).clamp_min(0.0)
+        b_round = _round_to_tiers(b_cont, tiers_t)
+        return b_round, b_round.mean().item()
+
+    # Bracket kappa in log space: smaller kappa => more bits.
+    lo_k = float(var.min().item()) * 1e-6  # high-bit end
+    hi_k = float(var.max().item()) * 1e6  # zero-bit end
+    lo = math.log(lo_k)
+    hi = math.log(hi_k)
+
+    # Bisect for the smallest kappa whose rounded mean <= budget (monotone:
+    # mean is non-increasing in kappa). Keep the best feasible candidate.
+    best = _round_to_tiers((0.5 * torch.log2(var / hi_k)).clamp_min(0.0), tiers_t)
+    for _ in range(n_search):
+        mid = 0.5 * (lo + hi)
+        b_round, m = rounded_mean(math.exp(mid))
+        if m <= budget_bits + 1e-12:
+            best = b_round  # feasible (not over budget); try for more bits
+            hi = mid  # decrease kappa
+        else:
+            lo = mid  # over budget; raise kappa
+    return best.to(torch.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +402,218 @@ def _lowrank_rtn_channel(
 
 
 # ---------------------------------------------------------------------------
+# Arm 7: lowrank_waterfill_channel
+# ---------------------------------------------------------------------------
+
+
+def _lowrank_waterfill_channel(
+    M: torch.Tensor,
+    budget_bits: float,
+    group: int,
+    rank: int,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    svd_factors: tuple | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Low-rank + per-channel residual at water-filled mixed bit-widths.
+
+    Same low-rank path as lowrank_rtn_channel; the residual R = M - L is
+    quantized per channel at bit-widths chosen by reverse water-filling over
+    per-channel variance (Cover-Thomas Thm 13.3.3). Tier 0 channels are dropped
+    (reconstructed from L only).
+    """
+    S, C = M.shape
+    assert rank > 0, f"lowrank_waterfill_channel requires rank > 0, got {rank}"
+    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
+    assert S % group == 0, f"S={S} not divisible by group={group}"
+
+    if svd_factors is not None:
+        Us, V = svd_factors
+    else:
+        Us, V = truncated_svd(M, rank)
+
+    # fp16 roundtrip for honest stored-precision — identical to _lowrank_rtn_channel
+    Us_stored = Us.half().float()
+    V_stored = V.half().float()
+    L = Us_stored @ V_stored.mT  # (S, C)
+
+    R = M - L  # (S, C)
+
+    # Allocate per-channel bits on the residual.
+    bits_per_ch = allocate_channel_bits(R, budget_bits, tiers=tiers, axis=0)  # (C,)
+
+    # Quantize each tier-group of channels at its bit-width; tier 0 -> zeros.
+    # Each b in the set is present by construction, so cols is never empty.
+    R_hat = torch.zeros_like(R)
+    for b in sorted(set(int(x) for x in bits_per_ch.tolist())):
+        if b == 0:
+            continue  # dropped channels stay zero
+        cols = (bits_per_ch == b).nonzero(as_tuple=True)[0]
+        sub = R[:, cols]  # (S, n_b); quantize per channel along token dim
+        sub_hat = rtn_quantize(sub.mT, b, group).mT  # (n_b, S) groups -> back
+        R_hat[:, cols] = sub_hat
+
+    M_hat = L + R_hat
+
+    # Honest bpe (per entry; all metadata counted):
+    mean_payload = float(bits_per_ch.float().mean().item())
+    scale_term = 16.0 / group
+    factor_term = 16.0 * rank * (S + C) / (S * C)
+    tier_term = math.ceil(math.log2(len(tiers))) / S
+    bpe = mean_payload + scale_term + factor_term + tier_term
+    return M_hat, bpe
+
+
+# ---------------------------------------------------------------------------
+# Arm 8+9: lowrank_eigwaterfill_channel / lowrank_randwaterfill_channel
+# ---------------------------------------------------------------------------
+
+
+def _klt_basis(X: torch.Tensor) -> torch.Tensor:
+    """KLT rotation for the channel covariance of X: eigenvectors of XᵀX, descending
+    eigenvalue order. Orthogonal (C×C) — columns are the residual's principal directions."""
+    _, ev = torch.linalg.eigh(X.mT @ X)
+    return ev.flip(dims=(1,))
+
+
+def _lowrank_rotwaterfill_channel(
+    M: torch.Tensor,
+    budget_bits: float,
+    group: int,
+    rank: int,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    rotation: str = "klt",
+    seed: int = 0,
+    charge_rotation: bool = False,
+    svd_factors: tuple | None = None,
+    topk_k: int = 0,
+    prefill_fit_len: int = 0,
+    h_kv: int = 0,
+) -> tuple[torch.Tensor, float]:
+    """Low-rank + rotated per-channel residual at water-filled mixed bit-widths.
+
+    Same as _lowrank_waterfill_channel, but the residual R = M - L is first rotated
+    by an orthogonal Q before per-channel water-filling, then unrotated. Q is either
+    the KLT (eigenvectors of R^T R, variance-concentrating) or a seeded random
+    orthogonal (variance-spreading control). Q orthogonal => inner products preserved,
+    so the rotation is logit-neutral; only the post-rotation quantization distorts.
+
+    Supported rotation modes:
+    - "klt": full C×C KLT on residual; charge_rotation=True adds 16*C/S.
+    - "random": seeded random orthogonal (0 stored bits; charge_rotation no-op).
+    - "topk": honest partial rotation — only top-k eigenvectors (C×k) stored;
+      complement stays in original basis. Charge: 16*topk_k/S when charge_rotation.
+    - "blockdiag": per-head (d×d) KLT; heads are independent. Charge: 16*d/S.
+    - "frozen": full KLT fit on the first prefill_fit_len tokens, applied to all.
+      Charge: 16*C/S when charge_rotation.
+    - "oracle": full KLT refit on ALL tokens (control; never charged).
+
+    bpe: idealized (rotation free) by default; charge_rotation=True charges the
+    stored rotation metadata per mode (except oracle which is never charged).
+    """
+    S, C = M.shape
+    assert rotation in (
+        "klt",
+        "random",
+        "topk",
+        "blockdiag",
+        "frozen",
+        "oracle",
+    ), f"unknown rotation {rotation!r}"
+    assert rank > 0, f"rotwaterfill requires rank > 0, got {rank}"
+    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
+    assert S % group == 0, f"S={S} not divisible by group={group}"
+
+    if svd_factors is not None:
+        Us, V = svd_factors
+    else:
+        Us, V = truncated_svd(M, rank)
+    Us_stored = Us.half().float()
+    V_stored = V.half().float()
+    L = Us_stored @ V_stored.mT
+    R = M - L  # (S, C)
+
+    # When there is only one tier, the allocation is trivially uniform regardless of
+    # rotation — skip the rotate/unrotate so the codec is identical to the base
+    # _lowrank_waterfill_channel arm (logit-neutral by construction).
+    use_rotation = len(set(tiers)) > 1
+
+    def _waterfill_in_basis(
+        R_in: torch.Tensor, Q: torch.Tensor | None
+    ) -> tuple[torch.Tensor, float]:
+        """Water-fill R_in after rotating by Q (None = identity). Returns (R_hat, mean_payload)
+        with R_hat in the ORIGINAL basis."""
+        R_rot = R_in if Q is None else (R_in @ Q)
+        bits_pc = allocate_channel_bits(R_rot, budget_bits, tiers=tiers, axis=0)
+        R_rot_hat = torch.zeros_like(R_rot)
+        # Each b in the set is present by construction, so cols is never empty.
+        for b in sorted(set(int(x) for x in bits_pc.tolist())):
+            if b == 0:
+                continue
+            cols = (bits_pc == b).nonzero(as_tuple=True)[0]
+            R_rot_hat[:, cols] = rtn_quantize(R_rot[:, cols].mT, b, group).mT
+        R_hat_local = R_rot_hat if Q is None else (R_rot_hat @ Q.mT)
+        return R_hat_local, float(bits_pc.float().mean().item())
+
+    if not use_rotation:
+        R_hat, mean_payload = _waterfill_in_basis(R, None)
+        rot_bits = 0.0
+    elif rotation in ("klt", "oracle", "frozen"):
+        # All three are a full-C×C KLT differing only in WHICH tokens fit it and the
+        # charge rule: klt/oracle fit on all tokens, frozen on the first P; oracle is
+        # the never-charged control (it refits on the scored tokens — not deployable).
+        P = min(prefill_fit_len if prefill_fit_len > 0 else S, S)
+        fit = R[:P] if rotation == "frozen" else R
+        Q = _klt_basis(fit)
+        R_hat, mean_payload = _waterfill_in_basis(R, Q)
+        rot_bits = (16.0 * C / S) if (charge_rotation and rotation != "oracle") else 0.0
+    elif rotation == "random":
+        Q = random_orthogonal(C, seed, dtype=R.dtype, device=R.device)
+        R_hat, mean_payload = _waterfill_in_basis(R, Q)
+        rot_bits = 0.0  # seeded rotation costs 0 stored bits
+    elif rotation == "topk":
+        # Honest partial rotation: only top-k eigen-directions (C×k) stored.
+        # The complement stays in the original basis — the complement eigenvectors
+        # are data-dependent and NOT recomputable by the decoder, so rotating the
+        # full basis and charging only 16*k/S would overstate compression.
+        # topk_k=0 defaults to C (full eigenbasis), equivalent to KLT.
+        kk = min(topk_k if topk_k > 0 else C, C)
+        Qk = _klt_basis(R)[:, :kk]  # (C, k) top-k eigenvectors by eigenvalue
+        # Rotate top-k subspace; water-fill those k columns.
+        Rk = R @ Qk  # (S, k) projection onto top-k subspace
+        Rk_hat, p_k = _waterfill_in_basis(Rk, None)  # already in rotated subspace
+        topk_back = Rk_hat @ Qk.mT  # (S, C) contribution from top-k subspace
+        # Complement: residual not explained by top-k, water-filled in original basis.
+        R_comp = R - (R @ Qk) @ Qk.mT  # project OUT the top-k subspace
+        Rcomp_hat, p_c = _waterfill_in_basis(R_comp, None)
+        R_hat = topk_back + Rcomp_hat
+        # Blended payload over all C channels (k rotated + C-k complement).
+        mean_payload = (p_k * kk + p_c * (C - kk)) / C
+        rot_bits = (16.0 * kk / S) if charge_rotation else 0.0
+    else:  # blockdiag
+        # h_kv=0 defaults to 1 (treat whole channel as one block = full KLT).
+        _h = h_kv if h_kv > 0 else 1
+        assert C % _h == 0, f"C={C} not divisible by h_kv={_h}"
+        d = C // _h
+        R_hat = torch.zeros_like(R)
+        payloads = []
+        for hh in range(_h):
+            sl = slice(hh * d, (hh + 1) * d)
+            Rh = R[:, sl]
+            Rh_hat, ph = _waterfill_in_basis(Rh, _klt_basis(Rh))
+            R_hat[:, sl] = Rh_hat
+            payloads.append(ph)
+        mean_payload = float(sum(payloads) / len(payloads))
+        rot_bits = (16.0 * d / S) if charge_rotation else 0.0
+
+    M_hat = L + R_hat
+    scale_term = 16.0 / group
+    factor_term = 16.0 * rank * (S + C) / (S * C)
+    tier_term = math.ceil(math.log2(len(tiers))) / S
+    bpe = mean_payload + scale_term + factor_term + tier_term + rot_bits
+    return M_hat, bpe
+
+
+# ---------------------------------------------------------------------------
 # Dispatch: quantize_cache
 # ---------------------------------------------------------------------------
 
@@ -338,6 +627,11 @@ def quantize_cache(
     group: int = 64,
     rank: int = 0,
     svd_factors: tuple | None = None,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    charge_rotation: bool = False,
+    topk_k: int = 0,
+    prefill_fit_len: int = 0,
+    h_kv: int = 0,
 ) -> tuple[torch.Tensor, float]:
     """Compress (S, C) fp32 matrix M with the specified arm.
 
@@ -360,7 +654,24 @@ def quantize_cache(
         bmx.quant.arms's ``ls`` param precedent.  When provided, the internal
         truncated_svd call is skipped (useful when sweeping bits for a fixed
         (M, rank) — the SVD result depends only on those two, not on bits).
-        Only used by lowrank_rtn_channel; ignored by all other arms.
+        Only used by lowrank_rtn_channel, lowrank_waterfill_channel,
+        lowrank_eigwaterfill_channel, and lowrank_randwaterfill_channel; ignored
+        by all other arms.
+    tiers : tuple[int, ...]
+        Allowed bit-widths for per-channel allocation in lowrank_waterfill_channel,
+        lowrank_eigwaterfill_channel, and lowrank_randwaterfill_channel.
+        Ignored by all other arms.
+    charge_rotation : bool
+        Add the rotation-matrix metadata cost to bpe; arm-dependent (see
+        _lowrank_rotwaterfill_channel docstring for per-mode details).
+    topk_k : int
+        Number of top eigen-directions to rotate; used by lowrank_topkwaterfill_channel.
+    prefill_fit_len : int
+        Number of prefix tokens to fit the frozen KLT on; used by
+        lowrank_frozenwaterfill_channel.
+    h_kv : int
+        Number of KV heads; used by lowrank_blockdiagwaterfill_channel to reshape
+        channels into per-head blocks.
 
     Returns
     -------
@@ -381,8 +692,80 @@ def quantize_cache(
         return _turboquant_mse(M, bits, seed)
     elif arm == "turboquant_prod":
         return _turboquant_prod(M, bits, seed)
-    else:  # lowrank_rtn_channel — guarded by the CACHE_ARMS assert above
+    elif arm == "lowrank_rtn_channel":
         return _lowrank_rtn_channel(M, bits, group, rank, svd_factors=svd_factors)
+    elif arm == "lowrank_waterfill_channel":
+        return _lowrank_waterfill_channel(
+            M, float(bits), group, rank, tiers=tiers, svd_factors=svd_factors
+        )
+    elif arm == "lowrank_eigwaterfill_channel":
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="klt",
+            charge_rotation=charge_rotation,
+            svd_factors=svd_factors,
+        )
+    elif arm == "lowrank_randwaterfill_channel":
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="random",
+            seed=seed,
+            svd_factors=svd_factors,
+        )
+    elif arm == "lowrank_topkwaterfill_channel":
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="topk",
+            topk_k=topk_k,
+            charge_rotation=charge_rotation,
+            svd_factors=svd_factors,
+        )
+    elif arm == "lowrank_blockdiagwaterfill_channel":
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="blockdiag",
+            h_kv=h_kv,
+            charge_rotation=charge_rotation,
+            svd_factors=svd_factors,
+        )
+    elif arm == "lowrank_frozenwaterfill_channel":
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="frozen",
+            prefill_fit_len=prefill_fit_len,
+            charge_rotation=charge_rotation,
+            svd_factors=svd_factors,
+        )
+    else:  # lowrank_oraclewaterfill_channel — guarded by the CACHE_ARMS assert above
+        return _lowrank_rotwaterfill_channel(
+            M,
+            float(bits),
+            group,
+            rank,
+            tiers=tiers,
+            rotation="oracle",
+            svd_factors=svd_factors,
+        )
 
 
 # ---------------------------------------------------------------------------
