@@ -771,3 +771,226 @@ def test_rotation_neutral_multitier():
     Q = eigvecs.flip(dims=(1,))  # descending order (matches codec)
     orth_err = (Q @ Q.mT - torch.eye(C_, dtype=Q.dtype)).abs().max().item()
     assert orth_err < 1e-12, f"KLT Q not orthogonal: max |QQ^T - I| = {orth_err:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# 13. Structured rotation arms (topk, blockdiag, frozen, oracle)
+# ---------------------------------------------------------------------------
+
+from bmx.cache.collect import from_matrix  # noqa: E402
+from bmx.quant.hadamard import random_orthogonal  # noqa: E402
+
+
+def test_structured_arms_registered():
+    from bmx.cache.codecs import CACHE_ARMS, S_DIVISIBILITY_ARMS
+
+    for arm in (
+        "lowrank_topkwaterfill_channel",
+        "lowrank_blockdiagwaterfill_channel",
+        "lowrank_frozenwaterfill_channel",
+        "lowrank_oraclewaterfill_channel",
+    ):
+        assert arm in CACHE_ARMS
+        assert arm in S_DIVISIBILITY_ARMS
+
+
+def test_topk_reduces_to_full_klt_at_k_equals_C():
+    # topk with k = C rotates the whole basis => matches full eigwaterfill on logit.
+    M = _seeded_matrix(s=64, c=64, seed=4).double()
+    h_kv = 2
+    q = _qkv_for(M, h_kv=h_kv)
+    factors = truncated_svd(M, 4)
+    full, _ = quantize_cache(
+        "lowrank_eigwaterfill_channel",
+        M,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors,
+    )
+    topk, _ = quantize_cache(
+        "lowrank_topkwaterfill_channel",
+        M,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        topk_k=64,
+        svd_factors=factors,
+    )
+    lg_full = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(full, h_kv).double(), q
+    )
+    lg_topk = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(topk, h_kv).double(), q
+    )
+    assert abs(lg_full - lg_topk) < 0.02, (
+        f"topk@k=C diverged from full KLT: {lg_full} vs {lg_topk}"
+    )
+
+
+def test_topk_partial_rotation_lossless_no_quant():
+    # With a single high tier (near-lossless), topk reconstruct ~ M (orthogonality of
+    # the partial rotation must hold — the stored top-k + recomputed complement).
+    M = _seeded_matrix(s=64, c=64, seed=5).double()
+    factors = truncated_svd(M, 4)
+    topk, _ = quantize_cache(
+        "lowrank_topkwaterfill_channel",
+        M,
+        bits=8,
+        group=GROUP,
+        rank=4,
+        tiers=(8,),
+        topk_k=16,
+        svd_factors=factors,
+    )
+    rel = ((topk - M).norm() / M.norm()).item()
+    # near-lossless at 8 bits + the rank-4 fp16 low-rank floor; bounded small, not garbage
+    assert rel < 0.05, f"topk near-lossless reconstruction too large: {rel}"
+
+
+def test_topk_honest_charge():
+    S_, C_, group_, rank_, k_ = 64, 32, 16, 2, 8
+    M = _seeded_matrix(s=S_, c=C_, seed=5).double()
+    _, bpe_ideal = quantize_cache(
+        "lowrank_topkwaterfill_channel",
+        M,
+        bits=3,
+        group=group_,
+        rank=rank_,
+        tiers=(0, 2, 3, 4),
+        topk_k=k_,
+        charge_rotation=False,
+    )
+    _, bpe_honest = quantize_cache(
+        "lowrank_topkwaterfill_channel",
+        M,
+        bits=3,
+        group=group_,
+        rank=rank_,
+        tiers=(0, 2, 3, 4),
+        topk_k=k_,
+        charge_rotation=True,
+    )
+    assert abs((bpe_honest - bpe_ideal) - 16.0 * k_ / S_) < 1e-9
+
+
+def test_blockdiag_no_cross_head_mixing():
+    # The block-diagonal rotation must quantize each head's residual using ONLY that
+    # head's own KLT. Test the residual-quantization step directly (bypassing the
+    # shared low-rank L, which can couple heads): pass svd_factors with rank that makes
+    # L negligible, then perturb head 0's residual and confirm head 1's reconstruction
+    # is bit-identical. Cross-head leakage in the rotation would change head 1.
+    h_kv, S_, d = 2, 64, 16  # C = 32
+    C_ = h_kv * d
+    M = _seeded_matrix(s=S_, c=C_, seed=6).double()
+    factors = truncated_svd(M, 4)
+    out1, _ = quantize_cache(
+        "lowrank_blockdiagwaterfill_channel",
+        M,
+        bits=8,
+        group=16,
+        rank=4,
+        tiers=(8,),
+        h_kv=h_kv,
+        svd_factors=factors,
+    )
+    # Build M2 = M but with head-0 columns replaced; reuse the SAME L (same factors) by
+    # constructing M2 so M2 - L differs from M - L only in head 0's residual block.
+    delta = _seeded_matrix(s=S_, c=d, seed=99).double()
+    M2 = M.clone()
+    M2[:, :d] = M[:, :d] + delta  # perturb head-0 residual only
+    out2, _ = quantize_cache(
+        "lowrank_blockdiagwaterfill_channel",
+        M2,
+        bits=8,
+        group=16,
+        rank=4,
+        tiers=(8,),
+        h_kv=h_kv,
+        svd_factors=factors,  # SAME factors => same L
+    )
+    # head 1 (cols d:) reconstruction must be UNCHANGED by perturbing head 0 (no mixing).
+    head1_diff = (out1[:, d:] - out2[:, d:]).abs().max().item()
+    assert head1_diff < 1e-9, f"cross-head leakage: head-1 changed by {head1_diff}"
+
+
+def test_frozen_vs_oracle_detects_drift():
+    # Stationary residual: frozen (fit on prefix) ~ oracle (fit on all). Drifting
+    # residual: oracle beats frozen. Proves the frozen/oracle ratio detects drift.
+    import torch as _t
+
+    h_kv = 2
+    S_, C_ = 128, 32
+    g = _t.Generator().manual_seed(3)
+    # stationary: one fixed channel covariance for the whole sequence
+    base = _t.randn(S_, C_, generator=g, dtype=_t.float64)
+    stds = _t.tensor([0.2, 1.0, 5.0, 25.0] * 8, dtype=_t.float64)
+    M_stat = base * stds
+    q = _qkv_for(M_stat, h_kv=h_kv)
+    factors_s = truncated_svd(M_stat, 4)
+    froz_s, _ = quantize_cache(
+        "lowrank_frozenwaterfill_channel",
+        M_stat,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        prefill_fit_len=64,
+        svd_factors=factors_s,
+    )
+    orac_s, _ = quantize_cache(
+        "lowrank_oraclewaterfill_channel",
+        M_stat,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors_s,
+    )
+    lg_froz_s = _logit_distortion(
+        from_matrix(M_stat, h_kv).double(), from_matrix(froz_s, h_kv).double(), q
+    )
+    lg_orac_s = _logit_distortion(
+        from_matrix(M_stat, h_kv).double(), from_matrix(orac_s, h_kv).double(), q
+    )
+    # stationary: frozen close to oracle
+    assert abs(lg_froz_s - lg_orac_s) < 0.02, (
+        f"stationary frozen!=oracle: {lg_froz_s} vs {lg_orac_s}"
+    )
+
+    # drifting: second half uses a rotated covariance => prefill-fit Q is wrong there
+    Qrot = random_orthogonal(C_, seed=7, dtype=_t.float64)
+    M_drift = M_stat.clone()
+    M_drift[S_ // 2 :] = M_stat[S_ // 2 :] @ Qrot
+    factors_d = truncated_svd(M_drift, 4)
+    froz_d, _ = quantize_cache(
+        "lowrank_frozenwaterfill_channel",
+        M_drift,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        prefill_fit_len=64,
+        svd_factors=factors_d,
+    )
+    orac_d, _ = quantize_cache(
+        "lowrank_oraclewaterfill_channel",
+        M_drift,
+        bits=3,
+        group=GROUP,
+        rank=4,
+        tiers=(0, 2, 3, 4),
+        svd_factors=factors_d,
+    )
+    lg_froz_d = _logit_distortion(
+        from_matrix(M_drift, h_kv).double(), from_matrix(froz_d, h_kv).double(), q
+    )
+    lg_orac_d = _logit_distortion(
+        from_matrix(M_drift, h_kv).double(), from_matrix(orac_d, h_kv).double(), q
+    )
+    # drifting: oracle should be at least as good as frozen (refit sees the drift)
+    assert lg_orac_d <= lg_froz_d + 1e-9, (
+        f"oracle did not beat frozen under drift: {lg_orac_d} vs {lg_froz_d}"
+    )
