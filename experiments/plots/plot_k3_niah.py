@@ -19,14 +19,18 @@ def make_figures(df, out_dir: str) -> list[Path]:
     out.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
 
+    # recall_full (precision-free ROUGE-1 recall) is the headline; instruct-model verbosity
+    # makes the F-measure `recall` column read low even when retrieval is perfect.
+    metric = "recall_full" if "recall_full" in df.columns else "recall"
+
     # --- Figure 1: recall vs length, one line per arm, annotated with compression. ---
     fig, ax = plt.subplots(figsize=(7, 5))
     for arm, g in df.groupby("arm"):
-        gl = g.groupby("length")["recall"].mean().sort_index()
+        gl = g.groupby("length")[metric].mean().sort_index()
         comp = g["compression"].iloc[0]
         ax.plot(gl.index, gl.values, marker="o", label=f"{arm} ({comp:.1f}×)")
     ax.set_xlabel("context length (tokens)")
-    ax.set_ylabel("recall (ROUGE-1 ×10, mean over depth)")
+    ax.set_ylabel("ROUGE-1 recall ×10 (mean over depth)")
     ax.set_title("NIAH recall vs length under KV compression")
     ax.legend()
     p1 = out / "niah_recall_vs_length.png"
@@ -47,7 +51,7 @@ def make_figures(df, out_dir: str) -> list[Path]:
             # Pivot to the (depth × length) grid directly; reindex to the full axes
             # so missing cells stay NaN (masked), repeated cells average.
             grid = (
-                g.pivot_table(index="depth", columns="length", values="recall")
+                g.pivot_table(index="depth", columns="length", values=metric)
                 .reindex(index=depths, columns=lengths)
                 .to_numpy()
             )

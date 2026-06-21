@@ -5,6 +5,7 @@ from bmx.cache.niah import (
     generate_through_cache,
     niah_recall_argmax,
     rouge1_recall,
+    rouge1_recall_only,
 )
 from bmx.cache.specs import CacheCodecSpec
 from factories import tiny_llama
@@ -53,6 +54,17 @@ def test_rouge1_recall_partial_is_graded():
     partial = "the magic number is"
     score = rouge1_recall(needle, partial)
     assert 0.0 < score < 10.0  # graded, not binary
+
+
+def test_rouge1_recall_only_ignores_verbosity():
+    # The needle, retrieved verbatim but buried in chatter: F-measure drops (precision), but
+    # recall stays ~10 because every needle word is present.
+    needle = "eat a sandwich in Dolores Park"
+    verbose = "Eat a sandwich in Dolores Park. Note: this is a humorous answer about the book."
+    assert rouge1_recall_only(needle, verbose) == 10.0  # all needle words present
+    assert (
+        rouge1_recall(needle, verbose) < 8.0
+    )  # F-measure penalized by the extra words
 
 
 def test_generate_through_cache_returns_str(tmp_path):

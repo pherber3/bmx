@@ -75,12 +75,23 @@ _SCORER = rouge_scorer.RougeScorer(["rouge1"], use_stemmer=True)
 
 
 def rouge1_recall(needle_text: str, response_text: str) -> float:
-    """ROUGE-1 F-measure ×10 (0–10) of the needle vs the response — the headline scorer.
+    """ROUGE-1 F-measure ×10 (0–10) of the needle vs the response.
 
-    Matches the Fu et al. metric (needle_in_haystack.py:265). Pure function; the
-    streaming-cache generate path feeds the model response in.
+    The Fu et al. metric (needle_in_haystack.py:265). F-measure includes precision, so a
+    verbose instruct-model response that contains the needle plus chatter is penalized; see
+    rouge1_recall_only for the precision-free retrieval signal.
     """
     return _SCORER.score(needle_text, response_text)["rouge1"].fmeasure * 10.0
+
+
+def rouge1_recall_only(needle_text: str, response_text: str) -> float:
+    """ROUGE-1 recall ×10 (0–10): fraction of needle words present in the response.
+
+    Ignores response verbosity — a response containing all needle words scores ~10 even with
+    trailing chatter. The "did the model retrieve the needle" signal, alongside the
+    paper-faithful F-measure.
+    """
+    return _SCORER.score(needle_text, response_text)["rouge1"].recall * 10.0
 
 
 def _insert_needle_at_sentence_boundary(

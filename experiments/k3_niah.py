@@ -66,7 +66,13 @@ def run(cfg: Config, model=None, root: str = "results"):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from bmx.cache.haystack import load_pg_corpus
-        from bmx.cache.niah import build_niah_prompt, niah_recall_generate
+        from bmx.cache.niah import (
+            NEEDLE_TEXT,
+            build_niah_prompt,
+            generate_through_cache,
+            rouge1_recall,
+            rouge1_recall_only,
+        )
 
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, torch_dtype=torch.float16
@@ -100,17 +106,18 @@ def run(cfg: Config, model=None, root: str = "results"):
                         v_spec=v_spec,
                         answer_id=cfg.answer_id,
                     )
-                    recall = 10.0 if hit else 0.0
+                    recall = recall_full = 10.0 if hit else 0.0
                     recall_kind = "argmax_proxy"
                 else:
-                    # Real: ROUGE-1 generate recall.
+                    # Real: generate once, score both F-measure (paper-faithful) and recall
+                    # (precision-free; survives instruct-model verbosity).
                     prompt_ids = build_niah_prompt(
                         tokenizer,
                         context_length=length,
                         depth_percent=depth * 100.0,
                         haystack=haystack,
                     )
-                    recall = niah_recall_generate(
+                    response = generate_through_cache(
                         model,
                         tokenizer,
                         prompt_ids,
@@ -119,6 +126,8 @@ def run(cfg: Config, model=None, root: str = "results"):
                         v_spec,
                         max_new_tokens=cfg.max_new_tokens,
                     )
+                    recall = rouge1_recall(NEEDLE_TEXT, response)
+                    recall_full = rouge1_recall_only(NEEDLE_TEXT, response)
                     recall_kind = "rouge1"
                 rows.append(
                     {
@@ -126,6 +135,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         "length": length,
                         "depth": depth,
                         "recall": recall,
+                        "recall_full": recall_full,
                         "recall_kind": recall_kind,
                         "bpe_k": bpe_k,
                         "bpe_v": bpe_v,

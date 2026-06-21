@@ -23,8 +23,10 @@ length×depth heatmap). All arms route through `_spec_pair` — structurally fai
 ## The VM run (the open work — engineering, not science)
 
 ```bash
-cd /d/Projects/bmx   # on the NVIDIA VM (no CUDA on the 7900 XTX dev box)
-uv run python experiments/k3_niah.py \
+cd ~/bmx   # on the NVIDIA VM (no CUDA on the 7900 XTX dev box)
+# Run as a module (-m): the experiment imports from the experiments package, which is only
+# importable with the repo root on sys.path — `python experiments/k3_niah.py` fails.
+uv run python -m experiments.k3_niah \
   --model-name meta-llama/Llama-3.1-8B-Instruct \
   --lengths 4096 8192 16384 32768 \
   --depths 0.1 0.3 0.5 0.7 0.9

@@ -24,8 +24,9 @@ structurally fair, same as NIAH.
 ## The VM run (the open work — engineering, not science)
 
 ```bash
-cd /d/Projects/bmx   # on the NVIDIA VM (no CUDA on the 7900 XTX dev box)
-uv run python experiments/k3_longbench.py \
+cd ~/bmx   # on the NVIDIA VM (no CUDA on the 7900 XTX dev box)
+# Run as a module (-m): `python experiments/k3_longbench.py` fails on the experiments-package import.
+uv run python -m experiments.k3_longbench \
   --model-name meta-llama/Llama-3.1-8B-Instruct
 # n_samples defaults to None = FULL sets (500 lcc + 500 repobench-p) → Table-1 comparable.
 # --n-samples N caps for a fast first look (prints a "NOT comparable to Table 1" warning).

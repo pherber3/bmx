@@ -24,6 +24,7 @@ def test_k3_niah_run_emits_parquet(tmp_path):
         "length",
         "depth",
         "recall",
+        "recall_full",
         "bpe_k",
         "bpe_v",
         "compression",
