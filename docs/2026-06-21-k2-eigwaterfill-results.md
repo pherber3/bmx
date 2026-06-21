@@ -7,8 +7,9 @@ key residual `R = M − L` into its own eigenbasis (KLT) before allocating bits,
 unrotates. Spec: `docs/superpowers/specs/2026-06-21-eigenbasis-waterfill-design.md`.
 Five arms on `k_pre`, dual metric (logit + MSE), random-rotation control, two-tier
 (idealized / honest) accounting. Runs:
-`results/k2_waterfill/20260621-165828-16d4df0` (llama, true post-RoPE),
-plus the gpt2 run in the same root. rank=16, group=64, tiers=(0,2,3,4), budget 3.0.
+`results/k2_waterfill/20260621-165828-16d4df0` (llama, true post-RoPE) and
+`results/k2_waterfill/20260621-165332-4c8d8fb` (gpt2). rank=16, group=64,
+tiers=(0,2,3,4), budget 3.0.
 
 ## Headline: the eigenbasis win is REAL — and KILLED on honest cost
 
