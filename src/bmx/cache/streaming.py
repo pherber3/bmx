@@ -499,6 +499,16 @@ def resolve_text_config(model_config):
     return model_config
 
 
+def resolve_vocab_size(model_config) -> int:
+    """Vocabulary size, unwrapping multimodal wrappers.
+
+    Gemma4 / Qwen3.5 ``*Config`` put ``vocab_size`` under ``text_config``; Llama-family
+    configs have it at the top level. Prefer the text config, fall back to top-level.
+    """
+    tc = resolve_text_config(model_config)
+    return getattr(tc, "vocab_size", None) or model_config.vocab_size
+
+
 def resolve_decoder_layers(model):
     """Return the list of decoder layers, across Llama / GPT-2 / multimodal nestings.
 

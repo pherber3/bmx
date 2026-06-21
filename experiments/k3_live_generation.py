@@ -34,6 +34,7 @@ from bmx.cache.needle import (
     needle_retrieved_from_ids,
 )
 from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.streaming import resolve_vocab_size
 
 
 @dataclasses.dataclass
@@ -139,7 +140,7 @@ def run(cfg: Config, model=None, input_ids=None, root: str = "results"):
 
     if input_ids is None:
         # Offline test supplied a model but no input_ids: use synthetic ids.
-        vocab = model.config.vocab_size
+        vocab = resolve_vocab_size(model.config)
         input_ids = _make_ids(cfg, vocab).to(cfg.device)
 
     run_dir = create_run("k3_live_generation", cfg, root=root)

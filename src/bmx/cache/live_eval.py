@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from bmx.cache.specs import CacheCodecSpec
-from bmx.cache.streaming import StreamingQuantizedCache
+from bmx.cache.streaming import StreamingQuantizedCache, resolve_vocab_size
 
 
 def compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, float]:
@@ -47,9 +47,8 @@ def compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, f
     cache.attach(model)
     g = torch.Generator().manual_seed(0)
     # Generate on CPU (seeded Generator is CPU-only), then move to the model's device.
-    ids = torch.randint(0, model.config.vocab_size, (1, length), generator=g).to(
-        model.device
-    )
+    vocab = resolve_vocab_size(model.config)
+    ids = torch.randint(0, vocab, (1, length), generator=g).to(model.device)
     with cache:
         with torch.no_grad():
             model(ids, past_key_values=cache, use_cache=True)

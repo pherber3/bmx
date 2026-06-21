@@ -475,3 +475,18 @@ def test_resolve_decoder_layers_across_nestings():
     # GPT-2: model.transformer.h
     gpt2 = types.SimpleNamespace(transformer=types.SimpleNamespace(h=sentinel))
     assert resolve_decoder_layers(gpt2) is sentinel
+
+
+def test_resolve_vocab_size_unwraps_multimodal():
+    """Qwen3.5/Gemma4 stash vocab_size under config.text_config; unwrap it."""
+    import types
+
+    from bmx.cache.streaming import resolve_vocab_size
+
+    # Multimodal: vocab_size lives under text_config, absent at the top level.
+    text = types.SimpleNamespace(num_attention_heads=24, vocab_size=152064)
+    top = types.SimpleNamespace(model_type="qwen3_5", text_config=text)
+    assert resolve_vocab_size(top) == 152064
+    # Llama-style flat config (text_config absent) returns top-level vocab_size.
+    flat = types.SimpleNamespace(vocab_size=128256)
+    assert resolve_vocab_size(flat) == 128256

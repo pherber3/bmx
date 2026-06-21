@@ -22,6 +22,7 @@ from bmx.cache.niah import (
     build_niah_ids_synthetic,
     niah_recall_argmax,
 )
+from bmx.cache.streaming import resolve_vocab_size
 from experiments.k3_live_generation import _spec_pair
 
 
@@ -75,7 +76,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                 if tokenizer is None:
                     # Offline: synthetic argmax proxy at this (small) length.
                     ids = build_niah_ids_synthetic(
-                        model.config.vocab_size,
+                        resolve_vocab_size(model.config),
                         length,
                         depth,
                         answer_id=cfg.answer_id,

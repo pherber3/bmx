@@ -20,6 +20,7 @@ from bmx.artifacts import create_run, write_metrics
 from bmx.cache.live_eval import compression_for
 from bmx.cache.longbench import code_sim
 from bmx.cache.niah import generate_through_cache
+from bmx.cache.streaming import resolve_vocab_size
 from experiments.k3_live_generation import _spec_pair
 
 
@@ -103,7 +104,10 @@ def run(cfg: Config, model=None, root: str = "results"):
                 # Generate on CPU (seeded Generator is CPU-only), move to model's device.
                 g = torch.Generator().manual_seed(cfg.seed)
                 prompt_ids = torch.randint(
-                    0, model.config.vocab_size, (1, calib_length[task]), generator=g
+                    0,
+                    resolve_vocab_size(model.config),
+                    (1, calib_length[task]),
+                    generator=g,
                 ).to(model.device)
                 resp = generate_through_cache(
                     model,
