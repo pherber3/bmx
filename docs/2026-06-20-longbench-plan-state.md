@@ -69,6 +69,57 @@ arms can diverge.** When reading the VM parquet:
   length); it is consistent across arms so rankings hold, but the absolute compression column
   is a lower bound. A future pass could thread the true tokenized prompt length through.
 
+## 2026-06-21 — smoke results, turboquant_prod diagnosis, matched-compression arms
+
+**Smoke (n=5, lcc, Llama-3.1-8B-Instruct, NOT Table-1-comparable):**
+
+| arm            | code_sim | compression |
+|----------------|----------|-------------|
+| fp16           | 0.768    | 1.00x       |
+| k2b            | 0.626    | 2.44x       |
+| turboquant_mse | 0.584    | 4.25x       |
+| turboquant_prod| 0.178    | 4.24x       |
+| kivi           | 0.120    | 2.81x       |
+
+(NIAH smoke, length 4096, 1 depth: fp16 7.14, k2b 6.67 @5.3x, turboquant_mse 7.14 @7.5x,
+turboquant_prod 1.43 @7.5x, kivi 2.38 @6.5x — recall_full column.)
+
+**Two findings:**
+
+1. **The head-to-head was NOT compression-matched.** k2b (keys@3b, "bits belong to K") sits at
+   2.4–5.3x; turboquant_mse at 4.3–7.9x. k2b scoring higher than turboquant is bought with extra
+   storage, not a fair win. Fix: `k2b_k{bits}r{rank}` arms drop the key budget. On Llama-3.1 head
+   dims (h_kv=8, d=128, group=64, S≈4096): **`k2b_k2r8` → 7.24x** (matched to turboquant_mse 7.94x
+   / kivi 7.11x), `k2b_k2r16` → 6.99x. Canonical `k2b` stays at keys@3b ≈ 5.74x. Pinned by
+   `tests/test_k3_experiment.py::test_k2b_matched_variants_parse_and_lower_key_bits`.
+
+2. **turboquant_prod collapse is NOT our bug — it is faithful.** Verified three ways: (a) the
+   `qjl_reconstruct` formula matches TurboQuant Alg. 2 / Theorem 2 verbatim (vault:
+   `[[Two-Stage Quantization for Unbiased Inner Products]]`, `[[Quantized Johnson-Lindenstrauss
+   Transform]]`); (b) the single-seed QJL inner-product estimate is **unbiased** (mean 0.3015 vs
+   true 0.3007); (c) its variance **matches the paper bound** π/(2d)·‖r‖²·‖y‖² to 0.97x. The
+   collapse is a real property of the method on our path: the per-key IP noise std (~0.31 at
+   d=128) is as large as the IP itself, and `StreamingQuantizedCache` exposes every per-key score
+   to softmax (no aggregation to average the unbiased noise down). The paper's own _mse_ arm beats
+   its _prod_ arm here. Carry prod as a faithful baseline that loses; do not "fix" it.
+
+**The matched-compression VM sweep (run after the canonical smoke):**
+
+```bash
+cd ~/bmx
+uv run python -m experiments.k3_longbench \
+  --model-name meta-llama/Llama-3.1-8B-Instruct \
+  --arms fp16 k2b k2b_k2r8 k2b_k2r16 turboquant_mse kivi \
+  --n-samples 50   # then drop --n-samples for the full Table-1 run
+# Read k2b_k2r8 (≈7.2x) vs turboquant_mse (≈7.9x) / kivi (≈7.1x): the fair head-to-head.
+# turboquant_prod dropped from the matched sweep (faithful-but-loses; keep in a separate
+# baseline run if a reviewer asks).
+```
+
+The same `--arms` list applies to `k3_niah`. Confirm the compression column lands near the
+table above before trusting the quality numbers — if k2b_k2r8 is not within ~10% of
+turboquant_mse's compression, the head-to-head is still mismatched.
+
 ## Deferred (not blockers)
 
 - **HumanEval pass@1** — explicitly NOT pursued. The paper used LongBench Code; that is the

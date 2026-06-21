@@ -56,6 +56,24 @@ def test_k3_run_emits_parquet(tmp_path):
     }
 
 
+def test_k2b_matched_variants_parse_and_lower_key_bits():
+    # The k2b_k{bits}r{rank} variants exist to match turboquant's compression by
+    # dropping the key budget. Pin the parse + the lowered-bits contract so the
+    # matched-compression head-to-head can't silently revert to keys@3b.
+    from experiments.k3_live_generation import Config, _spec_pair
+
+    cfg = Config()
+    k_can, _ = _spec_pair("k2b", cfg)
+    assert (k_can.bits, k_can.rank) == (3, cfg.rank)  # canonical: keys@3b
+
+    k8, v8 = _spec_pair("k2b_k2r8", cfg)
+    assert (k8.arm, k8.bits, k8.rank) == ("lowrank_rtn_channel", 2, 8)
+    assert v8.arm == "turboquant_mse" and v8.bits == 2  # V side unchanged
+
+    k16, _ = _spec_pair("k2b_k2r16", cfg)
+    assert (k16.bits, k16.rank) == (2, 16)
+
+
 def test_plot_k3_makes_pngs(tmp_path):
     import pandas as pd
     from experiments.plots.plot_k3 import make_figures
