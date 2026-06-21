@@ -51,7 +51,9 @@ def compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, f
     ids = torch.randint(0, vocab, (1, length), generator=g).to(model.device)
     with cache:
         with torch.no_grad():
-            model(ids, past_key_values=cache, use_cache=True)
+            # logits_to_keep=1: only the cache's bpe accounting is read, never the logits, so
+            # don't materialize the (length × vocab) logit tensor (~32 GB at 64k × 128k vocab).
+            model(ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
     bpe_k, bpe_v = cache.bits_per_entry()
     mem = cache.memory_report(seq_len=length)
     return bpe_k, bpe_v, mem["compression"]

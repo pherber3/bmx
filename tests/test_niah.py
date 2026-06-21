@@ -73,8 +73,11 @@ def test_generate_through_cache_returns_str(tmp_path):
     from factories import tiny_llama
 
     class _StubTokenizer:
+        eos_token_id = None
+
         def decode(self, ids, skip_special_tokens=True):
-            return " ".join(map(str, ids.tolist()))
+            seq = ids.tolist() if hasattr(ids, "tolist") else ids
+            return " ".join(map(str, seq))
 
     model = tiny_llama()
     g = torch.Generator().manual_seed(0)

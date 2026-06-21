@@ -43,7 +43,8 @@ class _StubTok:
     """Decode stub for the offline path: ids to a deterministic string."""
 
     def decode(self, ids, skip_special_tokens=True):
-        return " ".join(str(int(i)) for i in ids.tolist())
+        seq = ids.tolist() if hasattr(ids, "tolist") else ids
+        return " ".join(str(int(i)) for i in seq)
 
 
 def run(cfg: Config, model=None, root: str = "results"):

@@ -18,8 +18,19 @@ def _argmax_next_at(model, input_ids, query_pos, k_spec, v_spec, n_prefill):
     cache.attach(model)
     with cache:
         with torch.no_grad():
-            model(input_ids[:, :n_prefill], past_key_values=cache, use_cache=True)
-            out = model(input_ids[:, n_prefill : query_pos + 1], past_key_values=cache)
+            model(
+                input_ids[:, :n_prefill],
+                past_key_values=cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            # logits_to_keep=1: only the query-position logit is read (argmax), so the
+            # (S × vocab) tensor over all positions is never built — would OOM at long context.
+            out = model(
+                input_ids[:, n_prefill : query_pos + 1],
+                past_key_values=cache,
+                logits_to_keep=1,
+            )
     return out.logits[0, -1].argmax().item()
 
 
