@@ -54,6 +54,7 @@ class Config:
     out_root: str = ""  # override results root (tests pass tmp); empty => default
     topk_ks: tuple[int, ...] = (32, 64, 128)
     prefill_fit_len: int = 512
+    uniform_bits: tuple[int, ...] = (2, 3, 4, 5)  # bit-sweep for Pareto frontier
 
 
 def _resid_stable_rank(R: torch.Tensor) -> float:
@@ -322,6 +323,40 @@ def main(cfg: Config) -> pd.DataFrame:
                 flush=True,
             )
 
+        # uniform bit-sweep: Pareto frontier baselines at multiple bit-widths
+        for ub in cfg.uniform_bits:
+            ub_hat, bpe_ub = quantize_cache(
+                "lowrank_rtn_channel",
+                M,
+                bits=ub,
+                group=cfg.group,
+                rank=cfg.rank,
+                svd_factors=factors,
+            )
+            rf_ub, lg_ub = score(ub_hat)
+            rows.append(
+                dict(
+                    model=cfg.model_label or "unknown",
+                    layer=layer_i,
+                    kind="k_pre",
+                    arm=f"lowrank_rtn_channel_b{ub}",
+                    rank=cfg.rank,
+                    bpe=bpe_ub,
+                    bpe_honest=float("nan"),
+                    rel_fro=rf_ub,
+                    logit_rope=lg_ub,
+                    resid_stable_rank=sr,
+                    query_eigen_alignment=float("nan"),
+                    resid_eigengap=float("nan"),
+                    frozen_oracle_ratio=float("nan"),
+                )
+            )
+            print(
+                f"  L{layer_i:2d} {'lowrank_rtn_channel_b' + str(ub):30s} "
+                f"bpe={bpe_ub:.3f} logit={lg_ub:.4f} rel_fro={rf_ub:.4f}",
+                flush=True,
+            )
+
         # block-diagonal per-head KLT (honest cost folded in directly via charge_rotation)
         bd, bpe_bd = quantize_cache(
             "lowrank_blockdiagwaterfill_channel",
@@ -437,7 +472,7 @@ def main(cfg: Config) -> pd.DataFrame:
         "SUMMARY — mean logit_rope / rel_fro per arm (lower better); align = query-eigen"
     )
     uni_by_layer = df[df.arm == "lowrank_rtn_channel"].set_index("layer")["logit_rope"]
-    # classic arms
+    # classic arms (matched-bpe idealized; wins vs uniform@budget are valid)
     classic_arms = [
         "lowrank_rtn_channel",
         "lowrank_waterfill_channel",
@@ -445,6 +480,10 @@ def main(cfg: Config) -> pd.DataFrame:
         "lowrank_randwaterfill_channel",
         "outlier_two_tier",
     ]
+    # uniform sweep arms (Pareto baselines — NOT structured, NOT in classic_arms)
+    uniform_sweep_arms = {
+        a for a in df.arm.unique() if a.startswith("lowrank_rtn_channel_b")
+    }
     for arm in sorted(df.arm.unique()):
         if arm not in classic_arms:
             continue
@@ -454,12 +493,36 @@ def main(cfg: Config) -> pd.DataFrame:
         align_mean = sub["query_eigen_alignment"].mean()
         print(
             f"  {arm:34s} logit={sub.logit_rope.mean():.4f} rel_fro={sub.rel_fro.mean():.4f} "
-            f"bpe={sub.bpe.mean():.3f} align={align_mean:.3f} beats_uniform={wins}/{sub.layer.nunique()}"
+            f"bpe={sub.bpe.mean():.3f} align={align_mean:.3f} beats_uniform_at_matched_bpe={wins}/{sub.layer.nunique()}"
         )
-    # structured arms
-    structured_arm_names = [a for a in sorted(df.arm.unique()) if a not in classic_arms]
+    # uniform bit-sweep (Pareto frontier baselines; read alongside structured bpe_honest)
+    if uniform_sweep_arms:
+        print(
+            "\n--- uniform bit-sweep (Pareto frontier baselines; bpe increases with bits) ---"
+        )
+        for arm in sorted(uniform_sweep_arms):
+            sub = df[df.arm == arm]
+            print(
+                f"  {arm:34s} logit={sub.logit_rope.mean():.4f} "
+                f"bpe={sub.bpe.mean():.3f}"
+            )
+    # structured arms (HONEST bpe folded in; deployable verdict = Pareto vs uniform sweep)
+    structured_arm_names = [
+        a
+        for a in sorted(df.arm.unique())
+        if a not in classic_arms and a not in uniform_sweep_arms
+    ]
     if structured_arm_names:
-        print("\n--- structured rotation arms (HONEST bpe; deployable verdict) ---")
+        print(
+            "\n--- structured rotation arms (HONEST bpe; deployable verdict = Pareto vs uniform sweep above) ---"
+        )
+        print(
+            "    NOTE: wins-vs-uniform@3b below is NOT a deployable verdict — structured arms"
+        )
+        print(
+            "    spend more bits (bpe_honest >> 3.83). Compare logit vs bpe_honest against the"
+        )
+        print("    uniform sweep rows above to read the actual Pareto tradeoff.\n")
         for arm in structured_arm_names:
             sub = df[df.arm == arm]
             merged = sub.set_index("layer")["logit_rope"]
@@ -472,7 +535,8 @@ def main(cfg: Config) -> pd.DataFrame:
             fo_str = f"{fo_mean:.3f}" if fo_mean == fo_mean else "nan"
             print(
                 f"  {arm:34s} logit={sub.logit_rope.mean():.4f} rel_fro={sub.rel_fro.mean():.4f} "
-                f"bpe_h={bpe_h_str} gap={gap_str} fo={fo_str} beats_uniform={wins}/{sub.layer.nunique()}"
+                f"bpe_h={bpe_h_str} gap={gap_str} fo={fo_str} "
+                f"lower_logit_than_uniform_at_3b={wins}/{sub.layer.nunique()} (NOT matched-bpe)"
             )
     print(f"\n-> {run}")
     return df

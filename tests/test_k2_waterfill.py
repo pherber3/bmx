@@ -128,6 +128,7 @@ def test_experiment_has_structured_arms(tmp_path):
         topk_ks=(8,),
         prefill_fit_len=32,
         out_root=str(tmp_path / "results"),
+        uniform_bits=(2, 3, 4),  # trimmed for speed; real default is (2,3,4,5)
     )
     df = k2_waterfill.main(cfg)
     arms = set(df["arm"].unique())
@@ -145,6 +146,33 @@ def test_experiment_has_structured_arms(tmp_path):
     assert "bpe_honest" in df.columns
     bd = df[df.arm == "lowrank_blockdiagwaterfill_channel"]
     assert bd["bpe_honest"].notna().all()
+    # uniform bit-sweep: multiple distinct uniform baselines for Pareto comparison
+    sweep_arms = [a for a in arms if a.startswith("lowrank_rtn_channel_b")]
+    assert len(sweep_arms) > 1, f"expected >1 uniform sweep arms, got: {sweep_arms}"
+    # each sweep arm must appear at a distinct bpe (more bits => higher bpe)
+    sweep_bpes = df[df.arm.isin(sweep_arms)].groupby("arm")["bpe"].mean().sort_values()
+    assert sweep_bpes.nunique() == len(sweep_bpes), (
+        f"uniform sweep bpe values not distinct: {sweep_bpes.to_dict()}"
+    )
+    # sweep arms share the same schema columns as all other rows (no ragged parquet)
+    expected_cols = {
+        "model",
+        "layer",
+        "kind",
+        "arm",
+        "rank",
+        "bpe",
+        "bpe_honest",
+        "rel_fro",
+        "logit_rope",
+        "resid_stable_rank",
+        "query_eigen_alignment",
+        "resid_eigengap",
+        "frozen_oracle_ratio",
+    }
+    assert expected_cols <= set(df.columns), (
+        f"missing columns in parquet: {expected_cols - set(df.columns)}"
+    )
 
 
 def test_experiment_has_rotated_arms_and_dual_metric(tmp_path):
