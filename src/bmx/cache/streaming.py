@@ -88,12 +88,10 @@ class StreamingQuantizedLayer(DynamicLayer):
 
         self.bpe_k = float("nan")
         self.bpe_v = float("nan")
-        self._h_kv = getattr(
-            model_config, "num_key_value_heads", model_config.num_attention_heads
-        )
+        tc = resolve_text_config(model_config)
+        self._h_kv = getattr(tc, "num_key_value_heads", tc.num_attention_heads)
         self._d_head = (
-            getattr(model_config, "head_dim", None)
-            or model_config.hidden_size // model_config.num_attention_heads
+            getattr(tc, "head_dim", None) or tc.hidden_size // tc.num_attention_heads
         )
         # Precomputed per-instance constants (avoid re-evaluating each update step).
         self._passthrough = k_spec.arm == "fp16" and v_spec.arm == "fp16"
@@ -416,7 +414,7 @@ class StreamingQuantizedCache(Cache):
                 )
             )
 
-        for i, mlayer in enumerate(model.model.layers):
+        for i, mlayer in enumerate(resolve_decoder_layers(model)):
 
             def k_hook(module, inp, out, i=i):
                 self.layers[i].stash_pre_rope(out)
@@ -464,7 +462,7 @@ class StreamingQuantizedCache(Cache):
         the deployable number. Process-level peak memory (the literal 5x) is the
         fused-kernel/paged-store VM measurement.
         """
-        cfg = self.model_config
+        cfg = resolve_text_config(self.model_config)
         h_kv = h_kv or getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
         d = d_head or (
             getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
@@ -485,13 +483,45 @@ class StreamingQuantizedCache(Cache):
         }
 
 
+def resolve_text_config(model_config):
+    """Return the text/LM sub-config, unwrapping multimodal wrappers.
+
+    Qwen3.5 / Gemma4 are ``*ForConditionalGeneration`` models whose head counts
+    (num_attention_heads, num_key_value_heads, head_dim, hidden_size) live under
+    ``config.text_config``, not at the top level. Llama-family configs have those
+    attrs directly. Probe for ``text_config`` and unwrap when present so the cache
+    reads the right head geometry on either family.
+    """
+    tc = getattr(model_config, "text_config", None)
+    # A real text config has the head attrs; guard against an unrelated attr.
+    if tc is not None and hasattr(tc, "num_attention_heads"):
+        return tc
+    return model_config
+
+
+def resolve_decoder_layers(model):
+    """Return the list of decoder layers, across Llama / GPT-2 / multimodal nestings.
+
+    Layout probed (most-nested first): ``model.model.language_model.layers``
+    (Qwen3.5/Gemma4 multimodal), ``model.model.layers`` (Llama-family),
+    ``model.transformer.h`` (GPT-2).
+    """
+    inner = getattr(model, "model", None)
+    if inner is not None:
+        lm = getattr(inner, "language_model", None)
+        if lm is not None and hasattr(lm, "layers"):
+            return lm.layers
+        if hasattr(inner, "layers"):
+            return inner.layers
+    tr = getattr(model, "transformer", None)
+    if tr is not None and hasattr(tr, "h"):
+        return tr.h
+    raise ValueError(
+        f"Cannot locate decoder layers for {type(model).__name__}. Expected "
+        "model.model.language_model.layers, model.model.layers, or model.transformer.h."
+    )
+
+
 def model_config_n_layers(model) -> int:
     """Number of transformer layers in model (structural probe, not model_type)."""
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return len(model.model.layers)
-    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        return len(model.transformer.h)
-    raise ValueError(
-        f"Cannot determine n_layers for model type {type(model).__name__}. "
-        "Expected model.model.layers (Llama-family) or model.transformer.h (GPT-2)."
-    )
+    return len(resolve_decoder_layers(model))

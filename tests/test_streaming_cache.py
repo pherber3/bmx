@@ -428,3 +428,50 @@ def test_frozen_subspace_not_refit():
         )
     finally:
         cache.detach()
+
+
+# --- Multimodal-nesting resolvers (Qwen3.5 / Gemma4 ForConditionalGeneration) ---
+
+
+def test_resolve_text_config_unwraps_multimodal():
+    """Qwen3.5/Gemma4 stash head geometry under config.text_config; unwrap it."""
+    import types
+
+    from bmx.cache.streaming import resolve_text_config
+
+    text = types.SimpleNamespace(
+        num_attention_heads=24, num_key_value_heads=4, head_dim=256, hidden_size=5120
+    )
+    top = types.SimpleNamespace(model_type="qwen3_5", text_config=text)
+    assert resolve_text_config(top) is text
+    # Llama-style flat config (text_config absent) returns itself.
+    flat = types.SimpleNamespace(num_attention_heads=32, num_key_value_heads=8)
+    assert resolve_text_config(flat) is flat
+    # A text_config lacking head attrs (unrelated) is NOT mistaken for the LM config.
+    bogus = types.SimpleNamespace(
+        text_config=types.SimpleNamespace(foo=1), num_attention_heads=8
+    )
+    assert resolve_text_config(bogus) is bogus
+
+
+def test_resolve_decoder_layers_across_nestings():
+    """Layers live under model.model.language_model.layers (multimodal),
+    model.model.layers (Llama), or model.transformer.h (GPT-2)."""
+    import types
+
+    from bmx.cache.streaming import resolve_decoder_layers
+
+    sentinel = ["L0", "L1", "L2"]
+    # Multimodal: model.model.language_model.layers
+    mm = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            language_model=types.SimpleNamespace(layers=sentinel)
+        )
+    )
+    assert resolve_decoder_layers(mm) is sentinel
+    # Llama: model.model.layers
+    llama = types.SimpleNamespace(model=types.SimpleNamespace(layers=sentinel))
+    assert resolve_decoder_layers(llama) is sentinel
+    # GPT-2: model.transformer.h
+    gpt2 = types.SimpleNamespace(transformer=types.SimpleNamespace(h=sentinel))
+    assert resolve_decoder_layers(gpt2) is sentinel

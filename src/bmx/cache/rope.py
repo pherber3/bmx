@@ -29,6 +29,9 @@ def rope_cos_sin(
 
     Raises ValueError if the config has no rotary embedding (e.g. GPT2Config).
     """
+    from bmx.cache.streaming import resolve_text_config
+
+    config = resolve_text_config(config)  # unwrap multimodal text_config
     if not hasattr(config, "rope_parameters"):
         raise ValueError(
             f"Config {type(config).__name__} has no rotary embedding "

@@ -84,13 +84,16 @@ def _register_gpt2_hooks(model, store: dict, n_q_keep: int):
 
 def _register_qkproj_hooks(model, store: dict, n_q_keep: int):
     """Hooks on q_proj/k_proj (Llama-family); returns (handles, n_layer)."""
-    cfg = model.config
+    from bmx.cache.streaming import resolve_decoder_layers, resolve_text_config
+
+    cfg = resolve_text_config(model.config)  # unwrap multimodal text_config
     h = cfg.num_attention_heads
     h_kv = getattr(cfg, "num_key_value_heads", h)
     # qwen3/gemma-class configs set head_dim != hidden_size // heads explicitly
     d = getattr(cfg, "head_dim", None) or cfg.hidden_size // h
     handles = []
-    for i, layer in enumerate(model.model.layers):
+    layers = resolve_decoder_layers(model)
+    for i, layer in enumerate(layers):
 
         def q_hook(module, inp, out, i=i):
             q = _reshape_heads(out, h, d)
@@ -101,14 +104,20 @@ def _register_qkproj_hooks(model, store: dict, n_q_keep: int):
 
         handles.append(layer.self_attn.q_proj.register_forward_hook(q_hook))
         handles.append(layer.self_attn.k_proj.register_forward_hook(k_hook))
-    return handles, len(model.model.layers)
+    return handles, len(layers)
 
 
 def _register_hooks(model, store: dict, n_q_keep: int):
     """Structural dispatch: probe for the attention wiring, not model_type."""
+    from bmx.cache.streaming import resolve_decoder_layers
+
     if hasattr(model, "transformer") and hasattr(model.transformer.h[0].attn, "c_attn"):
         return _register_gpt2_hooks(model, store, n_q_keep)
-    if hasattr(model, "model") and hasattr(model.model.layers[0].self_attn, "q_proj"):
+    try:
+        layers = resolve_decoder_layers(model)
+    except ValueError:
+        layers = None
+    if layers is not None and hasattr(layers[0].self_attn, "q_proj"):
         return _register_qkproj_hooks(model, store, n_q_keep)
     raise ValueError(
         f"unsupported architecture {model.config.model_type!r}: expected "
