@@ -62,6 +62,8 @@ def test_experiment_smoke(tmp_path):
     assert {
         "lowrank_rtn_channel",
         "lowrank_waterfill_channel",
+        "lowrank_eigwaterfill_channel",
+        "lowrank_randwaterfill_channel",
         "outlier_two_tier",
     } <= arms
     assert "resid_stable_rank" in df.columns
@@ -91,12 +93,61 @@ def test_default_root_no_out_root(tmp_path, monkeypatch):
         # out_root intentionally left as "" (the default) to exercise the default path
     )
     df = k2_waterfill.main(cfg)
-    assert len(df) == 3 * 2, "expected 3 arms × 2 layers"
-    assert set(df["arm"].unique()) == {
+    assert len(df) == 5 * 2, "expected 5 arms × 2 layers"
+    assert {
         "lowrank_rtn_channel",
         "lowrank_waterfill_channel",
+        "lowrank_eigwaterfill_channel",
+        "lowrank_randwaterfill_channel",
         "outlier_two_tier",
-    }
+    } <= set(df["arm"].unique())
     # run dir must be under tmp_path, not the real repo results/
     results_dir = tmp_path / "results" / "k2_waterfill"
     assert results_dir.exists(), f"expected run dir under tmp_path: {results_dir}"
+
+
+def test_experiment_has_rotated_arms_and_dual_metric(tmp_path):
+    from safetensors.torch import save_file
+
+    h_kv, S, d = 2, 64, 8
+    g = torch.Generator().manual_seed(7)
+    tensors = {}
+    for i in range(2):
+        tensors[f"layer{i}.k_pre"] = torch.randn(h_kv, S, d, generator=g).half()
+        tensors[f"layer{i}.k"] = torch.randn(h_kv, S, d, generator=g).half()
+        tensors[f"layer{i}.v"] = torch.randn(h_kv, S, d, generator=g).half()
+        tensors[f"layer{i}.q"] = torch.randn(h_kv, S, d, generator=g).half()
+    cache_path = tmp_path / "synthetic.safetensors"
+    save_file(tensors, str(cache_path))
+
+    cfg = k2_waterfill.Config(
+        cache_path=str(cache_path),
+        model_label="synthetic",
+        model_name="",
+        budget_bits=3.0,
+        group=16,
+        rank=4,
+        out_root=str(tmp_path / "results"),
+    )
+    df = k2_waterfill.main(cfg)
+    arms = set(df["arm"].unique())
+    assert {"lowrank_eigwaterfill_channel", "lowrank_randwaterfill_channel"} <= arms
+    # dual metric present and populated for every arm
+    assert "rel_fro" in df.columns and "logit_rope" in df.columns
+    assert df["rel_fro"].notna().all() and df["logit_rope"].notna().all()
+    # alignment diagnostic present for the rotated arms
+    assert "query_eigen_alignment" in df.columns
+    eig = df[df.arm == "lowrank_eigwaterfill_channel"]
+    assert eig["query_eigen_alignment"].notna().all()
+    assert (
+        (eig["query_eigen_alignment"] >= 0) & (eig["query_eigen_alignment"] <= 1.0001)
+    ).all()
+    # matched idealized bpe: both rotated arms within tol of uniform, per layer
+    for layer in df["layer"].unique():
+        sub = df[df["layer"] == layer]
+        bpe_uni = sub[sub.arm == "lowrank_rtn_channel"]["bpe"].mean()
+        for arm in ("lowrank_eigwaterfill_channel", "lowrank_randwaterfill_channel"):
+            bpe_arm = sub[sub.arm == arm]["bpe"].mean()
+            assert abs(bpe_uni - bpe_arm) < 0.05, (
+                f"{arm} L{layer} bpe {bpe_arm} vs {bpe_uni}"
+            )
