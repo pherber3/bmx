@@ -39,6 +39,7 @@ from bmx.cache.specs import CacheCodecSpec
 @dataclasses.dataclass
 class Config:
     model_name: str = "meta-llama/Llama-3.2-1B"
+    device: str = "cpu"  # "cuda" on the VM
     arms: tuple[str, ...] = ("fp16", "k2b", "turboquant_mse", "turboquant_prod", "kivi")
     n_prefill: int = 256
     n_context: int = 512
@@ -105,23 +106,25 @@ def run(cfg: Config, model=None, input_ids=None, root: str = "results"):
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, torch_dtype=torch.float16
         )
+        model = model.to(cfg.device)
         model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
         # Real text: wikitext-2 test split → meaningful live-generation perplexity.
         toks = load_eval_tokens(cfg.model_name, n_tokens=cfg.n_context)
-        input_ids = toks[: cfg.n_context].unsqueeze(0)  # (1, n_context)
+        input_ids = toks[: cfg.n_context].unsqueeze(0).to(cfg.device)  # (1, n_context)
 
         # Real planted needle for retrieval scoring.
         needle_ids, answer_id = build_needle_ids(
             tokenizer, n_context=cfg.n_context, depth_frac=cfg.needle_depth
         )
+        needle_ids = needle_ids.to(cfg.device)
 
     if input_ids is None:
         # Offline test supplied a model but no input_ids: use synthetic ids.
         vocab = model.config.vocab_size
-        input_ids = _make_ids(cfg, vocab)
+        input_ids = _make_ids(cfg, vocab).to(cfg.device)
 
     run_dir = create_run("k3_live_generation", cfg, root=root)
 

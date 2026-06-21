@@ -17,15 +17,16 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.live_eval import compression_for
 from bmx.cache.longbench import code_sim
 from bmx.cache.niah import generate_through_cache
 from experiments.k3_live_generation import _spec_pair
-from experiments.k3_niah import _compression_for
 
 
 @dataclasses.dataclass
 class Config:
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    device: str = "cpu"  # "cuda" on the VM
     arms: tuple[str, ...] = ("fp16", "k2b", "turboquant_mse", "turboquant_prod", "kivi")
     tasks: tuple[str, ...] = ("lcc", "repobench-p")
     n_samples: int | None = (
@@ -54,6 +55,7 @@ def run(cfg: Config, model=None, root: str = "results"):
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, torch_dtype=torch.float16
         )
+        model = model.to(cfg.device)
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
@@ -78,14 +80,15 @@ def run(cfg: Config, model=None, root: str = "results"):
     rows = []
     for arm in cfg.arms:
         k_spec, v_spec = _spec_pair(arm, cfg)
-        bpe_k, bpe_v, compression = _compression_for(model, k_spec, v_spec, length)
+        bpe_k, bpe_v, compression = compression_for(model, k_spec, v_spec, length)
         for task in cfg.tasks:
             if tokenizer is None:
                 # Offline: score one synthetic generation against itself; mechanism only.
+                # Generate on CPU (seeded Generator is CPU-only), move to model's device.
                 g = torch.Generator().manual_seed(cfg.seed)
                 prompt_ids = torch.randint(
                     0, model.config.vocab_size, (1, length), generator=g
-                )
+                ).to(model.device)
                 resp = generate_through_cache(
                     model,
                     _StubTok(),

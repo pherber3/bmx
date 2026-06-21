@@ -17,17 +17,18 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.live_eval import compression_for
 from bmx.cache.niah import (
     build_niah_ids_synthetic,
     niah_recall_argmax,
 )
-from bmx.cache.streaming import StreamingQuantizedCache
 from experiments.k3_live_generation import _spec_pair
 
 
 @dataclasses.dataclass
 class Config:
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    device: str = "cpu"  # "cuda" on the VM
     arms: tuple[str, ...] = ("fp16", "k2b", "turboquant_mse", "turboquant_prod", "kivi")
     lengths: tuple[int, ...] = (4096, 8192, 16384, 32768)
     depths: tuple[float, ...] = (0.1, 0.3, 0.5, 0.7, 0.9)
@@ -38,24 +39,6 @@ class Config:
     answer_id: int = 7
     """Synthetic needle id for the offline argmax proxy (ignored on the real path)."""
     max_new_tokens: int = 50
-
-
-def _compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, float]:
-    """Measured (bpe_k, bpe_v, compression) for an arm at a given sequence length.
-
-    Runs a calibration prefill of `length` tokens first: bits_per_entry is nan until a
-    forward pass quantizes a block. Then reads the blended-bpe accounting off the cache.
-    """
-    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
-    cache.attach(model)
-    g = torch.Generator().manual_seed(0)
-    ids = torch.randint(0, model.config.vocab_size, (1, length), generator=g)
-    with cache:
-        with torch.no_grad():
-            model(ids, past_key_values=cache, use_cache=True)
-    bpe_k, bpe_v = cache.bits_per_entry()
-    mem = cache.memory_report(seq_len=length)
-    return bpe_k, bpe_v, mem["compression"]
 
 
 def run(cfg: Config, model=None, root: str = "results"):
@@ -77,6 +60,7 @@ def run(cfg: Config, model=None, root: str = "results"):
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, torch_dtype=torch.float16
         )
+        model = model.to(cfg.device)
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
         haystack = load_pg_corpus()
@@ -86,7 +70,7 @@ def run(cfg: Config, model=None, root: str = "results"):
     for arm in cfg.arms:
         k_spec, v_spec = _spec_pair(arm, cfg)
         for length in cfg.lengths:
-            bpe_k, bpe_v, compression = _compression_for(model, k_spec, v_spec, length)
+            bpe_k, bpe_v, compression = compression_for(model, k_spec, v_spec, length)
             for depth in cfg.depths:
                 if tokenizer is None:
                     # Offline: synthetic argmax proxy at this (small) length.
@@ -96,7 +80,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         depth,
                         answer_id=cfg.answer_id,
                         seed=cfg.seed,
-                    )
+                    ).to(model.device)
                     hit = niah_recall_argmax(
                         model,
                         ids,
@@ -116,7 +100,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         context_length=length,
                         depth_percent=depth * 100.0,
                         haystack=haystack,
-                    )
+                    ).to(cfg.device)
                     response = generate_through_cache(
                         model,
                         tokenizer,
