@@ -155,6 +155,7 @@ def generate_through_cache(
     supplied continuation followed by the new tokens, so the answer is out[0, L - n_prefill:].
     `strip` removes leading/trailing whitespace (off for whitespace-sensitive scorers).
     """
+    prompt_ids = prompt_ids.to(model.device)
     L = prompt_ids.shape[1]
     cont_len = L - n_prefill
     assert cont_len > 0, (
