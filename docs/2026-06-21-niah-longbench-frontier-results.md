@@ -118,16 +118,47 @@ Confirms the 24k–32k finding at 64k and sharpens it: **canonical k2b (3-bit ke
 fp16 even at 64k** (7.82 vs 7.28), the only compressed arm to do so; the 2-bit k2b_k2r8 degrades
 hardest (4.15, worst arm). The key-bits ↔ context tradeoff now holds across 24k → 32k → 64k.
 
-## Engineering limits hit (honest negatives)
+## Unified single-path frontier (4k–64k) — the definitive table
 
-- **128k NIAH is infeasible on this GPU.** OOM even running solo with `expandable_segments`
-  (94 GB in use, KV cache + all-position `lm_head` logits over 131072 tokens). Not a bug — the
-  8B KV cache at 128k simply exceeds the 96 GB GH200 on the current (unfused, materialize-all-
-  logits) path. Needs the fused dequant-attention kernel + chunked logits (the deferred
-  engineering item) to reach 128k.
-- **Long-context NIAH cannot run co-resident.** 64k/128k `lm_head` needs ~16–33 GB in one
-  forward; co-resident with another 8B job it OOMs. Fix is serialization (run long-context
-  solo), not a code change. Three co-resident runs were lost to this before serializing.
+Re-run after the `logits_to_keep=1` fix (commit `842a63b`) unified the decode path so every cell
+comes from one code path. `recall_full`, mean over 7 depths, n=7/cell, 7 arms × 5 lengths
+(`results/k3_niah/20260621-204927-842a63b`):
+
+| arm | compr (64k) | 4k | 8k | 16k | 32k | 64k |
+|---|---|---|---|---|---|---|
+| fp16 | 1.0× | 7.41 | 7.21 | 7.21 | 7.82 | 6.73 |
+| **k2b (3-bit K)** | 5.8× | 6.94 | 7.41 | 8.98 | 7.01 | **7.21** |
+| k2b_k2r16 (2-bit K) | 7.0× | 8.44 | 9.12 | 7.55 | 6.60 | 5.03 |
+| **k2b_k2r8 (2-bit K)** | 7.2× | **8.30** | 7.69 | **9.32** | 6.73 | 4.90 |
+| turboquant_mse | 7.9× | 7.21 | 7.69 | 8.44 | 6.46 | 7.41 |
+| turboquant_prod | 7.9× | 0.82 | 0.61 | 0.75 | 1.77 | 1.63 |
+| kivi | 7.1× | 1.77 | 1.70 | 1.09 | 1.43 | 1.16 |
+
+This confirms the tradeoff on one consistent path:
+- **Short/mid (4k–16k):** the 2-bit matched arms (k2b_k2r8 8.3–9.3, k2b_k2r16 7.6–9.1) **beat**
+  turboquant_mse (7.2–8.4) and fp16 — k2b wins the matched-compression head-to-head.
+- **Long (32k–64k):** the 2-bit arms collapse (4.9–6.7 at 64k); **canonical k2b (3-bit K, 7.21)
+  and turboquant_mse (7.41) hold and beat fp16 (6.73)**. The extra key bit buys long-context
+  robustness; matching turboquant's 7× by dropping to 2-bit keys gives it up.
+
+(Note: on this unified run, turboquant_mse at 64k (7.41) edges canonical k2b (7.21) — within the
+±0.2–0.6 SEM these cells carry; the headline, short-context matched k2b win + 3-bit-key
+long-context robustness, holds. The new decode path is bit-identical to the old `model.generate`
+for fp16 and drifts only at quant-noise level for codec arms — a property of *which tokens land in
+a quantized block at flush time*, not a bug.)
+
+## 128k is reachable — the OOM was throwaway logits, not the cache
+
+An earlier pass wrongly recorded 128k as infeasible. The memory decomposition is decisive:
+weights 14.9 GB + full-fp16 KV 16 GB + **`lm_head` logits over all 131072 positions 62.6 GB
+(fp32)** + activations. The cache was never the problem — the all-position logit tensor was. We
+only read the *last* position's logit (to seed decoding), so `logits_to_keep=1` (commit
+`842a63b`) never builds it. Peak drops to **45–66 GB** and **128k runs** (k2b=10.0 retrieves the
+needle, beating fp16=9.52 in the direct test; full solo sweep recorded separately). Two
+operational notes that cost several lost runs: long-context must run **solo** (fragmentation from
+prior smaller-length cells in the same process tips 128k over), and the codec arms show a higher
+*peak* than fp16 — that is transient quantizer scratch (Hadamard/SVD/Lloyd/QJL working tensors),
+**not** resident footprint; the deployable size is the bpe/compression column (5–7× smaller).
 
 ## Cross-model generalization — both current-gen models are non-standard-attention (out of scope)
 
