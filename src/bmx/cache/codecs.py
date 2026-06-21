@@ -442,13 +442,12 @@ def _lowrank_waterfill_channel(
     bits_per_ch = allocate_channel_bits(R, budget_bits, tiers=tiers, axis=0)  # (C,)
 
     # Quantize each tier-group of channels at its bit-width; tier 0 -> zeros.
+    # Each b in the set is present by construction, so cols is never empty.
     R_hat = torch.zeros_like(R)
     for b in sorted(set(int(x) for x in bits_per_ch.tolist())):
         if b == 0:
             continue  # dropped channels stay zero
         cols = (bits_per_ch == b).nonzero(as_tuple=True)[0]
-        if cols.numel() == 0:
-            continue
         sub = R[:, cols]  # (S, n_b); quantize per channel along token dim
         sub_hat = rtn_quantize(sub.mT, b, group).mT  # (n_b, S) groups -> back
         R_hat[:, cols] = sub_hat
@@ -467,6 +466,13 @@ def _lowrank_waterfill_channel(
 # ---------------------------------------------------------------------------
 # Arm 8+9: lowrank_eigwaterfill_channel / lowrank_randwaterfill_channel
 # ---------------------------------------------------------------------------
+
+
+def _klt_basis(X: torch.Tensor) -> torch.Tensor:
+    """KLT rotation for the channel covariance of X: eigenvectors of XᵀX, descending
+    eigenvalue order. Orthogonal (C×C) — columns are the residual's principal directions."""
+    _, ev = torch.linalg.eigh(X.mT @ X)
+    return ev.flip(dims=(1,))
 
 
 def _lowrank_rotwaterfill_channel(
@@ -539,12 +545,11 @@ def _lowrank_rotwaterfill_channel(
         R_rot = R_in if Q is None else (R_in @ Q)
         bits_pc = allocate_channel_bits(R_rot, budget_bits, tiers=tiers, axis=0)
         R_rot_hat = torch.zeros_like(R_rot)
+        # Each b in the set is present by construction, so cols is never empty.
         for b in sorted(set(int(x) for x in bits_pc.tolist())):
             if b == 0:
                 continue
             cols = (bits_pc == b).nonzero(as_tuple=True)[0]
-            if cols.numel() == 0:
-                continue
             R_rot_hat[:, cols] = rtn_quantize(R_rot[:, cols].mT, b, group).mT
         R_hat_local = R_rot_hat if Q is None else (R_rot_hat @ Q.mT)
         return R_hat_local, float(bits_pc.float().mean().item())
@@ -552,28 +557,19 @@ def _lowrank_rotwaterfill_channel(
     if not use_rotation:
         R_hat, mean_payload = _waterfill_in_basis(R, None)
         rot_bits = 0.0
-    elif rotation in ("klt", "random"):
-        if rotation == "klt":
-            _, ev = torch.linalg.eigh(R.mT @ R)
-            Q = ev.flip(dims=(1,))
-        else:
-            Q = random_orthogonal(C, seed, dtype=R.dtype, device=R.device)
-        R_hat, mean_payload = _waterfill_in_basis(R, Q)
-        rot_bits = (16.0 * C / S) if (rotation == "klt" and charge_rotation) else 0.0
-    elif rotation == "oracle":
-        # Full KLT refit on ALL tokens (control; never charged).
-        _, ev = torch.linalg.eigh(R.mT @ R)
-        Q = ev.flip(dims=(1,))
-        R_hat, mean_payload = _waterfill_in_basis(R, Q)
-        rot_bits = 0.0
-    elif rotation == "frozen":
-        # Full KLT fit on the first prefill_fit_len tokens, applied to all.
-        # prefill_fit_len=0 defaults to S (use all tokens = same as oracle).
+    elif rotation in ("klt", "oracle", "frozen"):
+        # All three are a full-C×C KLT differing only in WHICH tokens fit it and the
+        # charge rule: klt/oracle fit on all tokens, frozen on the first P; oracle is
+        # the never-charged control (it refits on the scored tokens — not deployable).
         P = min(prefill_fit_len if prefill_fit_len > 0 else S, S)
-        _, ev = torch.linalg.eigh(R[:P].mT @ R[:P])
-        Q = ev.flip(dims=(1,))
+        fit = R[:P] if rotation == "frozen" else R
+        Q = _klt_basis(fit)
         R_hat, mean_payload = _waterfill_in_basis(R, Q)
-        rot_bits = (16.0 * C / S) if charge_rotation else 0.0
+        rot_bits = (16.0 * C / S) if (charge_rotation and rotation != "oracle") else 0.0
+    elif rotation == "random":
+        Q = random_orthogonal(C, seed, dtype=R.dtype, device=R.device)
+        R_hat, mean_payload = _waterfill_in_basis(R, Q)
+        rot_bits = 0.0  # seeded rotation costs 0 stored bits
     elif rotation == "topk":
         # Honest partial rotation: only top-k eigen-directions (C×k) stored.
         # The complement stays in the original basis — the complement eigenvectors
@@ -581,8 +577,7 @@ def _lowrank_rotwaterfill_channel(
         # full basis and charging only 16*k/S would overstate compression.
         # topk_k=0 defaults to C (full eigenbasis), equivalent to KLT.
         kk = min(topk_k if topk_k > 0 else C, C)
-        _, ev = torch.linalg.eigh(R.mT @ R)
-        Qk = ev.flip(dims=(1,))[:, :kk]  # (C, k) top-k eigenvectors by eigenvalue
+        Qk = _klt_basis(R)[:, :kk]  # (C, k) top-k eigenvectors by eigenvalue
         # Rotate top-k subspace; water-fill those k columns.
         Rk = R @ Qk  # (S, k) projection onto top-k subspace
         Rk_hat, p_k = _waterfill_in_basis(Rk, None)  # already in rotated subspace
@@ -599,15 +594,12 @@ def _lowrank_rotwaterfill_channel(
         _h = h_kv if h_kv > 0 else 1
         assert C % _h == 0, f"C={C} not divisible by h_kv={_h}"
         d = C // _h
-        h_kv = _h
         R_hat = torch.zeros_like(R)
         payloads = []
-        for hh in range(h_kv):
+        for hh in range(_h):
             sl = slice(hh * d, (hh + 1) * d)
             Rh = R[:, sl]
-            _, evh = torch.linalg.eigh(Rh.mT @ Rh)
-            Qh = evh.flip(dims=(1,))
-            Rh_hat, ph = _waterfill_in_basis(Rh, Qh)
+            Rh_hat, ph = _waterfill_in_basis(Rh, _klt_basis(Rh))
             R_hat[:, sl] = Rh_hat
             payloads.append(ph)
         mean_payload = float(sum(payloads) / len(payloads))

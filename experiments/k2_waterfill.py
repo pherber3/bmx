@@ -32,7 +32,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.codecs import quantize_cache
+from bmx.cache.codecs import _klt_basis, quantize_cache
 from bmx.cache.collect import from_matrix, load_cache, to_matrix
 from bmx.cache.metrics import logit_distortion, rel_fro
 from bmx.cache.rope import apply_rope
@@ -98,8 +98,7 @@ def _query_eigen_alignment(
         return 0.0
     C = R.shape[1]
     d = C // h_kv
-    _, eigvecs = torch.linalg.eigh(R.mT @ R)
-    Qk = eigvecs.flip(dims=(1,))[:, :k]  # (C, k) top-k eigen-directions
+    Qk = _klt_basis(R)[:, :k]  # (C, k) top-k eigen-directions
     h_q, T, _ = q_t.shape
     group = h_q // h_kv  # GQA: how many query heads share each kv head
     fracs = []
@@ -259,8 +258,7 @@ def main(cfg: Config) -> pd.DataFrame:
         # alignment for the KLT arm: k = funded eigencols of the KLT-rotated residual
         from bmx.cache.codecs import allocate_channel_bits
 
-        _, eigvecs_a = torch.linalg.eigh(R_resid.mT @ R_resid)
-        Q_klt = eigvecs_a.flip(dims=(1,))
+        Q_klt = _klt_basis(R_resid)
         bits_rot = allocate_channel_bits(
             R_resid @ Q_klt, cfg.budget_bits, tiers=cfg.tiers, axis=0
         )
