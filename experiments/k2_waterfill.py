@@ -52,6 +52,8 @@ class Config:
     tiers: tuple[int, ...] = (0, 2, 3, 4)
     seed: int = 0
     out_root: str = ""  # override results root (tests pass tmp); empty => default
+    topk_ks: tuple[int, ...] = (32, 64, 128)
+    prefill_fit_len: int = 512
 
 
 def _resid_stable_rank(R: torch.Tensor) -> float:
@@ -59,6 +61,19 @@ def _resid_stable_rank(R: torch.Tensor) -> float:
     sv = torch.linalg.svdvals(R.double())
     s2 = sv**2
     return float((s2.sum() / s2[0].clamp_min(1e-30)).item())
+
+
+def _residual_eigengap(R: torch.Tensor) -> float:
+    """Max adjacent eigenvalue ratio in the top of the residual channel spectrum.
+
+    A value near 1.0 across the spectrum => no eigengap => frozen rotation likely
+    drifts (Davis-Kahan). Returns the largest λ_k/λ_{k+1} among the top-64 to expose
+    any elbow; ~1.0 means smooth decay.
+    """
+    ev = torch.linalg.eigvalsh(R.mT @ R).flip(0).clamp_min(1e-30)
+    top = ev[: min(64, len(ev) - 1)]
+    ratios = top[:-1] / top[1:]
+    return float(ratios.max().item())
 
 
 def _query_eigen_alignment(
@@ -267,6 +282,8 @@ def main(cfg: Config) -> pd.DataFrame:
                 svd_factors=factors,
             )
 
+        eigengap = _residual_eigengap(R_resid)
+
         arm_rows = {
             "lowrank_rtn_channel": (uni, bpe_uni, float("nan")),
             "lowrank_waterfill_channel": (wf, bpe_wf, float("nan")),
@@ -295,11 +312,120 @@ def main(cfg: Config) -> pd.DataFrame:
                     logit_rope=lg,
                     resid_stable_rank=sr,
                     query_eigen_alignment=align_col,
+                    resid_eigengap=float("nan"),
+                    frozen_oracle_ratio=float("nan"),
                 )
             )
             print(
                 f"  L{layer_i:2d} {arm:30s} bpe={bpe:.3f} logit={lg:.4f} "
                 f"rel_fro={rf:.4f} align={align_col if align_col == align_col else float('nan'):.3f}",
+                flush=True,
+            )
+
+        # block-diagonal per-head KLT (honest cost folded in directly via charge_rotation)
+        bd, bpe_bd = quantize_cache(
+            "lowrank_blockdiagwaterfill_channel",
+            M,
+            bits=cfg.budget_bits,
+            group=cfg.group,
+            rank=cfg.rank,
+            tiers=cfg.tiers,
+            h_kv=h_kv,
+            charge_rotation=True,
+            svd_factors=factors,
+        )
+        # frozen-prefill full KLT (honest) + oracle control (uncharged)
+        fz, bpe_fz = quantize_cache(
+            "lowrank_frozenwaterfill_channel",
+            M,
+            bits=cfg.budget_bits,
+            group=cfg.group,
+            rank=cfg.rank,
+            tiers=cfg.tiers,
+            prefill_fit_len=cfg.prefill_fit_len,
+            charge_rotation=True,
+            svd_factors=factors,
+        )
+        orc, bpe_orc = quantize_cache(
+            "lowrank_oraclewaterfill_channel",
+            M,
+            bits=cfg.budget_bits,
+            group=cfg.group,
+            rank=cfg.rank,
+            tiers=cfg.tiers,
+            svd_factors=factors,
+        )
+        _, lg_fz = score(fz)
+        _, lg_orc = score(orc)
+        frozen_oracle_ratio = lg_fz / lg_orc if lg_orc > 0 else float("nan")
+
+        structured = [
+            ("lowrank_blockdiagwaterfill_channel", bd, bpe_bd, bpe_bd, float("nan")),
+            (
+                "lowrank_frozenwaterfill_channel",
+                fz,
+                bpe_fz,
+                bpe_fz,
+                frozen_oracle_ratio,
+            ),
+            (
+                "lowrank_oraclewaterfill_channel",
+                orc,
+                bpe_orc,
+                float("nan"),
+                float("nan"),
+            ),
+        ]
+        # topk k-sweep, honest cost per k
+        C_full = M.shape[1]
+        for kk in cfg.topk_ks:
+            if kk > C_full:  # guard k <= C
+                continue
+            tk, bpe_tk = quantize_cache(
+                "lowrank_topkwaterfill_channel",
+                M,
+                bits=cfg.budget_bits,
+                group=cfg.group,
+                rank=cfg.rank,
+                tiers=cfg.tiers,
+                topk_k=kk,
+                charge_rotation=True,
+                svd_factors=factors,
+            )
+            structured.append(
+                (
+                    f"lowrank_topkwaterfill_channel_k{kk}",
+                    tk,
+                    bpe_tk,
+                    bpe_tk,
+                    float("nan"),
+                )
+            )
+
+        for arm, M_hat, bpe, bpe_h, fo_ratio in structured:
+            rf, lg = score(M_hat)
+            rows.append(
+                dict(
+                    model=cfg.model_label or "unknown",
+                    layer=layer_i,
+                    kind="k_pre",
+                    arm=arm,
+                    rank=cfg.rank,
+                    bpe=bpe,
+                    bpe_honest=bpe_h,
+                    rel_fro=rf,
+                    logit_rope=lg,
+                    resid_stable_rank=sr,
+                    query_eigen_alignment=float("nan"),
+                    resid_eigengap=eigengap,
+                    frozen_oracle_ratio=fo_ratio,
+                )
+            )
+            bpe_h_str = f"{bpe_h:.3f}" if bpe_h == bpe_h else "nan"
+            fo_str = f"{fo_ratio:.3f}" if fo_ratio == fo_ratio else "nan"
+            print(
+                f"  L{layer_i:2d} {arm:34s} bpe={bpe:.3f} bpe_h={bpe_h_str} "
+                f"logit={lg:.4f} rel_fro={rf:.4f} gap={eigengap:.3f} fo={fo_str}",
                 flush=True,
             )
 
@@ -311,15 +437,43 @@ def main(cfg: Config) -> pd.DataFrame:
         "SUMMARY — mean logit_rope / rel_fro per arm (lower better); align = query-eigen"
     )
     uni_by_layer = df[df.arm == "lowrank_rtn_channel"].set_index("layer")["logit_rope"]
+    # classic arms
+    classic_arms = [
+        "lowrank_rtn_channel",
+        "lowrank_waterfill_channel",
+        "lowrank_eigwaterfill_channel",
+        "lowrank_randwaterfill_channel",
+        "outlier_two_tier",
+    ]
     for arm in sorted(df.arm.unique()):
+        if arm not in classic_arms:
+            continue
         sub = df[df.arm == arm]
         merged = sub.set_index("layer")["logit_rope"]
         wins = int((merged < uni_by_layer.reindex(merged.index)).sum())
         align_mean = sub["query_eigen_alignment"].mean()
         print(
-            f"  {arm:30s} logit={sub.logit_rope.mean():.4f} rel_fro={sub.rel_fro.mean():.4f} "
+            f"  {arm:34s} logit={sub.logit_rope.mean():.4f} rel_fro={sub.rel_fro.mean():.4f} "
             f"bpe={sub.bpe.mean():.3f} align={align_mean:.3f} beats_uniform={wins}/{sub.layer.nunique()}"
         )
+    # structured arms
+    structured_arm_names = [a for a in sorted(df.arm.unique()) if a not in classic_arms]
+    if structured_arm_names:
+        print("\n--- structured rotation arms (HONEST bpe; deployable verdict) ---")
+        for arm in structured_arm_names:
+            sub = df[df.arm == arm]
+            merged = sub.set_index("layer")["logit_rope"]
+            wins = int((merged < uni_by_layer.reindex(merged.index)).sum())
+            bpe_h_mean = sub["bpe_honest"].mean()
+            gap_mean = sub["resid_eigengap"].mean()
+            fo_mean = sub["frozen_oracle_ratio"].mean()
+            bpe_h_str = f"{bpe_h_mean:.3f}" if bpe_h_mean == bpe_h_mean else "nan"
+            gap_str = f"{gap_mean:.3f}" if gap_mean == gap_mean else "nan"
+            fo_str = f"{fo_mean:.3f}" if fo_mean == fo_mean else "nan"
+            print(
+                f"  {arm:34s} logit={sub.logit_rope.mean():.4f} rel_fro={sub.rel_fro.mean():.4f} "
+                f"bpe_h={bpe_h_str} gap={gap_str} fo={fo_str} beats_uniform={wins}/{sub.layer.nunique()}"
+            )
     print(f"\n-> {run}")
     return df
 
