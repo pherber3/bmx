@@ -37,10 +37,13 @@ CACHE_ARMS = (
     "turboquant_mse",
     "turboquant_prod",
     "lowrank_rtn_channel",
+    "lowrank_waterfill_channel",
 )
 
 # Arms whose codec asserts S % group == 0 (used by streaming.py for alignment).
-S_DIVISIBILITY_ARMS = frozenset({"rtn_channel", "lowrank_rtn_channel"})
+S_DIVISIBILITY_ARMS = frozenset(
+    {"rtn_channel", "lowrank_rtn_channel", "lowrank_waterfill_channel"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +386,69 @@ def _lowrank_rtn_channel(
 
 
 # ---------------------------------------------------------------------------
+# Arm 7: lowrank_waterfill_channel
+# ---------------------------------------------------------------------------
+
+
+def _lowrank_waterfill_channel(
+    M: torch.Tensor,
+    budget_bits: float,
+    group: int,
+    rank: int,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    svd_factors: tuple | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Low-rank + per-channel residual at water-filled mixed bit-widths.
+
+    Same low-rank path as lowrank_rtn_channel; the residual R = M - L is
+    quantized per channel at bit-widths chosen by reverse water-filling over
+    per-channel variance (Cover-Thomas Thm 13.3.3). Tier 0 channels are dropped
+    (reconstructed from L only).
+    """
+    S, C = M.shape
+    assert rank > 0, f"lowrank_waterfill_channel requires rank > 0, got {rank}"
+    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
+    assert S % group == 0, f"S={S} not divisible by group={group}"
+
+    if svd_factors is not None:
+        Us, V = svd_factors
+    else:
+        Us, V = truncated_svd(M, rank)
+
+    # fp16 roundtrip for honest stored-precision — identical to _lowrank_rtn_channel
+    Us_stored = Us.half().float()
+    V_stored = V.half().float()
+    L = Us_stored @ V_stored.mT  # (S, C)
+
+    R = M - L  # (S, C)
+
+    # Allocate per-channel bits on the residual.
+    bits_per_ch = allocate_channel_bits(R, budget_bits, tiers=tiers, axis=0)  # (C,)
+
+    # Quantize each tier-group of channels at its bit-width; tier 0 -> zeros.
+    R_hat = torch.zeros_like(R)
+    for b in sorted(set(int(x) for x in bits_per_ch.tolist())):
+        if b == 0:
+            continue  # dropped channels stay zero
+        cols = (bits_per_ch == b).nonzero(as_tuple=True)[0]
+        if cols.numel() == 0:
+            continue
+        sub = R[:, cols]  # (S, n_b); quantize per channel along token dim
+        sub_hat = rtn_quantize(sub.mT, b, group).mT  # (n_b, S) groups -> back
+        R_hat[:, cols] = sub_hat
+
+    M_hat = L + R_hat
+
+    # Honest bpe (per entry; all metadata counted):
+    mean_payload = float(bits_per_ch.float().mean().item())
+    scale_term = 16.0 / group
+    factor_term = 16.0 * rank * (S + C) / (S * C)
+    tier_term = math.ceil(math.log2(len(tiers))) / S
+    bpe = mean_payload + scale_term + factor_term + tier_term
+    return M_hat, bpe
+
+
+# ---------------------------------------------------------------------------
 # Dispatch: quantize_cache
 # ---------------------------------------------------------------------------
 
@@ -396,6 +462,7 @@ def quantize_cache(
     group: int = 64,
     rank: int = 0,
     svd_factors: tuple | None = None,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
 ) -> tuple[torch.Tensor, float]:
     """Compress (S, C) fp32 matrix M with the specified arm.
 
@@ -418,7 +485,11 @@ def quantize_cache(
         bmx.quant.arms's ``ls`` param precedent.  When provided, the internal
         truncated_svd call is skipped (useful when sweeping bits for a fixed
         (M, rank) — the SVD result depends only on those two, not on bits).
-        Only used by lowrank_rtn_channel; ignored by all other arms.
+        Only used by lowrank_rtn_channel and lowrank_waterfill_channel; ignored
+        by all other arms.
+    tiers : tuple[int, ...]
+        Allowed bit-widths for per-channel allocation in lowrank_waterfill_channel.
+        Ignored by all other arms.
 
     Returns
     -------
@@ -439,8 +510,12 @@ def quantize_cache(
         return _turboquant_mse(M, bits, seed)
     elif arm == "turboquant_prod":
         return _turboquant_prod(M, bits, seed)
-    else:  # lowrank_rtn_channel — guarded by the CACHE_ARMS assert above
+    elif arm == "lowrank_rtn_channel":
         return _lowrank_rtn_channel(M, bits, group, rank, svd_factors=svd_factors)
+    else:  # lowrank_waterfill_channel — guarded by the CACHE_ARMS assert above
+        return _lowrank_waterfill_channel(
+            M, float(bits), group, rank, tiers=tiers, svd_factors=svd_factors
+        )
 
 
 # ---------------------------------------------------------------------------
