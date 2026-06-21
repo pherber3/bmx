@@ -40,11 +40,24 @@ def build_longbench_prompt(tokenizer, item: dict, task: str) -> torch.Tensor:
 
 
 def load_longbench_task(task: str, n_samples: int | None) -> list[dict]:
-    """Lazy-load THUDM/LongBench[task]; return up to n_samples items (all if None). VM-only."""
-    from datasets import load_dataset
+    """Load THUDM/LongBench[task]; return up to n_samples items (all if None). VM-only.
 
-    ds = load_dataset("THUDM/LongBench", task, split="test")
-    items = list(ds if n_samples is None else ds.select(range(min(n_samples, len(ds)))))
+    THUDM/LongBench ships as a loader script + data.zip; datasets>=4 no longer runs dataset
+    scripts, so read the task's jsonl out of data.zip directly via huggingface_hub.
+    """
+    import json
+    import zipfile
+
+    from huggingface_hub import hf_hub_download
+
+    zip_path = hf_hub_download("THUDM/LongBench", "data.zip", repo_type="dataset")
+    items: list[dict] = []
+    with zipfile.ZipFile(zip_path) as zf:
+        with zf.open(f"data/{task}.jsonl") as fh:
+            for line in fh:
+                items.append(json.loads(line))
+                if n_samples is not None and len(items) >= n_samples:
+                    break
     return items
 
 
