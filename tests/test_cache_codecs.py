@@ -703,3 +703,71 @@ def test_rotwaterfill_s_divisibility_assert():
             rank=2,
             tiers=(0, 2, 3, 4),
         )
+
+
+def test_rotation_neutral_multitier():
+    """Guard the multi-tier rotate/unrotate path for BOTH KLT and random arms.
+
+    With tiers=(2,8,8,8), use_rotation=True is active (len(set(tiers)) == 3 > 1).
+    At bits=8 the high-bit tiers dominate, so RTN noise is tiny; logit distortion
+    of the rotated arm is checked to be within 0.02 of the unrotated baseline
+    (NOT 1e-6 — rotated basis changes per-group RTN scales, so a small gap is
+    expected; the test guards against the path being BROKEN, not against the ~2%
+    overhead).  Also asserts Q orthogonality for the KLT path directly.
+    """
+    from bmx.cache.collect import from_matrix
+
+    S_, C_, rank_ = 64, 64, 4
+    M = _seeded_matrix(s=S_, c=C_, seed=15).double()
+    h_kv = 2
+    q = _qkv_for(M, h_kv=h_kv)
+    factors = truncated_svd(M, rank_)
+    TIERS_MULTI = (2, 8, 8, 8)  # multi-tier: use_rotation ACTIVE
+
+    # Unrotated baseline at the same tiers
+    base, _ = quantize_cache(
+        "lowrank_waterfill_channel",
+        M,
+        bits=8,
+        group=GROUP,
+        rank=rank_,
+        tiers=TIERS_MULTI,
+        svd_factors=factors,
+    )
+    lg_base = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(base, h_kv).double(), q
+    )
+
+    for arm_name, rotation_label in (
+        ("lowrank_eigwaterfill_channel", "klt"),
+        ("lowrank_randwaterfill_channel", "random"),
+    ):
+        rot, _ = quantize_cache(
+            arm_name,
+            M,
+            bits=8,
+            group=GROUP,
+            rank=rank_,
+            tiers=TIERS_MULTI,
+            seed=1,
+            svd_factors=factors,
+        )
+        lg_rot = _logit_distortion(
+            from_matrix(M, h_kv).double(), from_matrix(rot, h_kv).double(), q
+        )
+        assert abs(lg_rot - lg_base) < 0.02, (
+            f"{rotation_label} multi-tier: logit distortion gap {abs(lg_rot - lg_base):.4f}"
+            f" > 0.02 (base={lg_base:.4f}, rot={lg_rot:.4f})"
+        )
+
+    # KLT path: directly verify Q orthogonality independent of the codec.
+    # Replicate the eigh step on R = M - L.
+    Us, V = factors
+    Us_stored = Us.half().float()
+    V_stored = V.half().float()
+    L = Us_stored @ V_stored.mT
+    R = M - L
+    _, eigvecs = torch.linalg.eigh(R.mT @ R)  # ascending eigenvalues
+    Q = eigvecs.flip(dims=(1,))  # descending order (matches codec)
+    orth_err = (Q @ Q.mT - torch.eye(C_, dtype=Q.dtype)).abs().max().item()
+    assert orth_err < 1e-12, f"KLT Q not orthogonal: max |QQ^T - I| = {orth_err:.3e}"

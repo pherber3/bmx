@@ -586,10 +586,12 @@ def quantize_cache(
         bmx.quant.arms's ``ls`` param precedent.  When provided, the internal
         truncated_svd call is skipped (useful when sweeping bits for a fixed
         (M, rank) — the SVD result depends only on those two, not on bits).
-        Only used by lowrank_rtn_channel and lowrank_waterfill_channel; ignored
+        Only used by lowrank_rtn_channel, lowrank_waterfill_channel,
+        lowrank_eigwaterfill_channel, and lowrank_randwaterfill_channel; ignored
         by all other arms.
     tiers : tuple[int, ...]
-        Allowed bit-widths for per-channel allocation in lowrank_waterfill_channel.
+        Allowed bit-widths for per-channel allocation in lowrank_waterfill_channel,
+        lowrank_eigwaterfill_channel, and lowrank_randwaterfill_channel.
         Ignored by all other arms.
     charge_rotation : bool
         Add the KLT rotation-matrix cost (16*C/S) to bpe; lowrank_eigwaterfill_channel only.
