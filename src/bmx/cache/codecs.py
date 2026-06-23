@@ -583,7 +583,7 @@ def _lowrank_rotwaterfill_channel(
         Rk_hat, p_k = _waterfill_in_basis(Rk, None)  # already in rotated subspace
         topk_back = Rk_hat @ Qk.mT  # (S, C) contribution from top-k subspace
         # Complement: residual not explained by top-k, water-filled in original basis.
-        R_comp = R - (R @ Qk) @ Qk.mT  # project OUT the top-k subspace
+        R_comp = R - Rk @ Qk.mT  # project OUT the top-k subspace (Rk = R @ Qk, reused)
         Rcomp_hat, p_c = _waterfill_in_basis(R_comp, None)
         R_hat = topk_back + Rcomp_hat
         # Blended payload over all C channels (k rotated + C-k complement).

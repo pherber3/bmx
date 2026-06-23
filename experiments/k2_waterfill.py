@@ -317,7 +317,7 @@ def main(cfg: Config) -> pd.DataFrame:
             )
             print(
                 f"  L{layer_i:2d} {arm:30s} bpe={bpe:.3f} logit={lg:.4f} "
-                f"rel_fro={rf:.4f} align={align_col if align_col == align_col else float('nan'):.3f}",
+                f"rel_fro={rf:.4f} align={align_col:.3f}",
                 flush=True,
             )
 
