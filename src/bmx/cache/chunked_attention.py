@@ -132,6 +132,7 @@ def _prefill_dense_attention(
     scale,
     v_group,
     v_seed,
+    attn_mask=None,
 ):
     """Prefill (n_q > 1) attention: reconstruct dense K/V once, run flash SDPA.
 
@@ -166,12 +167,18 @@ def _prefill_dense_attention(
         V = vt if V is None else torch.cat([V.to(q.dtype), vt], dim=1)
     Kx = K.to(q.dtype).repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, S, d)
     Vx = V.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
-    # SDPA expects (..., L, d); add a batch dim of 1 so the flash kernel engages.
+    # Mirror stock sdpa_attention_forward: when the model supplies attn_mask (the
+    # cached-prefill case), it governs masking and is_causal is False; only fall back
+    # to is_causal=True when there is NO mask. Using is_causal=True in place of the
+    # model's mask is WRONG for n_q < n_kv prefill (bottom-right causal != the model's
+    # mask) — it produced garbage prefill logits. attn_mask is 4D (b,1,q,kv); add the
+    # batch dim to q/K/V so the shapes line up.
     out = F.scaled_dot_product_attention(
         q.unsqueeze(0),
         Kx.unsqueeze(0),
         Vx.unsqueeze(0),
-        is_causal=True,
+        attn_mask=attn_mask,
+        is_causal=(attn_mask is None),
         scale=scale,
     )
     return out.squeeze(0)  # (n_q_heads, n_q, d)
@@ -196,6 +203,7 @@ def chunked_dequant_attention(
     query_abs_start: int | None = None,
     v_group: int | None = None,
     v_seed: int | None = None,
+    attn_mask=None,
 ):
     """Online-softmax attention over per-block dequantized K/V. GQA-aware.
 
@@ -240,6 +248,7 @@ def chunked_dequant_attention(
             scale=scale,
             v_group=_v_group,
             v_seed=_v_seed,
+            attn_mask=attn_mask,
         )
     acc = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
     m = torch.full((n_q_heads, n_q, 1), float("-inf"), dtype=q.dtype, device=q.device)

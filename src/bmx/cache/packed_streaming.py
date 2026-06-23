@@ -41,9 +41,14 @@ def chunked_attention_forward(
     The dense key/value tensors passed by HF are ignored — attention is computed
     entirely from the packed blocks stored on module._packed_layer.
 
-    Causal masking: when n_q > 1 (prefill), SDPA applies is_causal=True internally.
-    We match this by passing a computed causal attention_mask to chunked_dequant_attention.
-    During decode (n_q == 1), no mask is needed — the single query attends to all history.
+    Masking (prefill, n_q > 1): the model supplies the exact attention_mask for the
+    cached-prefill case (a 4D (b,1,q,kv) tensor that is NOT equivalent to a plain
+    is_causal=True bottom-right mask). We thread it into the prefill SDPA path and
+    let it do the masking — mirroring stock sdpa_attention_forward, which uses
+    is_causal only when attention_mask is None. Using is_causal=True instead of the
+    model's mask was a real bug: it produced wrong prefill logits at scale.
+    During decode (n_q == 1), no mask is needed — the single query attends to all
+    history.
     """
     assert hasattr(module, "_packed_layer"), (
         "PackedStreamingCache.attach(model) must be called before forward"
@@ -51,7 +56,9 @@ def chunked_attention_forward(
     layer = module._packed_layer
     n_q = query.shape[2]  # query is (1, n_q_heads, n_q, d)
     q = query.squeeze(0)  # (n_q_heads, n_q, d)
-    out = layer.attend(q, scaling, is_causal=(n_q > 1))  # (n_q_heads, n_q, d)
+    out = layer.attend(
+        q, scaling, is_causal=(n_q > 1), attention_mask=attention_mask
+    )  # (n_q_heads, n_q, d)
     n_q_heads, n_q, d = out.shape
     attn_output = out.transpose(0, 1).reshape(1, n_q, n_q_heads * d)
     return attn_output.to(query.dtype), None
@@ -304,13 +311,18 @@ class PackedStreamingLayer(DynamicLayer):
         return self._committed_S_q + self.keys.shape[-2]
 
     def attend(
-        self, q: torch.Tensor, scaling: float, is_causal: bool = False
+        self,
+        q: torch.Tensor,
+        scaling: float,
+        is_causal: bool = False,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run chunked dequant-attention for this layer.
 
         q: (n_q_heads, n_q, d) — already sliced from HF's query tensor.
-        is_causal: apply causal masking (True during prefill when n_q > 1, matching
-            SDPA's is_causal=True; False during decode when n_q == 1).
+        is_causal: True during prefill (n_q > 1), False during decode (n_q == 1).
+        attention_mask: the model's 4D (b,1,q,kv) mask for the prefill SDPA path;
+            when provided it (not is_causal) governs masking, matching stock SDPA.
         Returns (n_q_heads, n_q, d).
         """
         # After Fix 3 (slab pruning), self.keys holds only the tail: the slab starts
@@ -347,6 +359,7 @@ class PackedStreamingLayer(DynamicLayer):
             query_abs_start=query_abs_start,
             v_group=self.v_spec.group,
             v_seed=self.v_spec.seed,
+            attn_mask=attention_mask,
         )
 
 
