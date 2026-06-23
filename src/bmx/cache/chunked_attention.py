@@ -14,6 +14,7 @@ shape so they are drop-in comparable:
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from bmx.cache.codecs import dequant_packed
 from bmx.cache.collect import from_matrix
@@ -113,6 +114,69 @@ def naive_dense_attention(
     return torch.softmax(scores, dim=-1) @ Vx
 
 
+def _prefill_dense_attention(
+    q,
+    k_blocks,
+    v_blocks,
+    *,
+    k_arm,
+    v_arm,
+    group,
+    seed,
+    k_pre_rope,
+    rope_cos,
+    rope_sin,
+    k_tail,
+    v_tail,
+    n_q_groups,
+    scale,
+    v_group,
+    v_seed,
+):
+    """Prefill (n_q > 1) attention: reconstruct dense K/V once, run flash SDPA.
+
+    The per-block online-softmax in chunked_dequant_attention is O(S^2) memory at
+    prefill, because each block produces an (heads, n_q=S, blk) score tile and the
+    tiles sum to (heads, S, S). At prefill the right tool is flash SDPA, which
+    tiles over the query dim internally in O(S) memory and never materializes the
+    (S, S) score matrix. We dequant all committed blocks + the fp16 tail into one
+    dense K/V (a transient that frees after this one-shot forward), GQA-expand, and
+    call F.scaled_dot_product_attention(is_causal=True). This matches what
+    transformers' own QuantizedCache does (dequant-to-dense + SDPA). The DECODE
+    path (n_q == 1) keeps the chunked online-softmax — that is the resident-memory
+    win and is O(S) there (tiny per-block tiles).
+    """
+    K = _dense_kv(
+        k_blocks,
+        k_arm,
+        group,
+        seed,
+        q.shape[0] // n_q_groups,
+        k_pre_rope,
+        rope_cos,
+        rope_sin,
+    )
+    V = _dense_kv(
+        v_blocks, v_arm, v_group, v_seed, q.shape[0] // n_q_groups, False, None, None
+    )
+    if k_tail is not None and k_tail.shape[1] > 0:
+        kt = k_tail.to(q.dtype)
+        vt = v_tail.to(q.dtype)
+        K = kt if K is None else torch.cat([K.to(q.dtype), kt], dim=1)
+        V = vt if V is None else torch.cat([V.to(q.dtype), vt], dim=1)
+    Kx = K.to(q.dtype).repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, S, d)
+    Vx = V.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
+    # SDPA expects (..., L, d); add a batch dim of 1 so the flash kernel engages.
+    out = F.scaled_dot_product_attention(
+        q.unsqueeze(0),
+        Kx.unsqueeze(0),
+        Vx.unsqueeze(0),
+        is_causal=True,
+        scale=scale,
+    )
+    return out.squeeze(0)  # (n_q_heads, n_q, d)
+
+
 def chunked_dequant_attention(
     q,
     k_blocks,
@@ -151,6 +215,32 @@ def chunked_dequant_attention(
     h_kv = n_q_heads // n_q_groups
     _v_group = v_group if v_group is not None else group
     _v_seed = v_seed if v_seed is not None else seed
+
+    # Prefill (n_q > 1): the per-block online-softmax below is O(S^2) memory because
+    # each block's score tile is (heads, n_q=S, blk). Delegate to the dense + flash
+    # SDPA path, which is O(S). Decode (n_q == 1) falls through to the chunked loop
+    # — that is the resident-memory win and is O(S) there. (query_abs_start is set
+    # iff prefill, per PackedStreamingLayer.attend; n_q > 1 is the same signal
+    # transformers' SDPA uses to pick is_causal.)
+    if query_abs_start is not None and n_q > 1:
+        return _prefill_dense_attention(
+            q,
+            k_blocks,
+            v_blocks,
+            k_arm=k_arm,
+            v_arm=v_arm,
+            group=group,
+            seed=seed,
+            k_pre_rope=k_pre_rope,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            k_tail=k_tail,
+            v_tail=v_tail,
+            n_q_groups=n_q_groups,
+            scale=scale,
+            v_group=_v_group,
+            v_seed=_v_seed,
+        )
     acc = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
     m = torch.full((n_q_heads, n_q, 1), float("-inf"), dtype=q.dtype, device=q.device)
     lse = torch.zeros(n_q_heads, n_q, 1, dtype=q.dtype, device=q.device)
