@@ -52,19 +52,24 @@ def _measure(model, input_ids, cache, max_new_tokens: int = 4):
     resident = torch.cuda.max_memory_allocated() if cuda else 0
     if cuda:
         torch.cuda.reset_peak_memory_stats()
-    # Feed only the last token as the continuation — the cache already holds all of
-    # input_ids from the prefill forward above. Passing the full sequence again would
-    # cause transformers to re-append it to the cache (double-prefill bug), inflating
-    # peak_decode by ~one full prefill worth of KV and falsely tripping the Phase-3 gate.
-    last_token = input_ids[:, -1:]
+    # Manual decode loop (NOT model.generate). The cache already holds all S prefill
+    # tokens from the forward above; generate() would compute new_tokens = given -
+    # cached and, given one token already cached, process ZERO tokens -> a 0-length
+    # reshape crash. We instead feed genuinely-new single tokens at positions S, S+1,
+    # ..., passing cache_position so each appends correctly. This measures a real
+    # decode step's peak without generate()'s pre-filled-cache bookkeeping.
+    S = input_ids.shape[1]
+    next_tok = input_ids[:, -1:]  # arbitrary token id; memory, not text, is measured
     with torch.no_grad():
-        model.generate(
-            last_token,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            past_key_values=cache,
-        )
+        for step in range(max_new_tokens):
+            pos = torch.tensor([S + step], device=input_ids.device)
+            out = model(
+                next_tok,
+                past_key_values=cache,
+                use_cache=True,
+                cache_position=pos,
+            )
+            next_tok = out.logits[:, -1:].argmax(dim=-1)
     if cuda:
         torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() if cuda else 0
@@ -95,14 +100,18 @@ def main(cfg: Config):
                 ("dense_stream", StreamingQuantizedCache),
                 ("chunked", PackedStreamingCache),
             ]:
+                # fp16 is the uncompressed BASELINE — measure it only on
+                # dense_stream. The chunked path exists to realize compression, and
+                # PackedStreamingCache has no fp16 passthrough (its flush calls
+                # quantize_packed, which rejects 'fp16'). fp16-chunked is not a
+                # meaningful config; the Phase-3 gate is about the COMPRESSED
+                # (k2b) chunked path. Skip the fp16 x chunked cell.
+                if arm == "fp16" and path == "chunked":
+                    continue
                 cache = Cls(model.config, k_spec=k_spec, v_spec=v_spec)
-                # Always attach PackedStreamingCache so ALL arms (incl fp16) route
-                # through chunked_attention_forward.  The Phase-3 gate measures the
-                # chunked path's peak; putting fp16 on stock SDPA would make its row
-                # incomparable.  attach() gates the k_proj hook on pre_rope, so the
-                # only extra cost for fp16 is the attention-fn registration.
-                # StreamingQuantizedCache only needs attach when pre_rope is True
-                # (its existing behavior).
+                # Attach PackedStreamingCache so the codec arm routes through
+                # chunked_attention_forward. StreamingQuantizedCache only needs
+                # attach when pre_rope is True (its existing behavior).
                 if isinstance(cache, PackedStreamingCache):
                     cache.attach(model)
                 elif k_spec.pre_rope:
