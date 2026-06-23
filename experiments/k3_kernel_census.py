@@ -40,24 +40,28 @@ def _specs(arm):
     raise ValueError(arm)
 
 
-def _measure(model, input_ids, cache):
+def _measure(model, input_ids, cache, max_new_tokens: int = 4):
     cuda = torch.cuda.is_available()
     if cuda:
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
         model(input_ids, past_key_values=cache, use_cache=True)
+    if cuda:
+        torch.cuda.synchronize()
     resident = torch.cuda.max_memory_allocated() if cuda else 0
     if cuda:
         torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
         model.generate(
             input_ids,
-            max_new_tokens=4,
+            max_new_tokens=max_new_tokens,
             do_sample=False,
             use_cache=True,
             past_key_values=cache,
         )
+    if cuda:
+        torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() if cuda else 0
     return resident, peak
 
@@ -83,7 +87,7 @@ def main(cfg: Config):
                 cache = Cls(model.config, k_spec=k_spec, v_spec=v_spec)
                 if k_spec.pre_rope:
                     cache.attach(model)
-                resident, peak = _measure(model, input_ids, cache)
+                resident, peak = _measure(model, input_ids, cache, cfg.max_new_tokens)
                 if hasattr(cache, "detach"):
                     cache.detach()
                 bpe_k, bpe_v = (
