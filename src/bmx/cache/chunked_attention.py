@@ -111,3 +111,58 @@ def naive_dense_attention(
     Vx = V.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
     scores = (q @ Kx.transpose(-1, -2)) * scale
     return torch.softmax(scores, dim=-1) @ Vx
+
+
+def chunked_dequant_attention(
+    q,
+    k_blocks,
+    v_blocks,
+    *,
+    k_arm,
+    v_arm,
+    group,
+    seed,
+    k_pre_rope,
+    rope_cos,
+    rope_sin,
+    k_tail,
+    v_tail,
+    tail_start,
+    n_q_groups,
+    scale,
+):
+    """Online-softmax attention over per-block dequantized K/V. GQA-aware.
+
+    q: (n_q_heads, n_q, d). k_blocks/v_blocks: list of (packed, start, end).
+    k_pre_rope: if True, dequantized K blocks are pre-RoPE and get RoPE applied at
+    [start,end) before the contraction. k_tail/v_tail: (h_kv, tail_len, d) fp16
+    recent window (post-RoPE for K). Returns (n_q_heads, n_q, d).
+    """
+    n_q_heads, n_q, d = q.shape
+    h_kv = n_q_heads // n_q_groups
+    acc = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
+    m = torch.full((n_q_heads, n_q, 1), float("-inf"), dtype=q.dtype, device=q.device)
+    lse = torch.zeros(n_q_heads, n_q, 1, dtype=q.dtype, device=q.device)
+
+    def attend(K_kv, V_kv):
+        nonlocal acc, m, lse
+        K_exp = K_kv.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, blk, d)
+        V_exp = V_kv.repeat_interleave(n_q_groups, dim=0)
+        s = (q @ K_exp.transpose(-1, -2)) * scale  # (n_q_heads, n_q, blk)
+        acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
+
+    for (kpacked, start, end), (vpacked, _vs, _ve) in zip(k_blocks, v_blocks):
+        K_kv = _dequant_block(kpacked, k_arm, group, seed, h_kv).to(q.dtype)
+        if k_pre_rope:
+            K_kv = apply_rope(
+                K_kv,
+                rope_cos[start:end].to(q.dtype),
+                rope_sin[start:end].to(q.dtype),
+            )
+        V_kv = _dequant_block(vpacked, v_arm, group, seed, h_kv).to(q.dtype)
+        attend(K_kv, V_kv)
+
+    if k_tail is not None and k_tail.shape[1] > 0:
+        attend(k_tail.to(q.dtype), v_tail.to(q.dtype))
+
+    return acc / lse

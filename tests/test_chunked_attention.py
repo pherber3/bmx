@@ -1,12 +1,16 @@
 """Chunked dequant-attention: oracle, online-softmax exactness, schedule."""
 
+import pytest
 import torch
 
 from bmx.cache.chunked_attention import (
     attention_diff,
+    chunked_dequant_attention,
     naive_dense_attention,
     online_softmax_update,
 )
+from bmx.cache.codecs import quantize_packed
+from bmx.cache.collect import to_matrix
 from bmx.cache.streaming import compute_flush_schedule
 
 
@@ -95,3 +99,55 @@ def test_online_softmax_equals_full_softmax():
         acc, m, lse = online_softmax_update(acc, m, lse, s, Vb)
     out = acc / lse
     assert torch.allclose(out, ref, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "k_arm,v_arm,kw",
+    [
+        ("fp16", "fp16", {}),
+        ("turboquant_mse", "turboquant_mse", dict(bits=2)),
+    ],
+)
+def test_chunked_matches_oracle_no_rope(k_arm, v_arm, kw):
+    # chunked dequant-attn must equal the oracle (dequant-all + full softmax) over
+    # the SAME packed blocks. Isolates the online-softmax + per-block assembly.
+    torch.manual_seed(0)
+    h_kv, n_q_heads, n_q, S, d = 2, 4, 1, 48, 8  # GQA: 4 q-heads over 2 kv-heads
+    group = 8
+    q = torch.randn(n_q_heads, n_q, d, dtype=torch.float64)
+    K = torch.randn(h_kv, S, d, dtype=torch.float64)
+    V = torch.randn(h_kv, S, d, dtype=torch.float64)
+    scale = 1.0 / (d**0.5)
+
+    def pack_side(T, arm):
+        blocks = []
+        for j in range(0, S, 16):
+            M = to_matrix(T[:, j : j + 16])  # (16, h_kv*d)
+            packed = (
+                {"fp16": M}
+                if arm == "fp16"
+                else quantize_packed(arm, M, group=group, **kw)[0]
+            )
+            blocks.append((packed, j, j + 16))
+        return blocks
+
+    k_blocks, v_blocks = pack_side(K, k_arm), pack_side(V, v_arm)
+    common = dict(
+        k_arm=k_arm,
+        v_arm=v_arm,
+        group=group,
+        seed=0,
+        k_pre_rope=False,
+        rope_cos=None,
+        rope_sin=None,
+        k_tail=None,
+        v_tail=None,
+        n_q_groups=n_q_heads // h_kv,
+        scale=scale,
+    )
+
+    oracle = naive_dense_attention(q, k_blocks, v_blocks, **common)
+    fast = chunked_dequant_attention(q, k_blocks, v_blocks, tail_start=S, **common)
+
+    drift = attention_diff(fast, oracle)
+    assert drift["max_abs"] < 1e-10, drift  # online softmax is exact vs oracle
