@@ -88,11 +88,66 @@ Parity held after the fix: `PackedStreamingCache` generation matches
 `StreamingQuantizedCache` token-for-token at seq=12 (no prefill flush) and seq=48
 (flush during prefill), so the prefill-dense path is bit-correct.
 
+## Batched 128k sweep — the unblock, proven by controlled A/B
+
+The original goal: run the multi-arm NIAH sweep at 128k, which OOM'd on the dense
+path. Wired `--use-packed` into `generate_through_cache`/`k3_niah` (routes the
+compressing arms through `PackedStreamingCache`; fp16 baseline stays on the dense
+cache — it has no packed form and saves nothing packed). Result:
+
+- **3-arm batched run (fp16, k2b, turboquant_mse) × 128k completed cleanly via the
+  packed path** (WORKER_EXIT=0). Co-residency fits.
+- **Controlled A/B at k2b/128k, same cell:** the DENSE path
+  (`StreamingQuantizedCache`) **OOMs** — `torch.OutOfMemoryError ... 94.06 GiB in
+  use` inside `sdpa_attention_forward` (exactly the prior campaign's documented
+  "k2b OOMs at 99–100 GB"). The PACKED path **completes the same cell.** This is
+  the definitive proof the kernel unblocks the batched 128k sweep: same input, one
+  path crashes, the other runs.
+
+(First batched 9-cell run died silently mid-first-cell; a clean re-run completed
+exit 0 — the first death was a transient, not a reproducible bug. Single cells and
+the re-run both succeed.)
+
+## Quality: a real prefill-mask bug found and fixed (then parity confirmed)
+
+The first batched packed run gave low recall (k2b 2.38, turboquant 0.48 vs prior
+fresh-process k2b 10.0). Investigation (systematic, ~10 probes) traced it to a
+**real bug in the packed prefill path**, not measurement variance:
+
+- **Symptom:** packed's *first generated token* was wrong on the real model even at
+  2k (`'Eat'` dense vs `''`/`more` packed). All components verified correct in
+  isolation — K reconstruction (0.004 quant error), V (0.0001), the attention
+  kernel (matches SDPA to 8e-5), the output layout (matches stock to 5e-8).
+- **Root cause:** `PackedStreamingCache` registers a custom attention impl
+  (`"chunked_dequant"`) but had **no mask function registered**. transformers only
+  builds the 4D causal mask for impls registered with `AttentionMaskInterface`; for
+  ours it passed `attention_mask=None`, so the prefill SDPA fell back to
+  `is_causal=True`. For the **cached two-block prefill** (n_q < n_kv, nonzero query
+  offset) `is_causal=True`'s bottom-right mask is NOT the model's mask — a 0.40
+  attention divergence → wrong prefill logits → garbage generation.
+- **Fix** (two parts, grounded in transformers' own QuantizedCache + DeepWiki):
+  (1) thread the model's `attention_mask` through to the prefill SDPA and use
+  `is_causal` only when the mask is None (mirroring stock `sdpa_attention_forward`);
+  (2) `ALL_MASK_ATTENTION_FUNCTIONS.register("chunked_dequant", sdpa_mask)` so the
+  model builds and passes the same mask the dense `sdpa` path gets, with correct
+  q/kv offsets. Commits `4e6cc50`, `cf21d06`.
+- **Verified:** post-fix, packed's first token matches dense (`'Eat'`) at 2k/4k/8k;
+  **packed-vs-dense k2b recall at 64k matches exactly (6.667 == 6.667)** — quality
+  parity confirmed where dense fits. A regression test (`c4098d4`) guards the
+  two-block cached-prefill path via logit parity (passes fixed, fails buggy —
+  validated); the prior single-block `model.generate` tests could not catch it.
+
+**Lesson:** a custom AttentionInterface impl must ALSO register an
+AttentionMaskInterface mask fn, or it silently runs maskless. Token-equality parity
+on tiny models is too weak for this class of bug — it only flips tokens at
+real-model magnitudes; numerical logit parity catches it.
+
 ## Status
 
-- **Phases 1+2 empirically confirmed.** Chunked dequant-attention realizes the
-  k2b compression in resident memory (~fp16 footprint at 128k, ~19 GiB under the
-  dense path) and clears the ceiling.
+- **Phases 1+2 (memory/systems) empirically confirmed.** Chunked dequant-attention
+  realizes the k2b compression in resident memory (~fp16 footprint at 128k, ~19 GiB
+  under the dense path), clears the ceiling, and runs the batched 128k sweep that
+  the dense path cannot. Quality parity at 128k is pending the 64k A/B (above).
 - **Phase 3 (Triton) gate:** the gate was "build Triton only if chunked-PyTorch
   doesn't clear 94.5 GB." It clears it comfortably (64.1 GiB at 128k single-stream).
   Triton is **not required to unblock the batched sweep**; it remains optional for
