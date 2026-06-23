@@ -79,6 +79,11 @@ def main(cfg: Config):
         torch_dtype=torch.float16,
         device_map="cuda" if torch.cuda.is_available() else "cpu",
     ).eval()
+
+    # Create the run dir up front so each cell can be written incrementally — a cell
+    # that OOMs (dense_stream @128k is EXPECTED to, >94.5 GB ceiling) must not lose
+    # the cells already measured. The parquet is rewritten after every cell.
+    run_dir = create_run("k3_kernel_census", cfg)
     rows = []
     for S in cfg.seq_lens:
         input_ids = torch.randint(
@@ -102,14 +107,31 @@ def main(cfg: Config):
                     cache.attach(model)
                 elif k_spec.pre_rope:
                     cache.attach(model)
-                resident, peak = _measure(model, input_ids, cache, cfg.max_new_tokens)
+
+                # An OOM is a DATA POINT here (the path exceeded the GPU), not a crash:
+                # record a sentinel row (oom=True, peak=-1) and continue so the rest of
+                # the census still lands. Without this, one expected OOM aborts the
+                # whole process before the parquet is written.
+                oom = False
+                bpe_k = bpe_v = float("nan")
+                try:
+                    resident, peak = _measure(
+                        model, input_ids, cache, cfg.max_new_tokens
+                    )
+                    # bpe is only meaningful for a cell that actually ran; read it
+                    # inside the try so a half-built post-OOM cache can't throw here.
+                    if hasattr(cache, "bits_per_entry"):
+                        bpe_k, bpe_v = cache.bits_per_entry()
+                except torch.cuda.OutOfMemoryError:
+                    oom = True
+                    resident, peak = -1, -1
                 if hasattr(cache, "detach"):
                     cache.detach()
-                bpe_k, bpe_v = (
-                    cache.bits_per_entry()
-                    if hasattr(cache, "bits_per_entry")
-                    else (float("nan"), float("nan"))
-                )
+                del cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+
                 rows.append(
                     {
                         "seq_len": S,
@@ -117,18 +139,19 @@ def main(cfg: Config):
                         "path": path,
                         "resident_after_prefill": resident,
                         "peak_decode": peak,
-                        "peak_decode_incremental": peak - resident,
+                        "peak_decode_incremental": (peak - resident if not oom else -1),
+                        "oom": oom,
                         "bpe_k": bpe_k,
                         "bpe_v": bpe_v,
                     }
                 )
-                del cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-    df = pd.DataFrame(rows)
-    run_dir = create_run("k3_kernel_census", cfg)
-    write_metrics(run_dir, df, "census")
-    print(df.to_string(index=False))
+                # Rewrite after every cell so a later OOM/crash keeps prior results.
+                write_metrics(run_dir, pd.DataFrame(rows), "census")
+                status = "OOM" if oom else f"peak={peak / 1024**3:.1f}GiB"
+                print(f"  {arm:5s} {path:12s} S={S:<7d} {status}", flush=True)
+
+    print()
+    print(pd.DataFrame(rows).to_string(index=False))
     print(f"\nwrote {run_dir / 'census.parquet'}")
 
 
