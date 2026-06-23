@@ -184,7 +184,17 @@ def generate_through_cache(
     )
     eos_ids = {_eos} if isinstance(_eos, int) else set(_eos or [])
 
-    cache_cls = PackedStreamingCache if use_packed else StreamingQuantizedCache
+    # fp16 is the uncompressed baseline — it has no packed representation
+    # (PackedStreamingCache's flush would call quantize_packed('fp16'), which raises).
+    # Route the all-fp16 spec through the dense cache even under use_packed; its
+    # recall is identical either way (no quantization), and fp16-through-packed
+    # would save zero memory. Only the compressing arms use the packed path.
+    is_fp16 = k_spec.arm == "fp16" and v_spec.arm == "fp16"
+    cache_cls = (
+        PackedStreamingCache
+        if (use_packed and not is_fp16)
+        else StreamingQuantizedCache
+    )
     cache = cache_cls(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
     new_ids: list[int] = []
