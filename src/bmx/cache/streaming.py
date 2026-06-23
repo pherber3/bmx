@@ -43,6 +43,16 @@ from bmx.cache.specs import CacheCodecSpec
 from bmx.decomp.lrs import truncated_svd
 
 
+def compute_flush_schedule(S: int, W: int, g: int) -> int:
+    """Largest multiple of g that leaves >= W recent tokens fp16, else 0.
+
+    Single source of truth for the committed-block boundary; both
+    StreamingQuantizedLayer and PackedStreamingLayer call this so their schedules
+    cannot drift (bit-for-bit parity depends on it).
+    """
+    return ((S - W) // g) * g if S > W else 0
+
+
 class StreamingQuantizedLayer(DynamicLayer):
     """Per-layer streaming-quantized cache.
 
@@ -218,7 +228,7 @@ class StreamingQuantizedLayer(DynamicLayer):
 
         # Compute the new committed length: largest multiple of g that leaves
         # at least W recent tokens in the fp16 window.
-        new_S_q = ((S - W) // g) * g if S > W else 0
+        new_S_q = compute_flush_schedule(S, W, g)
 
         if new_S_q <= 0:
             # Nothing to quantize yet — whole cache stays fp16 this step.
