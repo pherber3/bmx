@@ -88,6 +88,10 @@ class PackedStreamingLayer(DynamicLayer):
         # Committed block count (how many tokens are packed).
         self._committed_S_q: int = 0
 
+        # Absolute position of self.keys[..., 0, :] after slab pruning (Fix 3).
+        # Zero until the first flush; updated each time a block is committed.
+        self._fp16_offset: int = 0
+
         # Packed block lists: list of (packed_dict, start, end).
         self._k_blocks: list[tuple[dict, int, int]] = []
         self._v_blocks: list[tuple[dict, int, int]] = []
@@ -207,10 +211,12 @@ class PackedStreamingLayer(DynamicLayer):
         Returns (keys, values) for HF bookkeeping; attention routes through
         the registered chunked_attention_forward fn instead.
         """
-        # Let DynamicLayer concatenate the running full slab (post-RoPE).
+        # Let DynamicLayer concatenate the running slab (post-RoPE, pruned after Fix 3).
         keys, values = super().update(key_states, value_states, *args, **kwargs)
 
-        S = keys.shape[2]  # (1, h_kv, S, d)
+        # Total sequence length = absolute start of slab + current slab length.
+        # After Fix 3 pruning, _fp16_offset is the absolute position of slab[...,0,:].
+        S = self._fp16_offset + keys.shape[2]  # total tokens in sequence
         W = self.recent_window
         new_S_q = compute_flush_schedule(S, W, self._g)
 
@@ -230,7 +236,10 @@ class PackedStreamingLayer(DynamicLayer):
                 kpacked = self._pack_k_block(k_block_pre, block_start, block_end)
             else:
                 # Post-RoPE: block was pristine fp16 tail until now (same as streaming.py).
-                k_block_fp32 = keys.squeeze(0)[..., block_start:block_end, :].float()
+                # After slab pruning, keys is the local slab starting at _fp16_offset.
+                local_start = block_start - self._fp16_offset
+                local_end = block_end - self._fp16_offset
+                k_block_fp32 = keys.squeeze(0)[..., local_start:local_end, :].float()
                 M = to_matrix(k_block_fp32)
                 kpacked, _ = quantize_packed(
                     self.k_spec.arm,
@@ -242,7 +251,10 @@ class PackedStreamingLayer(DynamicLayer):
                 )
 
             # --- Pack V block ---
-            v_block_fp32 = values.squeeze(0)[..., block_start:block_end, :].float()
+            # After slab pruning, values is the local slab starting at _fp16_offset.
+            local_start = block_start - self._fp16_offset
+            local_end = block_end - self._fp16_offset
+            v_block_fp32 = values.squeeze(0)[..., local_start:local_end, :].float()
             vpacked = self._pack_v_block(v_block_fp32)
 
             self._k_blocks.append((kpacked, block_start, block_end))
@@ -259,12 +271,28 @@ class PackedStreamingLayer(DynamicLayer):
                     self._k_pre = self._k_pre[:, prune_local_end:, :].contiguous()
                     self._k_pre_offset = block_end
 
-        # Keep self.keys/.values as the FULL fp16 slab (DynamicLayer's own storage).
-        # HF uses get_seq_length() from this for positional bookkeeping; the actual
-        # attention value comes from attend() via the registered attention fn.
+            # --- Fix 3: Prune fp16 slab to tail-only ---
+            # Committed region lives solely as packed codes in _k_blocks/_v_blocks.
+            # After pruning, keys/values hold only [block_end:] in ABSOLUTE terms,
+            # which is [local_prune:] in the slab that starts at _fp16_offset.
+            # _fp16_offset tracks the absolute position of self.keys[..., 0, :].
+            # attend() computes total_seq_len = _committed_S_q + self.keys.shape[2],
+            # and get_seq_length() returns the same value.
+            local_prune = block_end - self._fp16_offset
+            keys = keys[..., local_prune:, :].contiguous()
+            values = values[..., local_prune:, :].contiguous()
+            self._fp16_offset = block_end
+
+        # Store pruned (or full, if no flush this step) slab.
         self.keys = keys
         self.values = values
         return keys, values
+
+    def get_seq_length(self) -> int:
+        """Total sequence length = committed tokens + resident fp16 slab length."""
+        if not self.is_initialized or self.keys is None or self.keys.numel() == 0:
+            return 0
+        return self._committed_S_q + self.keys.shape[-2]
 
     def attend(
         self, q: torch.Tensor, scaling: float, is_causal: bool = False
@@ -277,23 +305,33 @@ class PackedStreamingLayer(DynamicLayer):
         Returns (n_q_heads, n_q, d).
         """
         tail_start = self._committed_S_q
-        k_tail = self.keys.squeeze(0)[..., tail_start:, :]  # (h_kv, tail_len, d)
-        v_tail = self.values.squeeze(0)[..., tail_start:, :]  # (h_kv, tail_len, d)
+        # After Fix 3 (slab pruning), self.keys holds only the tail starting at
+        # absolute position _fp16_offset. Slicing [tail_start:] on the pruned slab
+        # would overshoot; use (tail_start - _fp16_offset) as the local index.
+        local_tail_start = tail_start - self._fp16_offset
+        k_tail = self.keys.squeeze(0)[..., local_tail_start:, :]  # (h_kv, tail_len, d)
+        v_tail = self.values.squeeze(0)[
+            ..., local_tail_start:, :
+        ]  # (h_kv, tail_len, d)
         n_q_heads = q.shape[0]
         n_q = q.shape[1]
         n_q_groups = n_q_heads // self._h_kv
 
         if is_causal and n_q > 1:
             # Prefill: causal attention to match SDPA's is_causal=True behaviour.
-            # Committed blocks are all strictly before the first query position, so
-            # those attend fully. Only the tail needs a causal mask.
-            # Use torch SDPA for correctness and to avoid re-implementing causal masking.
+            # Use absolute-position arithmetic in _attend_causal so both committed
+            # blocks and the tail are masked correctly.
+            # total_seq_len = committed + current fp16 slab length; query[0] is at
+            # absolute position (total_seq_len - n_q).
+            total_seq_len = self._committed_S_q + self.keys.shape[2]
+            query_abs_start = total_seq_len - n_q
             return self._attend_causal(
                 q,
                 k_tail,
                 v_tail,
                 scaling,
                 n_q_groups,
+                query_abs_start,
             )
 
         return chunked_dequant_attention(
@@ -321,13 +359,13 @@ class PackedStreamingLayer(DynamicLayer):
         v_tail: torch.Tensor,
         scaling: float,
         n_q_groups: int,
+        query_abs_start: int = 0,
     ) -> torch.Tensor:
         """Causal attention for prefill (n_q > 1) matching SDPA's is_causal=True.
 
-        Called when there may be committed blocks (full attention) plus a tail
-        (causal attention). In practice for this test the prefill is always within
-        the recent window so there are no committed blocks; the general case is
-        handled via the online-softmax framework with an explicit mask.
+        Absolute-position rule: query at absolute position (query_abs_start + qi)
+        must not attend key at absolute position j where j > query_abs_start + qi.
+        This applies uniformly to committed blocks and the tail.
 
         Returns (n_q_heads, n_q, d).
         """
@@ -345,8 +383,11 @@ class PackedStreamingLayer(DynamicLayer):
         )
         lse = torch.zeros(n_q_heads, n_q, 1, dtype=q.dtype, device=q.device)
 
-        # Committed blocks are ALL before the query positions in the sequence;
-        # they attend fully (no causal restriction for these historical blocks).
+        # Absolute positions of each query: shape (n_q,)
+        q_abs = torch.arange(query_abs_start, query_abs_start + n_q, device=q.device)
+
+        # Committed blocks: apply absolute-position causal mask so query qi
+        # cannot see key at block position j where (start + j) > q_abs[qi].
         for (kpacked, start, end), (vpacked, _vs, _ve) in zip(
             self._k_blocks, self._v_blocks
         ):
@@ -365,29 +406,27 @@ class PackedStreamingLayer(DynamicLayer):
             K_exp = K_kv.repeat_interleave(n_q_groups, dim=0)
             V_exp = V_kv.repeat_interleave(n_q_groups, dim=0)
             s = (q @ K_exp.transpose(-1, -2)) * scaling  # (n_q_heads, n_q, blk)
+            # key_abs[j] = start + j; mask where key_abs[j] > q_abs[qi].
+            key_abs = torch.arange(start, end, device=q.device)  # (blk,)
+            # causal_mask[qi, j] = True means MASK OUT (future key).
+            causal_mask = key_abs.unsqueeze(0) > q_abs.unsqueeze(1)  # (n_q, blk)
+            s = s.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
             acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
 
-        # Tail: apply causal mask so query at position i only sees keys 0..i.
-        # tail_len == n_q when no blocks are committed (common for prefill).
+        # Tail: apply absolute-position causal mask.
+        # key at tail-position j has absolute position (tail_start + j);
+        # mask out where (tail_start + j) > q_abs[qi].
         if k_tail is not None and k_tail.shape[1] > 0:
+            tail_start = self._committed_S_q
             tail_len = k_tail.shape[1]
             K_exp = k_tail.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
             V_exp = v_tail.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
-            # s[h, q_i, k_j] should be -inf when k_j > q_i (future keys).
-            # The committed_S_q tokens come before the tail; q_i is the position
-            # within the query block (0-indexed), k_j is within the tail.
-            # For the tail-only case (no committed blocks): q_i attends to
-            # tail positions 0..q_i (causal within the tail).
             s = (q @ K_exp.transpose(-1, -2)) * scaling  # (n_q_heads, n_q, tail_len)
-            # Causal mask: q_i cannot see k_j where j > q_i (q is at absolute
-            # position tail_start + q_i relative to q_i-th query position;
-            # but queries and tail tokens are laid out the same way in prefill).
-            # Build mask (n_q, tail_len): True means "mask out" (future position).
-            causal_mask = torch.ones(n_q, tail_len, dtype=torch.bool, device=q.device)
-            for qi in range(n_q):
-                # query at position qi can see tail positions 0..qi
-                causal_mask[qi, : qi + 1] = False  # keep these (not masked)
-            # Broadcast over heads: (1, n_q, tail_len)
+            key_abs = torch.arange(
+                tail_start, tail_start + tail_len, device=q.device
+            )  # (tail_len,)
+            # causal_mask[qi, j] = True means MASK OUT (future key).
+            causal_mask = key_abs.unsqueeze(0) > q_abs.unsqueeze(1)  # (n_q, tail_len)
             s = s.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
             acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
 
@@ -470,6 +509,12 @@ class PackedStreamingCache(Cache):
         for h in self._handles:
             h.remove()
         self._handles = []
+        # Fix 4: remove the _packed_layer back-reference so the model's attention
+        # modules do not hold a circular reference to this cache after detach.
+        if self._model is not None:
+            for mlayer in resolve_decoder_layers(self._model):
+                if hasattr(mlayer.self_attn, "_packed_layer"):
+                    del mlayer.self_attn._packed_layer
         if self._model is not None and self._saved_impl is not None:
             self._model.config._attn_implementation = self._saved_impl
         self._model = None
