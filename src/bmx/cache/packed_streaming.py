@@ -280,6 +280,15 @@ class PackedStreamingLayer(DynamicLayer):
             # attend() computes total_seq_len = _committed_S_q + self.keys.shape[2],
             # and get_seq_length() returns the same value.
             # block_start == old _committed_S_q (slab start), so local_prune = block_len.
+            #
+            # Guard: the prune relies on the slab starting at block_start
+            # (i.e. block_start was the old _committed_S_q before this flush).
+            # Capture the old committed value before the update and assert it matches.
+            old_committed = block_end - block_len  # == block_start (by construction)
+            assert block_start == old_committed, (
+                f"Flush schedule invariant violated: block_start={block_start} != "
+                f"old _committed_S_q={old_committed}; slab prune would use wrong length"
+            )
             keys = keys[..., block_len:, :].contiguous()
             values = values[..., block_len:, :].contiguous()
 

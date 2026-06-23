@@ -16,7 +16,7 @@ import tyro
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.packed_streaming import PackedStreamingCache
 from bmx.cache.specs import CacheCodecSpec
-from bmx.cache.streaming import StreamingQuantizedCache
+from bmx.cache.streaming import StreamingQuantizedCache, resolve_vocab_size
 
 
 @dataclasses.dataclass
@@ -52,9 +52,14 @@ def _measure(model, input_ids, cache, max_new_tokens: int = 4):
     resident = torch.cuda.max_memory_allocated() if cuda else 0
     if cuda:
         torch.cuda.reset_peak_memory_stats()
+    # Feed only the last token as the continuation — the cache already holds all of
+    # input_ids from the prefill forward above. Passing the full sequence again would
+    # cause transformers to re-append it to the cache (double-prefill bug), inflating
+    # peak_decode by ~one full prefill worth of KV and falsely tripping the Phase-3 gate.
+    last_token = input_ids[:, -1:]
     with torch.no_grad():
         model.generate(
-            input_ids,
+            last_token,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             use_cache=True,
@@ -67,9 +72,8 @@ def _measure(model, input_ids, cache, max_new_tokens: int = 4):
 
 
 def main(cfg: Config):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM
 
-    tok = AutoTokenizer.from_pretrained(cfg.model_name)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
         torch_dtype=torch.float16,
@@ -77,7 +81,9 @@ def main(cfg: Config):
     ).eval()
     rows = []
     for S in cfg.seq_lens:
-        input_ids = torch.randint(0, tok.vocab_size, (1, S), device=model.device)
+        input_ids = torch.randint(
+            0, resolve_vocab_size(model.config), (1, S), device=model.device
+        )
         for arm in cfg.arms:
             k_spec, v_spec = _specs(arm)
             for path, Cls in [
@@ -85,7 +91,16 @@ def main(cfg: Config):
                 ("chunked", PackedStreamingCache),
             ]:
                 cache = Cls(model.config, k_spec=k_spec, v_spec=v_spec)
-                if k_spec.pre_rope:
+                # Always attach PackedStreamingCache so ALL arms (incl fp16) route
+                # through chunked_attention_forward.  The Phase-3 gate measures the
+                # chunked path's peak; putting fp16 on stock SDPA would make its row
+                # incomparable.  attach() gates the k_proj hook on pre_rope, so the
+                # only extra cost for fp16 is the attention-fn registration.
+                # StreamingQuantizedCache only needs attach when pre_rope is True
+                # (its existing behavior).
+                if isinstance(cache, PackedStreamingCache):
+                    cache.attach(model)
+                elif k_spec.pre_rope:
                     cache.attach(model)
                 resident, peak = _measure(model, input_ids, cache, cfg.max_new_tokens)
                 if hasattr(cache, "detach"):

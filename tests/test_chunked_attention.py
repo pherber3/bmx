@@ -151,3 +151,50 @@ def test_chunked_matches_oracle_no_rope(k_arm, v_arm, kw):
 
     drift = attention_diff(fast, oracle)
     assert drift["max_abs"] < 1e-10, drift  # online softmax is exact vs oracle
+
+
+def test_empty_committed_blocks_degenerates_to_tail_attention():
+    """chunked_dequant_attention with no committed blocks equals plain softmax on tail.
+
+    This is the all-fp16-tail case: the first flush has not yet fired, so
+    k_blocks/v_blocks are empty and all KV lives in the tail window.
+    chunked_dequant_attention must degenerate to exactly naive_dense_attention over
+    the tail alone (both should match a from-scratch softmax).
+    """
+    torch.manual_seed(42)
+    h_kv, n_q_heads, n_q, tail_len, d = 2, 4, 1, 16, 8
+    q = torch.randn(n_q_heads, n_q, d, dtype=torch.float64)
+    k_tail = torch.randn(h_kv, tail_len, d, dtype=torch.float64)
+    v_tail = torch.randn(h_kv, tail_len, d, dtype=torch.float64)
+    scale = 1.0 / (d**0.5)
+    n_q_groups = n_q_heads // h_kv
+
+    common = dict(
+        k_arm="fp16",
+        v_arm="fp16",
+        group=8,
+        seed=0,
+        k_pre_rope=False,
+        rope_cos=None,
+        rope_sin=None,
+        k_tail=k_tail,
+        v_tail=v_tail,
+        n_q_groups=n_q_groups,
+        scale=scale,
+    )
+
+    # Both paths with empty block lists.
+    oracle = naive_dense_attention(q, [], [], **common)
+    chunked = chunked_dequant_attention(q, [], [], **common)
+
+    # Reference: plain softmax over the expanded tail.
+    Kx = k_tail.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, tail_len, d)
+    Vx = v_tail.repeat_interleave(n_q_groups, dim=0)
+    ref = torch.softmax((q @ Kx.transpose(-1, -2)) * scale, dim=-1) @ Vx
+
+    assert torch.allclose(oracle, ref, atol=1e-10, rtol=0), (
+        "oracle with empty blocks diverged from plain softmax"
+    )
+    assert torch.allclose(chunked, ref, atol=1e-10, rtol=0), (
+        "chunked with empty blocks diverged from plain softmax"
+    )
