@@ -24,7 +24,7 @@ import torch
 
 from bmx.decomp.lrs import truncated_svd
 from bmx.quant.hadamard import is_power_of_2, random_orthogonal, randomized_hadamard
-from bmx.quant.rtn import rtn_quantize
+from bmx.quant.rtn import rtn_dequantize_packed, rtn_quantize, rtn_quantize_packed
 
 # ---------------------------------------------------------------------------
 # Public arm registry
@@ -614,6 +614,157 @@ def _lowrank_rotwaterfill_channel(
 
 
 # ---------------------------------------------------------------------------
+# Packed split: quantize_packed / dequant_packed
+# ---------------------------------------------------------------------------
+
+_SPLIT_ARMS = frozenset(
+    {
+        "rtn_token",
+        "rtn_channel",
+        "rotate_rtn_token",
+        "turboquant_mse",
+        "turboquant_prod",
+        "lowrank_rtn_channel",
+    }
+)
+
+
+def _turboquant_mse_packed(
+    M: torch.Tensor, bits: int, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(S,C) -> (indices int16 (S,C), norms fp (S,1)). Codebook from bits+seed."""
+    S, C = M.shape
+    norms = M.norm(dim=1, keepdim=True).clamp_min(1e-12).half().float()
+    M_unit = M / norms
+    M_rot = _rotate(M_unit, seed)
+    cb = gaussian_codebook(bits).to(M.device)
+    sqrt_c = math.sqrt(C)
+    mid = (cb[:-1] + cb[1:]) / 2
+    indices = torch.bucketize(M_rot * sqrt_c, mid).to(torch.int16)
+    return indices, norms
+
+
+def _turboquant_mse_dequant(
+    indices: torch.Tensor, norms: torch.Tensor, bits: int, seed: int, C: int
+) -> torch.Tensor:
+    """Reconstruct from packed turboquant_mse representation."""
+    cb = gaussian_codebook(bits).to(norms.device)
+    sqrt_c = math.sqrt(C)
+    M_quant = cb[indices.long()] / sqrt_c
+    M_recon = _unrotate(M_quant, seed)
+    return M_recon * norms
+
+
+def quantize_packed(
+    arm: str,
+    M: torch.Tensor,
+    *,
+    bits: int,
+    seed: int = 0,
+    group: int = 64,
+    rank: int = 0,
+    svd_factors: tuple | None = None,
+) -> tuple[dict, float]:
+    """(S,C) fp -> (packed dict, honest bpe). Inverse: dequant_packed.
+
+    Only the streaming-path arms are supported; waterfill arms raise
+    NotImplementedError (use quantize_cache directly for those).
+    """
+    if arm not in _SPLIT_ARMS:
+        raise NotImplementedError(
+            f"arm {arm!r} not split into packed form (not on the streaming path); "
+            f"use quantize_cache. Split arms: {sorted(_SPLIT_ARMS)}"
+        )
+    S, C = M.shape
+    if arm == "rtn_token":
+        Q_int, scale = rtn_quantize_packed(M, bits, group)
+        return {"Q_int": Q_int, "scale": scale}, bits + 16.0 / group
+    if arm == "rtn_channel":
+        Q_int, scale = rtn_quantize_packed(M.mT, bits, group)
+        return {"Q_int": Q_int, "scale": scale}, bits + 16.0 / group
+    if arm == "rotate_rtn_token":
+        Q_int, scale = rtn_quantize_packed(_rotate(M, seed), bits, group)
+        return {"Q_int": Q_int, "scale": scale}, bits + 16.0 / group
+    if arm == "turboquant_mse":
+        indices, norms = _turboquant_mse_packed(M, bits, seed)
+        return {"indices": indices, "norms": norms, "bits": bits}, bits + 16.0 / C
+    if arm == "turboquant_prod":
+        assert bits >= 2, f"turboquant_prod requires bits >= 2, got {bits}"
+        indices, norms = _turboquant_mse_packed(M, bits - 1, seed)
+        M1 = _turboquant_mse_dequant(indices, norms, bits - 1, seed, C)
+        R = M - M1
+        r_norms = R.norm(dim=1, keepdim=True).clamp_min(1e-12).half().float()
+        R_unit = R / r_norms
+        G = _qjl_sketch(C, seed).to(R)
+        signs = torch.sign(R_unit @ G.T)
+        packed = {
+            "mse_indices": indices,
+            "mse_norms": norms,
+            "bits": bits,
+            "qjl_signs": signs.to(torch.int8),
+            "qjl_norms": r_norms,
+        }
+        return packed, (bits - 1) + 1 + 32.0 / C
+    # lowrank_rtn_channel
+    assert rank > 0, f"lowrank_rtn_channel requires rank > 0, got {rank}"
+    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
+    assert S % group == 0, f"S={S} not divisible by group={group}"
+    if svd_factors is not None:
+        Us, V = svd_factors
+    else:
+        Us, V = truncated_svd(M, rank)
+    Us_stored = Us.half().float()
+    V_stored = V.half().float()
+    L = Us_stored @ V_stored.mT
+    R = M - L
+    res_Q_int, res_scale = rtn_quantize_packed(R.mT, bits, group)
+    bpe = bits + 16.0 / group + 16.0 * rank * (S + C) / (S * C)
+    return {
+        "Us": Us_stored,
+        "V": V_stored,
+        "res_Q_int": res_Q_int,
+        "res_scale": res_scale,
+    }, bpe
+
+
+def dequant_packed(
+    arm: str, packed: dict, *, seed: int = 0, group: int = 64
+) -> torch.Tensor:
+    """Inverse of quantize_packed -> dequantized (S,C) M_hat."""
+    if arm not in _SPLIT_ARMS:
+        raise NotImplementedError(
+            f"arm {arm!r} not split into packed form (not on the streaming path); "
+            f"use quantize_cache. Split arms: {sorted(_SPLIT_ARMS)}"
+        )
+    if arm == "rtn_token":
+        return rtn_dequantize_packed(packed["Q_int"], packed["scale"], group)
+    if arm == "rtn_channel":
+        return rtn_dequantize_packed(packed["Q_int"], packed["scale"], group).mT
+    if arm == "rotate_rtn_token":
+        M_rot_hat = rtn_dequantize_packed(packed["Q_int"], packed["scale"], group)
+        return _unrotate(M_rot_hat, seed)
+    if arm == "turboquant_mse":
+        C = packed["indices"].shape[1]
+        return _turboquant_mse_dequant(
+            packed["indices"], packed["norms"], packed["bits"], seed, C
+        )
+    if arm == "turboquant_prod":
+        C = packed["mse_indices"].shape[1]
+        M1 = _turboquant_mse_dequant(
+            packed["mse_indices"], packed["mse_norms"], packed["bits"] - 1, seed, C
+        )
+        G = _qjl_sketch(C, seed).to(packed["qjl_norms"])
+        signs = packed["qjl_signs"].to(G.dtype)
+        scale = math.sqrt(math.pi / 2) / C
+        R_hat = packed["qjl_norms"] * scale * (signs @ G)
+        return M1 + R_hat
+    # lowrank_rtn_channel
+    L = packed["Us"] @ packed["V"].mT
+    R_hat = rtn_dequantize_packed(packed["res_Q_int"], packed["res_scale"], group).mT
+    return L + R_hat
+
+
+# ---------------------------------------------------------------------------
 # Dispatch: quantize_cache
 # ---------------------------------------------------------------------------
 
@@ -682,18 +833,17 @@ def quantize_cache(
     """
     assert arm in CACHE_ARMS, f"unknown arm {arm!r}; available: {CACHE_ARMS}"
 
-    if arm == "rtn_token":
-        return _rtn_token(M, bits, group)
-    elif arm == "rtn_channel":
-        return _rtn_channel(M, bits, group)
-    elif arm == "rotate_rtn_token":
-        return _rotate_rtn_token(M, bits, group, seed)
-    elif arm == "turboquant_mse":
-        return _turboquant_mse(M, bits, seed)
-    elif arm == "turboquant_prod":
-        return _turboquant_prod(M, bits, seed)
-    elif arm == "lowrank_rtn_channel":
-        return _lowrank_rtn_channel(M, bits, group, rank, svd_factors=svd_factors)
+    if arm in _SPLIT_ARMS:
+        packed, bpe = quantize_packed(
+            arm,
+            M,
+            bits=bits,
+            seed=seed,
+            group=group,
+            rank=rank,
+            svd_factors=svd_factors,
+        )
+        return dequant_packed(arm, packed, seed=seed, group=group), bpe
     elif arm == "lowrank_waterfill_channel":
         return _lowrank_waterfill_channel(
             M, float(bits), group, rank, tiers=tiers, svd_factors=svd_factors
