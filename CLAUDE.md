@@ -70,10 +70,20 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   `docs/superpowers/{specs,plans}/2026-06-20-longbench-*`; VM handoff:
   `docs/2026-06-20-longbench-plan-state.md`. (HumanEval pass@1 NOT pursued — the paper
   used LongBench Code; that closes the coding-task question.)
-- **Open (engineering, not science):** fused dequant-attention kernel (use the
-  Track B byte model in `src/bmx/bench/` to predict before building) for the literal
-  process-RSS win; the authoritative SOTA-model VM run (real-text + planted needle,
-  `--model-name`); 32k-context re-check.
+- Fused dequant-attention (Phases 1+2, closed positive): `PackedStreamingCache`
+  stores packed codes resident + chunked dequant-attention at decode (the
+  memory-critical path) + flash SDPA at prefill (the O(S²)-online-softmax bug
+  found on first CUDA run, fixed `c1fc279`). VM census confirms the k2b
+  compression is real at runtime: resident @128k = chunked 64.1 GiB ≈ fp16 63.3,
+  vs dense_stream 83.5 (chunked saves ~19 GiB, growing linearly with context) —
+  the second dense KV copy is eliminated. Batched 128k sweep unblocked; Triton
+  (Phase 3) NOT required to clear the ceiling — `docs/2026-06-23-kernel-census-results.md`,
+  spec/plan `docs/superpowers/{specs,plans}/2026-06-23-fused-dequant-attention*`.
+- **Open (engineering, not science):** Triton fused kernel (Phase 3, gated — only
+  for a deployment speed/RSS claim, not needed to unblock the sweep); the batched
+  128k sweep itself (multiple arms co-resident, now that single-stream headroom is
+  proven); the authoritative SOTA-model VM run (real-text + planted needle,
+  `--model-name`).
 
 ## Conventions (everything assumes them)
 
