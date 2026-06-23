@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 from transformers.cache_utils import Cache, DynamicLayer
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from bmx.cache.chunked_attention import chunked_dequant_attention
@@ -65,6 +66,12 @@ def chunked_attention_forward(
 
 
 ALL_ATTENTION_FUNCTIONS.register(_ATTN_NAME, chunked_attention_forward)
+# Register the mask builder too: without this, transformers skips mask creation for
+# our custom impl and passes attention_mask=None — which silently falls back to
+# is_causal=True in the prefill SDPA path, WRONG for the cached two-block prefill
+# (n_q < n_kv). sdpa_mask builds the same 4D causal mask (with correct q/kv offsets)
+# the stock 'sdpa' impl receives, so our prefill matches dense bit-for-bit.
+ALL_MASK_ATTENTION_FUNCTIONS.register(_ATTN_NAME, sdpa_mask)
 
 
 class PackedStreamingLayer(DynamicLayer):
