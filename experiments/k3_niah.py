@@ -40,6 +40,11 @@ class Config:
     answer_id: int = 7
     """Synthetic needle id for the offline argmax proxy (ignored on the real path)."""
     max_new_tokens: int = 50
+    use_packed: bool = False
+    """Run generation through PackedStreamingCache (packed codes resident +
+    chunked dequant-attention at decode) instead of StreamingQuantizedCache.
+    Token-identical output (parity-gated); lower resident memory — the path that
+    unblocks the batched 128k sweep. Real path only (ignored offline)."""
 
 
 def run(cfg: Config, model=None, root: str = "results"):
@@ -110,6 +115,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         k_spec,
                         v_spec,
                         max_new_tokens=cfg.max_new_tokens,
+                        use_packed=cfg.use_packed,
                     )
                     recall = rouge1_recall(NEEDLE_TEXT, response)
                     recall_full = rouge1_recall_only(NEEDLE_TEXT, response)
@@ -126,6 +132,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         "bpe_v": bpe_v,
                         "compression": compression,
                         "n_prefill": cfg.n_prefill,
+                        "use_packed": cfg.use_packed,
                     }
                 )
 

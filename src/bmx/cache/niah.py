@@ -11,6 +11,7 @@ from rouge_score import rouge_scorer
 
 from bmx.cache.needle import needle_retrieved
 from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.packed_streaming import PackedStreamingCache
 from bmx.cache.streaming import StreamingQuantizedCache
 
 
@@ -147,8 +148,16 @@ def generate_through_cache(
     v_spec: CacheCodecSpec,
     max_new_tokens: int,
     strip: bool = True,
+    use_packed: bool = False,
 ) -> str:
-    """Prefill prompt_ids into a StreamingQuantizedCache, greedy-decode, return the answer.
+    """Prefill prompt_ids into a streaming cache, greedy-decode, return the answer.
+
+    ``use_packed``: when True, run through ``PackedStreamingCache`` (packed codes
+    resident + chunked dequant-attention at decode, flash SDPA at prefill) — the
+    memory-saving path that keeps the bpe footprint resident instead of a second
+    dense KV copy. When False (default), uses ``StreamingQuantizedCache`` (the
+    quality/parity reference, dense dequant resident). Both produce identical
+    tokens (parity-gated); ``use_packed`` only changes the resident memory.
 
     The whole prompt is streamed into the cache (prefill block [0, n_prefill) then the rest
     [n_prefill, L) as one forward), and greedy decoding continues from the last prompt logit.
@@ -175,7 +184,8 @@ def generate_through_cache(
     )
     eos_ids = {_eos} if isinstance(_eos, int) else set(_eos or [])
 
-    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache_cls = PackedStreamingCache if use_packed else StreamingQuantizedCache
+    cache = cache_cls(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
     new_ids: list[int] = []
     with cache:
