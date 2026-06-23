@@ -240,52 +240,7 @@ def _rotate_rtn_token(
 
 
 # ---------------------------------------------------------------------------
-# Arm 4: turboquant_mse
-# ---------------------------------------------------------------------------
-
-
-def _turboquant_mse(
-    M: torch.Tensor, bits: int, seed: int
-) -> tuple[torch.Tensor, float]:
-    """Per-token: store ||x|| fp16, rotate normalized vector, quantize with
-    Lloyd-Max codebook scaled by 1/sqrt(C), unrotate, rescale."""
-    S, C = M.shape
-
-    # Per-token norms; fp16 roundtrip to simulate honest storage
-    norms = M.norm(dim=1, keepdim=True).clamp_min(1e-12)
-    norms_stored = norms.half().float()
-
-    # Normalize
-    M_unit = M / norms_stored
-
-    # Rotate
-    M_rot = _rotate(M_unit, seed)
-
-    # Quantize using Lloyd codebook: coords of unit vector ~ N(0, 1/C)
-    # so quantize x*sqrt(C) against N(0,1) codebook then divide by sqrt(C)
-    cb = gaussian_codebook(bits).to(M.device)
-    sqrt_c = math.sqrt(C)
-    M_scaled = M_rot * sqrt_c
-
-    # Nearest-codebook assignment: the codebook is sorted, so bucketize on the
-    # midpoints between adjacent levels is exact (up to measure-zero fp ties).
-    # M_scaled: (S, C), cb: (2^bits,)
-    mid = (cb[:-1] + cb[1:]) / 2  # (2^bits - 1,)
-    indices = torch.bucketize(M_scaled, mid)  # (S, C), values 0 .. 2^bits-1
-    M_quantized = cb[indices] / sqrt_c  # (S, C)
-
-    # Unrotate
-    M_recon = _unrotate(M_quantized, seed)
-
-    # Rescale
-    M_hat = M_recon * norms_stored
-
-    bpe = bits + 16.0 / C
-    return M_hat, bpe
-
-
-# ---------------------------------------------------------------------------
-# QJL public helper (also used by turboquant_prod)
+# QJL public helper
 # ---------------------------------------------------------------------------
 
 
@@ -330,34 +285,6 @@ def qjl_reconstruct(R: torch.Tensor, seed: int) -> torch.Tensor:
     R_hat = r_norms_stored * scale * (signs @ G)
 
     return R_hat
-
-
-# ---------------------------------------------------------------------------
-# Arm 5: turboquant_prod
-# ---------------------------------------------------------------------------
-
-
-def _turboquant_prod(
-    M: torch.Tensor, bits: int, seed: int
-) -> tuple[torch.Tensor, float]:
-    """Two-stage: turboquant_mse at (bits-1) + 1-bit QJL on residual."""
-    assert bits >= 2, f"turboquant_prod requires bits >= 2, got {bits}"
-    S, C = M.shape
-
-    # Stage 1: MSE quantization at (bits-1)
-    M1, _ = _turboquant_mse(M, bits - 1, seed)
-
-    # Residual
-    R = M - M1  # (S, C)
-
-    # Stage 2: QJL reconstruction (unbiased for inner product)
-    R_hat = qjl_reconstruct(R, seed)
-
-    M_hat = M1 + R_hat
-
-    # bpe = (b-1) + 1 + 32/C  (two fp16 norms: one from MSE stage, one from QJL)
-    bpe = (bits - 1) + 1 + 32.0 / C
-    return M_hat, bpe
 
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,9 @@ def chunked_attention_forward(
     We match this by passing a computed causal attention_mask to chunked_dequant_attention.
     During decode (n_q == 1), no mask is needed — the single query attends to all history.
     """
+    assert hasattr(module, "_packed_layer"), (
+        "PackedStreamingCache.attach(model) must be called before forward"
+    )
     layer = module._packed_layer
     n_q = query.shape[2]  # query is (1, n_q_heads, n_q, d)
     q = query.squeeze(0)  # (n_q_heads, n_q, d)
@@ -86,11 +89,9 @@ class PackedStreamingLayer(DynamicLayer):
         self._k_pre_offset: int = 0
 
         # Committed block count (how many tokens are packed).
+        # Also tracks the absolute position of self.keys[..., 0, :] after slab
+        # pruning (Fix 3) — these two quantities are always equal.
         self._committed_S_q: int = 0
-
-        # Absolute position of self.keys[..., 0, :] after slab pruning (Fix 3).
-        # Zero until the first flush; updated each time a block is committed.
-        self._fp16_offset: int = 0
 
         # Packed block lists: list of (packed_dict, start, end).
         self._k_blocks: list[tuple[dict, int, int]] = []
@@ -214,9 +215,9 @@ class PackedStreamingLayer(DynamicLayer):
         # Let DynamicLayer concatenate the running slab (post-RoPE, pruned after Fix 3).
         keys, values = super().update(key_states, value_states, *args, **kwargs)
 
-        # Total sequence length = absolute start of slab + current slab length.
-        # After Fix 3 pruning, _fp16_offset is the absolute position of slab[...,0,:].
-        S = self._fp16_offset + keys.shape[2]  # total tokens in sequence
+        # Total sequence length = committed tokens + current slab length.
+        # _committed_S_q is the absolute position of slab[..., 0, :] after pruning.
+        S = self._committed_S_q + keys.shape[2]  # total tokens in sequence
         W = self.recent_window
         new_S_q = compute_flush_schedule(S, W, self._g)
 
@@ -236,10 +237,10 @@ class PackedStreamingLayer(DynamicLayer):
                 kpacked = self._pack_k_block(k_block_pre, block_start, block_end)
             else:
                 # Post-RoPE: block was pristine fp16 tail until now (same as streaming.py).
-                # After slab pruning, keys is the local slab starting at _fp16_offset.
-                local_start = block_start - self._fp16_offset
-                local_end = block_end - self._fp16_offset
-                k_block_fp32 = keys.squeeze(0)[..., local_start:local_end, :].float()
+                # _committed_S_q is the absolute start of the slab (they're always equal).
+                # block_start == _committed_S_q (old), so local_start is always 0 here.
+                block_len = block_end - block_start
+                k_block_fp32 = keys.squeeze(0)[..., :block_len, :].float()
                 M = to_matrix(k_block_fp32)
                 kpacked, _ = quantize_packed(
                     self.k_spec.arm,
@@ -251,9 +252,10 @@ class PackedStreamingLayer(DynamicLayer):
                 )
 
             # --- Pack V block ---
-            # After slab pruning, values is the local slab starting at _fp16_offset.
-            local_start = block_start - self._fp16_offset
-            local_end = block_end - self._fp16_offset
+            # _committed_S_q is the absolute start of the slab; block_start == _committed_S_q.
+            block_len = block_end - block_start
+            local_start = 0
+            local_end = block_len
             v_block_fp32 = values.squeeze(0)[..., local_start:local_end, :].float()
             vpacked = self._pack_v_block(v_block_fp32)
 
@@ -273,15 +275,13 @@ class PackedStreamingLayer(DynamicLayer):
 
             # --- Fix 3: Prune fp16 slab to tail-only ---
             # Committed region lives solely as packed codes in _k_blocks/_v_blocks.
-            # After pruning, keys/values hold only [block_end:] in ABSOLUTE terms,
-            # which is [local_prune:] in the slab that starts at _fp16_offset.
-            # _fp16_offset tracks the absolute position of self.keys[..., 0, :].
+            # After pruning, keys/values hold only [block_end:] in ABSOLUTE terms.
+            # _committed_S_q tracks the absolute position of self.keys[..., 0, :].
             # attend() computes total_seq_len = _committed_S_q + self.keys.shape[2],
             # and get_seq_length() returns the same value.
-            local_prune = block_end - self._fp16_offset
-            keys = keys[..., local_prune:, :].contiguous()
-            values = values[..., local_prune:, :].contiguous()
-            self._fp16_offset = block_end
+            # block_start == old _committed_S_q (slab start), so local_prune = block_len.
+            keys = keys[..., block_len:, :].contiguous()
+            values = values[..., block_len:, :].contiguous()
 
         # Store pruned (or full, if no flush this step) slab.
         self.keys = keys
@@ -304,35 +304,21 @@ class PackedStreamingLayer(DynamicLayer):
             SDPA's is_causal=True; False during decode when n_q == 1).
         Returns (n_q_heads, n_q, d).
         """
-        tail_start = self._committed_S_q
-        # After Fix 3 (slab pruning), self.keys holds only the tail starting at
-        # absolute position _fp16_offset. Slicing [tail_start:] on the pruned slab
-        # would overshoot; use (tail_start - _fp16_offset) as the local index.
-        local_tail_start = tail_start - self._fp16_offset
-        k_tail = self.keys.squeeze(0)[..., local_tail_start:, :]  # (h_kv, tail_len, d)
-        v_tail = self.values.squeeze(0)[
-            ..., local_tail_start:, :
-        ]  # (h_kv, tail_len, d)
+        # After Fix 3 (slab pruning), self.keys holds only the tail: the slab starts
+        # at absolute position _committed_S_q, so the tail begins at index 0 of the slab.
+        k_tail = self.keys.squeeze(0)  # (h_kv, tail_len, d)
+        v_tail = self.values.squeeze(0)  # (h_kv, tail_len, d)
         n_q_heads = q.shape[0]
         n_q = q.shape[1]
         n_q_groups = n_q_heads // self._h_kv
 
+        # Compute query_abs_start for prefill causal masking.
+        # total_seq_len = committed + current fp16 slab length; query[0] is at
+        # absolute position (total_seq_len - n_q).
+        query_abs_start = None
         if is_causal and n_q > 1:
-            # Prefill: causal attention to match SDPA's is_causal=True behaviour.
-            # Use absolute-position arithmetic in _attend_causal so both committed
-            # blocks and the tail are masked correctly.
-            # total_seq_len = committed + current fp16 slab length; query[0] is at
-            # absolute position (total_seq_len - n_q).
             total_seq_len = self._committed_S_q + self.keys.shape[2]
             query_abs_start = total_seq_len - n_q
-            return self._attend_causal(
-                q,
-                k_tail,
-                v_tail,
-                scaling,
-                n_q_groups,
-                query_abs_start,
-            )
 
         return chunked_dequant_attention(
             q,
@@ -347,90 +333,12 @@ class PackedStreamingLayer(DynamicLayer):
             rope_sin=self._rope_sin,
             k_tail=k_tail,
             v_tail=v_tail,
-            tail_start=tail_start,
             n_q_groups=n_q_groups,
             scale=scaling,
+            query_abs_start=query_abs_start,
+            v_group=self.v_spec.group,
+            v_seed=self.v_spec.seed,
         )
-
-    def _attend_causal(
-        self,
-        q: torch.Tensor,
-        k_tail: torch.Tensor,
-        v_tail: torch.Tensor,
-        scaling: float,
-        n_q_groups: int,
-        query_abs_start: int = 0,
-    ) -> torch.Tensor:
-        """Causal attention for prefill (n_q > 1) matching SDPA's is_causal=True.
-
-        Absolute-position rule: query at absolute position (query_abs_start + qi)
-        must not attend key at absolute position j where j > query_abs_start + qi.
-        This applies uniformly to committed blocks and the tail.
-
-        Returns (n_q_heads, n_q, d).
-        """
-        from bmx.cache.chunked_attention import (
-            _dequant_block,
-            online_softmax_update,
-        )
-        from bmx.cache.rope import apply_rope
-
-        n_q_heads, n_q, d = q.shape
-        h_kv = n_q_heads // n_q_groups
-        acc = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
-        m = torch.full(
-            (n_q_heads, n_q, 1), float("-inf"), dtype=q.dtype, device=q.device
-        )
-        lse = torch.zeros(n_q_heads, n_q, 1, dtype=q.dtype, device=q.device)
-
-        # Absolute positions of each query: shape (n_q,)
-        q_abs = torch.arange(query_abs_start, query_abs_start + n_q, device=q.device)
-
-        # Committed blocks: apply absolute-position causal mask so query qi
-        # cannot see key at block position j where (start + j) > q_abs[qi].
-        for (kpacked, start, end), (vpacked, _vs, _ve) in zip(
-            self._k_blocks, self._v_blocks
-        ):
-            K_kv = _dequant_block(
-                kpacked, self.k_spec.arm, self.k_spec.group, self.k_spec.seed, h_kv
-            ).to(q.dtype)
-            if self.k_spec.pre_rope:
-                K_kv = apply_rope(
-                    K_kv,
-                    self._rope_cos[start:end].to(q.dtype),
-                    self._rope_sin[start:end].to(q.dtype),
-                )
-            V_kv = _dequant_block(
-                vpacked, self.v_spec.arm, self.v_spec.group, self.v_spec.seed, h_kv
-            ).to(q.dtype)
-            K_exp = K_kv.repeat_interleave(n_q_groups, dim=0)
-            V_exp = V_kv.repeat_interleave(n_q_groups, dim=0)
-            s = (q @ K_exp.transpose(-1, -2)) * scaling  # (n_q_heads, n_q, blk)
-            # key_abs[j] = start + j; mask where key_abs[j] > q_abs[qi].
-            key_abs = torch.arange(start, end, device=q.device)  # (blk,)
-            # causal_mask[qi, j] = True means MASK OUT (future key).
-            causal_mask = key_abs.unsqueeze(0) > q_abs.unsqueeze(1)  # (n_q, blk)
-            s = s.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
-            acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
-
-        # Tail: apply absolute-position causal mask.
-        # key at tail-position j has absolute position (tail_start + j);
-        # mask out where (tail_start + j) > q_abs[qi].
-        if k_tail is not None and k_tail.shape[1] > 0:
-            tail_start = self._committed_S_q
-            tail_len = k_tail.shape[1]
-            K_exp = k_tail.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
-            V_exp = v_tail.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
-            s = (q @ K_exp.transpose(-1, -2)) * scaling  # (n_q_heads, n_q, tail_len)
-            key_abs = torch.arange(
-                tail_start, tail_start + tail_len, device=q.device
-            )  # (tail_len,)
-            # causal_mask[qi, j] = True means MASK OUT (future key).
-            causal_mask = key_abs.unsqueeze(0) > q_abs.unsqueeze(1)  # (n_q, tail_len)
-            s = s.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
-            acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
-
-        return acc / lse
 
 
 class PackedStreamingCache(Cache):

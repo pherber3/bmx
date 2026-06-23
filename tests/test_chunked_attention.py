@@ -147,7 +147,7 @@ def test_chunked_matches_oracle_no_rope(k_arm, v_arm, kw):
     )
 
     oracle = naive_dense_attention(q, k_blocks, v_blocks, **common)
-    fast = chunked_dequant_attention(q, k_blocks, v_blocks, tail_start=S, **common)
+    fast = chunked_dequant_attention(q, k_blocks, v_blocks, **common)
 
     drift = attention_diff(fast, oracle)
     assert drift["max_abs"] < 1e-10, drift  # online softmax is exact vs oracle

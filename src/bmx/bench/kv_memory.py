@@ -54,6 +54,7 @@ class KVMemCase:
     weights_bytes: int
     act_bytes: int
     logits_bytes: int
+    dense_overhead_bytes: int = _DENSE_OVERHEAD_BYTES
 
 
 def _one_fp16_copy_bytes(c: KVMemCase) -> int:
@@ -86,7 +87,7 @@ def predict_peak(case: KVMemCase) -> dict:
         # overshoot to 108 GiB; the measured OOM is 99-100 GiB = fp16 + 7-8 GiB).
         # See module docstring for full term derivation.
         resident = one_copy
-        transient = _DENSE_OVERHEAD_BYTES  # codec scratch + partial reassembly
+        transient = case.dense_overhead_bytes  # codec scratch + partial reassembly
         attn = 0
 
     else:  # chunked

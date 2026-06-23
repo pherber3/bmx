@@ -127,9 +127,11 @@ def chunked_dequant_attention(
     rope_sin,
     k_tail,
     v_tail,
-    tail_start,
     n_q_groups,
     scale,
+    query_abs_start: int | None = None,
+    v_group: int | None = None,
+    v_seed: int | None = None,
 ):
     """Online-softmax attention over per-block dequantized K/V. GQA-aware.
 
@@ -137,18 +139,40 @@ def chunked_dequant_attention(
     k_pre_rope: if True, dequantized K blocks are pre-RoPE and get RoPE applied at
     [start,end) before the contraction. k_tail/v_tail: (h_kv, tail_len, d) fp16
     recent window (post-RoPE for K). Returns (n_q_heads, n_q, d).
+
+    query_abs_start: when not None (prefill, n_q > 1), apply a causal mask so
+    query at position (query_abs_start + qi) cannot attend key at absolute
+    position j where j > query_abs_start + qi. When None (decode, n_q == 1),
+    no masking is applied.
+    v_group / v_seed: dequant params for V blocks; default to group / seed when
+    not provided (allows K and V to use different packed formats).
     """
     n_q_heads, n_q, d = q.shape
     h_kv = n_q_heads // n_q_groups
+    _v_group = v_group if v_group is not None else group
+    _v_seed = v_seed if v_seed is not None else seed
     acc = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
     m = torch.full((n_q_heads, n_q, 1), float("-inf"), dtype=q.dtype, device=q.device)
     lse = torch.zeros(n_q_heads, n_q, 1, dtype=q.dtype, device=q.device)
 
-    def attend(K_kv, V_kv):
+    # Absolute positions of each query (only used when query_abs_start is set).
+    q_abs = (
+        torch.arange(query_abs_start, query_abs_start + n_q, device=q.device)
+        if query_abs_start is not None
+        else None
+    )
+
+    def attend(
+        K_kv, V_kv, key_abs_start: int | None = None, key_abs_end: int | None = None
+    ):
         nonlocal acc, m, lse
         K_exp = K_kv.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, blk, d)
         V_exp = V_kv.repeat_interleave(n_q_groups, dim=0)
         s = (q @ K_exp.transpose(-1, -2)) * scale  # (n_q_heads, n_q, blk)
+        if q_abs is not None and key_abs_start is not None:
+            key_abs = torch.arange(key_abs_start, key_abs_end, device=q.device)
+            causal_mask = key_abs.unsqueeze(0) > q_abs.unsqueeze(1)  # (n_q, blk)
+            s = s.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
         acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
 
     for (kpacked, start, end), (vpacked, _vs, _ve) in zip(k_blocks, v_blocks):
@@ -159,10 +183,23 @@ def chunked_dequant_attention(
                 rope_cos[start:end].to(q.dtype),
                 rope_sin[start:end].to(q.dtype),
             )
-        V_kv = _dequant_block(vpacked, v_arm, group, seed, h_kv).to(q.dtype)
-        attend(K_kv, V_kv)
+        V_kv = _dequant_block(vpacked, v_arm, _v_group, _v_seed, h_kv).to(q.dtype)
+        attend(
+            K_kv,
+            V_kv,
+            start if q_abs is not None else None,
+            end if q_abs is not None else None,
+        )
 
     if k_tail is not None and k_tail.shape[1] > 0:
-        attend(k_tail.to(q.dtype), v_tail.to(q.dtype))
+        tail_abs_start = (
+            k_blocks[-1][2] if k_blocks else 0
+        )  # end of last committed block
+        attend(
+            k_tail.to(q.dtype),
+            v_tail.to(q.dtype),
+            tail_abs_start if q_abs is not None else None,
+            (tail_abs_start + k_tail.shape[1]) if q_abs is not None else None,
+        )
 
     return acc / lse

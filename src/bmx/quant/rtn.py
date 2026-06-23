@@ -15,6 +15,7 @@ def rtn_quantize_packed(W: torch.Tensor, bits: int, group_size: int):
     """
     *lead, d = W.shape
     assert d % group_size == 0, f"dim {d} not divisible by group {group_size}"
+    assert bits <= 8, f"rtn_quantize_packed: int8 codes require bits <= 8, got {bits}"
     qmax = 2 ** (bits - 1) - 1
     G = W.reshape(*lead, d // group_size, group_size)
     scale = G.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / qmax
