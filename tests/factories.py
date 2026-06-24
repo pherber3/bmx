@@ -33,3 +33,42 @@ def ids(vocab=97, seq=12, seed=42):
     return torch.randint(
         0, vocab, (1, seq), generator=torch.Generator().manual_seed(seed)
     )
+
+
+def tiny_packed_blocks(
+    *, n_q_heads, n_q_groups, n_q, d, blk, n_blocks, arm="rtn_token", group=8, seed=0
+):
+    """Build (q, k_blocks, v_blocks, kwargs) for chunked/naive attention tests.
+
+    Returns rtn_token packed blocks (decode case: n_q=1, query_abs_start=None).
+    """
+    from bmx.cache.codecs import quantize_packed
+    from bmx.cache.collect import to_matrix
+
+    h_kv = n_q_heads // n_q_groups
+    torch.manual_seed(seed)
+    q = torch.randn(n_q_heads, n_q, d)
+    k_blocks, v_blocks = [], []
+    for i in range(n_blocks):
+        start, end = i * blk, (i + 1) * blk
+        kM = to_matrix(torch.randn(h_kv, blk, d))
+        vM = to_matrix(torch.randn(h_kv, blk, d))
+        kp, _ = quantize_packed(arm, kM, bits=4, group=group, seed=seed)
+        vp, _ = quantize_packed(arm, vM, bits=4, group=group, seed=seed)
+        k_blocks.append((kp, start, end))
+        v_blocks.append((vp, start, end))
+    kwargs = dict(
+        k_arm=arm,
+        v_arm=arm,
+        group=group,
+        seed=seed,
+        k_pre_rope=False,
+        rope_cos=None,
+        rope_sin=None,
+        k_tail=None,
+        v_tail=None,
+        n_q_groups=n_q_groups,
+        scale=d**-0.5,
+        query_abs_start=None,
+    )
+    return q, k_blocks, v_blocks, kwargs

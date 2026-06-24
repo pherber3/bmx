@@ -259,10 +259,20 @@ def chunked_dequant_attention(
 
     def attend(K_kv, V_kv):
         nonlocal acc, m, lse
-        K_exp = K_kv.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, blk, d)
-        V_exp = V_kv.repeat_interleave(n_q_groups, dim=0)
-        s = (q @ K_exp.transpose(-1, -2)) * scale  # (n_q_heads, n_q, blk)
-        acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
+        # Grouped contraction: avoid repeat_interleave materializing an
+        # (n_q_heads, blk, d) copy of K/V each block. q viewed as
+        # (h_kv, n_q_groups, n_q, d) contracts against (h_kv, blk, d).
+        qg = q.view(h_kv, n_q_groups, n_q, d)
+        s = torch.einsum("gpnd,gbd->gpnb", qg, K_kv) * scale  # (h_kv, grp, n_q, blk)
+        s = s.reshape(n_q_heads, n_q, K_kv.shape[1])
+        m_new = torch.maximum(m, s.amax(dim=-1, keepdim=True))
+        correction = torch.exp(m - m_new)
+        p = torch.exp(s - m_new)
+        lse = lse * correction + p.sum(dim=-1, keepdim=True)
+        pg = p.view(h_kv, n_q_groups, n_q, K_kv.shape[1])
+        av = torch.einsum("gpnb,gbd->gpnd", pg, V_kv).reshape(n_q_heads, n_q, d)
+        acc = acc * correction + av
+        m = m_new
 
     for (kpacked, start, end), (vpacked, _vs, _ve) in zip(k_blocks, v_blocks):
         K_kv = _dequant_block(kpacked, k_arm, group, seed, h_kv).to(q.dtype)
