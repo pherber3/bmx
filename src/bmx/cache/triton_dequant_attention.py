@@ -671,7 +671,12 @@ def _k2b_block_kernel_launch(
         res_int_kv = res_Q_int_full[lo:hi, :].contiguous()  # (d, blk) int8
         res_sc_kv = res_scale_mat[lo:hi, :].contiguous()  # (d, n_groups) fp16
 
-        v_kv = V_buf[kv]  # (blk, d) fp16 — contiguous slice of row-major V_kv
+        # .contiguous() REQUIRED: V_kv comes from from_matrix (a permute/reshape) and
+        # is NON-contiguous at h_kv>1 (V_kv[kv] strides (h_kv*d, 1), not (d, 1)). The
+        # kernel reads v_ptr + b_idx*d + d_idx assuming row-major (d,1), so a
+        # non-contiguous slice reads the WRONG (interleaved) V — m/scores stay right
+        # (K-based) but p@v is wrong (confirmed on GH200: head outputs 0.5+ off at h_kv=2).
+        v_kv = V_buf[kv].contiguous()  # (blk, d) fp16
 
         acc_kv = acc_buf[kv]  # (G, d) fp16 — written in-place by Triton
         m_kv = m_buf[kv]  # (G,)  fp32
