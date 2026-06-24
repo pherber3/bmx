@@ -169,22 +169,23 @@ def test_graphable_requires_cuda_seqlen():
 
 
 def test_graphable_requires_int32_seqlen():
-    """triton_decode_attention_graphable must raise if seq_len_dev is not int32."""
+    """triton_decode_attention_graphable must raise if seq_len_dev is not int32.
+
+    The dtype guard fires BEFORE the device guard (intentional ordering in the
+    launcher) so a CPU tensor with wrong dtype triggers the dtype assertion.
+    This lets the test run fully offline without CUDA.
+    """
     from bmx.cache.triton_dequant_attention import triton_decode_attention_graphable
     import bmx.cache.triton_dequant_attention as mod
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA needed to create a CUDA tensor for this smoke test")
 
     original = mod.TRITON_AVAILABLE
     try:
         mod.TRITON_AVAILABLE = True
-        q = torch.zeros(4, 1, 64, dtype=torch.float16, device="cuda")
-        k_stacked = torch.zeros(2, 2, 64, 64, dtype=torch.float16, device="cuda")
-        v_stacked = torch.zeros(2, 2, 64, 64, dtype=torch.float16, device="cuda")
-        seq_len_wrong_dtype = torch.tensor(
-            64, dtype=torch.int64, device="cuda"
-        )  # int64 — wrong
+        # CPU tensors — dtype guard fires before device guard, so no CUDA needed.
+        q = torch.zeros(4, 1, 64, dtype=torch.float16)
+        k_stacked = torch.zeros(2, 2, 64, 64, dtype=torch.float16)
+        v_stacked = torch.zeros(2, 2, 64, 64, dtype=torch.float16)
+        seq_len_wrong_dtype = torch.tensor(64, dtype=torch.int64)  # int64 — wrong
         with pytest.raises(AssertionError, match="int32"):
             triton_decode_attention_graphable(
                 q,

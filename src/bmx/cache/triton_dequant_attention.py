@@ -1128,7 +1128,7 @@ def triton_decode_attention(
 
 if TRITON_AVAILABLE:
 
-    @triton.jit(do_not_specialize=["max_blocks"])
+    @triton.jit(do_not_specialize=["h_kv"])
     def _graphable_decode_kernel(
         # Query: (h_kv, n_q_groups, d) — n_q=1 squeezed, GQA-expanded view
         q_ptr,
@@ -1143,8 +1143,10 @@ if TRITON_AVAILABLE:
         seq_len_ptr,
         # Scale factor (1/sqrt(d), fp32 scalar — runtime, not constexpr)
         scale,
+        # h_kv: runtime int (do_not_specialize) — passed explicitly to avoid
+        # tl.num_programs(1) which is grid-padding-dependent on some hardware.
+        h_kv,
         # Fixed-size launch params (constexpr — do NOT include seq_len here)
-        max_blocks: tl.constexpr,  # noqa: ARG001  — sets grid, not used inside
         blk_size: tl.constexpr,
         d: tl.constexpr,
         n_q_groups: tl.constexpr,
@@ -1163,8 +1165,9 @@ if TRITON_AVAILABLE:
         early (contributes nothing to the accumulator). The last block is
         partially masked: only tokens [block_start : seq_len] are active.
 
-        do_not_specialize: max_blocks is a runtime int (not constexpr) at the
-        Python level — it sets the grid but is not used inside the kernel body.
+        do_not_specialize: h_kv is a runtime int (not constexpr) — passed
+        explicitly so the stride computation is deterministic and not
+        grid-padding-dependent (avoids tl.num_programs(1) assumptions).
         scale is also a runtime float; neither goes in the autotune key.
         """
         block_idx = tl.program_id(0)
@@ -1202,13 +1205,11 @@ if TRITON_AVAILABLE:
         # Load k block: (blk_size, d).
         # k_stacked layout: (max_blocks, h_kv, blk_size, d).
         # k_stacked[block_idx, kv_head, :, :] offset:
-        #   = (block_idx * h_kv_total + kv_head) * blk_size * d
-        # We don't have h_kv as constexpr; compute from program grid.
-        # Grid dim 1 = h_kv (inferred at launch time; kernel sees it via
-        # tl.num_programs(1)).
+        #   = (block_idx * h_kv + kv_head) * blk_size * d
+        # h_kv is passed explicitly (do_not_specialize) — deterministic stride,
+        # not grid-padding-dependent (avoids tl.num_programs(1) assumption).
         # ------------------------------------------------------------------
-        h_kv_total = tl.num_programs(1)
-        k_base = (block_idx * h_kv_total + kv_head) * blk_size * d
+        k_base = (block_idx * h_kv + kv_head) * blk_size * d
         k_offsets = b_idx[:, None] * d + d_idx[None, :]  # (blk_size, d)
         # Mask for partial last block: b_idx < active
         k_mask = b_idx < active  # (blk_size,) bool — last block partial mask
@@ -1260,7 +1261,7 @@ if TRITON_AVAILABLE:
         lse_new = lse_local * alpha + tl.sum(p, axis=0)
 
         # acc = p @ v:
-        v_base = (block_idx * h_kv_total + kv_head) * blk_size * d
+        v_base = (block_idx * h_kv + kv_head) * blk_size * d
         v = tl.load(
             v_stacked_ptr + v_base + k_offsets,
             mask=k_mask[:, None],
@@ -1274,7 +1275,7 @@ if TRITON_AVAILABLE:
         # Store (acc_local, m_new, lse_new) to per-block scratch buffers.
         # Layout: [block_idx * (h_kv * n_q_groups) + kv_head * n_q_groups + g]
         # ------------------------------------------------------------------
-        scratch_row = block_idx * h_kv_total * n_q_groups + kv_head * n_q_groups + g
+        scratch_row = block_idx * h_kv * n_q_groups + kv_head * n_q_groups + g
         # acc_ptr in graphable path points to scratch: (max_blocks*h_kv*G, d)
         tl.store(acc_ptr + scratch_row * d + d_idx, acc_local.to(tl.float16))
         tl.store(m_ptr + scratch_row, m_new.to(tl.float32))
@@ -1369,11 +1370,13 @@ def triton_decode_attention_graphable(
 
     n_q_heads, n_q, d = q.shape
     assert n_q == 1, "graphable path is decode-only (n_q==1)"
-    assert seq_len_dev.is_cuda, "seq_len_dev must be a CUDA tensor"
+    # dtype guard BEFORE device guard so a CPU tensor with wrong dtype gets
+    # the dtype error — enabling an offline CPU test for the int32 requirement.
     assert seq_len_dev.dtype == torch.int32, (
         f"seq_len_dev must be int32, got {seq_len_dev.dtype}. "
         "This is the device-pointer that the kernel reads for graph safety."
     )
+    assert seq_len_dev.is_cuda, "seq_len_dev must be a CUDA tensor"
 
     max_blocks, h_kv, blk_size, _d = k_stacked.shape
     assert _d == d, f"k_stacked d={_d} != q d={d}"
@@ -1413,7 +1416,7 @@ def triton_decode_attention_graphable(
         lse_scratch,
         seq_len_dev,
         float(scale),
-        max_blocks=max_blocks,
+        h_kv,
         blk_size=blk_size,
         d=d,
         n_q_groups=n_q_groups,
