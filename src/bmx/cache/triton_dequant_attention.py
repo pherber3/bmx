@@ -410,13 +410,16 @@ if TRITON_AVAILABLE:
             # The scratch round-trip is a tiny per-block transient (negligible vs the
             # resident KV stream). Verified bit-exact (4.8e-7) vs apply_rope on GH200.
             # (In-register reshape/join half-swap fails to compile in this Triton.)
-            tl.store(scratch_ptr + rope_off, k)
+            # Per-program scratch slice (scratch is (n_q_groups, blk, d)): program g
+            # owns scratch[g] so the grid's programs don't race on a shared buffer.
+            g_base = g * blk * d
+            tl.store(scratch_ptr + g_base + rope_off, k)
             half = d // 2
             is_first = d_idx < half  # (D,)
             src_col = tl.where(is_first, d_idx + half, d_idx - half)  # (D,)
             sign = tl.where(is_first, -1.0, 1.0)  # (D,)
             rot_off = b_idx[:, None] * d + src_col[None, :]  # (BLK, D)
-            k_rot = tl.load(scratch_ptr + rot_off) * sign[None, :]  # (BLK, D)
+            k_rot = tl.load(scratch_ptr + g_base + rot_off) * sign[None, :]  # (BLK, D)
             k = k * cos + k_rot * sin  # (BLK, D)
 
         # ------------------------------------------------------------------
@@ -701,7 +704,9 @@ def _k2b_block_kernel_launch(
     if has_rope:
         cos_blk = _to_dev(rope_cos_blk).to(torch.float16).contiguous()  # (blk, d)
         sin_blk = _to_dev(rope_sin_blk).to(torch.float16).contiguous()  # (blk, d)
-        rope_scratch = torch.empty(blk, d, dtype=torch.float32, device=dev)
+        # Per-program scratch: (n_q_groups, blk, d) so each grid program (query head
+        # in the group) gets its own rotate_half scratch slice (no cross-program race).
+        rope_scratch = torch.empty(n_q_groups, blk, d, dtype=torch.float32, device=dev)
 
     for kv in range(h_kv):
         q_kv = q_v[
