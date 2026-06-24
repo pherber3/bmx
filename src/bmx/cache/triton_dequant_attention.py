@@ -411,9 +411,15 @@ if TRITON_AVAILABLE:
             # resident KV stream). Verified bit-exact (4.8e-7) vs apply_rope on GH200.
             # (In-register reshape/join half-swap fails to compile in this Triton.)
             # Per-program scratch slice (scratch is (n_q_groups, blk, d)): program g
-            # owns scratch[g] so the grid's programs don't race on a shared buffer.
+            # owns scratch[g] so grid programs don't race. tl.debug_barrier() between
+            # store and load is REQUIRED — store-then-load to the SAME HBM buffer in
+            # one program is NOT ordered without a fence (Triton memory model), the
+            # compiler reorders and the load misses the store (confirmed: wrong RoPE
+            # without the barrier). rotate_half(x)=cat(-x[d/2:],x[:d/2]): for col j,
+            # source col = j+half (j<half) or j-half (else); sign = -1/+1.
             g_base = g * blk * d
             tl.store(scratch_ptr + g_base + rope_off, k)
+            tl.debug_barrier()
             half = d // 2
             is_first = d_idx < half  # (D,)
             src_col = tl.where(is_first, d_idx + half, d_idx - half)  # (D,)
