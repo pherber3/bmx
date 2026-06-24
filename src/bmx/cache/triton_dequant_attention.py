@@ -2023,6 +2023,8 @@ def fused_decode_attention_packed(
     k_group: int,
     v_group: int,
     num_splits: int | None = None,
+    k_tail: torch.Tensor | None = None,
+    v_tail: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused split-KV decode over PACKED RTN codes — dequant in-kernel, no dense copy.
 
@@ -2035,10 +2037,15 @@ def fused_decode_attention_packed(
         q:         (n_q_heads, 1, d) fp16 CUDA.
         k_codes/v_codes:   (max_blocks, h_kv, blk_size, d) int8 CUDA.
         k_scales/v_scales: (max_blocks, h_kv, blk_size, d//group) fp16 CUDA.
-        seq_len:   live KV token count.
+        seq_len:   live KV token count (the PACKED committed region only).
         n_q_groups, scale: as fused_decode_attention.
         k_group/v_group: RTN group sizes (scale granularity along d).
         num_splits: None -> pick_num_splits.
+        k_tail/v_tail: optional dense fp16 (h_kv, tail_len, d) recent window NOT in
+            the packed region (the streaming cache keeps the last W tokens lossless).
+            Folded in via the online-softmax merge in PyTorch (tail_len is tiny,
+            <= recent_window; not worth a kernel). When None, the GPU merge kernel
+            is used directly (no PyTorch round-trip).
     Returns (n_q_heads, 1, d) fp16.
     """
     _require_triton()
@@ -2092,18 +2099,45 @@ def fused_decode_attention_packed(
         USE_DOT=use_dot,
     )
 
-    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
-    _fused_merge_kernel[(h_kv,)](
-        acc_part,
-        m_part,
-        lse_part,
-        out,
-        int(num_splits),
-        h_kv=h_kv,
-        d=d,
-        n_q_groups=n_q_groups,
-    )
-    return out.view(n_q_heads, 1, d)
+    if k_tail is None or k_tail.shape[1] == 0:
+        # No tail: GPU merge kernel directly (no PyTorch round-trip).
+        out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
+        _fused_merge_kernel[(h_kv,)](
+            acc_part,
+            m_part,
+            lse_part,
+            out,
+            int(num_splits),
+            h_kv=h_kv,
+            d=d,
+            n_q_groups=n_q_groups,
+        )
+        return out.view(n_q_heads, 1, d)
+
+    # Tail present: compute its pre-normalization partial in PyTorch and merge it
+    # with the kernel's split partials via the same online-softmax combine
+    # (_merge_partials). tail_len <= recent_window is tiny, so this is cheap.
+    # Partial layout (num_splits, h_kv, G, ...) -> per-split (n_q_heads,1,d) lists:
+    # head index = kv*G + g matches q's (h_kv, G) flatten -> the n_q_heads order.
+    assert v_tail is not None, "v_tail required when k_tail is set"
+    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
+    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
+    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
+
+    # Tail partial: dense fp16 (h_kv, tail_len, d), GQA-expanded to (n_q_heads, .).
+    kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
+    vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
+    qf = q.float()  # (n_q_heads, 1, d)
+    st = torch.einsum("hqd,hkd->hqk", qf, kt) * scale  # (n_q_heads, 1, tail_len)
+    mt = st.amax(dim=-1, keepdim=True)  # (n_q_heads, 1, 1)
+    pt = torch.exp(st - mt)  # (n_q_heads, 1, tail_len)
+    lse_t = pt.sum(dim=-1, keepdim=True)  # (n_q_heads, 1, 1)
+    acc_t = torch.einsum("hqk,hkd->hqd", pt, vt)  # (n_q_heads, 1, d) pre-norm
+    accs.append(acc_t)
+    ms.append(mt)
+    lses.append(lse_t)
+
+    return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
 
 
 def build_kv_stacked(

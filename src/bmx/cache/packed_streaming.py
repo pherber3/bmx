@@ -19,6 +19,8 @@ from bmx.cache.chunked_attention import chunked_dequant_attention
 from bmx.cache.codecs import S_DIVISIBILITY_ARMS, quantize_packed
 from bmx.cache.triton_dequant_attention import (
     TRITON_AVAILABLE,
+    build_kv_stacked_packed,
+    fused_decode_attention_packed,
     triton_decode_attention,
 )
 from bmx.cache.collect import _reshape_heads, to_matrix
@@ -364,6 +366,55 @@ class PackedStreamingLayer(DynamicLayer):
         # box). The Triton kernel needs CUDA tensors — a CPU q means use the chunked
         # path. (A CPU pointer to a Triton kernel raises "cannot be accessed".)
         is_decode = query_abs_start is None  # n_q==1
+
+        # FUSED PACKED fast path (the deployment kernel): single-launch split-KV
+        # decode that dequants int8 RTN codes IN-KERNEL (packed-resident, no dense
+        # copy) — ~3000x vs chunked, compression preserved. Applies when K and V
+        # are plain rtn_token (the packed-stack layout build_kv_stacked_packed
+        # assumes) and K is post-RoPE (this kernel has no in-kernel RoPE — k2b /
+        # pre-RoPE stay on the per-block triton path below). The fp16 recent-window
+        # tail is folded in via the online-softmax merge. Stacks are built per call
+        # here for correctness; a production engine maintains them incrementally
+        # (the kernel consumes exactly the paged-KV block-table layout).
+        fused_packed_ok = (
+            is_decode
+            and q.is_cuda
+            and TRITON_AVAILABLE
+            and self.k_spec.arm == "rtn_token"
+            and self.v_spec.arm == "rtn_token"
+            and not self.k_spec.pre_rope
+            and len(self._k_blocks) > 0
+        )
+        if fused_packed_ok:
+            blk = self._k_blocks[0][2] - self._k_blocks[0][1]  # block length
+            n_blocks = len(self._k_blocks)
+            seq_len_packed = n_blocks * blk
+            k_codes, v_codes, k_scales, v_scales = build_kv_stacked_packed(
+                self._k_blocks,
+                self._v_blocks,
+                max_blocks=n_blocks,
+                h_kv=self._h_kv,
+                blk_size=blk,
+                d=q.shape[2],
+                group=self.k_spec.group,
+                v_group=self.v_spec.group,
+                device=q.device,
+            )
+            return fused_decode_attention_packed(
+                q,
+                k_codes,
+                v_codes,
+                k_scales,
+                v_scales,
+                seq_len_packed,
+                n_q_groups=n_q_groups,
+                scale=scaling,
+                k_group=self.k_spec.group,
+                v_group=self.v_spec.group,
+                k_tail=k_tail,
+                v_tail=v_tail,
+            )
+
         if TRITON_AVAILABLE and is_decode and q.is_cuda:
             return triton_decode_attention(
                 q,
