@@ -215,8 +215,9 @@ class PackedStreamingLayer(DynamicLayer):
         """
         M = to_matrix(v_block)  # (block_len, h_kv*d)
         spec = self.v_spec
-        # turboquant_mse_perhead needs the head count (block-diagonal d_head rotation).
-        h_heads = self._h_kv if spec.arm == "turboquant_mse_perhead" else 0
+        # h_heads is inert for every arm except turboquant_mse_perhead (which uses it
+        # for the block-diagonal d_head rotation), so pass it unconditionally rather
+        # than sniffing the arm name here.
         packed, _ = quantize_packed(
             spec.arm,
             M,
@@ -224,7 +225,7 @@ class PackedStreamingLayer(DynamicLayer):
             group=spec.group,
             rank=spec.rank,
             seed=spec.seed,
-            h_heads=h_heads,
+            h_heads=self._h_kv,
         )
         return packed
 

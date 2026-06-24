@@ -13,12 +13,33 @@ Design rationale and staged-build ledger:
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
 
 from bmx.cache.collect import from_matrix
 from bmx.cache.rope import apply_rope
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power of 2 >= max(1, n)."""
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+@functools.lru_cache(maxsize=16)
+def _hadamard_matrix(d: int, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """Orthonormal (d,d) Walsh-Hadamard matrix H_d = fwht(I_d), cached per
+    (d, device, dtype). The per-head V unrotate is row-wise `x @ H_d * signs`
+    (fwht is symmetric, so H_d.T = H_d). Constant per d — cached so the k2b decode
+    launcher doesn't rebuild it (an O(d² log d) FWHT) every token."""
+    from bmx.quant.hadamard import fwht
+
+    return fwht(torch.eye(d, dtype=dtype, device=device))
+
 
 try:
     import triton
@@ -1765,6 +1786,63 @@ def pick_num_splits(
     return p
 
 
+def _finalize_decode(
+    acc_part: torch.Tensor,
+    m_part: torch.Tensor,
+    lse_part: torch.Tensor,
+    num_splits: int,
+    q: torch.Tensor,
+    scale: float,
+    n_q_groups: int,
+    k_tail: torch.Tensor | None,
+    v_tail: torch.Tensor | None,
+) -> torch.Tensor:
+    """Merge the split partials into the final (n_q_heads, 1, d) output.
+
+    Shared by every fused decode launcher. No tail -> the GPU merge kernel directly
+    (no PyTorch round-trip). Tail present -> fold the dense fp16 recent window
+    (k_tail/v_tail, <= recent_window tokens) into the split partials via the same
+    base-e online-softmax combine (_merge_partials) in PyTorch — tiny, so PyTorch is
+    fine. Partial layout (num_splits, h_kv, G, ...) flattens to head index kv*G+g,
+    matching q's (h_kv, G) order.
+    """
+    h_kv, n_q_groups_, d = acc_part.shape[1], acc_part.shape[2], acc_part.shape[3]
+    n_q_heads = h_kv * n_q_groups_
+
+    if k_tail is None or k_tail.shape[1] == 0:
+        out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
+        _fused_merge_kernel[(h_kv,)](
+            acc_part,
+            m_part,
+            lse_part,
+            out,
+            int(num_splits),
+            h_kv=h_kv,
+            d=d,
+            n_q_groups=n_q_groups,
+        )
+        return out.view(n_q_heads, 1, d)
+
+    assert v_tail is not None, "v_tail required when k_tail is set"
+    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
+    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
+    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
+
+    # Dense tail partial: (h_kv, tail_len, d) GQA-expanded to (n_q_heads, ...).
+    kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
+    vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
+    qf = q.float()  # (n_q_heads, 1, d)
+    st = torch.einsum("hqd,hkd->hqk", qf, kt) * scale  # (n_q_heads, 1, tail_len)
+    mt = st.amax(dim=-1, keepdim=True)
+    pt = torch.exp(st - mt)
+    lse_t = pt.sum(dim=-1, keepdim=True)
+    acc_t = torch.einsum("hqk,hkd->hqd", pt, vt)  # pre-norm
+    accs.append(acc_t)
+    ms.append(mt)
+    lses.append(lse_t)
+    return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
+
+
 def fused_decode_attention(
     q: torch.Tensor,
     k_stacked: torch.Tensor,
@@ -1820,9 +1898,7 @@ def fused_decode_attention(
     # tl.dot needs M,N,K>=16: pad the GQA group dim up to the next power of 2 >=16,
     # and use the dot path only when blk_size>=16 and d>=16 too (the tiny offline
     # test model has d=8 -> falls back to the broadcast cube; real models are d>=64).
-    gpad = 16
-    while gpad < n_q_groups:
-        gpad *= 2
+    gpad = _next_pow2(max(16, n_q_groups))
     use_dot = blk_size >= 16 and d >= 16
 
     # Query laid out (h_kv, G, d) contiguous so q[kv, g, :] is a clean offset.
@@ -2078,12 +2154,8 @@ def fused_decode_attention_packed(
         num_splits = pick_num_splits(seq_len, blk_size, h_kv)
     num_splits = max(1, int(num_splits))
 
-    gpad = 16
-    while gpad < n_q_groups:
-        gpad *= 2
-    blk_pow2 = 1
-    while blk_pow2 < blk_size:
-        blk_pow2 *= 2
+    gpad = _next_pow2(max(16, n_q_groups))
+    blk_pow2 = _next_pow2(blk_size)
     # tl.dot needs M,N,K>=16: M=GPAD>=16, N=BLK_POW2, K=d. d<16 only in the tiny
     # offline test (-> broadcast cube). BLK_POW2>=16 for real flush blocks.
     use_dot = blk_pow2 >= 16 and d >= 16
@@ -2122,45 +2194,9 @@ def fused_decode_attention_packed(
         USE_DOT=use_dot,
     )
 
-    if k_tail is None or k_tail.shape[1] == 0:
-        # No tail: GPU merge kernel directly (no PyTorch round-trip).
-        out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
-        _fused_merge_kernel[(h_kv,)](
-            acc_part,
-            m_part,
-            lse_part,
-            out,
-            int(num_splits),
-            h_kv=h_kv,
-            d=d,
-            n_q_groups=n_q_groups,
-        )
-        return out.view(n_q_heads, 1, d)
-
-    # Tail present: compute its pre-normalization partial in PyTorch and merge it
-    # with the kernel's split partials via the same online-softmax combine
-    # (_merge_partials). tail_len <= recent_window is tiny, so this is cheap.
-    # Partial layout (num_splits, h_kv, G, ...) -> per-split (n_q_heads,1,d) lists:
-    # head index = kv*G + g matches q's (h_kv, G) flatten -> the n_q_heads order.
-    assert v_tail is not None, "v_tail required when k_tail is set"
-    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
-    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
-    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
-
-    # Tail partial: dense fp16 (h_kv, tail_len, d), GQA-expanded to (n_q_heads, .).
-    kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
-    vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
-    qf = q.float()  # (n_q_heads, 1, d)
-    st = torch.einsum("hqd,hkd->hqk", qf, kt) * scale  # (n_q_heads, 1, tail_len)
-    mt = st.amax(dim=-1, keepdim=True)  # (n_q_heads, 1, 1)
-    pt = torch.exp(st - mt)  # (n_q_heads, 1, tail_len)
-    lse_t = pt.sum(dim=-1, keepdim=True)  # (n_q_heads, 1, 1)
-    acc_t = torch.einsum("hqk,hkd->hqd", pt, vt)  # (n_q_heads, 1, d) pre-norm
-    accs.append(acc_t)
-    ms.append(mt)
-    lses.append(lse_t)
-
-    return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
+    return _finalize_decode(
+        acc_part, m_part, lse_part, num_splits, q, scale, n_q_groups, k_tail, v_tail
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2169,21 +2205,24 @@ def fused_decode_attention_packed(
 #   K = lowrank_rtn_channel @3b: Us @ Vfac.T + RTN residual, keys PRE-RoPE ->
 #       RoPE applied in-kernel on the reconstructed K (ported from the proven
 #       per-block _k2b_softmax_block_kernel). All per-head, no cross-head coupling.
-#   V = turboquant_mse @2b: codebook gather + Hadamard unrotate (FWHT over the
-#       full C=h_kv*d row) + per-row norms. The unrotate COUPLES heads, so it
-#       can't run inside a per-head decode program. KEY TRICK (verified exact,
-#       scratch_fwht_defer_check.py): the FWHT is linear over C and the softmax
-#       weights act on the sequence axis, so they COMMUTE:
-#         o = Σ_s p[s]·V_real[s,:] = signs ⊙ H·( Σ_s (p[s]·norms[s])·M_quant[s,:] )
-#       The decode kernel accumulates the PER-HEAD raw-codebook value
-#         acc_pre[head,:] = Σ_s (p[s]·norms[s])·M_quant[s, head_cols]
-#       (M_quant = cb[idx]/√C, pure per-channel gather — fits the per-head kernel);
-#       the FWHT+signs run ONCE per query head in the merge epilogue over the
-#       assembled full-C row. O(S·C·logC) -> O(C·logC). Survives split-KV merge
-#       (linear commutes). norms[s] folds into p̃=p·norms; lse stays Σp (unweighted).
+#   V = turboquant_mse_perhead @2b: PER-HEAD Hadamard (block-diagonal over heads,
+#       had_dim = d_head) — the QuaRot/SpinQuant design. V[b,:] = norm · (signs ⊙
+#       (H_d · M_quant[b,:])), M_quant = cb[idx]/√d, over each head's OWN d columns.
+#       So V dequant is FULLY per-head and runs IN-KERNEL: codebook gather + a
+#       d-point Hadamard (a (d,d) matmul, tl.dot) + signs + norm. No cross-head
+#       coupling, so V is a standard online-softmax value and the merge is standard.
+#
+#   Why per-head, not the full-C turboquant_mse: a single C=h_kv*d Hadamard couples
+#   all heads, and under GQA each query head has its own softmax — so that unrotate
+#   neither fits a per-head decode program nor folds into o_proj (dimension mismatch
+#   + per-head-p commutation failure). Per-head rotation is quality-equivalent (the
+#   turboquant distortion bound is dimension-independent in the constant; the
+#   Beta→Gaussian concentration is excellent at d=128) and the production-standard
+#   choice. (An earlier cross-head "defer the FWHT past the p·v sum" attempt failed
+#   for exactly the per-head-p reason; per-head removes the coupling entirely.)
 #
 # Resident storage stays PACKED throughout (Us/Vfac/res int8 for K; int16 indices
-# + norms for V) — no dense KV copy.
+# + per-head norms for V) — no dense KV copy.
 # ---------------------------------------------------------------------------
 
 if TRITON_AVAILABLE:
@@ -2234,12 +2273,15 @@ if TRITON_AVAILABLE:
         BLK_POW2: tl.constexpr,
         HAS_ROPE: tl.constexpr,
     ):
-        """k2b fused decode: in-kernel lowrank-K + RoPE + deferred-FWHT V accumulation.
+        """k2b fused decode: in-kernel lowrank-K + RoPE + per-head turboquant-V.
 
-        Per (kv, split) program: reconstruct K (Us@Vfac.T + RTN residual + RoPE),
-        score via GEMV (rank/d may be <16 in tests -> multiply+sum, not tl.dot),
-        and accumulate the PER-HEAD raw V value Σ p̃·M_quant (p̃=p·norms). The FWHT
-        unrotate is deferred to the merge epilogue (see module comment).
+        Per (kv, split) program: reconstruct K (Us@Vfac.T + RTN residual + RoPE via
+        tl.dot), score via GEMV (n_q_groups may be <16 -> multiply+sum, not tl.dot),
+        and dequant V FULLY in-kernel per head — codebook gather + a per-head d-point
+        Hadamard unrotate (tl.dot(m_quant, hmat)) + per-channel signs + per-row norm —
+        then accumulate Σ p·V. Per-head rotation has no cross-head coupling, so V is
+        a standard online-softmax value here; the merge is the standard merge (no
+        deferred FWHT). acc/m/lse partials are standard.
         """
         kv = tl.program_id(0)
         s = tl.program_id(1)
@@ -2264,7 +2306,9 @@ if TRITON_AVAILABLE:
 
         m = tl.full((n_q_groups,), float("-inf"), tl.float32)
         lse = tl.zeros((n_q_groups,), tl.float32)
-        acc = tl.zeros((n_q_groups, d), tl.float32)  # Σ p̃·M_quant per head
+        acc = tl.zeros(
+            (n_q_groups, d), tl.float32
+        )  # Σ p·V per head (V dequant in-kernel)
 
         # rotate_half permutation+sign matrix (D,D), built once (RoPE).
         half: tl.constexpr = d // 2
@@ -2468,7 +2512,6 @@ def fused_decode_attention_k2b(
     """
     _require_triton()
     from bmx.cache.codecs import _hadamard_signs, gaussian_codebook
-    from bmx.quant.hadamard import fwht
 
     n_q_heads, n_q, d = q.shape
     assert n_q == 1, "decode-only"
@@ -2483,16 +2526,13 @@ def fused_decode_attention_k2b(
     if num_splits is None:
         num_splits = pick_num_splits(seq_len, blk_size, h_kv)
     num_splits = max(1, int(num_splits))
-    blk_pow2 = 1
-    while blk_pow2 < blk_size:
-        blk_pow2 *= 2
+    blk_pow2 = _next_pow2(blk_size)
 
     cb = gaussian_codebook(vbits).to(q.device, torch.float32)
     sqrt_d = 1.0 / math.sqrt(d)  # M_quant = cb[idx] / √d (per-head rotation)
-    # Per-head (d,d) orthonormal Hadamard matrix + per-channel signs for the unrotate.
-    # _unrotate(x) = fwht(x) * signs; as a matrix, H_d = fwht(I_d), so the row-wise
-    # unrotate is x @ H_d.T * signs. fwht is symmetric, so H_d.T = H_d.
-    hmat = fwht(torch.eye(d, dtype=torch.float32, device=q.device))  # (d,d)
+    # Per-head (d,d) orthonormal Hadamard matrix + per-channel signs for the unrotate
+    # (row-wise V = (x @ H_d) * signs * norm). hmat is cached per (d, device, dtype).
+    hmat = _hadamard_matrix(d, str(q.device), torch.float32)
     vsigns = _hadamard_signs(d, v_seed).to(q.device, torch.float32)  # (d,)
     has_rope = rope_cos is not None
 
@@ -2547,36 +2587,9 @@ def fused_decode_attention_k2b(
 
     # V is fully dequanted in-kernel (per-head) — acc_part/m_part/lse_part are the
     # standard online-softmax partials, so the standard merge applies (no FWHT here).
-    if k_tail is None or k_tail.shape[1] == 0:
-        out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
-        _fused_merge_kernel[(h_kv,)](
-            acc_part,
-            m_part,
-            lse_part,
-            out,
-            int(num_splits),
-            h_kv=h_kv,
-            d=d,
-            n_q_groups=n_q_groups,
-        )
-        return out.view(n_q_heads, 1, d)
-
-    # Tail: online-softmax-merge the split partials + the dense fp16 recent window.
-    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
-    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
-    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
-    kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
-    vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
-    qf = q.float()
-    st = torch.einsum("hqd,hkd->hqk", qf, kt) * scale
-    mt = st.amax(-1, keepdim=True)
-    pt = torch.exp(st - mt)
-    lse_t = pt.sum(-1, keepdim=True)
-    acc_t = torch.einsum("hqk,hkd->hqd", pt, vt)
-    accs.append(acc_t)
-    ms.append(mt)
-    lses.append(lse_t)
-    return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
+    return _finalize_decode(
+        acc_part, m_part, lse_part, num_splits, q, scale, n_q_groups, k_tail, v_tail
+    )
 
 
 def build_kv_stacked(
@@ -2715,17 +2728,15 @@ def build_kv_stacked_packed(
 
     def _fill(packed, codes, scales, grp, n_grp):
         # Q_int: (S=blk, C=h_kv*d) int8 ; scale: (S, C//grp, 1) fp16.
-        # Reshape per head: column c=head*d+dd -> (blk, h_kv, d). The scale groups
-        # tile C in grp-sized runs; head kv owns scale groups [kv*d//grp:(kv+1)*d//grp].
-        q_int = packed["Q_int"]  # (blk, h_kv*d) int8
-        sc = packed["scale"].squeeze(-1)  # (blk, h_kv*d//grp) fp16
-        blk = q_int.shape[0]
-        # (blk, h_kv, d) — head is the middle axis after reshape (c = head*d + dd).
-        q_hd = q_int.reshape(blk, h_kv, d).to(device)
-        sc_hd = sc.reshape(blk, h_kv, n_grp).to(device).to(torch.float16)
-        # -> (h_kv, blk, d) / (h_kv, blk, n_grp)
-        codes[i] = q_hd.permute(1, 0, 2)
-        scales[i] = sc_hd.permute(1, 0, 2)
+        # The (S, h*x) -> (h, S, x) per-head split is exactly from_matrix (codes use
+        # x=d; scales use x=n_grp, same permute since head kv owns scale groups
+        # [kv*n_grp:(kv+1)*n_grp]). CLAUDE.md: the head/matrix layout lives ONLY in
+        # to_matrix/from_matrix — never hand-roll the permute.
+        codes[i] = from_matrix(packed["Q_int"].to(device), h_kv)  # (h_kv, blk, d)
+        sc = (
+            packed["scale"].squeeze(-1).to(device).to(torch.float16)
+        )  # (blk, h_kv*n_grp)
+        scales[i] = from_matrix(sc, h_kv)  # (h_kv, blk, n_grp)
 
     for i, ((kpacked, _ks, _ke), (vpacked, _vs, _ve)) in enumerate(
         zip(k_blocks, v_blocks)
