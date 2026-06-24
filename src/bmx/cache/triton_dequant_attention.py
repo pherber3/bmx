@@ -147,6 +147,14 @@ if TRITON_AVAILABLE:
     @triton.autotune(
         configs=_AUTOTUNE_CONFIGS,
         key=["d", "n_q_groups"],
+        # This kernel mutates acc/m/lse IN PLACE (read-modify-write carry). Autotune
+        # benchmarks each config by calling the kernel repeatedly on the SAME buffers,
+        # which would accumulate N times and corrupt the carry on the first (tuning)
+        # call for each shape. restore_value clones+restores these between trials so the
+        # post-tuning real run starts from the correct pre-call carry. Without this the
+        # first call per shape returns garbage (confirmed on GH200: seed-dependent
+        # m/lse blow-up that vanished once the autotune cache was warm).
+        restore_value=["acc_ptr", "m_ptr", "lse_ptr"],
     )
     @triton.jit(do_not_specialize=["blk"])
     def _online_softmax_block_kernel(
