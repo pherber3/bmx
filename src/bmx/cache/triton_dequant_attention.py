@@ -1543,6 +1543,8 @@ if TRITON_AVAILABLE:
         blk_size: tl.constexpr,  # tokens per stored block (== build_kv_stacked blk)
         d: tl.constexpr,
         n_q_groups: tl.constexpr,  # G query heads per KV head (group-fused)
+        GPAD: tl.constexpr,  # G padded up to >=16 so tl.dot's M dim is legal
+        USE_DOT: tl.constexpr,  # tl.dot path (dims>=16) vs broadcast cube (tiny test)
     ):
         """Fused decode online-softmax with split-KV: one program per (kv_head, split).
 
@@ -1572,14 +1574,14 @@ if TRITON_AVAILABLE:
         kv = tl.program_id(0)  # which KV head
         s = tl.program_id(1)  # which split
         d_idx = tl.arange(0, d)  # (d,)
-        g_idx = tl.arange(0, n_q_groups)  # (G,)
+        gp_idx = tl.arange(0, GPAD)  # (GPAD,) padded query-head index
+        gp_valid = gp_idx < n_q_groups  # (GPAD,) real rows (rest are pad)
         r_idx = tl.arange(0, blk_size)  # (blk,) row offsets within one stored block
         # Flat element offsets for one contiguous (blk_size, d) stored block: as a
         # 1-D run [0, blk_size*d) this lets Triton's AxisInfoAnalysis prove
         # contiguity -> 128-bit LDG.E.128 loads. Per-row div/mod offset math
-        # DEFEATS that proof -> scalar loads (the coalescing wall: per-program
-        # ~25 GB/s in the split sweep). Splits are block-aligned so one stored
-        # block is fully contiguous for a single head.
+        # DEFEATS that proof -> scalar loads. Splits are block-aligned so one
+        # stored block is fully contiguous for a single head.
         flat_idx = tl.arange(0, blk_size * d)  # (blk*d,) contiguous run
 
         # ------------------------------------------------------------------
@@ -1598,17 +1600,24 @@ if TRITON_AVAILABLE:
         kv_head_off = kv * blk_size * d  # this head's offset within a stored block
 
         # ------------------------------------------------------------------
-        # Load all G query rows for this KV head: (G, d) fp32, resident in regs.
+        # Load q PADDED to GPAD rows (GPAD>=16 so tl.dot's M dim is legal). Pad
+        # rows (g>=n_q_groups) load 0 -> their scores are 0, harmless; we mask the
+        # pad rows out at the final store. The contraction is tl.dot, NOT a
+        # broadcast cube: the (G, blk, d) fp32 cube caused register pressure that
+        # capped per-program bandwidth (~3 GB/s vs ~14 GB/s for tl.dot in the
+        # micro-probe). tl.dot needs M,N,K>=16; GPAD>=16, blk>=16, d>=16 satisfy it.
         # ------------------------------------------------------------------
-        q_offsets = (kv * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G, d)
-        q_rows = tl.load(q_ptr + q_offsets).to(tl.float32)  # (G, d)
+        q_off = (kv * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]  # (GPAD, d)
+        q_rows = tl.load(q_off + q_ptr, mask=gp_valid[:, None], other=0.0).to(
+            tl.float32
+        )  # (GPAD, d)
 
         # ------------------------------------------------------------------
-        # Register carry for the whole GQA group (fp32 across the entire loop).
+        # Register carry for the padded group (fp32 across the entire loop).
         # ------------------------------------------------------------------
-        m = tl.full((n_q_groups,), float("-inf"), tl.float32)  # (G,) running max
-        lse = tl.zeros((n_q_groups,), tl.float32)  # (G,) running denom
-        acc = tl.zeros((n_q_groups, d), tl.float32)  # (G, d) running weighted V
+        m = tl.full((GPAD,), float("-inf"), tl.float32)  # (GPAD,) running max
+        lse = tl.zeros((GPAD,), tl.float32)  # (GPAD,) running denom
+        acc = tl.zeros((GPAD, d), tl.float32)  # (GPAD, d) running weighted V
 
         # ------------------------------------------------------------------
         # Internal loop: ONE stored block per iteration (the unit contiguous in
@@ -1629,18 +1638,24 @@ if TRITON_AVAILABLE:
                 (blk_size, d),
             )  # (blk, d)
 
-            # scores[g, n] = scale * sum_dd q[g, dd] * k[n, dd]  -> (G, blk)
-            scores = (
-                tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
-            )  # (G, blk)
-            scores = tl.where(tile_mask[None, :], scores, float("-inf"))  # (G, blk)
+            # scores[g, n] = scale * sum_dd q[g, dd] * k[n, dd]  -> (GPAD, blk).
+            # tl.dot when dims allow (M=GPAD>=16, N=blk>=16, K=d>=16); else the
+            # broadcast cube (only the tiny offline test model has d<16 — real
+            # models are d>=64). USE_DOT is a constexpr so one branch is compiled.
+            if USE_DOT:
+                scores = tl.dot(q_rows, tl.trans(k)) * scale  # (GPAD, blk)
+            else:
+                scores = (
+                    tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
+                )  # (GPAD, blk)
+            scores = tl.where(tile_mask[None, :], scores, float("-inf"))  # (GPAD, blk)
 
-            # Online-softmax update (base-e), per query head g:
-            m_tile = tl.max(scores, axis=1)  # (G,)
-            m_new = tl.maximum(m, m_tile)  # (G,)
-            alpha = tl.exp(m - m_new)  # (G,) (0 when m=-inf)
-            p = tl.exp(scores - m_new[:, None])  # (G, blk)
-            lse = lse * alpha + tl.sum(p, axis=1)  # (G,)
+            # Online-softmax update (base-e):
+            m_tile = tl.max(scores, axis=1)  # (GPAD,)
+            m_new = tl.maximum(m, m_tile)  # (GPAD,)
+            alpha = tl.exp(m - m_new)  # (GPAD,) (0 when m=-inf)
+            p = tl.exp(scores - m_new[:, None])  # (GPAD, blk)
+            lse = lse * alpha + tl.sum(p, axis=1)  # (GPAD,)
 
             v = tl.reshape(
                 tl.load(
@@ -1649,21 +1664,25 @@ if TRITON_AVAILABLE:
                 ).to(tl.float32),
                 (blk_size, d),
             )  # (blk, d)
-            # pv[g, dd] = sum_n p[g, n] * v[n, dd]  -> (G, d)
-            pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)  # (G, d)
-            acc = acc * alpha[:, None] + pv  # (G, d)
+            # pv[g, dd] = sum_n p[g, n] * v[n, dd]  -> (GPAD, d).
+            if USE_DOT:
+                pv = tl.dot(p, v)  # (GPAD, d)
+            else:
+                pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)  # (GPAD, d)
+            acc = acc * alpha[:, None] + pv  # (GPAD, d)
             m = m_new
 
         # ------------------------------------------------------------------
-        # Store PRE-normalization partials for this (split, kv_head): the merge
-        # kernel divides by the combined denominator. Do NOT divide here.
+        # Store PRE-normalization partials for this (split, kv_head): only the
+        # real G rows (pad rows masked out). The merge kernel divides by the
+        # combined denominator. Do NOT divide here.
         # ------------------------------------------------------------------
         head_row = s * h_kv + kv  # row index in (num_splits*h_kv, G[, d]) layout
-        acc_off = (head_row * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G,d)
-        tl.store(acc_part_ptr + acc_off, acc)  # fp32
-        ml_off = head_row * n_q_groups + g_idx  # (G,)
-        tl.store(m_part_ptr + ml_off, m)
-        tl.store(lse_part_ptr + ml_off, lse)
+        acc_off = (head_row * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]
+        tl.store(acc_part_ptr + acc_off, acc, mask=gp_valid[:, None])  # fp32
+        ml_off = head_row * n_q_groups + gp_idx  # (GPAD,)
+        tl.store(m_part_ptr + ml_off, m, mask=gp_valid)
+        tl.store(lse_part_ptr + ml_off, lse, mask=gp_valid)
 
     @triton.jit
     def _fused_merge_kernel(
@@ -1792,6 +1811,14 @@ def fused_decode_attention(
         num_splits = pick_num_splits(seq_len, blk_size, h_kv)
     num_splits = max(1, int(num_splits))
 
+    # tl.dot needs M,N,K>=16: pad the GQA group dim up to the next power of 2 >=16,
+    # and use the dot path only when blk_size>=16 and d>=16 too (the tiny offline
+    # test model has d=8 -> falls back to the broadcast cube; real models are d>=64).
+    gpad = 16
+    while gpad < n_q_groups:
+        gpad *= 2
+    use_dot = blk_size >= 16 and d >= 16
+
     # Query laid out (h_kv, G, d) contiguous so q[kv, g, :] is a clean offset.
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
 
@@ -1820,6 +1847,8 @@ def fused_decode_attention(
         blk_size=blk_size,
         d=d,
         n_q_groups=n_q_groups,
+        GPAD=gpad,
+        USE_DOT=use_dot,
     )
 
     out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
