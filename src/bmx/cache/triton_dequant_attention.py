@@ -1871,6 +1871,241 @@ def fused_decode_attention(
     return out.view(n_q_heads, 1, d)
 
 
+if TRITON_AVAILABLE:
+
+    @triton.autotune(configs=_FUSED_AUTOTUNE_CONFIGS, key=["d", "n_q_groups"])
+    @triton.jit(do_not_specialize=["seq_len", "num_splits"])
+    def _fused_decode_packed_kernel(
+        # Query: (h_kv, n_q_groups, d) — n_q=1 squeezed, GQA-grouped view
+        q_ptr,
+        # Pre-stacked PACKED RTN codes + per-group scales (NO dense copy):
+        #   k_codes/v_codes:   (max_blocks, h_kv, blk_size, d)         int8
+        #   k_scales/v_scales: (max_blocks, h_kv, blk_size, d//group)  fp16
+        k_codes_ptr,
+        v_codes_ptr,
+        k_scales_ptr,
+        v_scales_ptr,
+        # Partial outputs (same as the dense kernel).
+        acc_part_ptr,
+        m_part_ptr,
+        lse_part_ptr,
+        seq_len,
+        num_splits,
+        scale,  # fp32 1/sqrt(d)
+        h_kv: tl.constexpr,
+        blk_size: tl.constexpr,
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,
+        k_group: tl.constexpr,  # RTN group size for K (scale along d)
+        v_group: tl.constexpr,  # RTN group size for V
+        GPAD: tl.constexpr,  # G padded up to >=16 so tl.dot's M dim is legal
+        USE_DOT: tl.constexpr,  # tl.dot path (dims>=16) vs broadcast cube (tiny test)
+    ):
+        """Split-KV decode online-softmax, dequanting int8 RTN codes IN-KERNEL.
+
+        Identical skeleton + grid to _fused_decode_kernel, but each block's K/V is
+        loaded as int8 codes (blk, d) + per-group fp16 scale (blk, d//group) and
+        dequanted in-register: deq[r,dd] = code[r,dd] * scale[r, dd//group], via the
+        reshape-broadcast idiom. Resident storage stays PACKED (the compression is
+        preserved); int8 is half the bytes of fp16 so the bandwidth ceiling is ~2x.
+        """
+        kv = tl.program_id(0)
+        s = tl.program_id(1)
+        d_idx = tl.arange(0, d)
+        gp_idx = tl.arange(0, GPAD)
+        gp_valid = gp_idx < n_q_groups
+        n_kg: tl.constexpr = d // k_group  # K scale groups along d
+        n_vg: tl.constexpr = d // v_group  # V scale groups along d
+        # Contiguous flat runs for one stored block (one head): codes (blk*d) int8,
+        # scales (blk*n_*g) fp16. Flat -> 128-bit-vectorizable loads.
+        code_flat = tl.arange(0, blk_size * d)  # (blk*d,)
+        k_sc_flat = tl.arange(0, blk_size * n_kg)  # (blk*n_kg,)
+        v_sc_flat = tl.arange(0, blk_size * n_vg)  # (blk*n_vg,)
+
+        raw = (seq_len + num_splits - 1) // num_splits
+        tokens_per_split = ((raw + blk_size - 1) // blk_size) * blk_size
+        split_start = s * tokens_per_split
+        split_end = tl.minimum(split_start + tokens_per_split, seq_len)
+        first_block = split_start // blk_size
+        last_block = (split_end + blk_size - 1) // blk_size
+
+        head_stride = h_kv * blk_size * d  # advance one stored block (codes)
+        kv_head_off = kv * blk_size * d  # this head within a stored block (codes)
+        sc_head_stride_k = h_kv * blk_size * n_kg  # scale strides (smaller inner dim)
+        sc_kv_off_k = kv * blk_size * n_kg
+        sc_head_stride_v = h_kv * blk_size * n_vg
+        sc_kv_off_v = kv * blk_size * n_vg
+        r_idx = tl.arange(0, blk_size)
+
+        q_off = (kv * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]  # (GPAD, d)
+        q_rows = tl.load(q_off + q_ptr, mask=gp_valid[:, None], other=0.0).to(
+            tl.float32
+        )  # (GPAD, d)
+
+        m = tl.full((GPAD,), float("-inf"), tl.float32)
+        lse = tl.zeros((GPAD,), tl.float32)
+        acc = tl.zeros((GPAD, d), tl.float32)
+
+        for blk in range(first_block, last_block):
+            code_base = blk * head_stride + kv_head_off  # scalar
+            row_abs = blk * blk_size + r_idx
+            tile_mask = row_abs < split_end
+
+            # --- K: load int8 codes + per-group scale, dequant in-register ---
+            k_code = tl.reshape(
+                tl.load(
+                    k_codes_ptr + code_base + code_flat, eviction_policy="evict_first"
+                ),
+                (blk_size, n_kg, k_group),
+            ).to(tl.float32)  # (blk, n_kg, k_group)
+            k_sc = tl.reshape(
+                tl.load(
+                    k_scales_ptr + (blk * sc_head_stride_k + sc_kv_off_k) + k_sc_flat,
+                    eviction_policy="evict_first",
+                ),
+                (blk_size, n_kg, 1),
+            ).to(tl.float32)  # (blk, n_kg, 1)
+            k = tl.reshape(k_code * k_sc, (blk_size, d))  # (blk, d) dequant
+
+            if USE_DOT:
+                scores = tl.dot(q_rows, tl.trans(k)) * scale  # (GPAD, blk)
+            else:
+                scores = tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
+            scores = tl.where(tile_mask[None, :], scores, float("-inf"))
+
+            m_tile = tl.max(scores, axis=1)
+            m_new = tl.maximum(m, m_tile)
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            lse = lse * alpha + tl.sum(p, axis=1)
+
+            # --- V: load int8 codes + per-group scale, dequant in-register ---
+            v_code = tl.reshape(
+                tl.load(
+                    v_codes_ptr + code_base + code_flat, eviction_policy="evict_first"
+                ),
+                (blk_size, n_vg, v_group),
+            ).to(tl.float32)
+            v_sc = tl.reshape(
+                tl.load(
+                    v_scales_ptr + (blk * sc_head_stride_v + sc_kv_off_v) + v_sc_flat,
+                    eviction_policy="evict_first",
+                ),
+                (blk_size, n_vg, 1),
+            ).to(tl.float32)
+            v = tl.reshape(v_code * v_sc, (blk_size, d))  # (blk, d) dequant
+
+            if USE_DOT:
+                pv = tl.dot(p, v)  # (GPAD, d)
+            else:
+                pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)
+            acc = acc * alpha[:, None] + pv
+            m = m_new
+
+        head_row = s * h_kv + kv
+        acc_off = (head_row * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]
+        tl.store(acc_part_ptr + acc_off, acc, mask=gp_valid[:, None])
+        ml_off = head_row * n_q_groups + gp_idx
+        tl.store(m_part_ptr + ml_off, m, mask=gp_valid)
+        tl.store(lse_part_ptr + ml_off, lse, mask=gp_valid)
+
+
+def fused_decode_attention_packed(
+    q: torch.Tensor,
+    k_codes: torch.Tensor,
+    v_codes: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    seq_len: int,
+    *,
+    n_q_groups: int,
+    scale: float,
+    k_group: int,
+    v_group: int,
+    num_splits: int | None = None,
+) -> torch.Tensor:
+    """Fused split-KV decode over PACKED RTN codes — dequant in-kernel, no dense copy.
+
+    Same contract/output as fused_decode_attention but the resident KV stays packed
+    (int8 codes + per-group fp16 scales from build_kv_stacked_packed); the kernel
+    dequants each block in-register. int8 = half the bytes of fp16 -> ~2x the
+    bandwidth-bound ceiling of the dense path.
+
+    Args:
+        q:         (n_q_heads, 1, d) fp16 CUDA.
+        k_codes/v_codes:   (max_blocks, h_kv, blk_size, d) int8 CUDA.
+        k_scales/v_scales: (max_blocks, h_kv, blk_size, d//group) fp16 CUDA.
+        seq_len:   live KV token count.
+        n_q_groups, scale: as fused_decode_attention.
+        k_group/v_group: RTN group sizes (scale granularity along d).
+        num_splits: None -> pick_num_splits.
+    Returns (n_q_heads, 1, d) fp16.
+    """
+    _require_triton()
+    n_q_heads, n_q, d = q.shape
+    assert n_q == 1, "decode-only (n_q==1)"
+    max_blocks, h_kv, blk_size, _d = k_codes.shape
+    assert _d == d, f"k_codes d={_d} != q d={d}"
+    assert n_q_heads == h_kv * n_q_groups
+    assert seq_len <= max_blocks * blk_size
+    assert d % k_group == 0 and d % v_group == 0
+
+    if num_splits is None:
+        num_splits = pick_num_splits(seq_len, blk_size, h_kv)
+    num_splits = max(1, int(num_splits))
+
+    gpad = 16
+    while gpad < n_q_groups:
+        gpad *= 2
+    use_dot = blk_size >= 16 and d >= 16
+
+    q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
+    acc_part = torch.empty(
+        num_splits, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
+    )
+    m_part = torch.empty(
+        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+    )
+    lse_part = torch.empty(
+        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+    )
+
+    _fused_decode_packed_kernel[(h_kv, num_splits)](
+        q_kv,
+        k_codes,
+        v_codes,
+        k_scales,
+        v_scales,
+        acc_part,
+        m_part,
+        lse_part,
+        int(seq_len),
+        int(num_splits),
+        float(scale),
+        h_kv=h_kv,
+        blk_size=blk_size,
+        d=d,
+        n_q_groups=n_q_groups,
+        k_group=k_group,
+        v_group=v_group,
+        GPAD=gpad,
+        USE_DOT=use_dot,
+    )
+
+    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
+    _fused_merge_kernel[(h_kv,)](
+        acc_part,
+        m_part,
+        lse_part,
+        out,
+        int(num_splits),
+        h_kv=h_kv,
+        d=d,
+        n_q_groups=n_q_groups,
+    )
+    return out.view(n_q_heads, 1, d)
+
+
 def build_kv_stacked(
     k_blocks: list,
     v_blocks: list,
@@ -1944,3 +2179,88 @@ def build_kv_stacked(
         v_stacked[i] = V_kv.to(device)
 
     return k_stacked, v_stacked
+
+
+# ---------------------------------------------------------------------------
+# Phase 3a.4: PACKED fused decode — dequant int8 RTN codes IN-KERNEL.
+#
+# The dense fused kernel above throws away the compression (it consumes dense
+# fp16 KV). This path keeps the resident storage PACKED (int8 codes + per-group
+# fp16 scales) and dequants in-register inside the fused block loop — so the
+# memory saving is preserved AND, because int8 is HALF the bytes of fp16, the
+# packed kernel's bandwidth-bound ceiling is ~2x the dense one (brain consult:
+# decode is bandwidth-bound, dequant FMA rides in idle ALU slack; the per-group
+# scale does NOT fold through the q.k dot since group<d, so dequant-then-dot).
+#
+# Layout (RTN: rtn_quantize_packed on the (S, h_kv*d) matrix; column c -> head
+# c//d, channel c%d; per-(row, channel-group) scale, group along d):
+#   k_codes/v_codes:   (max_blocks, h_kv, blk_size, d)        int8
+#   k_scales/v_scales: (max_blocks, h_kv, blk_size, d//group) fp16
+# Dequant: K[r,dd] = code[r,dd] * scale[r, dd//group]  (reshape-broadcast idiom).
+# ---------------------------------------------------------------------------
+
+
+def build_kv_stacked_packed(
+    k_blocks: list,
+    v_blocks: list,
+    *,
+    max_blocks: int,
+    h_kv: int,
+    blk_size: int,
+    d: int,
+    group: int,
+    v_group: int | None = None,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pre-stack PACKED RTN codes + scales into device tensors (no dense copy).
+
+    RTN arms only (rtn_token / rtn_channel / rotate_rtn_token store Q_int+scale).
+    For rtn_channel the matrix is transposed at pack time; this builder assumes the
+    rtn_token (S, h_kv*d) layout where Q_int is (S, h_kv*d) and column c maps to
+    head c//d. Slots beyond len(k_blocks) are left zero (masked by seq_len).
+
+    Returns (k_codes, v_codes int8 (max_blocks,h_kv,blk,d);
+             k_scales, v_scales fp16 (max_blocks,h_kv,blk,d//group)).
+    """
+    _vg = v_group if v_group is not None else group
+    assert d % group == 0, f"d={d} not divisible by k group={group}"
+    assert d % _vg == 0, f"d={d} not divisible by v group={_vg}"
+    n_kg, n_vg = d // group, d // _vg
+
+    k_codes = torch.zeros(
+        max_blocks, h_kv, blk_size, d, dtype=torch.int8, device=device
+    )
+    v_codes = torch.zeros(
+        max_blocks, h_kv, blk_size, d, dtype=torch.int8, device=device
+    )
+    k_scales = torch.zeros(
+        max_blocks, h_kv, blk_size, n_kg, dtype=torch.float16, device=device
+    )
+    v_scales = torch.zeros(
+        max_blocks, h_kv, blk_size, n_vg, dtype=torch.float16, device=device
+    )
+
+    def _fill(packed, codes, scales, grp, n_grp):
+        # Q_int: (S=blk, C=h_kv*d) int8 ; scale: (S, C//grp, 1) fp16.
+        # Reshape per head: column c=head*d+dd -> (blk, h_kv, d). The scale groups
+        # tile C in grp-sized runs; head kv owns scale groups [kv*d//grp:(kv+1)*d//grp].
+        q_int = packed["Q_int"]  # (blk, h_kv*d) int8
+        sc = packed["scale"].squeeze(-1)  # (blk, h_kv*d//grp) fp16
+        blk = q_int.shape[0]
+        # (blk, h_kv, d) — head is the middle axis after reshape (c = head*d + dd).
+        q_hd = q_int.reshape(blk, h_kv, d).to(device)
+        sc_hd = sc.reshape(blk, h_kv, n_grp).to(device).to(torch.float16)
+        # -> (h_kv, blk, d) / (h_kv, blk, n_grp)
+        codes[i] = q_hd.permute(1, 0, 2)
+        scales[i] = sc_hd.permute(1, 0, 2)
+
+    for i, ((kpacked, _ks, _ke), (vpacked, _vs, _ve)) in enumerate(
+        zip(k_blocks, v_blocks)
+    ):
+        assert i < max_blocks, (
+            f"more blocks ({len(k_blocks)}) than max_blocks ({max_blocks})"
+        )
+        _fill(kpacked, k_codes, k_scales, group, n_kg)
+        _fill(vpacked, v_codes, v_scales, _vg, n_vg)
+
+    return k_codes, v_codes, k_scales, v_scales
