@@ -69,6 +69,22 @@ def _spec_pair(arm: str, cfg: Config):
     """
     if arm == "fp16":
         return CacheCodecSpec(arm="fp16"), CacheCodecSpec(arm="fp16")
+    # k2b_ph = canonical k2b but with the PER-HEAD Hadamard V codec
+    # (turboquant_mse_perhead). Quality-equivalent to k2b (full-C V) and the arm the
+    # fused k2b decode kernel runs — use it with --use-packed on CUDA to exercise +
+    # regression-check the fused kernel against the recorded k2b results.
+    if arm == "k2b_ph":
+        return (
+            CacheCodecSpec(
+                arm="lowrank_rtn_channel",
+                bits=3,
+                rank=cfg.rank,
+                group=cfg.group,
+                seed=cfg.seed,
+                pre_rope=True,
+            ),
+            CacheCodecSpec(arm="turboquant_mse_perhead", bits=2, seed=cfg.seed),
+        )
     if arm == "k2b" or arm.startswith("k2b_k"):
         # Default canonical k2b: keys@3b, rank=cfg.rank. Parameterized variants
         # "k2b_k{bits}r{rank}" override the key budget to match compression.
