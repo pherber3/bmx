@@ -627,10 +627,16 @@ def _k2b_block_kernel_launch(
     def _to_dev(t: torch.Tensor) -> torch.Tensor:
         return t.to(dev) if t.device != dev else t
 
-    Us = _to_dev(Us).to(torch.float16)
-    Vfac_full = _to_dev(Vfac_full).to(torch.float16)
-    res_Q_int_full = _to_dev(res_Q_int_full)  # keep int8
-    res_scale_full = _to_dev(res_scale_full)
+    # .contiguous() is REQUIRED: the codec produces these via SVD and can return
+    # NON-contiguous tensors (e.g. Us arrives with strides (1, rank) — a transposed
+    # view). The kernel indexes with row-major offset arithmetic (b_idx*rank + r_idx),
+    # so a non-contiguous input is read with the wrong strides -> garbage K
+    # reconstruction (confirmed on GH200: Us strides (1,64) -> us[0,1] read wrong).
+    # .to(fp16) alone does NOT guarantee contiguity (no-op when already fp16).
+    Us = _to_dev(Us).to(torch.float16).contiguous()
+    Vfac_full = _to_dev(Vfac_full).to(torch.float16).contiguous()
+    res_Q_int_full = _to_dev(res_Q_int_full).contiguous()  # keep int8
+    res_scale_full = _to_dev(res_scale_full).contiguous()
 
     rank = Us.shape[1]
     n_groups = blk // k_group
@@ -649,8 +655,9 @@ def _k2b_block_kernel_launch(
     # V_kv is (h_kv, blk, d_head) — fresh allocation from _v_dequant, contiguous.
     V_buf = V_kv
 
-    # Us is shared across all KV heads — hoist .contiguous() outside the loop.
-    us_kv = Us  # already fp16 contiguous (cast on line above via .to(torch.float16))
+    # Us is shared across all KV heads — made contiguous above (the SVD output is
+    # non-contiguous; the .contiguous() at the _to_dev cast is load-bearing).
+    us_kv = Us
 
     for kv in range(h_kv):
         q_kv = q_v[
