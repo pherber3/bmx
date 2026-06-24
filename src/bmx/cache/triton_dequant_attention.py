@@ -409,34 +409,39 @@ if TRITON_AVAILABLE:
         # multiply+sum, not tl.dot — no >=16 min-dim constraint).
         # ------------------------------------------------------------------
         if HAS_ROPE:
-            # In-register RoPE folded into the score reduction — NO HBM scratch, NO
-            # barrier (vault-optimal: store-then-load to scratch drains the memory
-            # pipeline + over-fences; same-thread half-swap is free in registers).
-            # rotate_half(x)=cat(-x[d/2:], x[:d/2]), so RoPE per half:
-            #   k_rope_first  = k1*cos1 - k2*sin1   (rotate_half's first half = -k2)
-            #   k_rope_second = k2*cos2 + k1*sin2   (its second half =  k1)
-            # k1/k2 are static slices of the in-register reconstructed K (BLK, D);
-            # q likewise. scores = sum over both halves — never recombine to (BLK, D),
-            # so no tl.cat needed. Verified bit-exact (4.8e-7) vs apply_rope.
-            half: tl.constexpr = d // 2
-            h_idx = tl.arange(0, half)  # (half,)
-            o1 = b_idx[:, None] * d + h_idx[None, :]  # (BLK, half) first-half offsets
-            o2 = b_idx[:, None] * d + (h_idx + half)[None, :]  # (BLK, half) second
-            cos1 = tl.load(cos_ptr + o1).to(tl.float32)
-            cos2 = tl.load(cos_ptr + o2).to(tl.float32)
-            sin1 = tl.load(sin_ptr + o1).to(tl.float32)
-            sin2 = tl.load(sin_ptr + o2).to(tl.float32)
-            k1 = k[:, :half]  # (BLK, half)
-            k2 = k[:, half:]  # (BLK, half)
-            kr1 = k1 * cos1 - k2 * sin1  # (BLK, half) RoPE'd first half
-            kr2 = k2 * cos2 + k1 * sin2  # (BLK, half) RoPE'd second half
-            q1 = q_row[:half]  # (half,)
-            q2 = q_row[half:]  # (half,)
-            scores = (
-                tl.sum(q1[None, :] * kr1, axis=1) + tl.sum(q2[None, :] * kr2, axis=1)
-            ) * scale  # (BLK,)
-        else:
-            scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK,)
+            # In-register RoPE via masked column gather — NO HBM scratch, NO barrier,
+            # NO 2D tensor slicing (this Triton supports none of tl.cat / tl.join /
+            # k[:, :half]). rotate_half(x)=cat(-x[d/2:], x[:d/2]): build rot from k by
+            # masking the FULL (BLK, D) tensor — for column j, rot[:,j] picks the
+            # opposite half with a sign flip. We form rot via two masked full-width
+            # tensors (shift up / shift down) selected by the column's half, all in
+            # registers. cos/sin are loaded full-width (BLK, D). Verified vs apply_rope.
+            half = d // 2
+            cos = tl.load(
+                cos_ptr + b_idx[:, None] * d + d_idx[None, :]
+            ).to(tl.float32)  # (BLK, D)
+            sin = tl.load(
+                sin_ptr + b_idx[:, None] * d + d_idx[None, :]
+            ).to(tl.float32)  # (BLK, D)
+            # k shifted by +half (cols d/2..d-1 brought to 0..d/2-1) and -half.
+            # Build via full-width multiply with a one-hot-ish reduction: rot[:,j] =
+            # sum_jj k[:,jj] * P[jj,j] where P is the rotate_half permutation+sign.
+            # P[jj,j] = -1 if (jj==j+half and j<half) ; +1 if (jj==j-half and j>=half).
+            jj = d_idx  # source col index (over D)
+            # For each output col j (d_idx) we need k[:, src] * sign:
+            #   j<half  -> src=j+half, sign=-1 ; j>=half -> src=j-half, sign=+1
+            # Implement as: rot = sum over a (D, D) permutation applied to k (BLK, D).
+            # P_mat[src, j]: (D, D)
+            j_is_first = d_idx < half  # over output cols j
+            src_for_j = tl.where(j_is_first, d_idx + half, d_idx - half)  # (D,) src col per j
+            sign_for_j = tl.where(j_is_first, -1.0, 1.0)  # (D,)
+            # one-hot P[src, j] = (jj==src_for_j[j]) * sign_for_j[j], shape (D, D)
+            P = tl.where(
+                jj[:, None] == src_for_j[None, :], sign_for_j[None, :], 0.0
+            )  # (D_src, D_out)
+            rot = tl.sum(k[:, :, None] * P[None, :, :], axis=1)  # (BLK, D_out)
+            k = k * cos + rot * sin  # (BLK, D)
+        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK,)
 
         # ------------------------------------------------------------------
         # Online softmax update (base-e):
