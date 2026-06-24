@@ -206,13 +206,14 @@ if TRITON_AVAILABLE:
         )  # (BLK, D)
 
         # ------------------------------------------------------------------
-        # scores = (q_row @ k.T) * scale  -> (BLK,)
-        # Use tl.dot: (1, D) x (D, BLK) -> (1, BLK), then squeeze to (BLK,).
-        # Reshape q_row to (1, D) for tl.dot.
+        # scores[b] = (sum_d q[d]*k[b,d]) * scale  -> (BLK,)
+        # Decode is M=1 (single query), so this is a GEMV/reduction, NOT a GEMM:
+        # use broadcast-multiply + tl.sum, which is numerically identical to tl.dot
+        # AND has no >=16 min-dim constraint (tl.dot needs M,N,K>=16 — fails for
+        # tiny head_dim d<16 or small BLK; real models have d>=64 but the test model
+        # has d=8). Verified bit-exact (1e-7) vs tl.dot at d=8 and d=64.
         # ------------------------------------------------------------------
-        q_2d = tl.reshape(q_row, (1, d))  # (1, D)
-        scores_2d = tl.dot(q_2d, tl.trans(k)) * scale  # (1, BLK)
-        scores = tl.reshape(scores_2d, (BLK,))  # (BLK,)
+        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK,)
         # Masked (OOB) positions -> -inf so they vanish in the softmax max + denom.
         scores = tl.where(blk_mask, scores, float("-inf"))  # (BLK,)
 
@@ -237,10 +238,9 @@ if TRITON_AVAILABLE:
 
         acc_old = tl.load(acc_ptr + g * d + d_idx).to(tl.float32)  # (D,)
 
-        # p @ v: (BLK,) x (BLK, D) -> (D,) via tl.dot on (1, BLK) x (BLK, D)
-        p_2d = tl.reshape(p, (1, BLK))  # (1, BLK)
-        pv_2d = tl.dot(p_2d, v)  # (1, D)
-        pv = tl.reshape(pv_2d, (d,))  # (D,)
+        # pv[dd] = sum_b p[b]*v[b,dd]  -> (D,)  (GEMV via multiply+sum, not tl.dot;
+        # same no-min-dim rationale as the scores above).
+        pv = tl.sum(p[:, None] * v, axis=0)  # (D,)
 
         acc_new = acc_old * alpha + pv  # (D,)
 
@@ -357,9 +357,14 @@ if TRITON_AVAILABLE:
         vfac_offsets = d_idx[:, None] * rank + r_idx[None, :]  # (D, RANK)
         vfac = tl.load(vfac_ptr + vfac_offsets).to(tl.float32)  # (D, RANK)
 
-        # Step 3: Lowrank component L = us_block @ vfac.T  → (BLK, D)
-        # tl.dot: (BLK, RANK) x (RANK, D) = (BLK, D)  [tl.trans(vfac) = (RANK, D)]
-        K_lowrank = tl.dot(us_block, tl.trans(vfac))  # (BLK, D) fp32
+        # Step 3: Lowrank L[b,dd] = sum_r us[b,r]*vfac[dd,r]  → (BLK, D).
+        # Broadcast-multiply + tl.sum over RANK instead of tl.dot — no >=16 min-dim
+        # constraint (tl.dot needs D,RANK,BLK>=16; the test model has D=8 and RANK can
+        # be 16-at-the-boundary). Materializes a (BLK,D,RANK) transient (small for
+        # decode blocks). Numerically identical to the dot.
+        K_lowrank = tl.sum(
+            us_block[:, None, :] * vfac[None, :, :], axis=2
+        )  # (BLK, D) fp32
 
         # ------------------------------------------------------------------
         # Step 4: RTN residual (D, BLK) int8 → dequant → (BLK, D)
@@ -429,11 +434,10 @@ if TRITON_AVAILABLE:
             k = k * cos + k_rot * sin  # (BLK, D)
 
         # ------------------------------------------------------------------
-        # scores = (q_row @ k.T) * scale  → (BLK,)
+        # scores[b] = (sum_dd q[dd]*k[b,dd]) * scale  → (BLK,)  (GEMV multiply+sum,
+        # not tl.dot — no >=16 min-dim constraint; same rationale as the 3a kernel).
         # ------------------------------------------------------------------
-        q_2d = tl.reshape(q_row, (1, d))  # (1, D)
-        scores_2d = tl.dot(q_2d, tl.trans(k)) * scale  # (1, BLK)
-        scores = tl.reshape(scores_2d, (blk,))  # (BLK,)
+        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK,)
 
         # ------------------------------------------------------------------
         # Online softmax update (base-e):
@@ -454,9 +458,8 @@ if TRITON_AVAILABLE:
 
         acc_old = tl.load(acc_ptr + g * d + d_idx).to(tl.float32)  # (D,)
 
-        p_2d = tl.reshape(p, (1, blk))  # (1, BLK)
-        pv_2d = tl.dot(p_2d, v)  # (1, D)
-        pv = tl.reshape(pv_2d, (d,))  # (D,)
+        # pv[dd] = sum_b p[b]*v[b,dd]  → (D,)  (GEMV multiply+sum, not tl.dot)
+        pv = tl.sum(p[:, None] * v, axis=0)  # (D,)
 
         acc_new = acc_old * alpha + pv  # (D,)
 
@@ -1256,11 +1259,10 @@ if TRITON_AVAILABLE:
         ).to(tl.float32)  # (blk_size, d) fp32
 
         # ------------------------------------------------------------------
-        # scores = (q_row @ k.T) * scale  -> (blk_size,)
+        # scores[b] = (sum_dd q[dd]*k[b,dd]) * scale  -> (blk_size,)  (GEMV
+        # multiply+sum, not tl.dot — no >=16 min-dim constraint).
         # ------------------------------------------------------------------
-        q_2d = tl.reshape(q_row, (1, d))  # (1, d)
-        scores_2d = tl.dot(q_2d, tl.trans(k)) * scale  # (1, blk_size)
-        scores = tl.reshape(scores_2d, (blk_size,))  # (blk_size,)
+        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (blk_size,)
 
         # Mask inactive tokens to -inf so they don't contribute to softmax.
         scores = tl.where(b_idx < active, scores, float("-inf"))
@@ -1303,9 +1305,8 @@ if TRITON_AVAILABLE:
             mask=k_mask[:, None],
             other=0.0,
         ).to(tl.float32)  # (blk_size, d)
-        p_2d = tl.reshape(p, (1, blk_size))
-        pv_2d = tl.dot(p_2d, v)  # (1, d)
-        acc_local = tl.reshape(pv_2d, (d,))  # (d,)
+        # acc[dd] = sum_b p[b]*v[b,dd]  (GEMV multiply+sum, not tl.dot)
+        acc_local = tl.sum(p[:, None] * v, axis=0)  # (d,)
 
         # ------------------------------------------------------------------
         # Store (acc_local, m_new, lse_new) to per-block scratch buffers.
