@@ -985,15 +985,17 @@ def triton_decode_attention(
             K_or_packed, V_kv = _dequant_block(kpacked, vpacked, start, end)
             if _k2b:
                 # K_or_packed is the raw packed dict; K is unpacked in-kernel
-                # Optionally apply RoPE to K after in-kernel unpack:
-                # RoPE is NOT applied inside _k2b_block_kernel_launch (3c deferred).
-                # It must be pre-applied to Us and/or res if k_pre_rope=True.
-                # For 3c: k_pre_rope is expected to be False for lowrank keys
-                # (pre-RoPE subspace design — keys stored pre-RoPE).
-                # RoPE is conceptually applied at read-time, but the lowrank Us
-                # contains pre-RoPE keys. See CLAUDE.md: "quantize keys PRE-RoPE".
+                if k_pre_rope:
+                    raise NotImplementedError(
+                        "in-kernel k2b/lowrank_rtn_channel path does not yet apply "
+                        "RoPE to lowrank-reconstructed keys (k_pre_rope=True); use "
+                        "the chunked PyTorch path, or extend the kernel (deferred). "
+                        "The RTN-only path supports k_pre_rope."
+                    )
+                # For 3c: k_pre_rope must be False for lowrank keys.
+                # Pre-RoPE subspace design — keys are stored pre-RoPE (quantized
+                # before RoPE is applied). See CLAUDE.md: "quantize keys PRE-RoPE".
                 # _k2b_softmax_block_kernel does NOT apply RoPE (deferred to 3c+).
-                # If k_pre_rope=True with lowrank arm, caller is responsible.
                 acc, m, lse = _k2b_block_kernel_launch(
                     q,
                     K_or_packed,

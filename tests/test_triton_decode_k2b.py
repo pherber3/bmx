@@ -111,7 +111,7 @@ def _tiny_k2b_blocks(
         start, end = i * blk, (i + 1) * blk
 
         # K: lowrank_rtn_channel
-        kM = to_matrix(torch.randn(h_kv, blk, d))  # (blk*h_kv, d) or (S, C)
+        kM = to_matrix(torch.randn(h_kv, blk, d))  # (blk, h_kv*d) == (S, C)
         kp, _ = quantize_packed(
             "lowrank_rtn_channel",
             kM,
