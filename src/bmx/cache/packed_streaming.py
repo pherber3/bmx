@@ -358,8 +358,13 @@ class PackedStreamingLayer(DynamicLayer):
         # The k2b (lowrank_rtn_channel K) + pre_rope=True path now applies RoPE to
         # the lowrank-reconstructed K IN-KERNEL (verified vs the chunked reference on
         # GH200), so the full k2b recipe runs on the Triton kernel — no fallback.
+        #
+        # q.is_cuda is part of the capability check: TRITON_AVAILABLE means Triton+CUDA
+        # are INSTALLED, but the model may still run on CPU (e.g. a CPU model on a CUDA
+        # box). The Triton kernel needs CUDA tensors — a CPU q means use the chunked
+        # path. (A CPU pointer to a Triton kernel raises "cannot be accessed".)
         is_decode = query_abs_start is None  # n_q==1
-        if TRITON_AVAILABLE and is_decode:
+        if TRITON_AVAILABLE and is_decode and q.is_cuda:
             return triton_decode_attention(
                 q,
                 self._k_blocks,
