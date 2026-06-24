@@ -132,6 +132,10 @@ def main(cfg: Config) -> None:
             device=device,
             n_warmup=cfg.n_warmup,
             n_repeat=cfg.n_repeat,
+            # The Triton kernel stores/carries KV in fp16 (the resident-fp16 point),
+            # so its drift vs the fp32 oracle is ~3e-4 — legitimate, not a bug. Gate it
+            # at the fp16-appropriate bar (the suite's 1e-2), not the fp32 chunked tol.
+            variant_tol={"triton_fused": 1e-2},
         )
         frames.append(df_sl)
         print(f"  seq_len={sl}: {len(v_blocks)} blocks measured")

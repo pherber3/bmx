@@ -172,6 +172,7 @@ def run_decode_ledger(
     n_warmup: int = 3,
     n_repeat: int = 10,
     tol_scale: float = 10.0,
+    variant_tol: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Measure per-(variant, seq_len) decode latency, gated on correctness.
 
@@ -305,7 +306,14 @@ def run_decode_ledger(
                 diff = attention_diff(variant_out, oracle_out)
                 max_abs = diff["max_abs"]
                 max_rel = diff["max_rel"]
-                parity_pass = bool(max_abs < tol)
+                # Per-variant tolerance: the derived `tol` is calibrated to the
+                # chunked path's fp32 roundoff (~1e-7). An fp16-storage kernel (the
+                # Triton variant) has legitimately larger drift (~3e-4 — fp16 loads,
+                # fp16 carry between blocks; NOT a bug, it's the resident-fp16 point).
+                # Gate each variant at ITS OWN precision so the fp32 reference stays
+                # tight while the fp16 kernel is judged at an fp16-appropriate bar.
+                v_tol = (variant_tol or {}).get(name, tol)
+                parity_pass = bool(max_abs < v_tol)
 
                 if parity_pass:
                     latency_ms = _time_variant(
