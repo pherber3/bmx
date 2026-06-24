@@ -160,6 +160,21 @@ fresh-process k2b; the earlier 10.0 was a single depth-0.5 point). Peak memory
 during the sweep held just under the 95.6 GiB ceiling (~94.7 GiB on the heaviest
 fp16 cell). **Memory unblock AND quality parity both confirmed at 128k.**
 
+**Reading the arms (what changed, and why fp16 fits here):** `fp16` is the
+**uncompressed baseline** (full 16-bit K/V, 1.0× — the quality ceiling); `k2b` is
+the **compressed** arm (3-bit keys / 2-bit values, 5.79×). The prior campaign's
+"128k OOM" was *not* the fp16 baseline — fp16 run alone always fit (~92 GB, one
+KV copy). It was the **compressed arms** that OOM'd, because the old
+`StreamingQuantizedCache` (dense) path ironically stored compression as **two full
+dense fp16 KV copies** (dequantized prefix + reassembled slab), making k2b *heavier*
+than fp16; co-residency + fragmentation then pushed past the ceiling. This run's
+unblock is specifically for the compressed arm: **k2b now runs through the packed
+path** (`PackedStreamingCache`, packed codes resident — no dense double-copy), so
+it fits. **fp16 deliberately stays on the dense path** (it has no packed form, and
+packing it would save nothing), and fits because, as a single arm, it holds only
+one KV copy. So the table mixes two paths by design: fp16 = dense baseline, k2b =
+packed.
+
 Note: the mask fix added the model's 4D causal mask to the prefill (a ~230 MB/layer
 transient at 128k the buggy is_causal path skipped), so the packed peak rose to
 ~94.7 GiB — it still fits single-stream, but the margin is now thin. A wider

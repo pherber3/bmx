@@ -328,9 +328,12 @@ class PackedStreamingLayer(DynamicLayer):
         n_q = q.shape[1]
         n_q_groups = n_q_heads // self._h_kv
 
-        # Compute query_abs_start for prefill causal masking.
-        # total_seq_len = committed + current fp16 slab length; query[0] is at
-        # absolute position (total_seq_len - n_q).
+        # query_abs_start is the PREFILL GATE for chunked_dequant_attention: set
+        # (not-None) iff this is a prefill (n_q > 1), which makes that fn delegate to
+        # the dense flash-SDPA path. Its integer value is not used for masking — the
+        # model's attn_mask (built via the registered sdpa_mask) handles causality.
+        # (Computed as total_seq_len - n_q = the absolute position of query[0], kept
+        # as a meaningful value in case a future path needs it.)
         query_abs_start = None
         if is_causal and n_q > 1:
             total_seq_len = self._committed_S_q + self.keys.shape[2]

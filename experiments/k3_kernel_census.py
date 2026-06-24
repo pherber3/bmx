@@ -3,6 +3,15 @@
 Measures both cache paths (StreamingQuantizedCache, PackedStreamingCache) and
 compares against the analytic byte-ledger. CUDA-authoritative (VM); falls back to
 a tiny CPU smoke run locally. Writes parquet to results/k3_kernel_census/<run-id>.
+
+Columns: `resident_after_prefill` is the LOAD-BEARING number — the total allocated
+peak after prefill (weights + KV + activations), what the analytic ledger's
+`predicted_peak` corresponds to and what determines whether a path clears the
+ceiling. `peak_decode` is the peak during a few decode steps measured after a
+SEPARATE `reset_peak_memory_stats()`; it is typically LOWER than the prefill peak
+(decode is one token), so `peak_decode_incremental = peak_decode - resident` is
+usually negative — it is NOT "how much decode added on top," just the gap between
+the two independently-reset peaks. Compare the ledger to `resident_after_prefill`.
 """
 
 from __future__ import annotations
