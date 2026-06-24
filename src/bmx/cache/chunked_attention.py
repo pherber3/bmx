@@ -88,15 +88,24 @@ def naive_dense_attention(
     v_tail,
     n_q_groups,
     scale,
+    v_group: int | None = None,
+    v_seed: int | None = None,
 ):
     """ORACLE: dequant everything, single full softmax, GQA-expand. No chunking.
 
     Same call shape as chunked_dequant_attention so they are drop-in comparable.
+
+    v_group / v_seed: allow K and V to use different quantization params
+    (added in 3c for k2b oracle tests where K=lowrank_rtn_channel and
+    V=turboquant_mse with different seeds).  Default to group / seed for
+    3a/3b back-compat (single-arm tests use same params for both K and V).
     """
+    _v_group = v_group if v_group is not None else group
+    _v_seed = v_seed if v_seed is not None else seed
     n_q_heads = q.shape[0]
     h_kv = n_q_heads // n_q_groups
     K = _dense_kv(k_blocks, k_arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin)
-    V = _dense_kv(v_blocks, v_arm, group, seed, h_kv, False, None, None)
+    V = _dense_kv(v_blocks, v_arm, _v_group, _v_seed, h_kv, False, None, None)
     if k_tail is not None and k_tail.shape[1] > 0:
         K = (
             k_tail.to(q.dtype)

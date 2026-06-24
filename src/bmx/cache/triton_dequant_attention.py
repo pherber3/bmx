@@ -2,6 +2,9 @@
 
 Stage 3a: Serial-over-blocks online-softmax decode, correctness-first skeleton.
 Stage 3b: Split-KV decode parallelism + autotune.
+Stage 3c: In-kernel k2b unpack — lowrank keys (tl.dot(Us, V_fac.T) + RTN
+    residual) and Lloyd-codebook value gather (cb[indices]/sqrt(C)), with
+    PyTorch _unrotate applied to V per block before the contraction kernel.
 
 Deliberate staging (do not collapse prematurely):
   3a (base): DEQUANT stays in PyTorch per block (reuse dequant_packed +
@@ -12,7 +15,23 @@ Deliberate staging (do not collapse prematurely):
       groups, each computing a partial (acc_i, m_i, lse_i), then a reduction
       kernel merges them via the standard online-softmax combine.  Adds
       @triton.autotune + do_not_specialize on the block-count runtime arg.
-  3c (future): Move RTN unpack into the Triton kernel.
+  3c (this stage): Move k2b unpack into Triton.  Two kernel paths:
+      - RTN arms (3a/3b path unchanged): Python dequant → dense K/V →
+        _online_softmax_block_kernel.
+      - k2b arm (lowrank_rtn_channel K + turboquant_mse V):
+          K: in-kernel lowrank tl.dot(Us, V_fac.T) + RTN residual dequant.
+          V: Python codebook gather + /sqrt(C) + _unrotate (FWHT, deferred
+             from kernel — see NOTE below) + * norms → dense V passed to
+             _k2b_softmax_block_kernel for the contraction.
+        NOTE: Full in-kernel FWHT for V is a DEFERRED optimisation (3c+).
+        The Hadamard _unrotate is O(C log C) but is a subtle-bug magnet as an
+        in-kernel FWHT.  Per-block-per-decode it is negligible vs the
+        memory-bandwidth saving on K.  Revisit only if VM profiling shows it
+        as a hot path.
+
+v_group / v_seed (3c): K and V may be on different arms with different
+    seed/group.  triton_decode_attention now accepts v_group / v_seed kwargs
+    (both default to k's values for back-compat with 3a/3b RTN-only tests).
 
 Carry strategy: (acc, m, lse) are Python/PyTorch tensors carried between
 per-block Triton kernel launches.  For decode (n_q==1) the blocks are small
@@ -253,6 +272,180 @@ if TRITON_AVAILABLE:
 
 
 # ---------------------------------------------------------------------------
+# Stage 3c: k2b kernel — in-kernel lowrank K unpack + online-softmax.
+#
+# This kernel handles k_arm="lowrank_rtn_channel" (K) with any pre-dequanted
+# V (turboquant_mse V is Python-dequanted before call via _v_dequant_turboquant).
+#
+# K reconstruction (in-kernel):
+#   L        = tl.dot(us_block, vfac.T)          — lowrank component (BLK, D)
+#   R_hat    = (res_int * res_scale).T            — RTN residual (BLK, D)
+#   K        = L + R_hat                          — full K block (BLK, D)
+#
+# Layout of packed K inputs (per block, single KV head):
+#   us_ptr      : (BLK, RANK) fp16 — Us[:, h, :] for this head & block
+#   vfac_ptr    : (D,   RANK) fp16 — V[:, h, :] for this head (full D×RANK)
+#   res_ptr     : (D,   BLK)  int8 — RTN codes, column-major within the block
+#   res_scale_ptr: (D, BLK//GROUP, 1) fp16 — per-group scale, same layout
+#   v_ptr       : (BLK, D)   fp16 — pre-dequanted V (Python applied _unrotate)
+#   q_ptr / acc_ptr / m_ptr / lse_ptr: same as _online_softmax_block_kernel
+#
+# RTN residual memory layout:
+#   rtn_quantize_packed(R.mT, bits, group) stores (C=D, S=full_S) int8.
+#   For a block [start:end] with blk=end-start tokens, the per-head slice is
+#   (D, blk) int8 contiguous after Python pre-slicing in the launcher.
+#   res_scale is (D, blk//group) after squeeze.
+#
+# VM risk #1 (highest): codebook gather — verify tl.load(cb_ptr + idx) round-
+#   trips indices correctly (int16 → int32 cast, no wraparound).
+# VM risk #2: RTN residual in-kernel — verify res_scale broadcast shape
+#   (D, blk//GROUP, 1) → (D, blk).  The kernel repeats scale GROUP times.
+# VM risk #3: tl.dot shape — us_block is (BLK, RANK), vfac is (D, RANK);
+#   we compute tl.dot(us_block, tl.trans(vfac)) → (BLK, D).  Requires
+#   BLK ≥ 16, D ≥ 16, RANK ≥ 16.  If RANK < 16, tl.dot may error; mitigate
+#   by tiling or using tl.sum elementwise.  Flag for VM.
+# ---------------------------------------------------------------------------
+
+if TRITON_AVAILABLE:
+
+    @triton.jit(do_not_specialize=["n_blocks_in_split"])
+    def _k2b_softmax_block_kernel(
+        # Packed K inputs (lowrank_rtn_channel, per head, per block)
+        us_ptr,  # (BLK, RANK) fp16 — Us block for this KV head
+        vfac_ptr,  # (D, RANK) fp16 — V factor (same for all blocks)
+        res_ptr,  # (D, BLK) int8 — RTN residual codes
+        res_scale_ptr,  # (D, N_GROUPS) fp16 — per-group RTN scales (squeezed)
+        # Pre-dequanted V (Python applied _unrotate * norms)
+        v_ptr,  # (BLK, D) fp16
+        # Query + carry buffers (same layout as _online_softmax_block_kernel)
+        q_ptr,
+        acc_ptr,
+        m_ptr,
+        lse_ptr,
+        scale,
+        n_blocks_in_split,  # do_not_specialize — prevents recompile per seq_len  # noqa: ARG001
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,  # noqa: ARG001
+        blk: tl.constexpr,  # actual block size (NOT autotuned — matches packed block)
+        rank: tl.constexpr,  # lowrank rank (small, e.g. 16–64)
+        group: tl.constexpr,  # RTN group size
+    ):
+        """Online-softmax step with in-kernel lowrank K unpack.
+
+        Grid: (n_q_groups,) — each program is one query head within the KV head.
+
+        K is reconstructed in-kernel:
+            L     = tl.dot(us_block, vfac.T)     (BLK, D)
+            R_hat = RTN dequant of res_ptr        (BLK, D)
+            K     = L + R_hat
+
+        V is passed pre-dequanted (Python _unrotate applied outside kernel).
+
+        VM risk #3 (RANK): tl.dot requires both inner dims ≥ 16.
+            BLK × RANK: BLK ≥ 16 ✓ (blk=block_size ≥ 64 in practice).
+            RANK × D: RANK ≥ 16 is NOT guaranteed (typical: 16–64).
+            If RANK < 16 on the VM, replace the lowrank tl.dot with a
+            manual accumulation loop (RANK iters of outer-product-add).
+            Flag this in the VM-verify checklist.
+        """
+        g = tl.program_id(0)  # query head index within this KV head
+        d_idx = tl.arange(0, d)
+        b_idx = tl.arange(0, blk)
+        r_idx = tl.arange(0, rank)
+        n_groups = blk // group
+
+        # ------------------------------------------------------------------
+        # Load q row: (D,) for this query head
+        # ------------------------------------------------------------------
+        q_row = tl.load(q_ptr + g * d + d_idx).to(tl.float32)  # (D,)
+
+        # ------------------------------------------------------------------
+        # In-kernel K lowrank reconstruction
+        # Step 1: Load Us block (BLK, RANK) — row-major (blk × rank)
+        # ------------------------------------------------------------------
+        us_offsets = b_idx[:, None] * rank + r_idx[None, :]  # (BLK, RANK)
+        us_block = tl.load(us_ptr + us_offsets).to(tl.float32)  # (BLK, RANK)
+
+        # Step 2: Load V factor (D, RANK) — stored row-major (d × rank)
+        vfac_offsets = d_idx[:, None] * rank + r_idx[None, :]  # (D, RANK)
+        vfac = tl.load(vfac_ptr + vfac_offsets).to(tl.float32)  # (D, RANK)
+
+        # Step 3: Lowrank component L = us_block @ vfac.T  → (BLK, D)
+        # tl.dot: (BLK, RANK) x (RANK, D) = (BLK, D)  [tl.trans(vfac) = (RANK, D)]
+        K_lowrank = tl.dot(us_block, tl.trans(vfac))  # (BLK, D) fp32
+
+        # ------------------------------------------------------------------
+        # Step 4: RTN residual (D, BLK) int8 → dequant → (BLK, D)
+        # res_ptr layout: (D, BLK) contiguous → res[d_i, b_j] = res_ptr[d_i*blk + b_j]
+        # res_scale layout: (D, N_GROUPS) fp16 → scale[d_i, g_j] = res_scale_ptr[d_i*n_groups + g_j]
+        # Dequant: for each (d_i, b_j): Q_int[d_i, b_j] * scale[d_i, b_j // group]
+        # ------------------------------------------------------------------
+        res_offsets = d_idx[:, None] * blk + b_idx[None, :]  # (D, BLK)
+        res_int = tl.load(res_ptr + res_offsets).to(tl.float32)  # (D, BLK) fp32
+
+        # Load scales per (D, BLK): for each (d_i, b_j), use res_scale[d_i, b_j // group].
+        # Directly compute load offsets as d_i * n_groups + b_j // group.
+        # This maps (D, BLK) → res_scale_ptr with correct group alignment.
+        # Each b_j in [0, BLK) maps to group index b_j // group in [0, N_GROUPS).
+        res_scale_expanded_offsets = (
+            d_idx[:, None] * n_groups + b_idx[None, :] // group
+        )  # (D, BLK) int
+        res_scale_expanded = tl.load(res_scale_ptr + res_scale_expanded_offsets).to(
+            tl.float32
+        )  # (D, BLK) fp32 — scale broadcast per group
+
+        # RTN dequant: element-wise multiply codes by their group scale
+        res_dequant_d_b = res_int * res_scale_expanded  # (D, BLK) fp32
+
+        # Transpose (D, BLK) → (BLK, D) for K reconstruction
+        K_residual = tl.trans(res_dequant_d_b)  # (BLK, D) fp32
+
+        # ------------------------------------------------------------------
+        # Full K = lowrank + residual
+        # ------------------------------------------------------------------
+        k = K_lowrank + K_residual  # (BLK, D) fp32
+
+        # ------------------------------------------------------------------
+        # scores = (q_row @ k.T) * scale  → (BLK,)
+        # ------------------------------------------------------------------
+        q_2d = tl.reshape(q_row, (1, d))  # (1, D)
+        scores_2d = tl.dot(q_2d, tl.trans(k)) * scale  # (1, BLK)
+        scores = tl.reshape(scores_2d, (blk,))  # (BLK,)
+
+        # ------------------------------------------------------------------
+        # Online softmax update (base-e):
+        # ------------------------------------------------------------------
+        m_old = tl.load(m_ptr + g).to(tl.float32)
+        lse_old = tl.load(lse_ptr + g).to(tl.float32)
+
+        m_new = tl.maximum(m_old, tl.max(scores, axis=0))
+        alpha = tl.exp(m_old - m_new)
+        p = tl.exp(scores - m_new)  # (BLK,)
+        lse_new = lse_old * alpha + tl.sum(p, axis=0)
+
+        # ------------------------------------------------------------------
+        # Accumulator update: acc_new = acc_old * alpha + p @ v  (D,)
+        # ------------------------------------------------------------------
+        v_offsets = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
+        v = tl.load(v_ptr + v_offsets).to(tl.float32)  # (BLK, D)
+
+        acc_old = tl.load(acc_ptr + g * d + d_idx).to(tl.float32)  # (D,)
+
+        p_2d = tl.reshape(p, (1, blk))  # (1, BLK)
+        pv_2d = tl.dot(p_2d, v)  # (1, D)
+        pv = tl.reshape(pv_2d, (d,))  # (D,)
+
+        acc_new = acc_old * alpha + pv  # (D,)
+
+        # ------------------------------------------------------------------
+        # Store updated carry
+        # ------------------------------------------------------------------
+        tl.store(acc_ptr + g * d + d_idx, acc_new.to(tl.float16))
+        tl.store(m_ptr + g, m_new.to(tl.float32))
+        tl.store(lse_ptr + g, lse_new.to(tl.float32))
+
+
+# ---------------------------------------------------------------------------
 # Python-level per-block launcher — carries (acc, m, lse) in PyTorch tensors
 # ---------------------------------------------------------------------------
 
@@ -333,6 +526,207 @@ def _online_block_kernel_launch(
         # Triton stores in-place via pointer, so acc_kv/m_kv/lse_kv are updated.
 
     # Reconstruct original-shape carry tensors from updated buffers.
+    acc_new = acc_buf.view(n_q_heads, 1, d)
+    m_new = m_buf.view(n_q_heads, 1, 1)
+    lse_new = lse_buf.view(n_q_heads, 1, 1)
+    return acc_new, m_new, lse_new
+
+
+# ---------------------------------------------------------------------------
+# Stage 3c: Python V pre-dequant for turboquant_mse + k2b kernel launcher
+# ---------------------------------------------------------------------------
+
+
+def _v_dequant_turboquant_mse(
+    vpacked: dict,
+    h_kv: int,
+    v_seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequant one turboquant_mse V block → (h_kv, blk, d) dense fp16.
+
+    Sequence:
+      1. Gather codebook:  M_quant = cb[indices.long()] / sqrt(C)
+      2. Unrotate (FWHT or matmul — stays Python, see module docstring):
+                           M_recon = _unrotate(M_quant, seed)
+      3. Scale by norms:   V_dense = M_recon * norms
+
+    This matches _turboquant_mse_dequant in codecs.py line-for-line.
+    The _unrotate step (FWHT) is deliberately kept in Python for 3c —
+    in-kernel FWHT is a deferred optimisation (see 3c+ note in module doc).
+
+    Args:
+        vpacked: packed dict with keys 'indices' (S,C) int16, 'norms' (S,1),
+                 'bits' int.
+        h_kv:    number of KV heads (for from_matrix layout conversion).
+        v_seed:  seed for the _unrotate Hadamard rotation (V's own seed).
+        device:  target device.
+        dtype:   target dtype (fp16).
+
+    Returns:
+        (h_kv, blk, d) fp16 dense V block, ready to pass to kernel as v_ptr.
+    """
+    import math
+
+    from bmx.cache.codecs import gaussian_codebook
+    from bmx.cache.collect import from_matrix
+
+    indices = vpacked["indices"]  # (S, C) int16  — S = blk tokens for this block
+    norms = vpacked["norms"]  # (S, 1) fp
+    bits = int(vpacked["bits"])
+    C = indices.shape[1]
+
+    # Move to target device if needed (mirrors _blocks_cuda pattern)
+    if indices.device != device:
+        indices = indices.to(device)
+        norms = norms.to(device)
+
+    # Line-for-line match of _turboquant_mse_dequant:
+    cb = gaussian_codebook(bits).to(device)
+    sqrt_c = math.sqrt(C)
+    M_quant = cb[indices.long()] / sqrt_c  # (S, C) fp32
+    # _unrotate stays Python (deferred in-kernel FWHT — see 3c note)
+    from bmx.cache.codecs import _unrotate
+
+    M_recon = _unrotate(M_quant, v_seed)  # (S, C) fp32
+    V_mat = (M_recon * norms.to(M_recon)).to(dtype)  # (S, C) fp16
+
+    # Convert from (S=blk, C=d) matrix layout back to (h_kv, blk, d)
+    return from_matrix(V_mat, h_kv).to(dtype)
+
+
+def _k2b_block_kernel_launch(
+    q: torch.Tensor,
+    kpacked: dict,
+    V_kv: torch.Tensor,
+    acc: torch.Tensor,
+    m: torch.Tensor,
+    lse: torch.Tensor,
+    n_q_groups: int,
+    scale: float,
+    k_group: int,
+    n_blocks_in_split: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the k2b Triton kernel (in-kernel lowrank K) for one K block.
+
+    K is unpacked in-kernel per head:  L_h = Us @ V_h.T + RTN_residual_h
+    V is pre-dequanted (Python _unrotate already applied) and passed dense.
+
+    Memory layout (from quantize_packed("lowrank_rtn_channel")):
+        The codec calls quantize_packed on the COMBINED (S, C) matrix where
+        C = h_kv * d_head (to_matrix layout).  The resulting tensors are:
+          'Us'        : (blk=S, rank)      — shared left singular vectors
+          'V'         : (h_kv*d, rank)     — right singular vectors (all heads)
+          'res_Q_int' : (h_kv*d, blk) int8 — RTN residual codes (C × S layout)
+          'res_scale' : (h_kv*d, n_groups, 1) — per-group RTN scales
+
+        For each KV head kv (0..h_kv-1), we slice the per-head block:
+          us_kv       = Us                                      (blk, rank)  [shared]
+          vfac_kv     = V[kv*d : (kv+1)*d, :]                 (d, rank)
+          res_int_kv  = res_Q_int[kv*d : (kv+1)*d, :]         (d, blk) int8
+          res_sc_kv   = res_scale[kv*d : (kv+1)*d, :, 0]      (d, n_groups) fp16
+
+        The per-head K reconstruction in-kernel:
+          L_h    = tl.dot(us_kv, vfac_kv.T)         (blk, d)
+          R_h    = RTN dequant(res_int_kv, res_sc_kv) (blk, d)
+          K_h    = L_h + R_h
+
+    Args:
+        q:                  (n_q_heads, 1, d) fp16  — d = d_head
+        kpacked:            packed K dict (lowrank_rtn_channel format)
+        V_kv:               (h_kv, blk, d) fp16 — pre-dequanted V values
+        acc / m / lse:      running carry tensors
+        n_q_groups:         n_q_heads // h_kv
+        scale:              attention scale (1/sqrt(d_head))
+        k_group:            RTN group size for K's residual (S must be divisible)
+        n_blocks_in_split:  do_not_specialize arg (prevents recompile per seq_len)
+
+    Returns updated (acc, m, lse).
+    """
+    _require_triton()
+    n_q_heads, n_q, d = q.shape  # d = d_head
+    h_kv, blk, _d = V_kv.shape
+    assert n_q == 1, "decode only"
+    assert _d == d, f"V_kv d_head={_d} != q d_head={d}"
+
+    # Unpack K tensors from the combined (S, C=h_kv*d) matrix layout
+    Us = kpacked["Us"]  # (blk, rank) — shared left singular vectors
+    Vfac_full = kpacked["V"]  # (h_kv*d, rank) — right singular vectors
+    res_Q_int_full = kpacked["res_Q_int"]  # (h_kv*d, blk) int8
+    res_scale_full = kpacked["res_scale"]  # (h_kv*d, n_groups, 1)
+
+    # Validate C dim = h_kv * d
+    C = Vfac_full.shape[0]
+    assert C == h_kv * d, (
+        f"Vfac C={C} != h_kv*d={h_kv}*{d}={h_kv * d}. "
+        "Expected lowrank_rtn_channel packed on the to_matrix (S, h_kv*d) layout."
+    )
+
+    dev = q.device
+
+    def _to_dev(t: torch.Tensor) -> torch.Tensor:
+        return t.to(dev) if t.device != dev else t
+
+    Us = _to_dev(Us).to(torch.float16)
+    Vfac_full = _to_dev(Vfac_full).to(torch.float16)
+    res_Q_int_full = _to_dev(res_Q_int_full)  # keep int8
+    res_scale_full = _to_dev(res_scale_full)
+
+    rank = Us.shape[1]
+    n_groups = blk // k_group
+    assert n_groups > 0, f"blk={blk} < k_group={k_group}"
+    assert blk % k_group == 0, f"blk={blk} not divisible by k_group={k_group}"
+
+    # res_scale: (h_kv*d, n_groups, 1) → (h_kv*d, n_groups) fp16
+    res_scale_mat = res_scale_full.view(C, n_groups).to(torch.float16)
+
+    # Lay out carry buffers as (h_kv, n_q_groups, d/1) contiguous
+    q_v = q.view(h_kv, n_q_groups, d)  # (h_kv, G, d)
+    acc_buf = acc.view(h_kv, n_q_groups, d).contiguous()
+    m_buf = m.view(h_kv, n_q_groups).float().contiguous()
+    lse_buf = lse.view(h_kv, n_q_groups).float().contiguous()
+
+    # V_kv is (h_kv, blk, d_head) — already per head
+    V_buf = V_kv.contiguous()
+
+    for kv in range(h_kv):
+        q_kv = q_v[kv].contiguous()  # (G, d) query rows for this KV head
+
+        # Slice per-head K factors from the combined (h_kv*d, ...) tensors.
+        # Head kv occupies channel rows [kv*d : (kv+1)*d].
+        lo, hi = kv * d, (kv + 1) * d
+        us_kv = Us.contiguous()  # (blk, rank) fp16 — shared across heads
+        vfac_kv = Vfac_full[lo:hi, :].contiguous()  # (d, rank) fp16
+        res_int_kv = res_Q_int_full[lo:hi, :].contiguous()  # (d, blk) int8
+        res_sc_kv = res_scale_mat[lo:hi, :].contiguous()  # (d, n_groups) fp16
+
+        v_kv = V_buf[kv].contiguous()  # (blk, d) fp16
+
+        acc_kv = acc_buf[kv]  # (G, d) fp16 — written in-place by Triton
+        m_kv = m_buf[kv]  # (G,)  fp32
+        lse_kv = lse_buf[kv]  # (G,)  fp32
+
+        _k2b_softmax_block_kernel[(n_q_groups,)](
+            us_kv,
+            vfac_kv,
+            res_int_kv,
+            res_sc_kv,
+            v_kv,
+            q_kv,
+            acc_kv,
+            m_kv,
+            lse_kv,
+            float(scale),
+            int(n_blocks_in_split),
+            d=d,
+            n_q_groups=n_q_groups,
+            blk=blk,
+            rank=rank,
+            group=k_group,
+        )
+
+    # Reconstruct carry tensors from updated buffers
     acc_new = acc_buf.view(n_q_heads, 1, d)
     m_new = m_buf.view(n_q_heads, 1, 1)
     lse_new = lse_buf.view(n_q_heads, 1, 1)
@@ -446,6 +840,8 @@ def triton_decode_attention(
     n_q_groups: int,
     scale: float,
     num_splits: int = 1,
+    v_group: int | None = None,
+    v_seed: int | None = None,
 ) -> torch.Tensor:
     """Triton decode attention: online-softmax over packed KV blocks.
 
@@ -466,6 +862,15 @@ def triton_decode_attention(
     num_splits=1 (default) is BACK-COMPATIBLE with 3a: the merge with a single
     partial reduces exactly to acc_0 / lse_0 (see _merge_partials docstring).
 
+    Stage 3c (k_arm="lowrank_rtn_channel"):
+    K lowrank reconstruction runs IN-KERNEL via _k2b_softmax_block_kernel:
+        K = tl.dot(Us, V_fac.T) + RTN_residual_dequant
+    V is dequanted in Python (_unrotate applied per block, deferred from kernel)
+    and passed dense to the contraction kernel.
+
+    v_group / v_seed: allow K and V to use different quantization params.
+    When not provided, they default to group / seed (3a/3b back-compat).
+
     GQA: one Triton launch per KV head per block (fusing into one launch
     per block is a 3c optimisation).
 
@@ -473,10 +878,10 @@ def triton_decode_attention(
         q:          (n_q_heads, 1, d) fp16 — single decode query token
         k_blocks:   list of (packed_dict, start, end) — packed KV key blocks
         v_blocks:   list of (packed_dict, start, end) — packed KV value blocks
-        k_arm:      codec arm name for keys (e.g. "rtn_token")
-        v_arm:      codec arm name for values
-        group:      quantization group size
-        seed:       quantization seed (for reproducibility)
+        k_arm:      codec arm name for keys (e.g. "rtn_token", "lowrank_rtn_channel")
+        v_arm:      codec arm name for values (e.g. "rtn_token", "turboquant_mse")
+        group:      K quantization group size (also V group if v_group not provided)
+        seed:       K quantization seed (also V seed if v_seed not provided)
         k_pre_rope: if True, apply RoPE to K at read time (pre-RoPE keys)
         rope_cos:   (S, d) fp16|fp32 — cosine table, sliced [start:end] per block
         rope_sin:   (S, d) fp16|fp32 — sine table
@@ -488,6 +893,9 @@ def triton_decode_attention(
                     1 = 3a serial path (back-compatible, bit-identical to 3a).
                     >1 = 3b split path: partition blocks, merge partials.
                     The tail block (k_tail/v_tail) is always processed in split 0.
+        v_group:    V quantization group size (defaults to group if None).
+                    Allows K and V to use different packed formats.
+        v_seed:     V quantization seed (defaults to seed if None).
 
     Returns:
         (n_q_heads, 1, d) fp16 attention output.
@@ -502,6 +910,13 @@ def triton_decode_attention(
     )
     h_kv = n_q_heads // n_q_groups
 
+    # Resolve V params — default to K's for 3a/3b back-compat
+    _v_group = v_group if v_group is not None else group
+    _v_seed = v_seed if v_seed is not None else seed
+
+    # k2b path flag: K uses lowrank_rtn_channel (in-kernel lowrank unpack)
+    _k2b = k_arm == "lowrank_rtn_channel"
+
     def _init_carry() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fresh (acc, m, lse) carry tensors on q's device."""
         acc_ = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
@@ -514,25 +929,46 @@ def triton_decode_attention(
     def _dequant_block(
         kpacked: dict, vpacked: dict, start: int, end: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dequantize one KV block pair → (K_kv, V_kv) on q's device, fp16."""
-        K_kv = from_matrix(
-            dequant_packed(k_arm, kpacked, seed=seed, group=group), h_kv
-        ).to(q.dtype)
-        if k_pre_rope:
-            K_kv = apply_rope(
-                K_kv,
-                rope_cos[start:end].to(K_kv.dtype),
-                rope_sin[start:end].to(K_kv.dtype),
-            )
-        V_kv = from_matrix(
-            dequant_packed(v_arm, vpacked, seed=seed, group=group), h_kv
-        ).to(q.dtype)
-        return K_kv, V_kv
+        """Dequantize one KV block pair → (K_kv, V_kv) on q's device, fp16.
+
+        For 3a/3b RTN arms: full Python dequant for both K and V.
+        For k2b (k_arm=lowrank_rtn_channel): K stays packed (returned as-is);
+        only V is dequanted here.  The k2b path calls _k2b_block_kernel_launch
+        with kpacked directly (K is unpacked in-kernel).
+        """
+        if not _k2b:
+            # 3a/3b RTN path: Python dequant for both K and V
+            K_kv = from_matrix(
+                dequant_packed(k_arm, kpacked, seed=seed, group=group), h_kv
+            ).to(q.dtype)
+            if k_pre_rope:
+                K_kv = apply_rope(
+                    K_kv,
+                    rope_cos[start:end].to(K_kv.dtype),
+                    rope_sin[start:end].to(K_kv.dtype),
+                )
+            V_kv = from_matrix(
+                dequant_packed(v_arm, vpacked, seed=_v_seed, group=_v_group), h_kv
+            ).to(q.dtype)
+            return K_kv, V_kv
+        else:
+            # k2b path: K stays packed; V is Python-dequanted here.
+            # For turboquant_mse V: codebook gather + _unrotate + norms scale.
+            if v_arm == "turboquant_mse":
+                V_kv = _v_dequant_turboquant_mse(
+                    vpacked, h_kv, _v_seed, q.device, q.dtype
+                )
+            else:
+                V_kv = from_matrix(
+                    dequant_packed(v_arm, vpacked, seed=_v_seed, group=_v_group), h_kv
+                ).to(q.dtype)
+            # K dequant is deferred to _k2b_block_kernel_launch
+            return kpacked, V_kv  # type: ignore[return-value]
 
     def _run_split(
         kb_split: list, vb_split: list, with_tail: bool
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the 3a serial online-softmax over one split's blocks.
+        """Run the 3a/3c serial online-softmax over one split's blocks.
 
         Returns pre-normalization (acc, m, lse) — do NOT divide acc by lse here.
         The caller (_merge_partials) handles the final normalization.
@@ -546,18 +982,42 @@ def triton_decode_attention(
         )
 
         for (kpacked, start, end), (vpacked, _vs, _ve) in zip(kb_split, vb_split):
-            K_kv, V_kv = _dequant_block(kpacked, vpacked, start, end)
-            acc, m, lse = _online_block_kernel_launch(
-                q,
-                K_kv,
-                V_kv,
-                acc,
-                m,
-                lse,
-                n_q_groups,
-                scale,
-                n_blocks_in_split=n_blocks_in_split,
-            )
+            K_or_packed, V_kv = _dequant_block(kpacked, vpacked, start, end)
+            if _k2b:
+                # K_or_packed is the raw packed dict; K is unpacked in-kernel
+                # Optionally apply RoPE to K after in-kernel unpack:
+                # RoPE is NOT applied inside _k2b_block_kernel_launch (3c deferred).
+                # It must be pre-applied to Us and/or res if k_pre_rope=True.
+                # For 3c: k_pre_rope is expected to be False for lowrank keys
+                # (pre-RoPE subspace design — keys stored pre-RoPE).
+                # RoPE is conceptually applied at read-time, but the lowrank Us
+                # contains pre-RoPE keys. See CLAUDE.md: "quantize keys PRE-RoPE".
+                # _k2b_softmax_block_kernel does NOT apply RoPE (deferred to 3c+).
+                # If k_pre_rope=True with lowrank arm, caller is responsible.
+                acc, m, lse = _k2b_block_kernel_launch(
+                    q,
+                    K_or_packed,
+                    V_kv,
+                    acc,
+                    m,
+                    lse,
+                    n_q_groups,
+                    scale,
+                    k_group=group,
+                    n_blocks_in_split=n_blocks_in_split,
+                )
+            else:
+                acc, m, lse = _online_block_kernel_launch(
+                    q,
+                    K_or_packed,
+                    V_kv,
+                    acc,
+                    m,
+                    lse,
+                    n_q_groups,
+                    scale,
+                    n_blocks_in_split=n_blocks_in_split,
+                )
 
         if with_tail and k_tail is not None and k_tail.shape[1] > 0:
             assert v_tail is not None, "v_tail must be set when k_tail is set"
