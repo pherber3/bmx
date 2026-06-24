@@ -2299,7 +2299,9 @@ if TRITON_AVAILABLE:
                 + (kv * d + d_idx)[:, None] * rank
                 + rank_idx[None, :]
             ).to(tl.float32)  # (d, rank)
-            k_low = tl.sum(us[:, None, :] * vfac[None, :, :], axis=2)  # (BLK_POW2, d)
+            # tl.dot (BLK_POW2, rank) @ (rank, d) — dims >=16 for real k2b; avoids the
+            # (BLK_POW2, d, rank) broadcast cube (512KB transient -> SMEM blowout).
+            k_low = tl.dot(us, tl.trans(vfac))  # (BLK_POW2, d)
 
             # --- K RTN residual: res_int (d, blk) int8 * per-group scale -> (blk,d) ---
             res = tl.load(
@@ -2332,10 +2334,11 @@ if TRITON_AVAILABLE:
                     mask=row_real[:, None],
                     other=0.0,
                 ).to(tl.float32)
-                rot = tl.sum(k[:, :, None] * P[None, :, :], axis=1)  # (BLK_POW2, d)
+                rot = tl.dot(k, P)  # (BLK_POW2, d) = k @ P (rotate_half); avoids cube
                 k = k * cos + rot * sin
 
-            # scores[g, b] = scale * Σ_dd q[g,dd]*k[b,dd]  (GEMV, rank/d may be <16)
+            # scores[g, b] = scale * Σ_dd q[g,dd]*k[b,dd]. GEMV (multiply+sum): G=
+            # n_q_groups may be <16 so no tl.dot on the G axis (k @ q.T would need M=G).
             scores = tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
             scores = tl.where(
                 tile_mask[None, :], scores, float("-inf")
