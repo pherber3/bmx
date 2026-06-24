@@ -148,7 +148,7 @@ if TRITON_AVAILABLE:
         configs=_AUTOTUNE_CONFIGS,
         key=["d", "n_q_groups"],
     )
-    @triton.jit(do_not_specialize=["n_blocks_in_split"])
+    @triton.jit(do_not_specialize=["blk"])
     def _online_softmax_block_kernel(
         q_ptr,
         k_ptr,
@@ -157,26 +157,32 @@ if TRITON_AVAILABLE:
         m_ptr,
         lse_ptr,
         scale,
-        n_blocks_in_split,  # runtime arg — do_not_specialize, NOT constexpr  # noqa: ARG001
+        blk,  # ACTUAL rows in this K/V block — do_not_specialize runtime arg
         d: tl.constexpr,
         n_q_groups: tl.constexpr,  # noqa: ARG001
-        BLK: tl.constexpr,  # set by autotune
+        BLK: tl.constexpr,  # autotune TILE size — may EXCEED blk (must mask)
     ):
-        """Online-softmax step for ONE query head over ONE (BLK, D) K/V block.
+        """Online-softmax step for ONE query head over ONE (blk, D) K/V block.
 
         Grid: (n_q_groups,) — each program is one query head within the KV head.
         Correctness-first (3a/3b): one query row at a time, full D loaded, no tiling.
 
-        tl.dot is safe here: all matrix dims are D (≥64) and BLK (≥16 in practice).
-        The G (n_q_groups) dimension is NOT a tl.dot dimension — it is the grid.
+        BLK (autotune tile) is INDEPENDENT of blk (the actual block length): autotune
+        picks BLK from a config list (64, 128, ...), so BLK may be LARGER than blk.
+        Every block-dim load/score MUST be masked by `b_idx < blk`, or the kernel
+        reads out-of-bounds rows -> garbage/NaN scores -> the softmax max/denominator
+        blow up (confirmed on GH200: BLK=128 on a 64-row block gave m=NaN).
+        Masked scores are set to -inf so exp(score-m)=0 — they contribute nothing to
+        the running max or the lse denominator (online-softmax max-subtraction;
+        Physics of LLM Inference ~line 1931, FlashAttention online-softmax).
 
-        3b note: n_blocks_in_split is do_not_specialize so Triton does not recompile
-        when sequence length changes between decode steps.  BLK is now autotune-
-        provided (constexpr from configs), not passed directly at each launch.
+        blk is do_not_specialize so Triton does not recompile per decode step / per
+        tail block.  tl.dot dims are D (>=64) and BLK (>=64 from configs).
         """
         g = tl.program_id(0)  # which query head (within this KV head)
         d_idx = tl.arange(0, d)
         b_idx = tl.arange(0, BLK)
+        blk_mask = b_idx < blk  # (BLK,) True for real rows, False for OOB tile rows
 
         # ------------------------------------------------------------------
         # Load q row: (1, D) for this query head
@@ -184,10 +190,12 @@ if TRITON_AVAILABLE:
         q_row = tl.load(q_ptr + g * d + d_idx).to(tl.float32)  # (D,)
 
         # ------------------------------------------------------------------
-        # Load k block: (BLK, D)
+        # Load k block: (BLK, D) — mask OOB tile rows to 0 (other=0.0)
         # ------------------------------------------------------------------
         k_offsets = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
-        k = tl.load(k_ptr + k_offsets).to(tl.float32)  # (BLK, D)
+        k = tl.load(k_ptr + k_offsets, mask=blk_mask[:, None], other=0.0).to(
+            tl.float32
+        )  # (BLK, D)
 
         # ------------------------------------------------------------------
         # scores = (q_row @ k.T) * scale  -> (BLK,)
@@ -197,6 +205,8 @@ if TRITON_AVAILABLE:
         q_2d = tl.reshape(q_row, (1, d))  # (1, D)
         scores_2d = tl.dot(q_2d, tl.trans(k)) * scale  # (1, BLK)
         scores = tl.reshape(scores_2d, (BLK,))  # (BLK,)
+        # Masked (OOB) positions -> -inf so they vanish in the softmax max + denom.
+        scores = tl.where(blk_mask, scores, float("-inf"))  # (BLK,)
 
         # ------------------------------------------------------------------
         # Online softmax update (base-e):
@@ -213,7 +223,9 @@ if TRITON_AVAILABLE:
         # Accumulator update: acc_new = acc_old * alpha + p @ v   (D,)
         # ------------------------------------------------------------------
         v_offsets = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
-        v = tl.load(v_ptr + v_offsets).to(tl.float32)  # (BLK, D)
+        v = tl.load(v_ptr + v_offsets, mask=blk_mask[:, None], other=0.0).to(
+            tl.float32
+        )  # (BLK, D) — OOB rows 0 (p is also 0 there, so doubly safe)
 
         acc_old = tl.load(acc_ptr + g * d + d_idx).to(tl.float32)  # (D,)
 
@@ -480,7 +492,7 @@ def _online_block_kernel_launch(
             m_kv,
             lse_kv,
             float(scale),
-            int(n_blocks_in_split),
+            int(_blk),  # ACTUAL block length — kernel masks the BLK tile down to this
             d=d,
             n_q_groups=n_q_groups,
         )
