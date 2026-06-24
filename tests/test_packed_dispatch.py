@@ -120,6 +120,10 @@ class _SentinelError(RuntimeError):
     """Raised by the fake Triton kernel to test that errors propagate."""
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="dispatch enters the Triton branch only when q.is_cuda — needs CUDA",
+)
 def test_no_silent_swallow(monkeypatch):
     """Monkeypatch TRITON_AVAILABLE=True and triton_decode_attention to raise a
     sentinel error; assert that calling attend decode RAISES that error.
@@ -127,7 +131,9 @@ def test_no_silent_swallow(monkeypatch):
     This test FAILS if attend wraps the dispatch in try/except that falls back
     to chunked on error — exactly the silent-swallow trap Task 4 guards against.
 
-    Patch targets:
+    CUDA-gated: the dispatch now also requires q.is_cuda (a CPU model on a CUDA
+    box uses chunked), so the model must be on CUDA for the Triton branch to be
+    taken at all.  Patch targets:
       - bmx.cache.packed_streaming.TRITON_AVAILABLE  (the name attend checks)
       - bmx.cache.packed_streaming.triton_decode_attention  (the name attend calls)
     Both are module-level names in packed_streaming, imported at load time.
@@ -141,20 +147,20 @@ def test_no_silent_swallow(monkeypatch):
     # Replace the kernel with a stub that raises.
     monkeypatch.setattr(ps_mod, "triton_decode_attention", _raise_sentinel)
 
-    model = tiny_llama()
+    model = tiny_llama().cuda()  # CUDA so q.is_cuda -> the Triton branch is taken
     k_spec, v_spec = _rtn_specs()
 
     # Prefill only (puts packed blocks in place + prepares the layer for decoding).
-    input_ids = ids(vocab=97, seq=12, seed=3)
+    input_ids = ids(vocab=97, seq=12, seed=3).cuda()
     cache = PackedStreamingCache(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
     with torch.no_grad():
         model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
 
     # Now run ONE decode step — this calls attend with n_q==1 (decode).
-    # With TRITON_AVAILABLE=True, attend must call triton_decode_attention, which raises.
-    # If it silently falls back to chunked, no error is raised and the test fails.
-    decode_ids = ids(vocab=97, seq=1, seed=99)
+    # With TRITON_AVAILABLE=True + q.is_cuda, attend must call triton_decode_attention,
+    # which raises.  If it silently falls back to chunked, no error is raised -> fail.
+    decode_ids = ids(vocab=97, seq=1, seed=99).cuda()
     with pytest.raises(_SentinelError, match="fake Triton kernel error"):
         with torch.no_grad():
             model(decode_ids, past_key_values=cache, use_cache=True)
