@@ -2364,83 +2364,6 @@ if TRITON_AVAILABLE:
         tl.store(m_part_ptr + ml_off, m)
         tl.store(lse_part_ptr + ml_off, lse)
 
-    @triton.jit
-    def _fused_merge_k2b_kernel(
-        acc_part_ptr,  # (num_splits, h_kv, G, d) fp32 — Σ p̃·M_quant per head
-        m_part_ptr,
-        lse_part_ptr,
-        signs_ptr,  # (C,) fp32 ±1 — Hadamard signs
-        out_ptr,  # (h_kv, G, d) fp16
-        num_splits,
-        h_kv: tl.constexpr,
-        d: tl.constexpr,
-        n_q_groups: tl.constexpr,
-        C: tl.constexpr,  # = h_kv * d
-        LOGC: tl.constexpr,  # log2(C)
-    ):
-        """Merge splits + deferred FWHT unrotate, per QUERY HEAD (grid = n_q_groups).
-
-        For query head g: combine the num_splits partials of EVERY kv head into the
-        full (C,) accumulator row (assembling all h_kv heads' d-column blocks), run
-        ONE orthonormal FWHT over C + sign flip (the unrotate), normalize by the
-        merged lse, and scatter back to each (kv, g, d) output slot.
-
-        The online-softmax denom uses the UNWEIGHTED lse (norms already folded into
-        the numerator via p̃ in the decode kernel).
-        """
-        g = tl.program_id(0)  # query head within each kv group
-        c_idx = tl.arange(0, C)  # full-row channel index
-        kv_of_c = c_idx // d  # which kv head each channel belongs to
-        dd_of_c = c_idx % d  # channel within that head
-
-        # Global max + merged lse PER kv head (the softmax is per (kv,g), and each
-        # channel c belongs to head kv_of_c[c]); gather per-channel via kv_of_c.
-        m_glob = tl.full((C,), float("-inf"), tl.float32)
-        for s in range(num_splits):
-            hr = s * h_kv + kv_of_c  # (C,) head_row per channel's kv head
-            m_s = tl.load(m_part_ptr + hr * n_q_groups + g)  # (C,)
-            m_glob = tl.maximum(m_glob, m_s)
-
-        l_acc = tl.zeros((C,), tl.float32)
-        row = tl.zeros((C,), tl.float32)  # Σ_s scale_s * acc_pre[s, kv_of_c, g, dd]
-        for s in range(num_splits):
-            hr = s * h_kv + kv_of_c  # (C,)
-            ml = hr * n_q_groups + g
-            m_s = tl.load(m_part_ptr + ml)
-            lse_s = tl.load(lse_part_ptr + ml)
-            sc = tl.exp(m_s - m_glob)  # (C,)
-            l_acc += lse_s * sc
-            acc_s = tl.load(
-                acc_part_ptr + (hr * n_q_groups + g) * d + dd_of_c
-            )  # (C,) acc_pre channel
-            row += acc_s * sc
-
-        # row now = Σ_s p̃·M_quant merged, laid out over the FULL C axis. Apply the
-        # deferred unrotate: signs ⊙ FWHT(row), then normalize by the merged lse.
-        # FWHT (Sylvester, LOGC butterfly stages) — port of fwht_butterfly_ref.
-        h = 1
-        for _stage in tl.static_range(LOGC):
-            # pair (lo, hi) with hi = lo + h; lo are channels where (c // h) is even.
-            partner = tl.where((c_idx // h) % 2 == 0, c_idx + h, c_idx - h)  # (C,)
-            # gather partner values via a (C,C) selection (C is small: h_kv*d).
-            partner_val = tl.sum(
-                tl.where(c_idx[None, :] == partner[:, None], row[None, :], 0.0), axis=1
-            )  # (C,) = row[partner[c]]
-            row = tl.where((c_idx // h) % 2 == 0, row + partner_val, partner_val - row)
-            # NB: lo' = a+b = row_lo + row_hi ; hi' = a-b = row_lo - row_hi.
-            # For lo (even): partner=hi, partner_val=row_hi -> row+partner_val = a+b ✓
-            # For hi (odd):  partner=lo, partner_val=row_lo -> partner_val-row = a-b ✓
-            h = h * 2
-        signs = tl.load(signs_ptr + c_idx).to(tl.float32)
-        # C is constexpr -> (C + 0.0) is a constexpr float; tl.sqrt of it is the
-        # orthonormal FWHT normalizer (1/√C). (C.to(...) fails: constexpr int.)
-        row = row / tl.sqrt(C + 0.0) * signs  # orthonormal FWHT + unrotate
-
-        # Normalize by merged lse (per channel's kv head) and store.
-        out_val = row / l_acc  # (C,)
-        out_off = (kv_of_c * n_q_groups + g) * d + dd_of_c  # (C,) -> (h_kv,G,d) slot
-        tl.store(out_ptr + out_off, out_val.to(tl.float16))
-
 
 def build_kv_stacked_k2b(
     k_blocks: list,
@@ -2536,14 +2459,10 @@ def fused_decode_attention_k2b(
     blk_pow2 = 1
     while blk_pow2 < blk_size:
         blk_pow2 *= 2
-    logc = 0
-    while (1 << logc) < C:
-        logc += 1
-    assert (1 << logc) == C, f"C={C} must be a power of 2 for the in-kernel FWHT"
+    assert (C & (C - 1)) == 0, f"C={C} must be a power of 2 for the FWHT unrotate"
 
     cb = gaussian_codebook(vbits).to(q.device, torch.float32)
-    signs = _hadamard_signs(C, v_seed).to(q.device, torch.float32)
-    sqrt_c = 1.0 / math.sqrt(C)
+    sqrt_c = 1.0 / math.sqrt(C)  # M_quant = cb[idx] / √C, folded into the gather
     has_rope = rope_cos is not None
 
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
@@ -2593,50 +2512,43 @@ def fused_decode_attention_k2b(
         HAS_ROPE=has_rope,
     )
 
-    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
-    _fused_merge_k2b_kernel[(n_q_groups,)](
-        acc_part,
-        m_part,
-        lse_part,
-        signs,
-        out,
-        int(num_splits),
-        h_kv=h_kv,
-        d=d,
-        n_q_groups=n_q_groups,
-        C=C,
-        LOGC=logc,
-    )
-    out = out.view(n_q_heads, 1, d)
-
-    if k_tail is None or k_tail.shape[1] == 0:
-        return out
-
-    # Tail: the merge kernel already normalized `out`; to fold the tail we need the
-    # packed region's pre-normalization (acc, m, lse) too. Recompute the merged
-    # packed partial in PyTorch from the kernel partials (cheap: h_kv*G*d), apply
-    # the deferred FWHT there, then online-softmax-merge with the dense tail.
+    # --- Merge epilogue (PyTorch): combine splits, apply the DEFERRED FWHT once ---
+    # The decode kernel did all the bandwidth-bound work (lowrank K + RoPE + the
+    # per-head Σ p̃·M_quant V accumulation). The unrotate is a single (n_q_heads, C)
+    # FWHT+signs per step — tiny, O(C·logC) per query head, done here in PyTorch.
+    # (An in-kernel FWHT over the full C=h_kv*d row needs a (C,C) register gather per
+    # butterfly stage, which blows up Triton compile; the defer math already gives
+    # the O(S·C·logC)->O(C·logC) win, so the final transform belongs out of the hot
+    # loop. Cf. QuaRot, which folds it into W_o offline — a future option.)
     from bmx.quant.hadamard import fwht
 
-    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
-    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
-    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
     # Merge the packed splits WITHOUT normalization -> (n_q_heads,1,d) acc_pre, lse, m.
-    stacked_m = torch.stack([mm.float() for mm in ms], 0)  # (S,H,1,1)
-    m_g = stacked_m.amax(0, keepdim=True)
+    stacked_m = m_part.reshape(num_splits, n_q_heads, 1, 1).float()  # (S,H,1,1)
+    m_g = stacked_m.amax(0, keepdim=True)  # (1,H,1,1)
     sc = torch.exp(stacked_m - m_g)  # (S,H,1,1)
-    acc_pre = (torch.stack([a.float() for a in accs], 0) * sc).sum(0)  # (H,1,d)
-    lse_p = (torch.stack([lz.float() for lz in lses], 0) * sc).sum(0)  # (H,1,1)
+    acc_pre = (acc_part.reshape(num_splits, n_q_heads, 1, d).float() * sc).sum(
+        0
+    )  # (H,1,d)
+    lse_p = (lse_part.reshape(num_splits, n_q_heads, 1, 1).float() * sc).sum(
+        0
+    )  # (H,1,1)
     m_p = m_g.squeeze(0)  # (H,1,1)
-    # Apply deferred FWHT+signs per query head over the full C row.
+
+    # Deferred FWHT+signs per query head over the full C row, then normalize.
+    # head index = kv*G + g (the kernel's partial layout); assemble (G, C) where the
+    # G query heads each gather all h_kv kv-heads' d-column blocks in kv-major order.
     acc_pre_c = (
         acc_pre.reshape(h_kv, n_q_groups, d).permute(1, 0, 2).reshape(n_q_groups, C)
-    )  # (G, C) — assemble full row per query head
+    )  # (G, C)
     sgn = _hadamard_signs(C, v_seed).to(acc_pre_c)
     acc_v = (fwht(acc_pre_c) * sgn).reshape(n_q_groups, h_kv, d).permute(1, 0, 2)
     acc_v = acc_v.reshape(n_q_heads, 1, d)  # (n_q_heads,1,d) pre-norm V numerator
 
-    # Dense tail partial.
+    if k_tail is None or k_tail.shape[1] == 0:
+        return (acc_v / lse_p).to(torch.float16).view(n_q_heads, 1, d)
+
+    # Tail present: online-softmax-merge the packed partial (acc_v, m_p, lse_p) with
+    # the dense fp16 recent-window tail.
     kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
     vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
     qf = q.float()
