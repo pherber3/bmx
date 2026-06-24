@@ -417,12 +417,12 @@ if TRITON_AVAILABLE:
             # tensors (shift up / shift down) selected by the column's half, all in
             # registers. cos/sin are loaded full-width (BLK, D). Verified vs apply_rope.
             half = d // 2
-            cos = tl.load(
-                cos_ptr + b_idx[:, None] * d + d_idx[None, :]
-            ).to(tl.float32)  # (BLK, D)
-            sin = tl.load(
-                sin_ptr + b_idx[:, None] * d + d_idx[None, :]
-            ).to(tl.float32)  # (BLK, D)
+            cos = tl.load(cos_ptr + b_idx[:, None] * d + d_idx[None, :]).to(
+                tl.float32
+            )  # (BLK, D)
+            sin = tl.load(sin_ptr + b_idx[:, None] * d + d_idx[None, :]).to(
+                tl.float32
+            )  # (BLK, D)
             # k shifted by +half (cols d/2..d-1 brought to 0..d/2-1) and -half.
             # Build via full-width multiply with a one-hot-ish reduction: rot[:,j] =
             # sum_jj k[:,jj] * P[jj,j] where P is the rotate_half permutation+sign.
@@ -433,7 +433,9 @@ if TRITON_AVAILABLE:
             # Implement as: rot = sum over a (D, D) permutation applied to k (BLK, D).
             # P_mat[src, j]: (D, D)
             j_is_first = d_idx < half  # over output cols j
-            src_for_j = tl.where(j_is_first, d_idx + half, d_idx - half)  # (D,) src col per j
+            src_for_j = tl.where(
+                j_is_first, d_idx + half, d_idx - half
+            )  # (D,) src col per j
             sign_for_j = tl.where(j_is_first, -1.0, 1.0)  # (D,)
             # one-hot P[src, j] = (jj==src_for_j[j]) * sign_for_j[j], shape (D, D)
             P = tl.where(
@@ -978,22 +980,28 @@ def triton_decode_attention(
         only V is dequanted here.  The k2b path calls _k2b_block_kernel_launch
         with kpacked directly (K is unpacked in-kernel).
         """
+        # Packed codes are stored CPU-resident in the cache (to save GPU memory), so
+        # dequant_packed/from_matrix produce CPU tensors — move to q.device for the
+        # kernel (a CPU pointer to a Triton kernel raises "cannot be accessed").
         if not _k2b:
             # 3a/3b RTN path: Python dequant for both K and V
             K_kv = from_matrix(
                 dequant_packed(k_arm, kpacked, seed=seed, group=group), h_kv
-            ).to(q.dtype)
+            ).to(device=q.device, dtype=q.dtype)
             if k_pre_rope:
-                # rope_cos/sin are stored fp16 (packed_streaming cast at grow-time);
-                # K_kv.dtype is fp16 — the .to() is a noop, omit it.
-                K_kv = apply_rope(K_kv, rope_cos[start:end], rope_sin[start:end])
+                # RTN path applies RoPE in PyTorch (not in-kernel); cos/sin may be CPU.
+                K_kv = apply_rope(
+                    K_kv,
+                    rope_cos[start:end].to(q.device),
+                    rope_sin[start:end].to(q.device),
+                )
             V_kv = from_matrix(
                 dequant_packed(v_arm, vpacked, seed=_v_seed, group=_v_group), h_kv
-            ).to(q.dtype)
+            ).to(device=q.device, dtype=q.dtype)
             return K_kv, V_kv
         else:
-            # k2b path: K stays packed; V is Python-dequanted here.
-            # For turboquant_mse V: codebook gather + _unrotate + norms scale.
+            # k2b path: K stays packed (moved to device in _k2b_block_kernel_launch);
+            # V is Python-dequanted here.
             if v_arm == "turboquant_mse":
                 V_kv = _v_dequant_turboquant_mse(
                     vpacked, h_kv, _v_seed, q.device, q.dtype
@@ -1001,7 +1009,7 @@ def triton_decode_attention(
             else:
                 V_kv = from_matrix(
                     dequant_packed(v_arm, vpacked, seed=_v_seed, group=_v_group), h_kv
-                ).to(q.dtype)
+                ).to(device=q.device, dtype=q.dtype)
             # K dequant is deferred to _k2b_block_kernel_launch
             return kpacked, V_kv  # type: ignore[return-value]
 
@@ -1063,8 +1071,8 @@ def triton_decode_attention(
             assert v_tail is not None, "v_tail must be set when k_tail is set"
             acc, m, lse = _online_block_kernel_launch(
                 q,
-                k_tail.to(q.dtype),
-                v_tail.to(q.dtype),
+                k_tail.to(device=q.device, dtype=q.dtype),
+                v_tail.to(device=q.device, dtype=q.dtype),
                 acc,
                 m,
                 lse,
