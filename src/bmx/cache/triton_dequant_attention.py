@@ -1739,19 +1739,25 @@ if TRITON_AVAILABLE:
         tl.store(out_ptr + out_off, out.to(tl.float16))
 
 
-def pick_num_splits(seq_len: int, blk_size: int, h_kv: int, n_sms: int = 132) -> int:
-    """Choose num_splits for split-KV decode (brain/vLLM heuristic).
+def pick_num_splits(
+    seq_len: int, blk_size: int, h_kv: int, n_sms: int = 132, occupancy_mult: int = 2
+) -> int:
+    """Choose num_splits for split-KV decode (brain/vLLM/flashinfer heuristic).
 
-    Targets ~one GH200 wave: base programs = h_kv; want h_kv*num_splits ≈ n_sms.
-    Clamp so each split still walks >= 1 stored block (min-work floor) and cap at
-    16 (vLLM: beyond ~16, reduce/HBM overhead dominates). Rounded to a power of 2.
+    OVERSUBSCRIBE the SMs: base programs = h_kv; target h_kv*num_splits ≈
+    occupancy_mult * n_sms so each SM gets >1 block and the scheduler always has
+    another warp to run when one stalls on an HBM load (vLLM occupancy_multiplier=2).
+    Confirmed empirically (split sweep, tl.dot kernel): 32 splits (=2*132/8 → pow2)
+    is the optimum at 32k AND 128k on GH200 (54% of HBM peak); 16 under-fills, 64
+    regresses (merge/over-split overhead). Clamp so each split walks >= 1 stored
+    block (min-work floor) and cap at 64. Rounded DOWN to a power of 2.
 
-    At ctx <= ~a few blocks num_splits collapses to 1 (the min-work floor), which
-    is the no-split fast path — correct, since there's no length to parallelize.
+    At ctx <= ~a few blocks num_splits collapses to 1 (the min-work floor) = the
+    no-split fast path — correct, since there's no length to parallelize.
     """
     n_blocks = max(1, (seq_len + blk_size - 1) // blk_size)
-    target = max(1, n_sms // max(1, h_kv))  # ~ceil(SMs / base programs)
-    target = min(target, n_blocks, 16)  # min-work floor + vLLM cap
+    target = max(1, occupancy_mult * n_sms // max(1, h_kv))  # oversubscribe SMs
+    target = min(target, n_blocks, 64)  # min-work floor + cap
     # Round DOWN to a power of 2 (stable launch grid; avoids odd split sizes).
     p = 1
     while p * 2 <= target:
