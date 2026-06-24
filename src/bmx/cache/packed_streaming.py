@@ -376,6 +376,13 @@ class PackedStreamingLayer(DynamicLayer):
         # tail is folded in via the online-softmax merge. Stacks are built per call
         # here for correctness; a production engine maintains them incrementally
         # (the kernel consumes exactly the paged-KV block-table layout).
+        # The fused kernel assumes a UNIFORM stored-block length (it pads the row
+        # dim to the next power of 2 internally, so blk need not be pow2). The
+        # geometric flush schedule normally emits equal-length blocks; on the rare
+        # mixed-length tail we fall back to the per-block triton path below.
+        blocks = self._k_blocks
+        uniform_blk = bool(blocks) and len({e - s for _, s, e in blocks}) == 1
+
         fused_packed_ok = (
             is_decode
             and q.is_cuda
@@ -383,7 +390,7 @@ class PackedStreamingLayer(DynamicLayer):
             and self.k_spec.arm == "rtn_token"
             and self.v_spec.arm == "rtn_token"
             and not self.k_spec.pre_rope
-            and len(self._k_blocks) > 0
+            and uniform_blk
         )
         if fused_packed_ok:
             blk = self._k_blocks[0][2] - self._k_blocks[0][1]  # block length

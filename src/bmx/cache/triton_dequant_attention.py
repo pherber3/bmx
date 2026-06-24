@@ -1898,6 +1898,7 @@ if TRITON_AVAILABLE:
         n_q_groups: tl.constexpr,
         k_group: tl.constexpr,  # RTN group size for K (scale along d)
         v_group: tl.constexpr,  # RTN group size for V
+        BLK_POW2: tl.constexpr,  # next pow2 >= blk_size (legal tl.arange row dim)
         GPAD: tl.constexpr,  # G padded up to >=16 so tl.dot's M dim is legal
         USE_DOT: tl.constexpr,  # tl.dot path (dims>=16) vs broadcast cube (tiny test)
     ):
@@ -1916,11 +1917,15 @@ if TRITON_AVAILABLE:
         gp_valid = gp_idx < n_q_groups
         n_kg: tl.constexpr = d // k_group  # K scale groups along d
         n_vg: tl.constexpr = d // v_group  # V scale groups along d
-        # Contiguous flat runs for one stored block (one head): codes (blk*d) int8,
-        # scales (blk*n_*g) fp16. Flat -> 128-bit-vectorizable loads.
-        code_flat = tl.arange(0, blk_size * d)  # (blk*d,)
-        k_sc_flat = tl.arange(0, blk_size * n_kg)  # (blk*n_kg,)
-        v_sc_flat = tl.arange(0, blk_size * n_vg)  # (blk*n_vg,)
+        # 2D loads (BLK_POW2 rows x d cols): each axis is a power of 2 (BLK_POW2 =
+        # next pow2 of the real block length blk_size; d is pow2 for real models),
+        # so tl.arange is legal even when blk_size is NOT a power of 2 (the geometric
+        # flush schedule emits arbitrary block lengths). Rows >= blk_size are masked
+        # out. This replaces the flat tl.arange(blk*d) which required blk*d be pow2.
+        r_idx = tl.arange(0, BLK_POW2)  # (BLK_POW2,) padded row index
+        row_real = r_idx < blk_size  # (BLK_POW2,) real rows of this block
+        kg_idx = tl.arange(0, n_kg)
+        vg_idx = tl.arange(0, n_vg)
 
         raw = (seq_len + num_splits - 1) // num_splits
         tokens_per_split = ((raw + blk_size - 1) // blk_size) * blk_size
@@ -1935,7 +1940,11 @@ if TRITON_AVAILABLE:
         sc_kv_off_k = kv * blk_size * n_kg
         sc_head_stride_v = h_kv * blk_size * n_vg
         sc_kv_off_v = kv * blk_size * n_vg
-        r_idx = tl.arange(0, blk_size)
+
+        # 2D row-major offsets within one stored block (one head):
+        code_off = r_idx[:, None] * d + d_idx[None, :]  # (BLK_POW2, d) codes
+        k_sc_off = r_idx[:, None] * n_kg + kg_idx[None, :]  # (BLK_POW2, n_kg)
+        v_sc_off = r_idx[:, None] * n_vg + vg_idx[None, :]  # (BLK_POW2, n_vg)
 
         q_off = (kv * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]  # (GPAD, d)
         q_rows = tl.load(q_off + q_ptr, mask=gp_valid[:, None], other=0.0).to(
@@ -1949,26 +1958,30 @@ if TRITON_AVAILABLE:
         for blk in range(first_block, last_block):
             code_base = blk * head_stride + kv_head_off  # scalar
             row_abs = blk * blk_size + r_idx
-            tile_mask = row_abs < split_end
+            tile_mask = (row_abs < split_end) & row_real  # (BLK_POW2,)
 
-            # --- K: load int8 codes + per-group scale, dequant in-register ---
-            k_code = tl.reshape(
-                tl.load(
-                    k_codes_ptr + code_base + code_flat, eviction_policy="evict_first"
-                ),
-                (blk_size, n_kg, k_group),
-            ).to(tl.float32)  # (blk, n_kg, k_group)
-            k_sc = tl.reshape(
-                tl.load(
-                    k_scales_ptr + (blk * sc_head_stride_k + sc_kv_off_k) + k_sc_flat,
-                    eviction_policy="evict_first",
-                ),
-                (blk_size, n_kg, 1),
-            ).to(tl.float32)  # (blk, n_kg, 1)
-            k = tl.reshape(k_code * k_sc, (blk_size, d))  # (blk, d) dequant
+            # --- K: 2D int8 code load (rows padded+masked) + per-group scale ---
+            k_code = tl.load(
+                k_codes_ptr + code_base + code_off,
+                mask=row_real[:, None],
+                other=0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)  # (BLK_POW2, d)
+            k_sc = tl.load(
+                k_scales_ptr + (blk * sc_head_stride_k + sc_kv_off_k) + k_sc_off,
+                mask=row_real[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)  # (BLK_POW2, n_kg)
+            # Dequant: deq[r,dd] = code[r,dd] * scale[r, dd//group]. reshape the d
+            # axis to (n_kg, group), broadcast the per-group scale, reshape back.
+            k = tl.reshape(
+                tl.reshape(k_code, (BLK_POW2, n_kg, k_group)) * k_sc[:, :, None],
+                (BLK_POW2, d),
+            )  # (BLK_POW2, d) dequant
 
             if USE_DOT:
-                scores = tl.dot(q_rows, tl.trans(k)) * scale  # (GPAD, blk)
+                scores = tl.dot(q_rows, tl.trans(k)) * scale  # (GPAD, BLK_POW2)
             else:
                 scores = tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
             scores = tl.where(tile_mask[None, :], scores, float("-inf"))
@@ -1979,21 +1992,25 @@ if TRITON_AVAILABLE:
             p = tl.exp(scores - m_new[:, None])
             lse = lse * alpha + tl.sum(p, axis=1)
 
-            # --- V: load int8 codes + per-group scale, dequant in-register ---
-            v_code = tl.reshape(
-                tl.load(
-                    v_codes_ptr + code_base + code_flat, eviction_policy="evict_first"
-                ),
-                (blk_size, n_vg, v_group),
-            ).to(tl.float32)
-            v_sc = tl.reshape(
-                tl.load(
-                    v_scales_ptr + (blk * sc_head_stride_v + sc_kv_off_v) + v_sc_flat,
-                    eviction_policy="evict_first",
-                ),
-                (blk_size, n_vg, 1),
-            ).to(tl.float32)
-            v = tl.reshape(v_code * v_sc, (blk_size, d))  # (blk, d) dequant
+            # --- V: 2D int8 code load + per-group scale, dequant in-register ---
+            v_code = tl.load(
+                v_codes_ptr + code_base + code_off,
+                mask=row_real[:, None],
+                other=0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)  # (BLK_POW2, d)
+            v_sc = tl.load(
+                v_scales_ptr + (blk * sc_head_stride_v + sc_kv_off_v) + v_sc_off,
+                mask=row_real[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)  # (BLK_POW2, n_vg)
+            v = tl.reshape(
+                tl.reshape(v_code, (BLK_POW2, n_vg, v_group)) * v_sc[:, :, None],
+                (BLK_POW2, d),
+            )  # (BLK_POW2, d) dequant
+            # Zero masked rows so they don't contribute to p@v (p is already 0 there
+            # via scores=-inf -> exp=0, so v rows are multiplied by 0; safe either way).
 
             if USE_DOT:
                 pv = tl.dot(p, v)  # (GPAD, d)
@@ -2064,7 +2081,12 @@ def fused_decode_attention_packed(
     gpad = 16
     while gpad < n_q_groups:
         gpad *= 2
-    use_dot = blk_size >= 16 and d >= 16
+    blk_pow2 = 1
+    while blk_pow2 < blk_size:
+        blk_pow2 *= 2
+    # tl.dot needs M,N,K>=16: M=GPAD>=16, N=BLK_POW2, K=d. d<16 only in the tiny
+    # offline test (-> broadcast cube). BLK_POW2>=16 for real flush blocks.
+    use_dot = blk_pow2 >= 16 and d >= 16
 
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
     acc_part = torch.empty(
@@ -2095,6 +2117,7 @@ def fused_decode_attention_packed(
         n_q_groups=n_q_groups,
         k_group=k_group,
         v_group=v_group,
+        BLK_POW2=blk_pow2,
         GPAD=gpad,
         USE_DOT=use_dot,
     )
