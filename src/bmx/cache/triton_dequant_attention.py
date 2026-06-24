@@ -158,14 +158,6 @@ def _require_triton() -> None:
 #   because it varies per split; it is used only for loop bounds.
 
 
-# ---------------------------------------------------------------------------
-# Autotune configs — a few representative BLOCK/warp/stage combos.
-# Tuned on shape args only (d, n_q_groups).  NOT on seq_len.
-# ---------------------------------------------------------------------------
-#
-# These configs are intentionally modest; the VM run will tell us the winner.
-# Adding more configs costs compile time, not correctness.
-
 if TRITON_AVAILABLE:
     # ---------------------------------------------------------------------------
     # Autotune configs — a few representative BLOCK/warp/stage combos.
@@ -494,10 +486,10 @@ def _online_block_kernel_launch(
     # The kernel writes back via stored pointers, so the slice IS the buffer.
     q_v = q.view(h_kv, n_q_groups, d)  # (h_kv, G, d)  squeeze n_q
     # acc: fp16 in/out  — (h_kv, G, d)
-    acc_buf = acc.view(h_kv, n_q_groups, d).contiguous()  # (h_kv, G, d) fp16
+    acc_buf = acc.view(h_kv, n_q_groups, d)  # (h_kv, G, d) fp16 — zeros, contiguous
     # m, lse: fp32 carry — (h_kv, G)
-    m_buf = m.view(h_kv, n_q_groups).float().contiguous()  # (h_kv, G) fp32
-    lse_buf = lse.view(h_kv, n_q_groups).float().contiguous()  # (h_kv, G) fp32
+    m_buf = m.view(h_kv, n_q_groups).float()  # (h_kv, G) fp32 — already contiguous
+    lse_buf = lse.view(h_kv, n_q_groups).float()  # (h_kv, G) fp32 — already contiguous
 
     for kv in range(h_kv):
         # Each slice [kv] is contiguous (last dims G, d/1 are row-major).
@@ -552,7 +544,7 @@ def _v_dequant_turboquant_mse(
                            M_recon = _unrotate(M_quant, seed)
       3. Scale by norms:   V_dense = M_recon * norms
 
-    This matches _turboquant_mse_dequant in codecs.py line-for-line.
+    Delegates to codecs._turboquant_mse_dequant for the core sequence.
     The _unrotate step (FWHT) is deliberately kept in Python for 3c —
     in-kernel FWHT is a deferred optimisation (see 3c+ note in module doc).
 
@@ -567,33 +559,26 @@ def _v_dequant_turboquant_mse(
     Returns:
         (h_kv, blk, d) fp16 dense V block, ready to pass to kernel as v_ptr.
     """
-    import math
+    # Deferred imports: codecs is not imported at module top (circular-import
+    # avoidance — codecs → collect → triton_dequant_attention would cycle).
+    from bmx.cache.codecs import _turboquant_mse_dequant
 
-    from bmx.cache.codecs import gaussian_codebook
-    from bmx.cache.collect import from_matrix
-
-    indices = vpacked["indices"]  # (S, C) int16  — S = blk tokens for this block
+    indices = vpacked["indices"]  # (S, C) int16
     norms = vpacked["norms"]  # (S, 1) fp
     bits = int(vpacked["bits"])
     C = indices.shape[1]
 
-    # Move to target device if needed (mirrors _blocks_cuda pattern)
+    # Move to target device if needed (mirrors _blocks_cuda pattern).
     if indices.device != device:
         indices = indices.to(device)
         norms = norms.to(device)
 
-    # Line-for-line match of _turboquant_mse_dequant:
-    cb = gaussian_codebook(bits).to(device)
-    sqrt_c = math.sqrt(C)
-    M_quant = cb[indices.long()] / sqrt_c  # (S, C) fp32
-    # _unrotate stays Python (deferred in-kernel FWHT — see 3c note)
-    from bmx.cache.codecs import _unrotate
+    # Delegate to the canonical codec dequant (_unrotate stays Python — deferred
+    # in-kernel FWHT; see 3c note in module docstring).
+    V_mat = _turboquant_mse_dequant(indices, norms, bits, v_seed, C).to(dtype)
 
-    M_recon = _unrotate(M_quant, v_seed)  # (S, C) fp32
-    V_mat = (M_recon * norms.to(M_recon)).to(dtype)  # (S, C) fp16
-
-    # Convert from (S=blk, C=d) matrix layout back to (h_kv, blk, d)
-    return from_matrix(V_mat, h_kv).to(dtype)
+    # Convert from (S=blk, C=d) matrix layout back to (h_kv, blk, d).
+    return from_matrix(V_mat, h_kv)
 
 
 def _k2b_block_kernel_launch(
@@ -681,27 +666,31 @@ def _k2b_block_kernel_launch(
     # res_scale: (h_kv*d, n_groups, 1) → (h_kv*d, n_groups) fp16
     res_scale_mat = res_scale_full.view(C, n_groups).to(torch.float16)
 
-    # Lay out carry buffers as (h_kv, n_q_groups, d/1) contiguous
+    # Lay out carry buffers as (h_kv, n_q_groups, d/1) — zeros, already contiguous.
     q_v = q.view(h_kv, n_q_groups, d)  # (h_kv, G, d)
-    acc_buf = acc.view(h_kv, n_q_groups, d).contiguous()
-    m_buf = m.view(h_kv, n_q_groups).float().contiguous()
-    lse_buf = lse.view(h_kv, n_q_groups).float().contiguous()
+    acc_buf = acc.view(h_kv, n_q_groups, d)  # fp16 — contiguous (from torch.zeros)
+    m_buf = m.view(h_kv, n_q_groups).float()  # fp32 — contiguous
+    lse_buf = lse.view(h_kv, n_q_groups).float()  # fp32 — contiguous
 
-    # V_kv is (h_kv, blk, d_head) — already per head
-    V_buf = V_kv.contiguous()
+    # V_kv is (h_kv, blk, d_head) — fresh allocation from _v_dequant, contiguous.
+    V_buf = V_kv
+
+    # Us is shared across all KV heads — hoist .contiguous() outside the loop.
+    us_kv = Us  # already fp16 contiguous (cast on line above via .to(torch.float16))
 
     for kv in range(h_kv):
-        q_kv = q_v[kv].contiguous()  # (G, d) query rows for this KV head
+        q_kv = q_v[
+            kv
+        ].contiguous()  # (G, d) query rows for this KV head — view, needs .contiguous()
 
         # Slice per-head K factors from the combined (h_kv*d, ...) tensors.
         # Head kv occupies channel rows [kv*d : (kv+1)*d].
         lo, hi = kv * d, (kv + 1) * d
-        us_kv = Us.contiguous()  # (blk, rank) fp16 — shared across heads
         vfac_kv = Vfac_full[lo:hi, :].contiguous()  # (d, rank) fp16
         res_int_kv = res_Q_int_full[lo:hi, :].contiguous()  # (d, blk) int8
         res_sc_kv = res_scale_mat[lo:hi, :].contiguous()  # (d, n_groups) fp16
 
-        v_kv = V_buf[kv].contiguous()  # (blk, d) fp16
+        v_kv = V_buf[kv]  # (blk, d) fp16 — contiguous slice of row-major V_kv
 
         acc_kv = acc_buf[kv]  # (G, d) fp16 — written in-place by Triton
         m_kv = m_buf[kv]  # (G,)  fp32
@@ -942,11 +931,9 @@ def triton_decode_attention(
                 dequant_packed(k_arm, kpacked, seed=seed, group=group), h_kv
             ).to(q.dtype)
             if k_pre_rope:
-                K_kv = apply_rope(
-                    K_kv,
-                    rope_cos[start:end].to(K_kv.dtype),
-                    rope_sin[start:end].to(K_kv.dtype),
-                )
+                # rope_cos/sin are stored fp16 (packed_streaming cast at grow-time);
+                # K_kv.dtype is fp16 — the .to() is a noop, omit it.
+                K_kv = apply_rope(K_kv, rope_cos[start:end], rope_sin[start:end])
             V_kv = from_matrix(
                 dequant_packed(v_arm, vpacked, seed=_v_seed, group=_v_group), h_kv
             ).to(q.dtype)
@@ -1287,8 +1274,8 @@ def _graphable_reduce(
     m_scratch: torch.Tensor,
     lse_scratch: torch.Tensor,
     max_blocks: int,
-    h_kv: int,
-    n_q_groups: int,
+    h_kv: int,  # noqa: ARG001 — kept for call-site symmetry; folded into n_q_heads
+    n_q_groups: int,  # noqa: ARG001 — kept for call-site symmetry; folded into n_q_heads
     n_q_heads: int,
     d: int,
 ) -> torch.Tensor:
@@ -1301,25 +1288,15 @@ def _graphable_reduce(
     Reshapes to (max_blocks, n_q_heads, 1, d/1) and applies _merge_partials.
     Returns (n_q_heads, 1, d) fp16.
     """
-    G = n_q_groups
-    # Reshape from flat scratch to (max_blocks, h_kv, G, d/1)
-    acc_s = acc_scratch.view(max_blocks, h_kv, G, d).float()  # fp32 for merge
-    m_s = m_scratch.view(max_blocks, h_kv, G)
-    lse_s = lse_scratch.view(max_blocks, h_kv, G)
-
-    # Merge across block_idx dimension using online-softmax combine (base-e).
-    # Reuse the 3b _merge_partials logic by rearranging dims to
-    # (n_splits=max_blocks, n_q_heads, 1, d/1).
-    # n_q_heads = h_kv * G; reshape (h_kv, G) -> (n_q_heads,).
-    acc_s = acc_s.view(max_blocks, n_q_heads, 1, d)  # (B, H, 1, d)
-    m_s = m_s.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
-    lse_s = lse_s.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
-
-    m_global = m_s.amax(dim=0, keepdim=True)  # (1, H, 1, 1)
-    scales = torch.exp(m_s - m_global)  # (B, H, 1, 1)
-    l_merged = (lse_s * scales).sum(dim=0)  # (H, 1, 1)
-    acc_merged = (acc_s * scales).sum(dim=0)  # (H, 1, d)
-    return (acc_merged / l_merged).to(torch.float16)  # (H, 1, d)
+    # Reshape flat scratch → (max_blocks, n_q_heads, 1, d/1) so each split is
+    # a (n_q_heads, 1, d/1) slice — the shape _merge_partials expects.
+    # n_q_heads = h_kv * n_q_groups; (h_kv, G) dims are already folded in.
+    acc_s = acc_scratch.view(max_blocks, n_q_heads, 1, d)  # (B, H, 1, d)
+    m_s = m_scratch.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
+    lse_s = lse_scratch.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
+    return _merge_partials(
+        list(acc_s.unbind(0)), list(m_s.unbind(0)), list(lse_s.unbind(0))
+    )
 
 
 def triton_decode_attention_graphable(

@@ -14,3 +14,5 @@ results/cache/
 # local reference clones (NIAH + LongBench harnesses) — referenced, not vendored
 /Long-Context-Data-Engineering/
 /LongBench/
+# superpowers SDD scratch — session scaffolding, not project artefacts
+.superpowers/

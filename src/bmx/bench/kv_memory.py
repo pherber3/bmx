@@ -73,7 +73,7 @@ def _kv_read_bytes_per_step(case: KVMemCase) -> int:
     if case.path == "fp16":
         return entries * 2 * 2  # K and V, 2 bytes each
     # packed: codes at (bpe_k+bpe_v)/8 bytes/entry + the fp16 recent window resident
-    packed = int(entries * (case.bpe_k + case.bpe_v) / 8)
+    packed = _packed_bytes(case)
     window = 2 * case.n_layer * case.h_kv * case.recent_window * case.d_head * 2
     return packed + window
 
