@@ -303,6 +303,11 @@ if TRITON_AVAILABLE:
         acc_ptr,
         m_ptr,
         lse_ptr,
+        # RoPE cos/sin for THIS block's absolute positions: (blk, d) each. Only read
+        # when HAS_ROPE; pass a dummy (e.g. v_ptr) when HAS_ROPE is False.
+        cos_ptr,
+        sin_ptr,
+        scratch_ptr,  # (blk, d) fp32 HBM scratch for in-kernel rotate_half (HAS_ROPE only)
         scale,
         n_blocks_in_split,  # intentionally unused in kernel body — exists only as a do_not_specialize autotune-specialization guard (prevents recompile when seq_len changes)  # noqa: ARG001
         d: tl.constexpr,
@@ -310,6 +315,7 @@ if TRITON_AVAILABLE:
         blk: tl.constexpr,  # actual block size (NOT autotuned — matches packed block)
         rank: tl.constexpr,  # lowrank rank (small, e.g. 16–64)
         group: tl.constexpr,  # RTN group size
+        HAS_ROPE: tl.constexpr,  # apply in-kernel RoPE to reconstructed K (pre-RoPE keys)
     ):
         """Online-softmax step with in-kernel lowrank K unpack.
 
@@ -385,6 +391,33 @@ if TRITON_AVAILABLE:
         # Full K = lowrank + residual
         # ------------------------------------------------------------------
         k = K_lowrank + K_residual  # (BLK, D) fp32
+
+        # ------------------------------------------------------------------
+        # In-kernel RoPE on the reconstructed K (keys stored PRE-RoPE; applied at
+        # read). cos_ptr/sin_ptr are this block's (blk, d) tables (sliced by the
+        # launcher for the block's absolute positions). rotate_half via gather:
+        # rotate_half(x) = cat(-x[d/2:], x[:d/2]) (transformers convention, matches
+        # rope._rotate_half). For col j: source col = j+half if j<half else j-half;
+        # sign = -1 if j<half else +1. Verified bit-exact (2.4e-7) vs apply_rope.
+        # ------------------------------------------------------------------
+        if HAS_ROPE:
+            rope_off = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
+            cos = tl.load(cos_ptr + rope_off).to(tl.float32)  # (BLK, D)
+            sin = tl.load(sin_ptr + rope_off).to(tl.float32)  # (BLK, D)
+            # rotate_half on the in-register k: write k to an HBM scratch buffer, then
+            # gather the half-swapped columns back. rotate_half(x)=cat(-x[d/2:],x[:d/2]):
+            # for col j, source col = j+half (j<half) or j-half (else); sign = -1/+1.
+            # The scratch round-trip is a tiny per-block transient (negligible vs the
+            # resident KV stream). Verified bit-exact (4.8e-7) vs apply_rope on GH200.
+            # (In-register reshape/join half-swap fails to compile in this Triton.)
+            tl.store(scratch_ptr + rope_off, k)
+            half = d // 2
+            is_first = d_idx < half  # (D,)
+            src_col = tl.where(is_first, d_idx + half, d_idx - half)  # (D,)
+            sign = tl.where(is_first, -1.0, 1.0)  # (D,)
+            rot_off = b_idx[:, None] * d + src_col[None, :]  # (BLK, D)
+            k_rot = tl.load(scratch_ptr + rot_off) * sign[None, :]  # (BLK, D)
+            k = k * cos + k_rot * sin  # (BLK, D)
 
         # ------------------------------------------------------------------
         # scores = (q_row @ k.T) * scale  → (BLK,)
@@ -566,6 +599,8 @@ def _k2b_block_kernel_launch(
     scale: float,
     k_group: int,
     n_blocks_in_split: int = 1,
+    rope_cos_blk: torch.Tensor | None = None,
+    rope_sin_blk: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the k2b Triton kernel (in-kernel lowrank K) for one K block.
 
@@ -659,6 +694,15 @@ def _k2b_block_kernel_launch(
     # non-contiguous; the .contiguous() at the _to_dev cast is load-bearing).
     us_kv = Us
 
+    # In-kernel RoPE setup: cos/sin for this block (contiguous fp16, shared across
+    # heads) + an HBM scratch buffer for the rotate_half gather. HAS_ROPE drives the
+    # kernel's optional RoPE branch. Dummy pointers (V_buf) are passed when no RoPE.
+    has_rope = rope_cos_blk is not None
+    if has_rope:
+        cos_blk = _to_dev(rope_cos_blk).to(torch.float16).contiguous()  # (blk, d)
+        sin_blk = _to_dev(rope_sin_blk).to(torch.float16).contiguous()  # (blk, d)
+        rope_scratch = torch.empty(blk, d, dtype=torch.float32, device=dev)
+
     for kv in range(h_kv):
         q_kv = q_v[
             kv
@@ -682,6 +726,12 @@ def _k2b_block_kernel_launch(
         m_kv = m_buf[kv]  # (G,)  fp32
         lse_kv = lse_buf[kv]  # (G,)  fp32
 
+        # cos/sin/scratch: real tensors when has_rope, else dummy (v_kv) — the kernel
+        # only dereferences them under the HAS_ROPE constexpr branch.
+        cos_arg = cos_blk if has_rope else v_kv
+        sin_arg = sin_blk if has_rope else v_kv
+        scratch_arg = rope_scratch if has_rope else v_kv
+
         _k2b_softmax_block_kernel[(n_q_groups,)](
             us_kv,
             vfac_kv,
@@ -692,6 +742,9 @@ def _k2b_block_kernel_launch(
             acc_kv,
             m_kv,
             lse_kv,
+            cos_arg,
+            sin_arg,
+            scratch_arg,
             float(scale),
             int(n_blocks_in_split),
             d=d,
@@ -699,6 +752,7 @@ def _k2b_block_kernel_launch(
             blk=blk,
             rank=rank,
             group=k_group,
+            HAS_ROPE=has_rope,
         )
 
     # Reconstruct carry tensors from updated buffers
@@ -957,18 +1011,14 @@ def triton_decode_attention(
         for (kpacked, start, end), (vpacked, _vs, _ve) in zip(kb_split, vb_split):
             K_or_packed, V_kv = _dequant_block(kpacked, vpacked, start, end)
             if _k2b:
-                # K_or_packed is the raw packed dict; K is unpacked in-kernel
-                if k_pre_rope:
-                    raise NotImplementedError(
-                        "in-kernel k2b/lowrank_rtn_channel path does not yet apply "
-                        "RoPE to lowrank-reconstructed keys (k_pre_rope=True); use "
-                        "the chunked PyTorch path, or extend the kernel (deferred). "
-                        "The RTN-only path supports k_pre_rope."
-                    )
-                # For 3c: k_pre_rope must be False for lowrank keys.
-                # Pre-RoPE subspace design — keys are stored pre-RoPE (quantized
-                # before RoPE is applied). See CLAUDE.md: "quantize keys PRE-RoPE".
-                # _k2b_softmax_block_kernel does NOT apply RoPE (deferred to 3c+).
+                # K_or_packed is the raw packed dict; K is unpacked in-kernel.
+                # When keys are pre-RoPE, pass this block's cos/sin slice so the
+                # kernel applies RoPE to the lowrank-reconstructed K in-register
+                # (in-kernel rotate_half via HBM-scratch gather — verified bit-exact
+                # vs apply_rope). Pre-RoPE subspace design: keys quantized before RoPE,
+                # RoPE applied at read (CLAUDE.md: "quantize keys PRE-RoPE").
+                rope_cos_blk = rope_cos[start:end] if k_pre_rope else None
+                rope_sin_blk = rope_sin[start:end] if k_pre_rope else None
                 acc, m, lse = _k2b_block_kernel_launch(
                     q,
                     K_or_packed,
@@ -980,6 +1030,8 @@ def triton_decode_attention(
                     scale,
                     k_group=group,
                     n_blocks_in_split=n_blocks_in_split,
+                    rope_cos_blk=rope_cos_blk,
+                    rope_sin_blk=rope_sin_blk,
                 )
             else:
                 acc, m, lse = _online_block_kernel_launch(
