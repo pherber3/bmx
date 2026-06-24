@@ -19,7 +19,9 @@ from bmx.cache.chunked_attention import chunked_dequant_attention
 from bmx.cache.codecs import S_DIVISIBILITY_ARMS, quantize_packed
 from bmx.cache.triton_dequant_attention import (
     TRITON_AVAILABLE,
+    build_kv_stacked_k2b,
     build_kv_stacked_packed,
+    fused_decode_attention_k2b,
     fused_decode_attention_packed,
     triton_decode_attention,
 )
@@ -213,6 +215,8 @@ class PackedStreamingLayer(DynamicLayer):
         """
         M = to_matrix(v_block)  # (block_len, h_kv*d)
         spec = self.v_spec
+        # turboquant_mse_perhead needs the head count (block-diagonal d_head rotation).
+        h_heads = self._h_kv if spec.arm == "turboquant_mse_perhead" else 0
         packed, _ = quantize_packed(
             spec.arm,
             M,
@@ -220,6 +224,7 @@ class PackedStreamingLayer(DynamicLayer):
             group=spec.group,
             rank=spec.rank,
             seed=spec.seed,
+            h_heads=h_heads,
         )
         return packed
 
@@ -418,6 +423,44 @@ class PackedStreamingLayer(DynamicLayer):
                 scale=scaling,
                 k_group=self.k_spec.group,
                 v_group=self.v_spec.group,
+                k_tail=k_tail,
+                v_tail=v_tail,
+            )
+
+        # FUSED k2b fast path (the REAL recipe): in-kernel lowrank-K + RoPE +
+        # per-head turboquant-V (in-kernel d-Hadamard unrotate), all dequant-in-kernel,
+        # packed-resident, no dense copy. Applies when K=lowrank_rtn_channel and
+        # V=turboquant_mse_perhead (the per-head Hadamard codec the kernel needs).
+        fused_k2b_ok = (
+            is_decode
+            and q.is_cuda
+            and TRITON_AVAILABLE
+            and self.k_spec.arm == "lowrank_rtn_channel"
+            and self.v_spec.arm == "turboquant_mse_perhead"
+            and uniform_blk
+        )
+        if fused_k2b_ok:
+            blk = self._k_blocks[0][2] - self._k_blocks[0][1]
+            n_blocks = len(self._k_blocks)
+            stacks = build_kv_stacked_k2b(
+                self._k_blocks,
+                self._v_blocks,
+                max_blocks=n_blocks,
+                h_kv=self._h_kv,
+                blk_size=blk,
+                d=q.shape[2],
+                device=q.device,
+            )
+            return fused_decode_attention_k2b(
+                q,
+                stacks,
+                n_blocks * blk,
+                n_q_groups=n_q_groups,
+                scale=scaling,
+                vbits=self.v_spec.bits,
+                v_seed=self.v_spec.seed,
+                rope_cos=self._rope_cos if self.k_spec.pre_rope else None,
+                rope_sin=self._rope_sin if self.k_spec.pre_rope else None,
                 k_tail=k_tail,
                 v_tail=v_tail,
             )

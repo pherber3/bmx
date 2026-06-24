@@ -193,3 +193,50 @@ def test_fused_packed_generate_matches_streaming_cuda():
         f"fused-packed decode logits diverged from streaming: max_abs={max_abs} "
         "(fused_decode_attention_packed in packed_streaming.attend)"
     )
+
+
+def _k2b_perhead():
+    """The REAL recipe with the per-head Hadamard V (the fused-k2b kernel's arm)."""
+    return (
+        CacheCodecSpec(
+            arm="lowrank_rtn_channel", bits=3, rank=4, group=16, pre_rope=True
+        ),
+        CacheCodecSpec(arm="turboquant_mse_perhead", bits=2),
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="fused-k2b decode path is taken only when q.is_cuda + Triton present",
+)
+def test_fused_k2b_generate_matches_streaming_cuda():
+    """The REAL-recipe deployment path: PackedStreamingCache decode routes through
+    the fused k2b kernel (in-kernel lowrank-K + RoPE + per-head turboquant-V with an
+    in-kernel d-point Hadamard unrotate). On CUDA with lowrank_rtn_channel K +
+    turboquant_mse_perhead V, attend() takes fused_decode_attention_k2b.
+
+    Compares decode-logit closeness vs StreamingQuantizedCache (same per-head codec,
+    chunked path). seq > recent_window so blocks flush and the committed-packed +
+    fp16-tail merge is exercised. tf32 tensor cores -> ~1e-3 logit drift.
+    """
+    model = tiny_llama().cuda()
+    input_ids = ids(vocab=97, seq=60, seed=13).cuda()
+    k_spec, v_spec = _k2b_perhead()
+
+    def _decode_logits(Cls):
+        cache = Cls(model.config, k_spec=k_spec, v_spec=v_spec)
+        cache.attach(model)
+        with cache, torch.no_grad():
+            model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
+            step = ids(vocab=97, seq=1, seed=14).cuda()
+            out = model(step, past_key_values=cache, use_cache=True)
+        cache.detach()
+        return out.logits[0, -1].float()
+
+    ref = _decode_logits(StreamingQuantizedCache)
+    fused = _decode_logits(PackedStreamingCache)
+    max_abs = (ref - fused).abs().max().item()
+    assert max_abs < 5e-2, (
+        f"fused-k2b decode logits diverged from streaming: max_abs={max_abs} "
+        "(fused_decode_attention_k2b in packed_streaming.attend)"
+    )

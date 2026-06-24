@@ -35,6 +35,7 @@ CACHE_ARMS = (
     "rtn_channel",
     "rotate_rtn_token",
     "turboquant_mse",
+    "turboquant_mse_perhead",
     "turboquant_prod",
     "lowrank_rtn_channel",
     "lowrank_waterfill_channel",
@@ -562,6 +563,7 @@ _SPLIT_ARMS = frozenset(
         "rtn_channel",
         "rotate_rtn_token",
         "turboquant_mse",
+        "turboquant_mse_perhead",
         "turboquant_prod",
         "lowrank_rtn_channel",
     }
@@ -625,7 +627,9 @@ def _turboquant_mse_perhead_packed(
     Mh = M.reshape(S, h, d)  # (S, h, d) — per-head blocks
     norms = Mh.norm(dim=2).clamp_min(1e-12).half().float()  # (S, h) per-head norm
     Mh_unit = Mh / norms[:, :, None]  # (S, h, d)
-    Mh_rot = _rotate(Mh_unit.reshape(S * h, d), seed).reshape(S, h, d)  # per-d-block rot
+    Mh_rot = _rotate(Mh_unit.reshape(S * h, d), seed).reshape(
+        S, h, d
+    )  # per-d-block rot
     cb = gaussian_codebook(bits).to(M.device)
     sqrt_d = math.sqrt(d)
     mid = (cb[:-1] + cb[1:]) / 2
@@ -655,6 +659,7 @@ def quantize_packed(
     group: int = 64,
     rank: int = 0,
     svd_factors: tuple | None = None,
+    h_heads: int = 0,
 ) -> tuple[dict, float]:
     """(S,C) fp -> (packed dict, honest bpe). Inverse: dequant_packed.
 
@@ -679,6 +684,18 @@ def quantize_packed(
     if arm == "turboquant_mse":
         indices, norms = _turboquant_mse_packed(M, bits, seed)
         return {"indices": indices, "norms": norms, "bits": bits}, bits + 16.0 / C
+    if arm == "turboquant_mse_perhead":
+        # Per-head (block-diagonal d_head Hadamard) turboquant — fuses into the
+        # per-head decode kernel (no cross-head coupling). norms are per-(row, head).
+        # h_heads omitted (0) -> degenerate single head = full-C rotation (same as
+        # turboquant_mse); the cache always passes the real h_kv. C % h_heads == 0.
+        h = h_heads if h_heads > 0 else 1
+        assert C % h == 0, f"C={C} not divisible by h_heads={h}"
+        indices, norms = _turboquant_mse_perhead_packed(M, bits, seed, h)
+        # bpe: bits/elem + 16 (fp16 norm) per (head's d) channels = bits + 16/(C/h).
+        return {"indices": indices, "norms": norms, "bits": bits, "h": h}, (
+            bits + 16.0 * h / C
+        )
     if arm == "turboquant_prod":
         assert bits >= 2, f"turboquant_prod requires bits >= 2, got {bits}"
         indices, norms = _turboquant_mse_packed(M, bits - 1, seed)
@@ -738,6 +755,10 @@ def dequant_packed(
         C = packed["indices"].shape[1]
         return _turboquant_mse_dequant(
             packed["indices"], packed["norms"], packed["bits"], seed, C
+        )
+    if arm == "turboquant_mse_perhead":
+        return _turboquant_mse_perhead_dequant(
+            packed["indices"], packed["norms"], packed["bits"], seed, packed["h"]
         )
     if arm == "turboquant_prod":
         C = packed["mse_indices"].shape[1]
