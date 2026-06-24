@@ -184,16 +184,25 @@ def test_triton_decode_asserts_n_q_eq_1():
 
 
 @cuda
-@pytest.mark.parametrize("num_splits", [1, 2, 4, 8])
-def test_triton_split_kv_matches_oracle(num_splits):
+@pytest.mark.parametrize(
+    "num_splits,n_blocks",
+    [
+        (1, 16),  # even: 16 blocks, 1 split  — baseline (3a-identical path)
+        (2, 16),  # even: 16 blocks, 2 splits of 8
+        (4, 16),  # even: 16 blocks, 4 splits of 4
+        (8, 16),  # even: 16 blocks, 8 splits of 2
+        (4, 5),  # UNEVEN remainder: 5 blocks, 4 splits → [2,2,1,0] sizes
+    ],
+)
+def test_triton_split_kv_matches_oracle(num_splits, n_blocks):
     """triton_decode_attention(num_splits=N) must match naive_dense_attention.
 
-    Tests all four split counts {1, 2, 4, 8} against the oracle.  A wrong
-    LSE merge produces O(1) error at >1 split — caught here before any VM run.
+    Tests even split counts {1,2,4,8} (all divide n_blocks=16 evenly) AND the
+    UNEVEN case (n_blocks=5, num_splits=4 → split sizes [2,2,1,0]) that
+    exercises the 1-block split and the empty-split skip path.
 
-    num_splits=1 also MUST be bit-identical to the 3a serial path.  We verify
-    this by asserting the num_splits=1 result matches the num_splits=1 baseline
-    (same call, same seed — should be exact).
+    A wrong LSE merge produces O(1) error at >1 split — caught here before any
+    VM run.
 
     Tolerance: max_abs < 1e-2.  Expect near fp16 rounding (~2e-4).
     Do NOT loosen this bound — drift means the merge formula is wrong.
@@ -212,8 +221,7 @@ def test_triton_split_kv_matches_oracle(num_splits):
     from tests.factories import tiny_packed_blocks
 
     torch.manual_seed(0)
-    # 16 blocks so splits {1,2,4,8} all divide evenly; d=64, n_q_groups=4.
-    n_q_heads, n_q_groups, d, blk, n_blocks = 8, 4, 64, 64, 16
+    n_q_heads, n_q_groups, d, blk = 8, 4, 64, 64
     q, kb_cpu, vb_cpu, kw = tiny_packed_blocks(
         n_q_heads=n_q_heads,
         n_q_groups=n_q_groups,
@@ -238,21 +246,31 @@ def test_triton_split_kv_matches_oracle(num_splits):
 
     diff = attention_diff(out_cpu, ref_cpu)
     assert diff["max_abs"] < 1e-2, (
-        f"triton_decode_attention(num_splits={num_splits}) drifted from oracle: "
-        f"{diff}.  If max_abs >= 1e-2 the LSE merge is wrong — do NOT loosen."
+        f"triton_decode_attention(num_splits={num_splits}, n_blocks={n_blocks}) "
+        f"drifted from oracle: {diff}.  "
+        "If max_abs >= 1e-2 the LSE merge is wrong — do NOT loosen."
     )
 
 
 @cuda
 def test_triton_split_kv_num_splits_1_bit_identical_to_3a():
-    """num_splits=1 must produce bit-identical output to the 3a serial path.
+    """num_splits=1 must be bit-identical to the 3a default path (no num_splits).
 
-    Both calls use the same kernel path (the num_splits=1 branch calls
-    _run_split + acc/lse directly, exactly as 3a did).  This test asserts
-    max_abs == 0.0 (exact equality in fp16), confirming back-compat.
+    The 3b refactor introduced num_splits as an explicit kwarg; when num_splits=1
+    the code takes the same `acc / lse` shortcut as the old 3a serial path.
+    This test proves back-compat: calling with num_splits=1 and calling with
+    the default (no num_splits arg) must produce EXACTLY the same fp16 tensor
+    (torch.equal, not just close), AND both must match naive_dense_attention
+    within fp16 tolerance.
 
-    If this fails it means the 3b refactor broke the num_splits=1 path.
+    Invariant verified:
+      out_default (3a path, no num_splits) == out_split1 (num_splits=1)  [bit-exact]
+      out_split1 vs oracle: max_abs < 1e-2
+
+    If torch.equal fails: the 3b refactor changed the num_splits=1 code path.
+    If the oracle check fails: the serial path itself is broken.
     """
+    from bmx.cache.chunked_attention import attention_diff, naive_dense_attention
     from bmx.cache.triton_dequant_attention import (
         TRITON_AVAILABLE,
         triton_decode_attention,
@@ -278,16 +296,23 @@ def test_triton_split_kv_num_splits_1_bit_identical_to_3a():
     kb_cuda = _blocks_cuda(kb_cpu)
     vb_cuda = _blocks_cuda(vb_cpu)
 
-    # Two calls with num_splits=1 — must produce identical fp16 tensors.
-    out_a = triton_decode_attention(
-        q_cuda, kb_cuda, vb_cuda, num_splits=1, **oracle_kwargs
-    )
-    out_b = triton_decode_attention(
+    # 3a default path: no num_splits kwarg (uses the default=1 shortcut).
+    out_default = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **oracle_kwargs)
+    # 3b explicit num_splits=1: must follow the identical code branch.
+    out_split1 = triton_decode_attention(
         q_cuda, kb_cuda, vb_cuda, num_splits=1, **oracle_kwargs
     )
 
-    # Bit-identical: max_abs must be exactly 0.0 (same code path, same inputs).
-    assert torch.equal(out_a, out_b), (
-        "num_splits=1 produced different outputs on identical inputs — "
-        "the 3b refactor broke determinism on the serial path."
+    # Bit-identical: num_splits=1 IS the 3a path — same tensors, not just close.
+    assert torch.equal(out_default, out_split1), (
+        "num_splits=1 diverged from the default (3a) path — "
+        "the 3b refactor broke back-compat on the serial path."
+    )
+
+    # Also confirm both agree with the oracle (catches a broken serial path).
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+    diff = attention_diff(out_split1.cpu(), ref_cpu)
+    assert diff["max_abs"] < 1e-2, (
+        f"num_splits=1 drifted from oracle: {diff}. "
+        "Investigate the serial path — do NOT loosen tolerance."
     )

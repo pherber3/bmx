@@ -160,3 +160,77 @@ _require_triton() raises RuntimeError("...TRITON_AVAILABLE...")  ✓
 Files:
 - `src/bmx/cache/triton_dequant_attention.py` — extended (split-KV + reduction + autotune)
 - `tests/test_triton_decode_rtn.py` — extended (5 new CUDA-gated tests: 4 parametrized + 1 bit-identity)
+
+---
+
+## Test-quality fixes (post-3b)
+
+### Fix 1 — `test_triton_split_kv_num_splits_1_bit_identical_to_3a`: self-referential → real equivalence
+
+**Bug:** Original called `triton_decode_attention(..., num_splits=1)` TWICE and asserted `torch.equal` — proved only determinism, not 3a equivalence (tautological test).
+
+**Fix:** Now calls the DEFAULT path (no `num_splits` kwarg, i.e. the 3a code path) AND `num_splits=1` explicitly, then asserts `torch.equal` between the two AND checks oracle within `1e-2`:
+
+```python
+# 3a default path: no num_splits kwarg (uses the default=1 shortcut).
+out_default = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **oracle_kwargs)
+# 3b explicit num_splits=1: must follow the identical code branch.
+out_split1  = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, num_splits=1, **oracle_kwargs)
+
+# Bit-identical: num_splits=1 IS the 3a path — same tensors, not just close.
+assert torch.equal(out_default, out_split1), (
+    "num_splits=1 diverged from the default (3a) path — "
+    "the 3b refactor broke back-compat on the serial path."
+)
+
+# Also confirm both agree with the oracle (catches a broken serial path).
+ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+diff = attention_diff(out_split1.cpu(), ref_cpu)
+assert diff["max_abs"] < 1e-2, ...
+```
+
+### Fix 2 — `test_triton_split_kv_matches_oracle`: add uneven remainder-split case
+
+**Bug:** Parametrize only covered `num_splits ∈ {1,2,4,8}` with `n_blocks=16` (all divide evenly) — never exercised the empty-split skip path or 1-block split path.
+
+**Fix:** Extended parametrize to 5 cases — added `(num_splits=4, n_blocks=5)`:
+
+```python
+@pytest.mark.parametrize(
+    "num_splits,n_blocks",
+    [
+        (1, 16),  # even: 16 blocks, 1 split  — baseline (3a-identical path)
+        (2, 16),  # even: 16 blocks, 2 splits of 8
+        (4, 16),  # even: 16 blocks, 4 splits of 4
+        (8, 16),  # even: 16 blocks, 8 splits of 2
+        (4, 5),   # UNEVEN remainder: 5 blocks, 4 splits → [2,2,1,0] sizes
+    ],
+)
+def test_triton_split_kv_matches_oracle(num_splits, n_blocks):
+```
+
+The `(4, 5)` case (`ceil(5/4)=2` chunk size → splits [0:2], [2:4], [4:5], [5:5]) exercises:
+- A 1-block final split ([4:5])
+- An empty trailing split ([5:5]) that must be skipped cleanly
+
+`tiny_packed_blocks` accepts arbitrary `n_blocks` — no factory changes needed.
+
+### Local skip/pass output after fixes
+
+```
+tests/test_triton_decode_rtn.py::test_triton_module_imports_with_available_flag PASSED
+tests/test_triton_decode_rtn.py::test_require_triton_raises_without_cuda PASSED
+tests/test_triton_decode_rtn.py::test_triton_rtn_decode_matches_oracle SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_rtn_decode_matches_oracle_prerope SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_decode_asserts_n_q_eq_1 SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_split_kv_matches_oracle[1-16] SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_split_kv_matches_oracle[2-16] SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_split_kv_matches_oracle[4-16] SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_split_kv_matches_oracle[8-16] SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_split_kv_matches_oracle[4-5] SKIPPED
+tests/test_triton_decode_rtn.py::test_triton_split_kv_num_splits_1_bit_identical_to_3a SKIPPED
+2 passed, 9 skipped
+
+uv run ruff format . && uv run ruff check .  →  All checks passed!
+uv run pytest -q  →  259 passed, 9 skipped, 1 xfailed in 56.76s
+```
