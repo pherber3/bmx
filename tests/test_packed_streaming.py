@@ -6,7 +6,7 @@ import torch
 from bmx.cache.packed_streaming import PackedStreamingCache
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
-from factories import ids, tiny_llama
+from factories import ids, tiny_llama, tiny_llama_d32
 
 
 def _k2b():
@@ -196,10 +196,14 @@ def test_fused_packed_generate_matches_streaming_cuda():
 
 
 def _k2b_perhead():
-    """The REAL recipe with the per-head Hadamard V (the fused-k2b kernel's arm)."""
+    """The REAL recipe with the per-head Hadamard V (the fused-k2b kernel's arm).
+
+    rank=16 and the d32 model (head_dim=32) so the fused-k2b dims gate (d>=16,
+    rank>=16, d pow2) passes and attend() actually takes fused_decode_attention_k2b.
+    """
     return (
         CacheCodecSpec(
-            arm="lowrank_rtn_channel", bits=3, rank=4, group=16, pre_rope=True
+            arm="lowrank_rtn_channel", bits=3, rank=16, group=16, pre_rope=True
         ),
         CacheCodecSpec(arm="turboquant_mse_perhead", bits=2),
     )
@@ -219,7 +223,7 @@ def test_fused_k2b_generate_matches_streaming_cuda():
     chunked path). seq > recent_window so blocks flush and the committed-packed +
     fp16-tail merge is exercised. tf32 tensor cores -> ~1e-3 logit drift.
     """
-    model = tiny_llama().cuda()
+    model = tiny_llama_d32().cuda()  # head_dim=32 so the fused-k2b dims gate passes
     input_ids = ids(vocab=97, seq=60, seed=13).cuda()
     k_spec, v_spec = _k2b_perhead()
 

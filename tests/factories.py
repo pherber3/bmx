@@ -29,6 +29,24 @@ def tiny_llama():
     return LlamaForCausalLM(cfg).eval()
 
 
+def tiny_llama_d32():
+    """Tiny Llama with head_dim=32 (>=16, power of 2) — for the fused k2b kernel,
+    whose tl.dot (lowrank-K, rotate_half, V-Hadamard) needs d>=16 and d a power of 2.
+    hidden=64, 2 q heads, 1 kv head -> d_head=32, n_q_groups=2.
+    """
+    cfg = LlamaConfig(
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        hidden_size=64,
+        intermediate_size=128,
+        vocab_size=97,
+        max_position_embeddings=128,
+    )
+    torch.manual_seed(1)
+    return LlamaForCausalLM(cfg).eval()
+
+
 def ids(vocab=97, seq=12, seed=42):
     return torch.randint(
         0, vocab, (1, seq), generator=torch.Generator().manual_seed(seed)

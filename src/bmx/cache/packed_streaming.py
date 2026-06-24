@@ -431,6 +431,16 @@ class PackedStreamingLayer(DynamicLayer):
         # per-head turboquant-V (in-kernel d-Hadamard unrotate), all dequant-in-kernel,
         # packed-resident, no dense copy. Applies when K=lowrank_rtn_channel and
         # V=turboquant_mse_perhead (the per-head Hadamard codec the kernel needs).
+        # The k2b fused kernel uses tl.dot for lowrank-K, rotate_half, and the V
+        # Hadamard, so it needs d>=16, rank>=16, and d a power of 2 (the per-head
+        # Hadamard). Real models satisfy this (d=128, rank>=16); tiny/incompatible
+        # configs fall back to the per-block triton path below (which handles d<16).
+        d_head = q.shape[2]
+        k2b_dims_ok = (
+            d_head >= 16
+            and (d_head & (d_head - 1)) == 0
+            and (self.k_spec.rank or 0) >= 16
+        )
         fused_k2b_ok = (
             is_decode
             and q.is_cuda
@@ -438,6 +448,7 @@ class PackedStreamingLayer(DynamicLayer):
             and self.k_spec.arm == "lowrank_rtn_channel"
             and self.v_spec.arm == "turboquant_mse_perhead"
             and uniform_blk
+            and k2b_dims_ok
         )
         if fused_k2b_ok:
             blk = self._k_blocks[0][2] - self._k_blocks[0][1]
