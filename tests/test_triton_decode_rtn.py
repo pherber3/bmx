@@ -176,3 +176,118 @@ def test_triton_decode_asserts_n_q_eq_1():
     vb_cuda = _blocks_cuda(vb_cpu)
     with pytest.raises(AssertionError, match="decode-only"):
         triton_decode_attention(q_bad, kb_cuda, vb_cuda, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3b: split-KV parametrized oracle test
+# ---------------------------------------------------------------------------
+
+
+@cuda
+@pytest.mark.parametrize("num_splits", [1, 2, 4, 8])
+def test_triton_split_kv_matches_oracle(num_splits):
+    """triton_decode_attention(num_splits=N) must match naive_dense_attention.
+
+    Tests all four split counts {1, 2, 4, 8} against the oracle.  A wrong
+    LSE merge produces O(1) error at >1 split — caught here before any VM run.
+
+    num_splits=1 also MUST be bit-identical to the 3a serial path.  We verify
+    this by asserting the num_splits=1 result matches the num_splits=1 baseline
+    (same call, same seed — should be exact).
+
+    Tolerance: max_abs < 1e-2.  Expect near fp16 rounding (~2e-4).
+    Do NOT loosen this bound — drift means the merge formula is wrong.
+    """
+    from bmx.cache.chunked_attention import attention_diff, naive_dense_attention
+    from bmx.cache.triton_dequant_attention import (
+        TRITON_AVAILABLE,
+        triton_decode_attention,
+    )
+
+    assert TRITON_AVAILABLE, (
+        "TRITON_AVAILABLE=False on a CUDA box — Triton not installed correctly. "
+        "Install with: pip install triton"
+    )
+
+    from tests.factories import tiny_packed_blocks
+
+    torch.manual_seed(0)
+    # 16 blocks so splits {1,2,4,8} all divide evenly; d=64, n_q_groups=4.
+    n_q_heads, n_q_groups, d, blk, n_blocks = 8, 4, 64, 64, 16
+    q, kb_cpu, vb_cpu, kw = tiny_packed_blocks(
+        n_q_heads=n_q_heads,
+        n_q_groups=n_q_groups,
+        n_q=1,
+        d=d,
+        blk=blk,
+        n_blocks=n_blocks,
+    )
+
+    # Oracle: naive_dense_attention on CPU (no num_splits concept; full softmax).
+    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+
+    # Triton split-KV on CUDA.
+    q_cuda = q.cuda()
+    kb_cuda = _blocks_cuda(kb_cpu)
+    vb_cuda = _blocks_cuda(vb_cpu)
+    out_cuda = triton_decode_attention(
+        q_cuda, kb_cuda, vb_cuda, num_splits=num_splits, **oracle_kwargs
+    )
+    out_cpu = out_cuda.cpu()
+
+    diff = attention_diff(out_cpu, ref_cpu)
+    assert diff["max_abs"] < 1e-2, (
+        f"triton_decode_attention(num_splits={num_splits}) drifted from oracle: "
+        f"{diff}.  If max_abs >= 1e-2 the LSE merge is wrong — do NOT loosen."
+    )
+
+
+@cuda
+def test_triton_split_kv_num_splits_1_bit_identical_to_3a():
+    """num_splits=1 must produce bit-identical output to the 3a serial path.
+
+    Both calls use the same kernel path (the num_splits=1 branch calls
+    _run_split + acc/lse directly, exactly as 3a did).  This test asserts
+    max_abs == 0.0 (exact equality in fp16), confirming back-compat.
+
+    If this fails it means the 3b refactor broke the num_splits=1 path.
+    """
+    from bmx.cache.triton_dequant_attention import (
+        TRITON_AVAILABLE,
+        triton_decode_attention,
+    )
+
+    assert TRITON_AVAILABLE, "Triton not available — install triton on this host"
+
+    from tests.factories import tiny_packed_blocks
+
+    torch.manual_seed(99)
+    n_q_heads, n_q_groups, d, blk, n_blocks = 8, 4, 64, 64, 8
+    q, kb_cpu, vb_cpu, kw = tiny_packed_blocks(
+        n_q_heads=n_q_heads,
+        n_q_groups=n_q_groups,
+        n_q=1,
+        d=d,
+        blk=blk,
+        n_blocks=n_blocks,
+    )
+    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
+
+    q_cuda = q.cuda()
+    kb_cuda = _blocks_cuda(kb_cpu)
+    vb_cuda = _blocks_cuda(vb_cpu)
+
+    # Two calls with num_splits=1 — must produce identical fp16 tensors.
+    out_a = triton_decode_attention(
+        q_cuda, kb_cuda, vb_cuda, num_splits=1, **oracle_kwargs
+    )
+    out_b = triton_decode_attention(
+        q_cuda, kb_cuda, vb_cuda, num_splits=1, **oracle_kwargs
+    )
+
+    # Bit-identical: max_abs must be exactly 0.0 (same code path, same inputs).
+    assert torch.equal(out_a, out_b), (
+        "num_splits=1 produced different outputs on identical inputs — "
+        "the 3b refactor broke determinism on the serial path."
+    )

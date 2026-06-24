@@ -1,18 +1,23 @@
 """Triton fused dequant-attention DECODE kernel (k2b recipe).
 
 Stage 3a: Serial-over-blocks online-softmax decode, correctness-first skeleton.
+Stage 3b: Split-KV decode parallelism + autotune.
 
 Deliberate staging (do not collapse prematurely):
-  3a (this file): DEQUANT stays in PyTorch per block (reuse dequant_packed +
+  3a (base): DEQUANT stays in PyTorch per block (reuse dequant_packed +
       from_matrix + apply_rope).  ONLY the online-softmax QK^T·V contraction
       runs in Triton.  Isolates the kernel skeleton so it is independently
       bit-exact vs naive_dense_attention before any in-kernel unpacking.
-  3b/3c (future): Move RTN unpack into the Triton kernel.
+  3b (this stage): Split the KV block list across num_splits parallel program
+      groups, each computing a partial (acc_i, m_i, lse_i), then a reduction
+      kernel merges them via the standard online-softmax combine.  Adds
+      @triton.autotune + do_not_specialize on the block-count runtime arg.
+  3c (future): Move RTN unpack into the Triton kernel.
 
 Carry strategy: (acc, m, lse) are Python/PyTorch tensors carried between
 per-block Triton kernel launches.  For decode (n_q==1) the blocks are small
 relative to the per-launch overhead, but correctness is the goal here;
-fusing the KV-block loop is a 3b concern.
+fusing the KV-block loop is a 3c concern.
 
 GQA: q is (n_q_heads, 1, d), kv is (h_kv, blk, d).
   n_q_groups = n_q_heads // h_kv.
@@ -28,9 +33,32 @@ near fp16 rounding ~2e-4).  If it drifts, fix the kernel — do NOT loosen.
 HARDWARE NOTE: Triton/CUDA not available on this AMD dev box.  The module
 imports cleanly with TRITON_AVAILABLE=False.  The @triton.jit kernel is
 verified on VM (Task 6 batch).  Concerns flagged in the report.
+
+SPLIT-KV MERGE CORRECTNESS (3b — the one invariant that MUST hold):
+  Each split stores pre-normalization (acc_i, m_i, lse_i):
+    - m_i   = running max of softmax exponent for split i (fp32)
+    - lse_i = sum of exp(score - m_i) for split i (NOT log-normalized; raw sum)
+    - acc_i = sum of exp(score - m_i) * v for split i (NOT divided by lse_i)
+  Merge across splits (base-e, the online-softmax combine):
+    m   = max_i(m_i)
+    l   = sum_i(lse_i * exp(m_i - m))
+    out = sum_i(acc_i * exp(m_i - m)) / l
+  Identity at num_splits=1:
+    m   = m_0
+    l   = lse_0 * exp(m_0 - m_0) = lse_0 * 1 = lse_0
+    out = acc_0 * exp(0) / lse_0 = acc_0 / lse_0
+  This is EXACTLY the 3a final division: acc / lse — bit-identical.
+  At >1 splits: the combine is exactly online_softmax_update applied across splits.
+
+BASE-E CONSISTENCY: 3a kernel uses natural exp throughout (no exp2/log2 trick).
+  The 3b split kernel and merge kernel MUST also use base-e.  DO NOT import a
+  base-2 merge formula — that is a silent correctness trap (same class as the
+  3a base-e/base-2 issue flagged in the 3a report).
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 
@@ -100,12 +128,47 @@ def _require_triton() -> None:
 #   lse_new = lse_old * alpha + sum(p)
 #   acc_new = acc_old * alpha + p @ v    (1, D)
 #
-# For 3a we do NOT tile over D (one kernel launch loads the full D-slice).
+# For 3a/3b we do NOT tile over D (one kernel launch loads the full D-slice).
+#
+# 3b AUTOTUNE NOTE:
+#   @triton.autotune wraps the kernel with a configs list; key=["d","n_q_groups"]
+#   so Triton specializes on head dim + GQA groups (hardware-characteristic),
+#   NOT on seq_len / block count (which changes every decode step).
+#   do_not_specialize=["n_blocks_in_split"] prevents per-block-count recompiles
+#   (the AWS 10x TTFT regression).  n_blocks_in_split cannot be tl.constexpr
+#   because it varies per split; it is used only for loop bounds.
 
+
+# ---------------------------------------------------------------------------
+# Autotune configs — a few representative BLOCK/warp/stage combos.
+# Tuned on shape args only (d, n_q_groups).  NOT on seq_len.
+# ---------------------------------------------------------------------------
+#
+# These configs are intentionally modest; the VM run will tell us the winner.
+# Adding more configs costs compile time, not correctness.
 
 if TRITON_AVAILABLE:
+    # ---------------------------------------------------------------------------
+    # Autotune configs — a few representative BLOCK/warp/stage combos.
+    # Tuned on shape args only (d, n_q_groups).  NOT on seq_len.
+    # These configs are intentionally modest; the VM run will tell us the winner.
+    # Adding more configs costs compile time, not correctness.
+    # ---------------------------------------------------------------------------
+    # Import Config directly so Pylance sees the concrete type (not `triton: None`).
+    from triton import Config as _TritonConfig
 
-    @triton.jit
+    _AUTOTUNE_CONFIGS = [
+        _TritonConfig({"BLK": 64}, num_warps=4, num_stages=2),
+        _TritonConfig({"BLK": 64}, num_warps=8, num_stages=2),
+        _TritonConfig({"BLK": 128}, num_warps=4, num_stages=2),
+        _TritonConfig({"BLK": 128}, num_warps=8, num_stages=2),
+    ]
+
+    @triton.autotune(
+        configs=_AUTOTUNE_CONFIGS,
+        key=["d", "n_q_groups"],
+    )
+    @triton.jit(do_not_specialize=["n_blocks_in_split"])
     def _online_softmax_block_kernel(
         q_ptr,
         k_ptr,
@@ -114,30 +177,36 @@ if TRITON_AVAILABLE:
         m_ptr,
         lse_ptr,
         scale,
-        BLK: tl.constexpr,
-        D: tl.constexpr,
+        n_blocks_in_split,  # runtime arg — do_not_specialize, NOT constexpr  # noqa: ARG001
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,  # noqa: ARG001
+        BLK: tl.constexpr,  # set by autotune
     ):
         """Online-softmax step for ONE query head over ONE (BLK, D) K/V block.
 
         Grid: (n_q_groups,) — each program is one query head within the KV head.
-        Correctness-first (3a): one query row at a time, full D loaded, no tiling.
+        Correctness-first (3a/3b): one query row at a time, full D loaded, no tiling.
 
         tl.dot is safe here: all matrix dims are D (≥64) and BLK (≥16 in practice).
         The G (n_q_groups) dimension is NOT a tl.dot dimension — it is the grid.
+
+        3b note: n_blocks_in_split is do_not_specialize so Triton does not recompile
+        when sequence length changes between decode steps.  BLK is now autotune-
+        provided (constexpr from configs), not passed directly at each launch.
         """
         g = tl.program_id(0)  # which query head (within this KV head)
-        d_idx = tl.arange(0, D)
+        d_idx = tl.arange(0, d)
         b_idx = tl.arange(0, BLK)
 
         # ------------------------------------------------------------------
         # Load q row: (1, D) for this query head
         # ------------------------------------------------------------------
-        q_row = tl.load(q_ptr + g * D + d_idx).to(tl.float32)  # (D,)
+        q_row = tl.load(q_ptr + g * d + d_idx).to(tl.float32)  # (D,)
 
         # ------------------------------------------------------------------
         # Load k block: (BLK, D)
         # ------------------------------------------------------------------
-        k_offsets = b_idx[:, None] * D + d_idx[None, :]  # (BLK, D)
+        k_offsets = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
         k = tl.load(k_ptr + k_offsets).to(tl.float32)  # (BLK, D)
 
         # ------------------------------------------------------------------
@@ -145,7 +214,7 @@ if TRITON_AVAILABLE:
         # Use tl.dot: (1, D) x (D, BLK) -> (1, BLK), then squeeze to (BLK,).
         # Reshape q_row to (1, D) for tl.dot.
         # ------------------------------------------------------------------
-        q_2d = tl.reshape(q_row, (1, D))  # (1, D)
+        q_2d = tl.reshape(q_row, (1, d))  # (1, D)
         scores_2d = tl.dot(q_2d, tl.trans(k)) * scale  # (1, BLK)
         scores = tl.reshape(scores_2d, (BLK,))  # (BLK,)
 
@@ -163,22 +232,22 @@ if TRITON_AVAILABLE:
         # ------------------------------------------------------------------
         # Accumulator update: acc_new = acc_old * alpha + p @ v   (D,)
         # ------------------------------------------------------------------
-        v_offsets = b_idx[:, None] * D + d_idx[None, :]  # (BLK, D)
+        v_offsets = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
         v = tl.load(v_ptr + v_offsets).to(tl.float32)  # (BLK, D)
 
-        acc_old = tl.load(acc_ptr + g * D + d_idx).to(tl.float32)  # (D,)
+        acc_old = tl.load(acc_ptr + g * d + d_idx).to(tl.float32)  # (D,)
 
         # p @ v: (BLK,) x (BLK, D) -> (D,) via tl.dot on (1, BLK) x (BLK, D)
         p_2d = tl.reshape(p, (1, BLK))  # (1, BLK)
         pv_2d = tl.dot(p_2d, v)  # (1, D)
-        pv = tl.reshape(pv_2d, (D,))  # (D,)
+        pv = tl.reshape(pv_2d, (d,))  # (D,)
 
         acc_new = acc_old * alpha + pv  # (D,)
 
         # ------------------------------------------------------------------
         # Store updated (acc, m, lse)
         # ------------------------------------------------------------------
-        tl.store(acc_ptr + g * D + d_idx, acc_new.to(tl.float16))
+        tl.store(acc_ptr + g * d + d_idx, acc_new.to(tl.float16))
         tl.store(m_ptr + g, m_new.to(tl.float32))
         tl.store(lse_ptr + g, lse_new.to(tl.float32))
 
@@ -197,6 +266,7 @@ def _online_block_kernel_launch(
     lse: torch.Tensor,
     n_q_groups: int,
     scale: float,
+    n_blocks_in_split: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the Triton online-softmax kernel for one (h_kv, blk, d) K/V block.
 
@@ -206,20 +276,23 @@ def _online_block_kernel_launch(
     into one launch is a 3b concern.
 
     Args:
-        q:          (n_q_heads, 1, d) fp16
-        K_kv:       (h_kv, blk, d) fp16 — dequanted + RoPE applied
-        V_kv:       (h_kv, blk, d) fp16
-        acc:        (n_q_heads, 1, d) fp16 — running accumulator (in-out)
-        m:          (n_q_heads, 1, 1) fp32 — running max (in-out)
-        lse:        (n_q_heads, 1, 1) fp32 — running lse denominator (in-out)
-        n_q_groups: n_q_heads // h_kv
-        scale:      attention scale (1/sqrt(d))
+        q:                  (n_q_heads, 1, d) fp16
+        K_kv:               (h_kv, blk, d) fp16 — dequanted + RoPE applied
+        V_kv:               (h_kv, blk, d) fp16
+        acc:                (n_q_heads, 1, d) fp16 — running accumulator (in-out)
+        m:                  (n_q_heads, 1, 1) fp32 — running max (in-out)
+        lse:                (n_q_heads, 1, 1) fp32 — running lse denominator (in-out)
+        n_q_groups:         n_q_heads // h_kv
+        scale:              attention scale (1/sqrt(d))
+        n_blocks_in_split:  total blocks in this split (passed to kernel as
+                            do_not_specialize runtime arg; prevents recompile
+                            per seq_len).
 
     Returns updated (acc, m, lse) — same shapes, updated in-place internally.
     """
     _require_triton()
     n_q_heads, n_q, d = q.shape
-    h_kv, blk, _d = K_kv.shape
+    h_kv, _blk, _d = K_kv.shape
     assert n_q == 1, "decode only"
     assert _d == d
 
@@ -243,6 +316,8 @@ def _online_block_kernel_launch(
         lse_kv = lse_buf[kv]  # (G,)  fp32 — Triton writes in-place
 
         # Grid = (n_q_groups,): each program is one query head within this KV head.
+        # Note: BLK is NOT passed explicitly — autotune provides it.
+        # n_blocks_in_split is a do_not_specialize runtime arg (not constexpr).
         _online_softmax_block_kernel[(n_q_groups,)](
             q_kv,
             k_kv,
@@ -251,8 +326,9 @@ def _online_block_kernel_launch(
             m_kv,
             lse_kv,
             float(scale),
-            BLK=blk,
-            D=d,
+            int(n_blocks_in_split),
+            d=d,
+            n_q_groups=n_q_groups,
         )
         # Triton stores in-place via pointer, so acc_kv/m_kv/lse_kv are updated.
 
@@ -261,6 +337,91 @@ def _online_block_kernel_launch(
     m_new = m_buf.view(n_q_heads, 1, 1)
     lse_new = lse_buf.view(n_q_heads, 1, 1)
     return acc_new, m_new, lse_new
+
+
+# ---------------------------------------------------------------------------
+# Split-KV helpers: partition + merge (3b)
+# ---------------------------------------------------------------------------
+
+
+def _partition_blocks(
+    k_blocks: list,
+    v_blocks: list,
+    num_splits: int,
+) -> list[tuple[list, list]]:
+    """Partition (k_blocks, v_blocks) into num_splits contiguous ranges.
+
+    If len(blocks) < num_splits, some splits get zero blocks.  The caller
+    handles empty splits by detecting them before the kernel launch.
+
+    Returns a list of (k_split, v_split) pairs of length num_splits.
+    """
+    n = len(k_blocks)
+    # Ceiling-division chunk sizes so all blocks are covered.
+    chunk = math.ceil(n / num_splits) if n > 0 else 1
+    splits = []
+    for s in range(num_splits):
+        lo = s * chunk
+        hi = min(lo + chunk, n)
+        splits.append((k_blocks[lo:hi], v_blocks[lo:hi]))
+    return splits
+
+
+def _merge_partials(
+    partial_accs: list[torch.Tensor],
+    partial_ms: list[torch.Tensor],
+    partial_lses: list[torch.Tensor],
+) -> torch.Tensor:
+    """Merge per-split (acc_i, m_i, lse_i) into the final normalized output.
+
+    Implements the standard online-softmax combine across splits (base-e):
+
+        m   = max_i(m_i)                            # global running max
+        l   = sum_i(lse_i * exp(m_i - m))           # re-scaled lse sum
+        out = sum_i(acc_i * exp(m_i - m)) / l       # re-scaled acc sum, normalized
+
+    CORRECTNESS INVARIANT (num_splits=1):
+        m   = m_0
+        l   = lse_0 * exp(m_0 - m_0) = lse_0
+        out = acc_0 * 1 / lse_0 = acc_0 / lse_0
+        => Bit-identical to 3a's final division `acc / lse`.
+
+    AT MULTIPLE SPLITS:
+        This is exactly online_softmax_update applied across the split axis,
+        giving the same result as if all blocks had been processed serially.
+
+    BASE-E NOTE: partial_lse is the raw unnormalized sum-of-softmax-weights
+    (lse in online_softmax_update — not the log of that sum).  The correction
+    exp(m_i - m) is base-e.  Do NOT use exp2/log2 here (3a kernel is base-e).
+
+    Args:
+        partial_accs:  list of (n_q_heads, 1, d) fp32/fp16 — pre-normalized acc
+        partial_ms:    list of (n_q_heads, 1, 1) fp32 — per-split running max
+        partial_lses:  list of (n_q_heads, 1, 1) fp32 — per-split lse denominator
+
+    Returns:
+        out: (n_q_heads, 1, d) fp16 — merged normalized attention output
+    """
+    # Stack to (num_splits, n_q_heads, 1, d/1) for vectorized ops.
+    # Keep fp32 throughout to avoid fp16 saturation during accumulation.
+    accs = torch.stack([a.float() for a in partial_accs], dim=0)  # (S, H, 1, d)
+    ms = torch.stack([m.float() for m in partial_ms], dim=0)  # (S, H, 1, 1)
+    lses = torch.stack([lse_t.float() for lse_t in partial_lses], dim=0)  # (S, H, 1, 1)
+
+    # Global max across splits — shape (1, H, 1, 1) -> broadcast over S
+    m_global = ms.amax(dim=0, keepdim=True)  # (1, H, 1, 1)
+
+    # Rescaling factors per split: exp(m_i - m_global)
+    scales = torch.exp(ms - m_global)  # (S, H, 1, 1) — base-e, matches 3a
+
+    # Merged denominator: sum_i(lse_i * exp(m_i - m))
+    l_merged = (lses * scales).sum(dim=0)  # (H, 1, 1)
+
+    # Merged numerator: sum_i(acc_i * exp(m_i - m))  — (S, H, 1, d) * (S, H, 1, 1)
+    acc_merged = (accs * scales).sum(dim=0)  # (H, 1, d)
+
+    # Normalize and return in fp16 (matches 3a's `acc / lse.to(q.dtype)`)
+    return (acc_merged / l_merged).to(torch.float16)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +445,7 @@ def triton_decode_attention(
     v_tail: torch.Tensor | None,
     n_q_groups: int,
     scale: float,
+    num_splits: int = 1,
 ) -> torch.Tensor:
     """Triton decode attention: online-softmax over packed KV blocks.
 
@@ -295,8 +457,40 @@ def triton_decode_attention(
     Each block:  PyTorch dequant -> Triton _online_softmax_block_kernel.
     Carry (acc, m, lse) flows between launches in Python/PyTorch tensors.
 
+    Stage 3b (num_splits > 1):
+    The block list is partitioned into num_splits contiguous ranges.  Each
+    split runs the 3a serial-online-softmax independently, producing a partial
+    (acc_i, m_i, lse_i) with acc_i NOT yet divided by lse_i.  _merge_partials
+    then combines them via the standard online-softmax combine (base-e).
+
+    num_splits=1 (default) is BACK-COMPATIBLE with 3a: the merge with a single
+    partial reduces exactly to acc_0 / lse_0 (see _merge_partials docstring).
+
     GQA: one Triton launch per KV head per block (fusing into one launch
-    per block is a 3b optimisation).
+    per block is a 3c optimisation).
+
+    Args:
+        q:          (n_q_heads, 1, d) fp16 — single decode query token
+        k_blocks:   list of (packed_dict, start, end) — packed KV key blocks
+        v_blocks:   list of (packed_dict, start, end) — packed KV value blocks
+        k_arm:      codec arm name for keys (e.g. "rtn_token")
+        v_arm:      codec arm name for values
+        group:      quantization group size
+        seed:       quantization seed (for reproducibility)
+        k_pre_rope: if True, apply RoPE to K at read time (pre-RoPE keys)
+        rope_cos:   (S, d) fp16|fp32 — cosine table, sliced [start:end] per block
+        rope_sin:   (S, d) fp16|fp32 — sine table
+        k_tail:     (h_kv, tail_len, d) fp16|None — unquantized residual window
+        v_tail:     (h_kv, tail_len, d) fp16|None
+        n_q_groups: n_q_heads // h_kv (GQA group count)
+        scale:      attention scale, typically 1/sqrt(d)
+        num_splits: number of KV-block splits for decode parallelism (default 1).
+                    1 = 3a serial path (back-compatible, bit-identical to 3a).
+                    >1 = 3b split path: partition blocks, merge partials.
+                    The tail block (k_tail/v_tail) is always processed in split 0.
+
+    Returns:
+        (n_q_heads, 1, d) fp16 attention output.
     """
     _require_triton()
     from bmx.cache.codecs import dequant_packed
@@ -308,21 +502,19 @@ def triton_decode_attention(
     )
     h_kv = n_q_heads // n_q_groups
 
-    # Initialise carry tensors on the same device as q.
-    acc = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
-    m = torch.full(
-        (n_q_heads, n_q, 1), float("-inf"), dtype=torch.float32, device=q.device
-    )
-    lse = torch.zeros(n_q_heads, n_q, 1, dtype=torch.float32, device=q.device)
-
-    def _attend(K_kv: torch.Tensor, V_kv: torch.Tensor) -> None:
-        nonlocal acc, m, lse
-        acc, m, lse = _online_block_kernel_launch(
-            q, K_kv, V_kv, acc, m, lse, n_q_groups, scale
+    def _init_carry() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fresh (acc, m, lse) carry tensors on q's device."""
+        acc_ = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
+        m_ = torch.full(
+            (n_q_heads, n_q, 1), float("-inf"), dtype=torch.float32, device=q.device
         )
+        lse_ = torch.zeros(n_q_heads, n_q, 1, dtype=torch.float32, device=q.device)
+        return acc_, m_, lse_
 
-    for (kpacked, start, end), (vpacked, _vs, _ve) in zip(k_blocks, v_blocks):
-        # Stage 3a: dequant in PyTorch (3b/3c will move this in-kernel).
+    def _dequant_block(
+        kpacked: dict, vpacked: dict, start: int, end: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dequantize one KV block pair → (K_kv, V_kv) on q's device, fp16."""
         K_kv = from_matrix(
             dequant_packed(k_arm, kpacked, seed=seed, group=group), h_kv
         ).to(q.dtype)
@@ -335,11 +527,94 @@ def triton_decode_attention(
         V_kv = from_matrix(
             dequant_packed(v_arm, vpacked, seed=seed, group=group), h_kv
         ).to(q.dtype)
-        _attend(K_kv, V_kv)
+        return K_kv, V_kv
 
-    # fp16 tail window (post-RoPE for K, already in correct dtype).
-    if k_tail is not None and k_tail.shape[1] > 0:
-        _attend(k_tail.to(q.dtype), v_tail.to(q.dtype))
+    def _run_split(
+        kb_split: list, vb_split: list, with_tail: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the 3a serial online-softmax over one split's blocks.
 
-    # Normalise: acc / lse (lse is the raw sum-of-weights, not log-normalised).
-    return acc / lse.to(q.dtype)
+        Returns pre-normalization (acc, m, lse) — do NOT divide acc by lse here.
+        The caller (_merge_partials) handles the final normalization.
+
+        with_tail: if True, also consume the k_tail/v_tail residual window.
+        NOTE: Only one split (split 0) receives the tail (avoids double-counting).
+        """
+        acc, m, lse = _init_carry()
+        n_blocks_in_split = len(kb_split) + (
+            1 if with_tail and k_tail is not None and k_tail.shape[1] > 0 else 0
+        )
+
+        for (kpacked, start, end), (vpacked, _vs, _ve) in zip(kb_split, vb_split):
+            K_kv, V_kv = _dequant_block(kpacked, vpacked, start, end)
+            acc, m, lse = _online_block_kernel_launch(
+                q,
+                K_kv,
+                V_kv,
+                acc,
+                m,
+                lse,
+                n_q_groups,
+                scale,
+                n_blocks_in_split=n_blocks_in_split,
+            )
+
+        if with_tail and k_tail is not None and k_tail.shape[1] > 0:
+            assert v_tail is not None, "v_tail must be set when k_tail is set"
+            acc, m, lse = _online_block_kernel_launch(
+                q,
+                k_tail.to(q.dtype),
+                v_tail.to(q.dtype),
+                acc,
+                m,
+                lse,
+                n_q_groups,
+                scale,
+                n_blocks_in_split=n_blocks_in_split,
+            )
+
+        return acc, m, lse
+
+    # ------------------------------------------------------------------
+    # num_splits=1 fast path: 3a-compatible serial loop (back-compat)
+    # ------------------------------------------------------------------
+    if num_splits == 1:
+        acc, _m, lse = _run_split(k_blocks, v_blocks, with_tail=True)
+        # 3a-identical normalization path (preserves bit-identity for num_splits=1)
+        return acc / lse.to(q.dtype)
+
+    # ------------------------------------------------------------------
+    # num_splits>1: split-KV parallel path (3b)
+    # ------------------------------------------------------------------
+    splits = _partition_blocks(k_blocks, v_blocks, num_splits)
+
+    partial_accs = []
+    partial_ms = []
+    partial_lses = []
+
+    for s_idx, (kb_split, vb_split) in enumerate(splits):
+        # Skip empty splits (when n_blocks < num_splits).
+        # Empty splits contribute zero to the merge — handled by sentinel m=-inf, lse=0.
+        # But that would break the merge (0/0 if ALL splits empty).
+        # Instead, only add non-empty splits to the partial lists.
+        with_tail = s_idx == 0  # tail always goes to split 0
+        has_blocks = len(kb_split) > 0
+        has_tail_here = with_tail and k_tail is not None and k_tail.shape[1] > 0
+        if not has_blocks and not has_tail_here:
+            # Truly empty split — skip to avoid degenerate lse=0
+            continue
+
+        acc_i, m_i, lse_i = _run_split(kb_split, vb_split, with_tail=with_tail)
+        partial_accs.append(acc_i)
+        partial_ms.append(m_i)
+        partial_lses.append(lse_i)
+
+    if not partial_accs:
+        # Edge case: no blocks and no tail — return zeros (empty context)
+        return torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
+
+    if len(partial_accs) == 1:
+        # Only one non-empty split: skip merge overhead, normalize directly.
+        return partial_accs[0] / partial_lses[0].to(q.dtype)
+
+    return _merge_partials(partial_accs, partial_ms, partial_lses)
