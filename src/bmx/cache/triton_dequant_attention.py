@@ -1471,6 +1471,236 @@ def triton_decode_attention_graphable(
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 3a: FUSED decode kernel — single launch, internal KV-block loop.
+#
+# THE REWRITE. The per-block Python launch loop (triton_decode_attention,
+# _online_block_kernel_launch) is the dominant suboptimality: n_blocks * h_kv
+# launches per decode step, carry threaded through PyTorch between launches.
+# Baseline (results/k3_triton_decode/...1767dcf): ~1.6x SLOWER than chunked
+# PyTorch at every context (launch overhead dominates).
+#
+# This fused kernel does ONE launch and loops over ALL KV blocks INTERNALLY,
+# carrying (m, lse, acc) in fp32 registers, one output write. Design grounded in
+# the brain consult (personal-brain both layers + deepwiki flashinfer/vLLM/triton;
+# see SDD ledger "VM PHASE 3a — design locked"):
+#   - GQA GROUP FUSION: each program handles ONE kv_head and ALL n_q_groups query
+#     heads. The KV tile is loaded ONCE per block and reused across the whole group
+#     -> 4x less KV HBM traffic (the KV load IS the whole cost at M=1 decode).
+#     (vLLM "3D kernel": process all Q heads of a KV head together for cache reuse.)
+#   - REGISTER CARRY: acc[G, D], m[G], lse[G] live in fp32 registers across the
+#     whole block loop (acc = 4*128 fp32 = 2KB/program, trivial vs 256KB SM regs).
+#     fp16 accumulation over 512-2000 blocks would lose precision (FlashAttention).
+#   - FIRST-BLOCK -inf: m init -inf, lse/acc init 0. On block 0, alpha =
+#     exp(-inf - m_new) = 0 annihilates the garbage init (lse=0*0+sum p,
+#     acc=0*0+pv). No special-case — flashinfer relies on exactly this.
+#   - 128-bit LDG.E.128 loads are AUTOMATIC from contiguous fp16 D=128 inner axis;
+#     eviction_policy="evict_first" makes KV a read-once L2 stream (read exactly
+#     once per decode step) so it doesn't evict the reused weight working set.
+#   - GEMV (multiply + tl.sum), NOT tl.dot: decode is M=1, bandwidth-bound; tl.dot
+#     is useless at M=1 and has a min-dim>=16 constraint.
+#
+# num_splits=1 first cut (this kernel). Split-KV (grid z-dim + merge kernel) is
+# 3a.2 — needed for SM utilization at long context (no-split = 32/132 SMs on GH200).
+#
+# Correctness bar: max_abs vs naive_dense_attention < 1e-2 (expect ~2-3e-4 at fp16).
+# ---------------------------------------------------------------------------
+
+if TRITON_AVAILABLE:
+    _FUSED_AUTOTUNE_CONFIGS = [
+        _TritonConfig({"BLOCK_N": 64}, num_warps=4, num_stages=2),
+        _TritonConfig({"BLOCK_N": 64}, num_warps=8, num_stages=3),
+        _TritonConfig({"BLOCK_N": 128}, num_warps=4, num_stages=3),
+        _TritonConfig({"BLOCK_N": 128}, num_warps=8, num_stages=4),
+    ]
+
+    @triton.autotune(configs=_FUSED_AUTOTUNE_CONFIGS, key=["d", "n_q_groups"])
+    @triton.jit(do_not_specialize=["seq_len"])
+    def _fused_decode_kernel(
+        # Query: (h_kv, n_q_groups, d) — n_q=1 squeezed, GQA-grouped view
+        q_ptr,
+        # Pre-stacked dense KV: (max_blocks, h_kv, blk_size, d) contiguous fp16
+        k_stacked_ptr,
+        v_stacked_ptr,
+        # Output: (h_kv, n_q_groups, d) fp16 — final normalized attention out
+        out_ptr,
+        # Live sequence length (Python int runtime arg; do_not_specialize so the
+        # kernel is NOT recompiled per decode step / per seq_len).
+        seq_len,
+        scale,  # fp32 1/sqrt(d)
+        h_kv: tl.constexpr,  # number of KV heads (stacked stride; fixed model dim)
+        blk_size: tl.constexpr,  # tokens per stored block (== build_kv_stacked blk)
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,  # G query heads per KV head (group-fused)
+        BLOCK_N: tl.constexpr,  # KV tile rows per loop iter (autotuned; mult of blk_size)
+    ):
+        """Fused decode online-softmax: ONE program per KV head, loops all blocks.
+
+        Grid: (h_kv,) — program_id(0) = kv_head. Each program walks the entire KV
+        length for its head and accumulates ALL n_q_groups query heads in registers.
+
+        Layout (all contiguous):
+          q_ptr:         (h_kv, G, d)            — q[kv, g, :] = q_ptr[(kv*G+g)*d + :]
+          k/v_stacked:   (max_blocks, h_kv, blk_size, d)
+                         block b, head kv -> base = (b*h_kv + kv)*blk_size*d
+          out_ptr:       (h_kv, G, d)            — same layout as q
+
+        KV is stored block-major (blk_size rows per stored block). We iterate in
+        BLOCK_N-row tiles (BLOCK_N a multiple of blk_size) over [0, seq_len); the
+        last tile is masked by `b_abs < seq_len`. Within a tile the K/V load is
+        (BLOCK_N, d) contiguous fp16 -> automatic 128-bit loads; evict_first marks
+        it read-once.
+        """
+        kv = tl.program_id(0)  # which KV head
+        d_idx = tl.arange(0, d)  # (d,)
+        g_idx = tl.arange(0, n_q_groups)  # (G,)
+        n_idx = tl.arange(0, BLOCK_N)  # (BLOCK_N,) tile-local row offsets
+
+        # ------------------------------------------------------------------
+        # Load all G query rows for this KV head: (G, d) fp32, resident in regs.
+        # q[kv, g, dd] = q_ptr[(kv*G + g)*d + dd]
+        # ------------------------------------------------------------------
+        q_offsets = (kv * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G, d)
+        q_rows = tl.load(q_ptr + q_offsets).to(tl.float32)  # (G, d)
+
+        # ------------------------------------------------------------------
+        # Register carry for the whole GQA group (fp32 across the entire loop).
+        # ------------------------------------------------------------------
+        m = tl.full((n_q_groups,), float("-inf"), tl.float32)  # (G,) running max
+        lse = tl.zeros((n_q_groups,), tl.float32)  # (G,) running denom
+        acc = tl.zeros((n_q_groups, d), tl.float32)  # (G, d) running weighted V
+
+        # Per-head base offset into the stacked KV for THIS kv head (block stride
+        # added per iteration). Stacked stride over blocks = h_kv*blk_size*d.
+        block_stride = blk_size * d  # within one (block, head) the rows are blk_size*d
+        head_stride = h_kv * blk_size * d  # advance one stored block = h_kv heads
+
+        # ------------------------------------------------------------------
+        # Internal block loop: walk [0, seq_len) in BLOCK_N-row tiles.
+        # ------------------------------------------------------------------
+        n_tiles = (seq_len + BLOCK_N - 1) // BLOCK_N
+        for t in range(n_tiles):
+            tile_start = t * BLOCK_N  # absolute first token of this tile
+            b_abs = tile_start + n_idx  # (BLOCK_N,) absolute token indices
+            tile_mask = b_abs < seq_len  # (BLOCK_N,) valid-token mask
+
+            # Map each absolute token to its (stored_block, row_in_block) and then
+            # to a flat element offset in the stacked tensor for THIS kv head:
+            #   stored_block = b_abs // blk_size ; row = b_abs % blk_size
+            #   elem_base(row, dd) = stored_block*head_stride + kv*block_stride
+            #                        + row*d + dd
+            stored_block = b_abs // blk_size  # (BLOCK_N,)
+            row_in_block = b_abs % blk_size  # (BLOCK_N,)
+            kv_row_base = (
+                stored_block * head_stride + kv * block_stride + row_in_block * d
+            )  # (BLOCK_N,) flat base for each tile row
+            kv_offsets = kv_row_base[:, None] + d_idx[None, :]  # (BLOCK_N, d)
+
+            # evict_first: KV is read exactly once per decode step (read-once L2
+            # streaming; keep it from evicting the reused weight working set).
+            k = tl.load(
+                k_stacked_ptr + kv_offsets,
+                mask=tile_mask[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)  # (BLOCK_N, d)
+
+            # scores[g, n] = scale * sum_dd q[g, dd] * k[n, dd]  -> (G, BLOCK_N)
+            # GEMV via broadcast-multiply + tl.sum (M=1 decode; no tl.dot min-dim).
+            scores = (
+                tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
+            )  # (G, BLOCK_N)
+            # Mask OOB tile rows to -inf so they vanish in max + denom.
+            scores = tl.where(tile_mask[None, :], scores, float("-inf"))  # (G, BLOCK_N)
+
+            # Online-softmax update (base-e), per query head g:
+            m_tile = tl.max(scores, axis=1)  # (G,) max over this tile
+            m_new = tl.maximum(m, m_tile)  # (G,)
+            alpha = tl.exp(m - m_new)  # (G,) old-state rescale (0 when m=-inf)
+            p = tl.exp(scores - m_new[:, None])  # (G, BLOCK_N)
+            lse = lse * alpha + tl.sum(p, axis=1)  # (G,)
+
+            v = tl.load(
+                v_stacked_ptr + kv_offsets,
+                mask=tile_mask[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)  # (BLOCK_N, d)
+            # pv[g, dd] = sum_n p[g, n] * v[n, dd]  -> (G, d)
+            pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)  # (G, d)
+            acc = acc * alpha[:, None] + pv  # (G, d)
+            m = m_new
+
+        # ------------------------------------------------------------------
+        # Normalize and write out: out[kv, g, :] = acc[g, :] / lse[g]
+        # ------------------------------------------------------------------
+        out = acc / lse[:, None]  # (G, d) fp32
+        out_offsets = (kv * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G, d)
+        tl.store(out_ptr + out_offsets, out.to(tl.float16))
+
+
+def fused_decode_attention(
+    q: torch.Tensor,
+    k_stacked: torch.Tensor,
+    v_stacked: torch.Tensor,
+    seq_len: int,
+    *,
+    n_q_groups: int,
+    scale: float,
+) -> torch.Tensor:
+    """Fused single-launch decode attention over pre-stacked dense KV.
+
+    ONE Triton launch (grid=(h_kv,)); the kernel loops over ALL KV blocks
+    internally with a register-resident (m, lse, acc) carry, group-fusing all
+    n_q_groups query heads of each KV head (KV tile loaded once per block,
+    reused across the group). This replaces the per-block Python launch loop.
+
+    num_splits=1 (this entry point). Split-KV parallelism is 3a.2.
+
+    Args:
+        q:           (n_q_heads, 1, d) fp16 CUDA — single decode query token.
+        k_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted
+                     keys (RoPE already applied if pre-RoPE). See build_kv_stacked.
+        v_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted V.
+        seq_len:     live number of KV tokens (<= max_blocks*blk_size). Tokens
+                     beyond seq_len in the last stored block are masked out.
+        n_q_groups:  n_q_heads // h_kv (GQA group count).
+        scale:       attention scale (1/sqrt(d)).
+
+    Returns:
+        (n_q_heads, 1, d) fp16 attention output.
+    """
+    _require_triton()
+    n_q_heads, n_q, d = q.shape
+    assert n_q == 1, "fused_decode_attention is decode-only (n_q==1)"
+    max_blocks, h_kv, blk_size, _d = k_stacked.shape
+    assert _d == d, f"k_stacked d={_d} != q d={d}"
+    assert n_q_heads == h_kv * n_q_groups, (
+        f"n_q_heads={n_q_heads} != h_kv={h_kv} * n_q_groups={n_q_groups}"
+    )
+    assert seq_len <= max_blocks * blk_size, (
+        f"seq_len={seq_len} > capacity max_blocks*blk_size={max_blocks * blk_size}"
+    )
+
+    # Query laid out (h_kv, G, d) contiguous so q[kv, g, :] is a clean offset.
+    q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
+    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
+
+    _fused_decode_kernel[(h_kv,)](
+        q_kv,
+        k_stacked,
+        v_stacked,
+        out,
+        int(seq_len),
+        float(scale),
+        h_kv=h_kv,
+        blk_size=blk_size,
+        d=d,
+        n_q_groups=n_q_groups,
+    )
+    return out.view(n_q_heads, 1, d)
+
+
 def build_kv_stacked(
     k_blocks: list,
     v_blocks: list,
