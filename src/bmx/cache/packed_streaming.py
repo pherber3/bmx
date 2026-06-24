@@ -355,17 +355,11 @@ class PackedStreamingLayer(DynamicLayer):
         # that would silently fall back on a kernel error.  A kernel error must
         # propagate so correctness regressions are never hidden.
         #
-        # CAPABILITY GUARD: k2b (lowrank_rtn_channel K) + pre_rope=True requires
-        # in-kernel RoPE application to lowrank-reconstructed keys — not yet
-        # implemented (triton_dequant_attention raises NotImplementedError for this
-        # config).  This is a capability-absence guard (explicit check, not
-        # try/except fallback), consistent with the fail-loud taxonomy.
-        # Tracked for VM/post-VM: extend _k2b_softmax_block_kernel to apply RoPE.
-        _k2b_pre_rope = (
-            self.k_spec.arm == "lowrank_rtn_channel" and self.k_spec.pre_rope
-        )
+        # The k2b (lowrank_rtn_channel K) + pre_rope=True path now applies RoPE to
+        # the lowrank-reconstructed K IN-KERNEL (verified vs the chunked reference on
+        # GH200), so the full k2b recipe runs on the Triton kernel — no fallback.
         is_decode = query_abs_start is None  # n_q==1
-        if TRITON_AVAILABLE and is_decode and not _k2b_pre_rope:
+        if TRITON_AVAILABLE and is_decode:
             return triton_decode_attention(
                 q,
                 self._k_blocks,

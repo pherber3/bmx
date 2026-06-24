@@ -285,6 +285,54 @@ def test_triton_k2b_decode_matches_oracle():
 
 
 @cuda
+def test_triton_k2b_pre_rope_matches_chunked():
+    """k2b with k_pre_rope=True (the canonical recipe) applies RoPE to the
+    lowrank-reconstructed K IN-KERNEL.  Reference is chunked_dequant_attention
+    (PyTorch apply_rope on reconstructed K — the verified pre-RoPE path), so this
+    confirms the in-kernel rotate_half matches.  GQA (n_q_groups=4) + multi-KV-head.
+    """
+    from bmx.cache.chunked_attention import attention_diff, chunked_dequant_attention
+    from bmx.cache.triton_dequant_attention import triton_decode_attention
+
+    torch.manual_seed(99)
+    n_q_heads, n_q_groups, d, blk, n_blocks = 8, 4, 64, 64, 2
+    q, kb_cpu, vb_cpu, kw = _tiny_k2b_blocks(
+        n_q_heads=n_q_heads,
+        n_q_groups=n_q_groups,
+        d=d,
+        blk=blk,
+        n_blocks=n_blocks,
+        k_bits=3,
+        k_rank=16,
+        k_group=32,
+        k_seed=0,
+        v_bits=2,
+        v_seed=7,
+    )
+    # Fabricate valid RoPE cos/sin covering all positions (consistency is the test).
+    S = n_blocks * blk
+    ang = torch.randn(S, d)
+    cos, sin = torch.cos(ang).to(torch.float16), torch.sin(ang).to(torch.float16)
+    okw = {k: v for k, v in kw.items() if k != "query_abs_start"}
+    okw.update(k_pre_rope=True, rope_cos=cos, rope_sin=sin)
+
+    # Reference: chunked PyTorch path (apply_rope on reconstructed K).
+    ref = chunked_dequant_attention(q, kb_cpu, vb_cpu, **okw)
+
+    # Kernel path (RoPE applied in-kernel).
+    okw_cuda = dict(okw, rope_cos=cos.cuda(), rope_sin=sin.cuda())
+    out = triton_decode_attention(
+        q.cuda(), _blocks_cuda(kb_cpu), _blocks_cuda(vb_cpu), **okw_cuda
+    ).cpu()
+
+    diff = attention_diff(out, ref)
+    assert diff["max_abs"] < 2e-2, (
+        f"k2b in-kernel RoPE diverged from chunked reference: {diff}. "
+        "If max_abs >= 2e-2 investigate the in-kernel rotate_half — do NOT loosen."
+    )
+
+
+@cuda
 def test_triton_k2b_different_seeds_detected():
     """Verify K and V use DIFFERENT seeds — a seed mixup changes V significantly.
 
