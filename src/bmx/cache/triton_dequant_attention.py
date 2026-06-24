@@ -1610,7 +1610,7 @@ if TRITON_AVAILABLE:
         m_g = []  # scalar running max per head
         lse_g = []  # scalar running denom per head
         acc_g = []  # (d,) running weighted V per head
-        for g in tl.static_range(n_q_groups):
+        for g in range(n_q_groups):
             q_g.append(
                 tl.load(q_ptr + (kv * n_q_groups + g) * d + d_idx).to(tl.float32)
             )
@@ -1642,7 +1642,7 @@ if TRITON_AVAILABLE:
             ).to(tl.float32)  # (blk*d,)
             v = tl.reshape(v_flat, (blk_size, d))  # (blk, d)
 
-            for g in tl.static_range(n_q_groups):
+            for g in range(n_q_groups):
                 # scores[n] = scale * sum_dd q_g[dd] * k[n, dd]  -> (blk,)  (reduce
                 # only d; no G/BLOCK_N/d cube). q_g[g][None,:] broadcasts over rows.
                 scores = tl.sum(q_g[g][None, :] * k, axis=1) * scale  # (blk,)
@@ -1662,7 +1662,7 @@ if TRITON_AVAILABLE:
         # kernel divides by the combined denominator. Do NOT divide here.
         # ------------------------------------------------------------------
         head_row = s * h_kv + kv  # row index in (num_splits*h_kv, G[, d]) layout
-        for g in tl.static_range(n_q_groups):
+        for g in range(n_q_groups):
             base = (head_row * n_q_groups + g) * d
             tl.store(acc_part_ptr + base + d_idx, acc_g[g])  # (d,) fp32
             tl.store(m_part_ptr + head_row * n_q_groups + g, m_g[g])
