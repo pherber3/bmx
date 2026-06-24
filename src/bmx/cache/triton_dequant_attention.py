@@ -1515,18 +1515,24 @@ if TRITON_AVAILABLE:
     ]
 
     @triton.autotune(configs=_FUSED_AUTOTUNE_CONFIGS, key=["d", "n_q_groups"])
-    @triton.jit(do_not_specialize=["seq_len"])
+    @triton.jit(do_not_specialize=["seq_len", "num_splits"])
     def _fused_decode_kernel(
         # Query: (h_kv, n_q_groups, d) — n_q=1 squeezed, GQA-grouped view
         q_ptr,
         # Pre-stacked dense KV: (max_blocks, h_kv, blk_size, d) contiguous fp16
         k_stacked_ptr,
         v_stacked_ptr,
-        # Output: (h_kv, n_q_groups, d) fp16 — final normalized attention out
-        out_ptr,
-        # Live sequence length (Python int runtime arg; do_not_specialize so the
-        # kernel is NOT recompiled per decode step / per seq_len).
+        # Partial outputs (one per split), written by every program:
+        #   acc_part: (num_splits, h_kv, G, d) fp32 — pre-normalization weighted V
+        #   m_part:   (num_splits, h_kv, G)    fp32 — per-split running max
+        #   lse_part: (num_splits, h_kv, G)    fp32 — per-split denominator
+        acc_part_ptr,
+        m_part_ptr,
+        lse_part_ptr,
+        # Live sequence length + split count (Python int runtime args;
+        # do_not_specialize so the kernel is NOT recompiled per decode step).
         seq_len,
+        num_splits,
         scale,  # fp32 1/sqrt(d)
         h_kv: tl.constexpr,  # number of KV heads (stacked stride; fixed model dim)
         blk_size: tl.constexpr,  # tokens per stored block (== build_kv_stacked blk)
@@ -1534,31 +1540,48 @@ if TRITON_AVAILABLE:
         n_q_groups: tl.constexpr,  # G query heads per KV head (group-fused)
         BLOCK_N: tl.constexpr,  # KV tile rows per loop iter (autotuned; mult of blk_size)
     ):
-        """Fused decode online-softmax: ONE program per KV head, loops all blocks.
+        """Fused decode online-softmax with split-KV: one program per (kv_head, split).
 
-        Grid: (h_kv,) — program_id(0) = kv_head. Each program walks the entire KV
-        length for its head and accumulates ALL n_q_groups query heads in registers.
+        Grid: (h_kv, num_splits) — program (kv, s) walks ONLY its contiguous token
+        slice of the KV length and accumulates ALL n_q_groups query heads in
+        registers, writing a PARTIAL (acc, m, lse) to scratch. A second merge kernel
+        combines the num_splits partials per query head (Triton has no global
+        barrier -> the merge must be a separate launch; vLLM "3D kernel" pattern).
+
+        Token slice for split s: [s*tokens_per_split, (s+1)*tokens_per_split) ∩
+        [0, seq_len). tokens_per_split = ceil(seq_len / num_splits) rounded UP to a
+        multiple of blk_size so split boundaries land on stored-block edges (keeps
+        loads block-aligned). A split whose slice is empty writes m=-inf, lse=0 (the
+        merge skips it via the same alpha=exp(-inf)=0 mechanism).
 
         Layout (all contiguous):
-          q_ptr:         (h_kv, G, d)            — q[kv, g, :] = q_ptr[(kv*G+g)*d + :]
-          k/v_stacked:   (max_blocks, h_kv, blk_size, d)
-                         block b, head kv -> base = (b*h_kv + kv)*blk_size*d
-          out_ptr:       (h_kv, G, d)            — same layout as q
+          q_ptr:        (h_kv, G, d)          — q[kv, g, :] = q_ptr[(kv*G+g)*d + :]
+          k/v_stacked:  (max_blocks, h_kv, blk_size, d)
+                        token t, head kv -> base = ((t//blk)*h_kv + kv)*blk*d + (t%blk)*d
+          acc_part:     (num_splits, h_kv, G, d) — [(s*h_kv+kv)*G+g]*d + dd
+          m/lse_part:   (num_splits, h_kv, G)    — (s*h_kv+kv)*G + g
 
-        KV is stored block-major (blk_size rows per stored block). We iterate in
-        BLOCK_N-row tiles (BLOCK_N a multiple of blk_size) over [0, seq_len); the
-        last tile is masked by `b_abs < seq_len`. Within a tile the K/V load is
-        (BLOCK_N, d) contiguous fp16 -> automatic 128-bit loads; evict_first marks
-        it read-once.
+        Within a tile the K/V load is (BLOCK_N, d) contiguous fp16 -> automatic
+        128-bit loads; evict_first marks it read-once.
         """
         kv = tl.program_id(0)  # which KV head
+        s = tl.program_id(1)  # which split
         d_idx = tl.arange(0, d)  # (d,)
         g_idx = tl.arange(0, n_q_groups)  # (G,)
         n_idx = tl.arange(0, BLOCK_N)  # (BLOCK_N,) tile-local row offsets
 
         # ------------------------------------------------------------------
+        # This split's contiguous token range, block-aligned.
+        # tokens_per_split = ceil(seq_len/num_splits) rounded UP to a blk_size
+        # multiple so each split starts on a stored-block boundary.
+        # ------------------------------------------------------------------
+        raw = (seq_len + num_splits - 1) // num_splits  # ceil
+        tokens_per_split = ((raw + blk_size - 1) // blk_size) * blk_size  # round to blk
+        split_start = s * tokens_per_split
+        split_end = tl.minimum(split_start + tokens_per_split, seq_len)
+
+        # ------------------------------------------------------------------
         # Load all G query rows for this KV head: (G, d) fp32, resident in regs.
-        # q[kv, g, dd] = q_ptr[(kv*G + g)*d + dd]
         # ------------------------------------------------------------------
         q_offsets = (kv * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G, d)
         q_rows = tl.load(q_ptr + q_offsets).to(tl.float32)  # (G, d)
@@ -1570,25 +1593,20 @@ if TRITON_AVAILABLE:
         lse = tl.zeros((n_q_groups,), tl.float32)  # (G,) running denom
         acc = tl.zeros((n_q_groups, d), tl.float32)  # (G, d) running weighted V
 
-        # Per-head base offset into the stacked KV for THIS kv head (block stride
-        # added per iteration). Stacked stride over blocks = h_kv*blk_size*d.
         block_stride = blk_size * d  # within one (block, head) the rows are blk_size*d
         head_stride = h_kv * blk_size * d  # advance one stored block = h_kv heads
 
         # ------------------------------------------------------------------
-        # Internal block loop: walk [0, seq_len) in BLOCK_N-row tiles.
+        # Internal loop: walk [split_start, split_end) in BLOCK_N-row tiles.
+        # If split_start >= seq_len the range is empty and the loop runs 0 times
+        # -> carry stays (m=-inf, lse=0, acc=0): the empty-split partial.
         # ------------------------------------------------------------------
-        n_tiles = (seq_len + BLOCK_N - 1) // BLOCK_N
+        n_tiles = (split_end - split_start + BLOCK_N - 1) // BLOCK_N
         for t in range(n_tiles):
-            tile_start = t * BLOCK_N  # absolute first token of this tile
+            tile_start = split_start + t * BLOCK_N  # absolute first token of tile
             b_abs = tile_start + n_idx  # (BLOCK_N,) absolute token indices
-            tile_mask = b_abs < seq_len  # (BLOCK_N,) valid-token mask
+            tile_mask = b_abs < split_end  # (BLOCK_N,) valid-token mask
 
-            # Map each absolute token to its (stored_block, row_in_block) and then
-            # to a flat element offset in the stacked tensor for THIS kv head:
-            #   stored_block = b_abs // blk_size ; row = b_abs % blk_size
-            #   elem_base(row, dd) = stored_block*head_stride + kv*block_stride
-            #                        + row*d + dd
             stored_block = b_abs // blk_size  # (BLOCK_N,)
             row_in_block = b_abs % blk_size  # (BLOCK_N,)
             kv_row_base = (
@@ -1632,11 +1650,89 @@ if TRITON_AVAILABLE:
             m = m_new
 
         # ------------------------------------------------------------------
-        # Normalize and write out: out[kv, g, :] = acc[g, :] / lse[g]
+        # Store PRE-normalization partials for this (split, kv_head): the merge
+        # kernel divides by the combined denominator. Do NOT divide here.
         # ------------------------------------------------------------------
-        out = acc / lse[:, None]  # (G, d) fp32
-        out_offsets = (kv * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G, d)
-        tl.store(out_ptr + out_offsets, out.to(tl.float16))
+        head_row = s * h_kv + kv  # row index in (num_splits*h_kv, G[, d]) layout
+        acc_off = (head_row * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G,d)
+        tl.store(acc_part_ptr + acc_off, acc)  # fp32
+        ml_off = head_row * n_q_groups + g_idx  # (G,)
+        tl.store(m_part_ptr + ml_off, m)
+        tl.store(lse_part_ptr + ml_off, lse)
+
+    @triton.jit
+    def _fused_merge_kernel(
+        # Partials: (num_splits, h_kv, G, d) / (num_splits, h_kv, G)
+        acc_part_ptr,
+        m_part_ptr,
+        lse_part_ptr,
+        # Output: (h_kv, G, d) fp16
+        out_ptr,
+        num_splits,  # runtime int (do_not_specialize via being non-constexpr)
+        h_kv: tl.constexpr,
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,
+    ):
+        """Merge num_splits partial (acc, m, lse) into the final normalized output.
+
+        Grid: (h_kv,) — one program per KV head, merges all G query heads.
+
+        Online-softmax combine across splits (base-e):
+            m_g   = max_s m_part[s, g]
+            l_g   = sum_s lse_part[s, g] * exp(m_part[s, g] - m_g)
+            o_g   = sum_s acc_part[s, g] * exp(m_part[s, g] - m_g) / l_g
+        Empty splits carry m=-inf -> exp(-inf - m_g)=0, contributing nothing
+        (provided some split is non-empty so m_g is finite). With num_splits chosen
+        so at least split 0 is non-empty, m_g is always finite.
+        """
+        kv = tl.program_id(0)
+        d_idx = tl.arange(0, d)
+        g_idx = tl.arange(0, n_q_groups)
+
+        # First pass: global max across splits, per query head.
+        m_global = tl.full((n_q_groups,), float("-inf"), tl.float32)
+        for s in range(num_splits):
+            head_row = s * h_kv + kv
+            m_s = tl.load(m_part_ptr + head_row * n_q_groups + g_idx)  # (G,)
+            m_global = tl.maximum(m_global, m_s)
+
+        # Second pass: accumulate rescaled denom + numerator.
+        l_acc = tl.zeros((n_q_groups,), tl.float32)  # (G,)
+        o_acc = tl.zeros((n_q_groups, d), tl.float32)  # (G, d)
+        for s in range(num_splits):
+            head_row = s * h_kv + kv
+            ml_off = head_row * n_q_groups + g_idx  # (G,)
+            m_s = tl.load(m_part_ptr + ml_off)  # (G,)
+            lse_s = tl.load(lse_part_ptr + ml_off)  # (G,)
+            scale_s = tl.exp(m_s - m_global)  # (G,) 0 for empty/-inf splits
+            l_acc += lse_s * scale_s
+            acc_off = (head_row * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]
+            acc_s = tl.load(acc_part_ptr + acc_off)  # (G, d)
+            o_acc += acc_s * scale_s[:, None]
+
+        out = o_acc / l_acc[:, None]  # (G, d)
+        out_off = (kv * n_q_groups + g_idx)[:, None] * d + d_idx[None, :]  # (G, d)
+        tl.store(out_ptr + out_off, out.to(tl.float16))
+
+
+def pick_num_splits(seq_len: int, blk_size: int, h_kv: int, n_sms: int = 132) -> int:
+    """Choose num_splits for split-KV decode (brain/vLLM heuristic).
+
+    Targets ~one GH200 wave: base programs = h_kv; want h_kv*num_splits ≈ n_sms.
+    Clamp so each split still walks >= 1 stored block (min-work floor) and cap at
+    16 (vLLM: beyond ~16, reduce/HBM overhead dominates). Rounded to a power of 2.
+
+    At ctx <= ~a few blocks num_splits collapses to 1 (the min-work floor), which
+    is the no-split fast path — correct, since there's no length to parallelize.
+    """
+    n_blocks = max(1, (seq_len + blk_size - 1) // blk_size)
+    target = max(1, n_sms // max(1, h_kv))  # ~ceil(SMs / base programs)
+    target = min(target, n_blocks, 16)  # min-work floor + vLLM cap
+    # Round DOWN to a power of 2 (stable launch grid; avoids odd split sizes).
+    p = 1
+    while p * 2 <= target:
+        p *= 2
+    return p
 
 
 def fused_decode_attention(
@@ -1647,15 +1743,18 @@ def fused_decode_attention(
     *,
     n_q_groups: int,
     scale: float,
+    num_splits: int | None = None,
 ) -> torch.Tensor:
-    """Fused single-launch decode attention over pre-stacked dense KV.
+    """Fused split-KV decode attention over pre-stacked dense KV.
 
-    ONE Triton launch (grid=(h_kv,)); the kernel loops over ALL KV blocks
-    internally with a register-resident (m, lse, acc) carry, group-fusing all
-    n_q_groups query heads of each KV head (KV tile loaded once per block,
-    reused across the group). This replaces the per-block Python launch loop.
+    The decode kernel launches grid=(h_kv, num_splits): each program walks ONLY
+    its contiguous token slice, group-fusing all n_q_groups query heads (KV tile
+    loaded once per block, reused across the group), carrying (m, lse, acc) in
+    fp32 registers, and writes a PARTIAL. A second tiny merge kernel combines the
+    partials per query head. This replaces the per-block Python launch loop.
 
-    num_splits=1 (this entry point). Split-KV parallelism is 3a.2.
+    Split-KV gives the device-level parallelism a no-split grid lacks: grid=(h_kv,)
+    is only h_kv programs (8 on GH200's 132 SMs); the split dim fills the machine.
 
     Args:
         q:           (n_q_heads, 1, d) fp16 CUDA — single decode query token.
@@ -1666,6 +1765,8 @@ def fused_decode_attention(
                      beyond seq_len in the last stored block are masked out.
         n_q_groups:  n_q_heads // h_kv (GQA group count).
         scale:       attention scale (1/sqrt(d)).
+        num_splits:  KV splits for decode parallelism. None -> pick_num_splits
+                     (SM-aware heuristic). 1 = no-split (single program per head).
 
     Returns:
         (n_q_heads, 1, d) fp16 attention output.
@@ -1682,19 +1783,48 @@ def fused_decode_attention(
         f"seq_len={seq_len} > capacity max_blocks*blk_size={max_blocks * blk_size}"
     )
 
+    if num_splits is None:
+        num_splits = pick_num_splits(seq_len, blk_size, h_kv)
+    num_splits = max(1, int(num_splits))
+
     # Query laid out (h_kv, G, d) contiguous so q[kv, g, :] is a clean offset.
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
-    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
 
-    _fused_decode_kernel[(h_kv,)](
+    # Partial buffers, one per split (pre-normalization). fp32 to avoid loss.
+    acc_part = torch.empty(
+        num_splits, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
+    )
+    m_part = torch.empty(
+        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+    )
+    lse_part = torch.empty(
+        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+    )
+
+    _fused_decode_kernel[(h_kv, num_splits)](
         q_kv,
         k_stacked,
         v_stacked,
-        out,
+        acc_part,
+        m_part,
+        lse_part,
         int(seq_len),
+        int(num_splits),
         float(scale),
         h_kv=h_kv,
         blk_size=blk_size,
+        d=d,
+        n_q_groups=n_q_groups,
+    )
+
+    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
+    _fused_merge_kernel[(h_kv,)](
+        acc_part,
+        m_part,
+        lse_part,
+        out,
+        int(num_splits),
+        h_kv=h_kv,
         d=d,
         n_q_groups=n_q_groups,
     )
