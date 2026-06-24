@@ -1507,11 +1507,16 @@ def triton_decode_attention_graphable(
 # ---------------------------------------------------------------------------
 
 if TRITON_AVAILABLE:
+    # The kernel iterates ONE stored block (blk_size rows) per loop iter — the unit
+    # contiguous in memory for a single head — so there's no BLOCK_N tile to tune.
+    # Tune only num_warps (memory-bound tops ~4-8) and num_stages (the software
+    # pipeline that overlaps the next block's loads with current compute).
     _FUSED_AUTOTUNE_CONFIGS = [
-        _TritonConfig({"BLOCK_N": 64}, num_warps=4, num_stages=2),
-        _TritonConfig({"BLOCK_N": 64}, num_warps=8, num_stages=3),
-        _TritonConfig({"BLOCK_N": 128}, num_warps=4, num_stages=3),
-        _TritonConfig({"BLOCK_N": 128}, num_warps=8, num_stages=4),
+        _TritonConfig({}, num_warps=2, num_stages=2),
+        _TritonConfig({}, num_warps=4, num_stages=2),
+        _TritonConfig({}, num_warps=4, num_stages=3),
+        _TritonConfig({}, num_warps=8, num_stages=3),
+        _TritonConfig({}, num_warps=8, num_stages=4),
     ]
 
     @triton.autotune(configs=_FUSED_AUTOTUNE_CONFIGS, key=["d", "n_q_groups"])
@@ -1538,7 +1543,6 @@ if TRITON_AVAILABLE:
         blk_size: tl.constexpr,  # tokens per stored block (== build_kv_stacked blk)
         d: tl.constexpr,
         n_q_groups: tl.constexpr,  # G query heads per KV head (group-fused)
-        BLOCK_N: tl.constexpr,  # KV tile rows per loop iter (autotuned; mult of blk_size)
     ):
         """Fused decode online-softmax with split-KV: one program per (kv_head, split).
 
@@ -1561,24 +1565,37 @@ if TRITON_AVAILABLE:
           acc_part:     (num_splits, h_kv, G, d) — [(s*h_kv+kv)*G+g]*d + dd
           m/lse_part:   (num_splits, h_kv, G)    — (s*h_kv+kv)*G + g
 
-        Within a tile the K/V load is (BLOCK_N, d) contiguous fp16 -> automatic
-        128-bit loads; evict_first marks it read-once.
+        The K/V load is one stored block (blk_size, d) via a FLAT contiguous run
+        (block_base + arange(blk_size*d)) so Triton proves contiguity and emits
+        128-bit LDG.E.128; evict_first marks it read-once.
         """
         kv = tl.program_id(0)  # which KV head
         s = tl.program_id(1)  # which split
         d_idx = tl.arange(0, d)  # (d,)
         g_idx = tl.arange(0, n_q_groups)  # (G,)
-        n_idx = tl.arange(0, BLOCK_N)  # (BLOCK_N,) tile-local row offsets
+        r_idx = tl.arange(0, blk_size)  # (blk,) row offsets within one stored block
+        # Flat element offsets for one contiguous (blk_size, d) stored block: as a
+        # 1-D run [0, blk_size*d) this lets Triton's AxisInfoAnalysis prove
+        # contiguity -> 128-bit LDG.E.128 loads. Per-row div/mod offset math
+        # DEFEATS that proof -> scalar loads (the coalescing wall: per-program
+        # ~25 GB/s in the split sweep). Splits are block-aligned so one stored
+        # block is fully contiguous for a single head.
+        flat_idx = tl.arange(0, blk_size * d)  # (blk*d,) contiguous run
 
         # ------------------------------------------------------------------
         # This split's contiguous token range, block-aligned.
         # tokens_per_split = ceil(seq_len/num_splits) rounded UP to a blk_size
-        # multiple so each split starts on a stored-block boundary.
+        # multiple so each split starts/ends on stored-block boundaries.
         # ------------------------------------------------------------------
         raw = (seq_len + num_splits - 1) // num_splits  # ceil
         tokens_per_split = ((raw + blk_size - 1) // blk_size) * blk_size  # round to blk
         split_start = s * tokens_per_split
         split_end = tl.minimum(split_start + tokens_per_split, seq_len)
+        first_block = split_start // blk_size  # this split's first stored block
+        last_block = (split_end + blk_size - 1) // blk_size  # exclusive
+
+        head_stride = h_kv * blk_size * d  # advance one stored block (skip h_kv heads)
+        kv_head_off = kv * blk_size * d  # this head's offset within a stored block
 
         # ------------------------------------------------------------------
         # Load all G query rows for this KV head: (G, d) fp32, resident in regs.
@@ -1593,57 +1610,45 @@ if TRITON_AVAILABLE:
         lse = tl.zeros((n_q_groups,), tl.float32)  # (G,) running denom
         acc = tl.zeros((n_q_groups, d), tl.float32)  # (G, d) running weighted V
 
-        block_stride = blk_size * d  # within one (block, head) the rows are blk_size*d
-        head_stride = h_kv * blk_size * d  # advance one stored block = h_kv heads
-
         # ------------------------------------------------------------------
-        # Internal loop: walk [split_start, split_end) in BLOCK_N-row tiles.
-        # If split_start >= seq_len the range is empty and the loop runs 0 times
-        # -> carry stays (m=-inf, lse=0, acc=0): the empty-split partial.
+        # Internal loop: ONE stored block per iteration (the unit contiguous in
+        # memory for a single head). Empty split -> range empty -> 0 iters ->
+        # carry stays (m=-inf, lse=0, acc=0): the empty-split partial.
         # ------------------------------------------------------------------
-        n_tiles = (split_end - split_start + BLOCK_N - 1) // BLOCK_N
-        for t in range(n_tiles):
-            tile_start = split_start + t * BLOCK_N  # absolute first token of tile
-            b_abs = tile_start + n_idx  # (BLOCK_N,) absolute token indices
-            tile_mask = b_abs < split_end  # (BLOCK_N,) valid-token mask
+        for blk in range(first_block, last_block):
+            block_base = blk * head_stride + kv_head_off  # scalar contiguous base
+            row_abs = blk * blk_size + r_idx  # (blk,) absolute token per row
+            tile_mask = row_abs < split_end  # (blk,) last block may be partial
 
-            stored_block = b_abs // blk_size  # (BLOCK_N,)
-            row_in_block = b_abs % blk_size  # (BLOCK_N,)
-            kv_row_base = (
-                stored_block * head_stride + kv * block_stride + row_in_block * d
-            )  # (BLOCK_N,) flat base for each tile row
-            kv_offsets = kv_row_base[:, None] + d_idx[None, :]  # (BLOCK_N, d)
+            # Flat contiguous load -> reshape to (blk, d). evict_first: read-once.
+            k = tl.reshape(
+                tl.load(
+                    k_stacked_ptr + block_base + flat_idx,
+                    eviction_policy="evict_first",
+                ).to(tl.float32),
+                (blk_size, d),
+            )  # (blk, d)
 
-            # evict_first: KV is read exactly once per decode step (read-once L2
-            # streaming; keep it from evicting the reused weight working set).
-            k = tl.load(
-                k_stacked_ptr + kv_offsets,
-                mask=tile_mask[:, None],
-                other=0.0,
-                eviction_policy="evict_first",
-            ).to(tl.float32)  # (BLOCK_N, d)
-
-            # scores[g, n] = scale * sum_dd q[g, dd] * k[n, dd]  -> (G, BLOCK_N)
-            # GEMV via broadcast-multiply + tl.sum (M=1 decode; no tl.dot min-dim).
+            # scores[g, n] = scale * sum_dd q[g, dd] * k[n, dd]  -> (G, blk)
             scores = (
                 tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
-            )  # (G, BLOCK_N)
-            # Mask OOB tile rows to -inf so they vanish in max + denom.
-            scores = tl.where(tile_mask[None, :], scores, float("-inf"))  # (G, BLOCK_N)
+            )  # (G, blk)
+            scores = tl.where(tile_mask[None, :], scores, float("-inf"))  # (G, blk)
 
             # Online-softmax update (base-e), per query head g:
-            m_tile = tl.max(scores, axis=1)  # (G,) max over this tile
+            m_tile = tl.max(scores, axis=1)  # (G,)
             m_new = tl.maximum(m, m_tile)  # (G,)
-            alpha = tl.exp(m - m_new)  # (G,) old-state rescale (0 when m=-inf)
-            p = tl.exp(scores - m_new[:, None])  # (G, BLOCK_N)
+            alpha = tl.exp(m - m_new)  # (G,) (0 when m=-inf)
+            p = tl.exp(scores - m_new[:, None])  # (G, blk)
             lse = lse * alpha + tl.sum(p, axis=1)  # (G,)
 
-            v = tl.load(
-                v_stacked_ptr + kv_offsets,
-                mask=tile_mask[:, None],
-                other=0.0,
-                eviction_policy="evict_first",
-            ).to(tl.float32)  # (BLOCK_N, d)
+            v = tl.reshape(
+                tl.load(
+                    v_stacked_ptr + block_base + flat_idx,
+                    eviction_policy="evict_first",
+                ).to(tl.float32),
+                (blk_size, d),
+            )  # (blk, d)
             # pv[g, dd] = sum_n p[g, n] * v[n, dd]  -> (G, d)
             pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)  # (G, d)
             acc = acc * alpha[:, None] + pv  # (G, d)
