@@ -18,6 +18,21 @@ this module measures.
 Tolerance: derived from the measured chunked-vs-oracle drift at startup
 (compute once, log it). NOT hardcoded.
 
+MEASURED vs ANALYTIC COLUMNS
+-----------------------------
+The ``timing_seq_len`` parameter controls which row gets real timing:
+  - ``predicted_speedup`` is ANALYTIC (decode_speedup_curve formula) — populated
+    for every (variant, seq_len) row regardless of the fixture size.
+  - ``latency_ms``, ``max_abs_vs_oracle``, ``max_rel_vs_oracle``,
+    ``logit_parity_pass``, and ``measured_speedup`` are MEASURED — they require
+    running the variant on the actual fixture tensors. These are populated ONLY
+    for the row where ``row.seq_len == timing_seq_len`` (the context length the
+    supplied fixture actually represents). All other rows carry NaN / None for
+    these columns.
+
+This makes the gap between "what we timed" and "what we're labelling"
+structurally visible in the DataFrame rather than silently wrong.
+
 Schema (exact): ["variant", "seq_len", "latency_ms", "max_abs_vs_oracle",
                   "max_rel_vs_oracle", "logit_parity_pass",
                   "predicted_speedup", "measured_speedup"]
@@ -152,6 +167,7 @@ def run_decode_ledger(
     attn_kwargs: dict,
     seq_lens: list[int],
     *,
+    timing_seq_len: int | None = None,
     device: str = "cpu",
     n_warmup: int = 3,
     n_repeat: int = 10,
@@ -159,7 +175,29 @@ def run_decode_ledger(
 ) -> pd.DataFrame:
     """Measure per-(variant, seq_len) decode latency, gated on correctness.
 
-    Steps for each (variant, seq_len):
+    MEASURED vs ANALYTIC COLUMNS
+    ----------------------------
+    ``timing_seq_len`` is the context length that the supplied fixture tensors
+    (q, k_blocks, v_blocks) actually represent.  For the row where
+    ``seq_len == timing_seq_len`` the following columns are populated from real
+    measurements (subject to the correctness gate):
+        latency_ms, max_abs_vs_oracle, max_rel_vs_oracle,
+        logit_parity_pass, measured_speedup
+    For all OTHER seq_len rows these columns are NaN / None — the fixture does
+    not correspond to those lengths, so timing them would be silently wrong.
+    ``predicted_speedup`` is always populated (it is purely analytic).
+
+    If ``timing_seq_len`` is None and ``len(seq_lens) == 1``, it defaults to
+    that single entry.  If ``len(seq_lens) > 1`` and ``timing_seq_len`` is None
+    a ``ValueError`` is raised — callers must be explicit about which seq_len
+    the fixture represents to prevent silent mis-labelling.
+
+    On the VM, call run_decode_ledger once per seq_len with a correctly-sized
+    fixture and timing_seq_len set to match:
+        for sl in seq_lens:
+            df_sl = run_decode_ledger(..., seq_lens=[sl], timing_seq_len=sl)
+
+    Steps for each (variant, seq_len) where seq_len == timing_seq_len:
       1. Run the oracle (naive_dense_attention) on (q, k_blocks, v_blocks).
       2. Run the variant.
       3. attention_diff(variant_out, oracle_out) -> max_abs, max_rel.
@@ -167,31 +205,52 @@ def run_decode_ledger(
          start (see below). logit_parity_pass = (max_abs < tol).
       5. latency_ms and measured_speedup are ONLY recorded when BOTH:
            max_abs_vs_oracle < tol  AND  logit_parity_pass is True.
-         Else they are NaN (None).
+         Else latency_ms = NaN and measured_speedup = NaN.
 
     Tolerance derivation:
       We call chunked_dequant_attention on the supplied inputs as the "reference
       correct" path, measure its drift from the oracle, then set
-        tol = max(chunked_drift * tol_scale, 1e-4)
-      This means tol is ~10× the machine's genuine chunked drift (a generous
-      but honest threshold). A variant like oracle * 1.5 will always fail; the
-      chunked path will always pass.
+        tol = max(chunked_drift * tol_scale, 1e-6)
+      Floor is 1e-6 — one order of magnitude above the measured fp16 roundoff
+      drift (~2.4e-7 chunked vs oracle). This is tight enough to catch subtle
+      masking or quantisation bugs whose drift falls in the [1e-7, 1e-5] range.
+      The old 1e-4 floor was ~420× the real drift and would silently pass a
+      variant with up to 1e-4 error, defeating the gate's purpose.
 
     Args:
-        variants:   {name: callable(q, k_blocks, v_blocks, **attn_kwargs)}
-        q, k_blocks, v_blocks, attn_kwargs: attention inputs.
-        seq_lens:   used only for the predicted_speedup column (analytic).
-        device:     "cpu" or "cuda".
+        variants:        {name: callable(q, k_blocks, v_blocks, **attn_kwargs)}
+        q, k_blocks, v_blocks, attn_kwargs: attention inputs (sized for timing_seq_len).
+        seq_lens:        context lengths to include in the ledger.
+        timing_seq_len:  the seq_len the fixture actually represents; measured
+                         columns are populated only for this row.  Defaults to
+                         seq_lens[0] when len(seq_lens)==1; must be explicit
+                         when len(seq_lens)>1.
+        device:          "cpu" or "cuda".
         n_warmup / n_repeat: timing parameters.
-        tol_scale:  multiplier on reference drift for the pass threshold.
+        tol_scale:       multiplier on reference drift for the pass threshold.
 
     Returns:
         pd.DataFrame with EXACTLY columns:
         ["variant", "seq_len", "latency_ms", "max_abs_vs_oracle",
          "max_rel_vs_oracle", "logit_parity_pass", "predicted_speedup",
          "measured_speedup"]
+        Rows where seq_len != timing_seq_len have NaN for all measured columns
+        and None for logit_parity_pass; predicted_speedup is finite for all rows.
     """
     from bmx.cache.chunked_attention import chunked_dequant_attention
+
+    # ── Resolve timing_seq_len ────────────────────────────────────────────────
+    if timing_seq_len is None:
+        if len(seq_lens) == 1:
+            timing_seq_len = seq_lens[0]
+        else:
+            raise ValueError(
+                "timing_seq_len must be provided when len(seq_lens) > 1. "
+                "The fixture tensors correspond to one specific context length; "
+                "timing the same fixture and labelling it as a different seq_len "
+                "is silently wrong. Pass timing_seq_len=<the fixture's real context "
+                "length>, or call run_decode_ledger once per seq_len."
+            )
 
     # naive_dense_attention does not accept query_abs_start / attn_mask / v_group /
     # v_seed — strip them so callers can pass full chunked kwargs unchanged.
@@ -202,12 +261,20 @@ def run_decode_ledger(
         oracle_ref = naive_dense_attention(q, k_blocks, v_blocks, **_oracle_kwargs)
         chunked_ref = chunked_dequant_attention(q, k_blocks, v_blocks, **attn_kwargs)
     ref_diff = attention_diff(chunked_ref, oracle_ref)
-    tol = max(ref_diff["max_abs"] * tol_scale, 1e-4)
+    measured_drift = ref_diff["max_abs"]
+    # Floor at 1e-6: one order above the measured fp16 roundoff drift (~2.4e-7).
+    # Tight enough to catch subtle masking/quant bugs whose drift lands in
+    # [1e-7, 1e-5]. The old 1e-4 floor was ~420x the real drift and would
+    # silently pass a buggy variant.
+    tol = max(measured_drift * tol_scale, 1e-6)
     print(
-        f"[triton_bench] reference chunked drift: max_abs={ref_diff['max_abs']:.3e}  tol={tol:.3e}"
+        f"[triton_bench] reference chunked drift: max_abs={measured_drift:.3e}  "
+        f"tol={tol:.3e}  (floor=1e-6, tol_scale={tol_scale})"
     )
 
     # ── Step 1: measure fp16 baseline latency (for measured_speedup ratio) ────
+    # Only needed for the timing_seq_len row; compute once unconditionally since
+    # it is cheap and we need it as the denominator regardless.
     # oracle baseline uses filtered kwargs (no query_abs_start etc.)
     fp16_ms = _time_variant(
         naive_dense_attention,
@@ -220,36 +287,47 @@ def run_decode_ledger(
         device=device,
     )
 
-    # ── Step 2: measure each variant at each seq_len ──────────────────────────
+    # ── Step 2: build rows — measure only at timing_seq_len ──────────────────
     rows = []
     for seq_len in seq_lens:
         pred_speedup = _predicted_speedup(seq_len)
+        is_timed_row = seq_len == timing_seq_len
 
         for name, fn in variants.items():
-            with torch.no_grad():
-                oracle_out = naive_dense_attention(
-                    q, k_blocks, v_blocks, **_oracle_kwargs
-                )
-                variant_out = fn(q, k_blocks, v_blocks, **attn_kwargs)
+            if is_timed_row:
+                # Real measurement: correctness check + conditional timing
+                with torch.no_grad():
+                    oracle_out = naive_dense_attention(
+                        q, k_blocks, v_blocks, **_oracle_kwargs
+                    )
+                    variant_out = fn(q, k_blocks, v_blocks, **attn_kwargs)
 
-            diff = attention_diff(variant_out, oracle_out)
-            max_abs = diff["max_abs"]
-            max_rel = diff["max_rel"]
-            parity_pass = bool(max_abs < tol)
+                diff = attention_diff(variant_out, oracle_out)
+                max_abs = diff["max_abs"]
+                max_rel = diff["max_rel"]
+                parity_pass = bool(max_abs < tol)
 
-            if parity_pass:
-                latency_ms = _time_variant(
-                    fn,
-                    q,
-                    k_blocks,
-                    v_blocks,
-                    attn_kwargs,
-                    n_warmup=n_warmup,
-                    n_repeat=n_repeat,
-                    device=device,
-                )
-                measured_speedup = fp16_ms / latency_ms
+                if parity_pass:
+                    latency_ms = _time_variant(
+                        fn,
+                        q,
+                        k_blocks,
+                        v_blocks,
+                        attn_kwargs,
+                        n_warmup=n_warmup,
+                        n_repeat=n_repeat,
+                        device=device,
+                    )
+                    measured_speedup = fp16_ms / latency_ms
+                else:
+                    latency_ms = float("nan")
+                    measured_speedup = float("nan")
             else:
+                # Analytic-only row: fixture does not represent this seq_len.
+                # All measured columns are NaN / None to make the gap visible.
+                max_abs = float("nan")
+                max_rel = float("nan")
+                parity_pass = None  # None = "not measured", distinct from False = "measured and failed"
                 latency_ms = float("nan")
                 measured_speedup = float("nan")
 
