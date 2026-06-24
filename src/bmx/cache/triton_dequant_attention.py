@@ -307,7 +307,6 @@ if TRITON_AVAILABLE:
         # when HAS_ROPE; pass a dummy (e.g. v_ptr) when HAS_ROPE is False.
         cos_ptr,
         sin_ptr,
-        scratch_ptr,  # (blk, d) fp32 HBM scratch for in-kernel rotate_half (HAS_ROPE only)
         scale,
         n_blocks_in_split,  # intentionally unused in kernel body — exists only as a do_not_specialize autotune-specialization guard (prevents recompile when seq_len changes)  # noqa: ARG001
         d: tl.constexpr,
@@ -405,39 +404,39 @@ if TRITON_AVAILABLE:
         # rope._rotate_half). For col j: source col = j+half if j<half else j-half;
         # sign = -1 if j<half else +1. Verified bit-exact (2.4e-7) vs apply_rope.
         # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # scores[b] = (sum_dd q[dd] * k_rope[b,dd]) * scale  → (BLK,)  (GEMV
+        # multiply+sum, not tl.dot — no >=16 min-dim constraint).
+        # ------------------------------------------------------------------
         if HAS_ROPE:
-            rope_off = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
-            cos = tl.load(cos_ptr + rope_off).to(tl.float32)  # (BLK, D)
-            sin = tl.load(sin_ptr + rope_off).to(tl.float32)  # (BLK, D)
-            # rotate_half on the in-register k: write k to an HBM scratch buffer, then
-            # gather the half-swapped columns back. rotate_half(x)=cat(-x[d/2:],x[:d/2]):
-            # for col j, source col = j+half (j<half) or j-half (else); sign = -1/+1.
-            # The scratch round-trip is a tiny per-block transient (negligible vs the
-            # resident KV stream). Verified bit-exact (4.8e-7) vs apply_rope on GH200.
-            # (In-register reshape/join half-swap fails to compile in this Triton.)
-            # Per-program scratch slice (scratch is (n_q_groups, blk, d)): program g
-            # owns scratch[g] so grid programs don't race. tl.debug_barrier() between
-            # store and load is REQUIRED — store-then-load to the SAME HBM buffer in
-            # one program is NOT ordered without a fence (Triton memory model), the
-            # compiler reorders and the load misses the store (confirmed: wrong RoPE
-            # without the barrier). rotate_half(x)=cat(-x[d/2:],x[:d/2]): for col j,
-            # source col = j+half (j<half) or j-half (else); sign = -1/+1.
-            g_base = g * blk * d
-            tl.store(scratch_ptr + g_base + rope_off, k)
-            tl.debug_barrier()
+            # In-register RoPE folded into the score reduction — NO HBM scratch, NO
+            # barrier (vault-optimal: store-then-load to scratch drains the memory
+            # pipeline + over-fences; same-thread half-swap is free in registers).
+            # rotate_half(x)=cat(-x[d/2:], x[:d/2]), so RoPE per half:
+            #   k_rope_first  = k1*cos1 - k2*sin1   (rotate_half's first half = -k2)
+            #   k_rope_second = k2*cos2 + k1*sin2   (its second half =  k1)
+            # k1/k2 are static slices of the in-register reconstructed K (BLK, D);
+            # q likewise. scores = sum over both halves — never recombine to (BLK, D),
+            # so no tl.cat needed. Verified bit-exact (4.8e-7) vs apply_rope.
             half = d // 2
-            is_first = d_idx < half  # (D,)
-            src_col = tl.where(is_first, d_idx + half, d_idx - half)  # (D,)
-            sign = tl.where(is_first, -1.0, 1.0)  # (D,)
-            rot_off = b_idx[:, None] * d + src_col[None, :]  # (BLK, D)
-            k_rot = tl.load(scratch_ptr + g_base + rot_off) * sign[None, :]  # (BLK, D)
-            k = k * cos + k_rot * sin  # (BLK, D)
-
-        # ------------------------------------------------------------------
-        # scores[b] = (sum_dd q[dd]*k[b,dd]) * scale  → (BLK,)  (GEMV multiply+sum,
-        # not tl.dot — no >=16 min-dim constraint; same rationale as the 3a kernel).
-        # ------------------------------------------------------------------
-        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK,)
+            h_idx = tl.arange(0, half)  # (half,)
+            o1 = b_idx[:, None] * d + h_idx[None, :]  # (BLK, half) first-half offsets
+            o2 = b_idx[:, None] * d + (h_idx + half)[None, :]  # (BLK, half) second
+            cos1 = tl.load(cos_ptr + o1).to(tl.float32)
+            cos2 = tl.load(cos_ptr + o2).to(tl.float32)
+            sin1 = tl.load(sin_ptr + o1).to(tl.float32)
+            sin2 = tl.load(sin_ptr + o2).to(tl.float32)
+            k1 = k[:, :half]  # (BLK, half)
+            k2 = k[:, half:]  # (BLK, half)
+            kr1 = k1 * cos1 - k2 * sin1  # (BLK, half) RoPE'd first half
+            kr2 = k2 * cos2 + k1 * sin2  # (BLK, half) RoPE'd second half
+            q1 = q_row[:half]  # (half,)
+            q2 = q_row[half:]  # (half,)
+            scores = (
+                tl.sum(q1[None, :] * kr1, axis=1) + tl.sum(q2[None, :] * kr2, axis=1)
+            ) * scale  # (BLK,)
+        else:
+            scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK,)
 
         # ------------------------------------------------------------------
         # Online softmax update (base-e):
@@ -713,9 +712,6 @@ def _k2b_block_kernel_launch(
     if has_rope:
         cos_blk = _to_dev(rope_cos_blk).to(torch.float16).contiguous()  # (blk, d)
         sin_blk = _to_dev(rope_sin_blk).to(torch.float16).contiguous()  # (blk, d)
-        # Per-program scratch: (n_q_groups, blk, d) so each grid program (query head
-        # in the group) gets its own rotate_half scratch slice (no cross-program race).
-        rope_scratch = torch.empty(n_q_groups, blk, d, dtype=torch.float32, device=dev)
 
     for kv in range(h_kv):
         q_kv = q_v[
@@ -740,11 +736,10 @@ def _k2b_block_kernel_launch(
         m_kv = m_buf[kv]  # (G,)  fp32
         lse_kv = lse_buf[kv]  # (G,)  fp32
 
-        # cos/sin/scratch: real tensors when has_rope, else dummy (v_kv) — the kernel
-        # only dereferences them under the HAS_ROPE constexpr branch.
+        # cos/sin: real tensors when has_rope, else dummy (v_kv) — the kernel only
+        # dereferences them under the HAS_ROPE constexpr branch.
         cos_arg = cos_blk if has_rope else v_kv
         sin_arg = sin_blk if has_rope else v_kv
-        scratch_arg = rope_scratch if has_rope else v_kv
 
         _k2b_softmax_block_kernel[(n_q_groups,)](
             us_kv,
@@ -758,7 +753,6 @@ def _k2b_block_kernel_launch(
             lse_kv,
             cos_arg,
             sin_arg,
-            scratch_arg,
             float(scale),
             int(n_blocks_in_split),
             d=d,
