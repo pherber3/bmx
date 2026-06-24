@@ -35,6 +35,58 @@ def ids(vocab=97, seq=12, seed=42):
     )
 
 
+def tiny_packed_blocks_prerope(*, n_q_heads, n_q_groups, d, blk, n_blocks, seed=0):
+    """Build (q, k_blocks, v_blocks, kwargs) for pre-RoPE decode tests.
+
+    rope_cos/sin are pre-cast to fp16 (mirrors the grow-time cast optimisation).
+    k_pre_rope=True so chunked_dequant_attention applies RoPE at read.
+    """
+    from bmx.cache.codecs import quantize_packed
+    from bmx.cache.collect import to_matrix
+
+    torch.manual_seed(seed)
+    h_kv = n_q_heads // n_q_groups
+    S = blk * n_blocks
+    q = torch.randn(n_q_heads, 1, d)
+    # Already compute-dtype (fp16) — mirrors the grow-time cast (the optimisation).
+    cos = torch.randn(S, d).to(torch.float16)
+    sin = torch.randn(S, d).to(torch.float16)
+    k_blocks, v_blocks = [], []
+    for i in range(n_blocks):
+        start, end = i * blk, (i + 1) * blk
+        kp, _ = quantize_packed(
+            "rtn_token",
+            to_matrix(torch.randn(h_kv, blk, d)),
+            bits=4,
+            group=8,
+            seed=seed,
+        )
+        vp, _ = quantize_packed(
+            "rtn_token",
+            to_matrix(torch.randn(h_kv, blk, d)),
+            bits=4,
+            group=8,
+            seed=seed,
+        )
+        k_blocks.append((kp, start, end))
+        v_blocks.append((vp, start, end))
+    kwargs = dict(
+        k_arm="rtn_token",
+        v_arm="rtn_token",
+        group=8,
+        seed=seed,
+        k_pre_rope=True,
+        rope_cos=cos,
+        rope_sin=sin,
+        k_tail=None,
+        v_tail=None,
+        n_q_groups=n_q_groups,
+        scale=d**-0.5,
+        query_abs_start=None,
+    )
+    return q, k_blocks, v_blocks, kwargs
+
+
 def tiny_packed_blocks(
     *, n_q_heads, n_q_groups, n_q, d, blk, n_blocks, arm="rtn_token", group=8, seed=0
 ):

@@ -277,11 +277,7 @@ def chunked_dequant_attention(
     for (kpacked, start, end), (vpacked, _vs, _ve) in zip(k_blocks, v_blocks):
         K_kv = _dequant_block(kpacked, k_arm, group, seed, h_kv).to(q.dtype)
         if k_pre_rope:
-            K_kv = apply_rope(
-                K_kv,
-                rope_cos[start:end].to(q.dtype),
-                rope_sin[start:end].to(q.dtype),
-            )
+            K_kv = apply_rope(K_kv, rope_cos[start:end], rope_sin[start:end])
         V_kv = _dequant_block(vpacked, v_arm, _v_group, _v_seed, h_kv).to(q.dtype)
         attend(K_kv, V_kv)
 

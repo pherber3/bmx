@@ -144,6 +144,9 @@ class PackedStreamingLayer(DynamicLayer):
             nc, ns = rope_cos_sin(
                 self.model_config, new_committed - covered, start=covered, device=device
             )
+            # Cast once at grow-time to the cache compute dtype (fp16), so the
+            # decode loop doesn't re-cast the slice every block (deferred opt #2).
+            nc, ns = nc.to(torch.float16), ns.to(torch.float16)
             if self._rope_cos is None:
                 self._rope_cos, self._rope_sin = nc, ns
             else:
