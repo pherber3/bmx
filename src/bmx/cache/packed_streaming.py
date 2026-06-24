@@ -17,6 +17,10 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from bmx.cache.chunked_attention import chunked_dequant_attention
 from bmx.cache.codecs import S_DIVISIBILITY_ARMS, quantize_packed
+from bmx.cache.triton_dequant_attention import (
+    TRITON_AVAILABLE,
+    triton_decode_attention,
+)
 from bmx.cache.collect import _reshape_heads, to_matrix
 from bmx.cache.rope import rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
@@ -342,6 +346,34 @@ class PackedStreamingLayer(DynamicLayer):
             total_seq_len = self._committed_S_q + self.keys.shape[2]
             query_abs_start = total_seq_len - n_q
 
+        # Dispatch: decode (n_q==1, query_abs_start is None) → Triton kernel when
+        # TRITON_AVAILABLE, else chunked PyTorch.  Prefill (n_q>1) always uses
+        # chunked (it delegates to flash-SDPA inside chunked_dequant_attention).
+        #
+        # FAIL-LOUD RULE: TRITON_AVAILABLE is a CAPABILITY check (Triton+CUDA
+        # present).  When True, the kernel call is UNCONDITIONAL — no try/except
+        # that would silently fall back on a kernel error.  A kernel error must
+        # propagate so correctness regressions are never hidden.
+        is_decode = query_abs_start is None  # n_q==1
+        if TRITON_AVAILABLE and is_decode:
+            return triton_decode_attention(
+                q,
+                self._k_blocks,
+                self._v_blocks,
+                k_arm=self.k_spec.arm,
+                v_arm=self.v_spec.arm,
+                group=self.k_spec.group,
+                seed=self.k_spec.seed,
+                k_pre_rope=self.k_spec.pre_rope,
+                rope_cos=self._rope_cos,
+                rope_sin=self._rope_sin,
+                k_tail=k_tail,
+                v_tail=v_tail,
+                n_q_groups=n_q_groups,
+                scale=scaling,
+                v_group=self.v_spec.group,
+                v_seed=self.v_spec.seed,
+            )
         return chunked_dequant_attention(
             q,
             self._k_blocks,
