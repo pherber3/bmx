@@ -212,10 +212,11 @@ def chunked_dequant_attention(
     [start,end) before the contraction. k_tail/v_tail: (h_kv, tail_len, d) fp16
     recent window (post-RoPE for K). Returns (n_q_heads, n_q, d).
 
-    query_abs_start: when not None (prefill, n_q > 1), apply a causal mask so
-    query at position (query_abs_start + qi) cannot attend key at absolute
-    position j where j > query_abs_start + qi. When None (decode, n_q == 1),
-    no masking is applied.
+    query_abs_start: prefill flag. When not None this is a prefill (n_q > 1) and we
+    delegate to the dense + flash-SDPA path (which applies the model's causal mask
+    via attn_mask). When None this is decode (n_q == 1) and the online-softmax loop
+    runs — no masking needed, the single query attends all cached keys.
+    attn_mask: the model's 4D causal mask, forwarded to the prefill SDPA path.
     v_group / v_seed: dequant params for V blocks; default to group / seed when
     not provided (allows K and V to use different packed formats).
     """
@@ -224,13 +225,11 @@ def chunked_dequant_attention(
     _v_group = v_group if v_group is not None else group
     _v_seed = v_seed if v_seed is not None else seed
 
-    # Prefill (n_q > 1): the per-block online-softmax below is O(S^2) memory because
-    # each block's score tile is (heads, n_q=S, blk). Delegate to the dense + flash
-    # SDPA path, which is O(S). Decode (n_q == 1) falls through to the chunked loop
-    # — that is the resident-memory win and is O(S) there. (query_abs_start is set
-    # iff prefill, per PackedStreamingLayer.attend; n_q > 1 is the same signal
-    # transformers' SDPA uses to pick is_causal.)
-    if query_abs_start is not None and n_q > 1:
+    # Prefill (n_q > 1) delegates to the dense + flash-SDPA path: the per-block
+    # online-softmax below is O(S^2) memory at prefill (each block's score tile is
+    # (heads, n_q=S, blk)), whereas SDPA tiles internally in O(S). query_abs_start is
+    # set iff prefill (per PackedStreamingLayer.attend), so this is the prefill gate.
+    if query_abs_start is not None:
         return _prefill_dense_attention(
             q,
             k_blocks,
@@ -250,28 +249,19 @@ def chunked_dequant_attention(
             v_seed=_v_seed,
             attn_mask=attn_mask,
         )
+
+    # Decode (n_q == 1): the single query at the last position attends ALL cached keys
+    # — no causal masking needed. Online-softmax over per-block dequant keeps peak
+    # memory at the packed footprint (one tiny block dequantized at a time).
     acc = torch.zeros(n_q_heads, n_q, d, dtype=q.dtype, device=q.device)
     m = torch.full((n_q_heads, n_q, 1), float("-inf"), dtype=q.dtype, device=q.device)
     lse = torch.zeros(n_q_heads, n_q, 1, dtype=q.dtype, device=q.device)
 
-    # Absolute positions of each query (only used when query_abs_start is set).
-    q_abs = (
-        torch.arange(query_abs_start, query_abs_start + n_q, device=q.device)
-        if query_abs_start is not None
-        else None
-    )
-
-    def attend(
-        K_kv, V_kv, key_abs_start: int | None = None, key_abs_end: int | None = None
-    ):
+    def attend(K_kv, V_kv):
         nonlocal acc, m, lse
         K_exp = K_kv.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, blk, d)
         V_exp = V_kv.repeat_interleave(n_q_groups, dim=0)
         s = (q @ K_exp.transpose(-1, -2)) * scale  # (n_q_heads, n_q, blk)
-        if q_abs is not None and key_abs_start is not None:
-            key_abs = torch.arange(key_abs_start, key_abs_end, device=q.device)
-            causal_mask = key_abs.unsqueeze(0) > q_abs.unsqueeze(1)  # (n_q, blk)
-            s = s.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
         acc, m, lse = online_softmax_update(acc, m, lse, s, V_exp)
 
     for (kpacked, start, end), (vpacked, _vs, _ve) in zip(k_blocks, v_blocks):
@@ -283,22 +273,9 @@ def chunked_dequant_attention(
                 rope_sin[start:end].to(q.dtype),
             )
         V_kv = _dequant_block(vpacked, v_arm, _v_group, _v_seed, h_kv).to(q.dtype)
-        attend(
-            K_kv,
-            V_kv,
-            start if q_abs is not None else None,
-            end if q_abs is not None else None,
-        )
+        attend(K_kv, V_kv)
 
     if k_tail is not None and k_tail.shape[1] > 0:
-        tail_abs_start = (
-            k_blocks[-1][2] if k_blocks else 0
-        )  # end of last committed block
-        attend(
-            k_tail.to(q.dtype),
-            v_tail.to(q.dtype),
-            tail_abs_start if q_abs is not None else None,
-            (tail_abs_start + k_tail.shape[1]) if q_abs is not None else None,
-        )
+        attend(k_tail.to(q.dtype), v_tail.to(q.dtype))
 
     return acc / lse

@@ -238,6 +238,11 @@ class PackedStreamingLayer(DynamicLayer):
         if new_S_q > self._committed_S_q:
             block_start = self._committed_S_q
             block_end = new_S_q
+            block_len = block_end - block_start
+            # block_start == old _committed_S_q == the slab's absolute start, so the
+            # newly-committed block is the slab's leading [: block_len] in BOTH K and
+            # V, and the slab prune below trims exactly that. (Invariant of the flush
+            # schedule: each flush commits the front of the un-flushed slab.)
 
             # --- Pack K block ---
             if self.k_spec.pre_rope:
@@ -251,9 +256,6 @@ class PackedStreamingLayer(DynamicLayer):
                 kpacked = self._pack_k_block(k_block_pre, block_start, block_end)
             else:
                 # Post-RoPE: block was pristine fp16 tail until now (same as streaming.py).
-                # _committed_S_q is the absolute start of the slab (they're always equal).
-                # block_start == _committed_S_q (old), so local_start is always 0 here.
-                block_len = block_end - block_start
                 k_block_fp32 = keys.squeeze(0)[..., :block_len, :].float()
                 M = to_matrix(k_block_fp32)
                 kpacked, _ = quantize_packed(
@@ -265,12 +267,8 @@ class PackedStreamingLayer(DynamicLayer):
                     seed=self.k_spec.seed,
                 )
 
-            # --- Pack V block ---
-            # _committed_S_q is the absolute start of the slab; block_start == _committed_S_q.
-            block_len = block_end - block_start
-            local_start = 0
-            local_end = block_len
-            v_block_fp32 = values.squeeze(0)[..., local_start:local_end, :].float()
+            # --- Pack V block (leading [: block_len] of the slab, same as K) ---
+            v_block_fp32 = values.squeeze(0)[..., :block_len, :].float()
             vpacked = self._pack_v_block(v_block_fp32)
 
             self._k_blocks.append((kpacked, block_start, block_end))
@@ -289,20 +287,10 @@ class PackedStreamingLayer(DynamicLayer):
 
             # --- Fix 3: Prune fp16 slab to tail-only ---
             # Committed region lives solely as packed codes in _k_blocks/_v_blocks.
-            # After pruning, keys/values hold only [block_end:] in ABSOLUTE terms.
-            # _committed_S_q tracks the absolute position of self.keys[..., 0, :].
-            # attend() computes total_seq_len = _committed_S_q + self.keys.shape[2],
-            # and get_seq_length() returns the same value.
-            # block_start == old _committed_S_q (slab start), so local_prune = block_len.
-            #
-            # Guard: the prune relies on the slab starting at block_start
-            # (i.e. block_start was the old _committed_S_q before this flush).
-            # Capture the old committed value before the update and assert it matches.
-            old_committed = block_end - block_len  # == block_start (by construction)
-            assert block_start == old_committed, (
-                f"Flush schedule invariant violated: block_start={block_start} != "
-                f"old _committed_S_q={old_committed}; slab prune would use wrong length"
-            )
+            # The slab started at block_start (== old _committed_S_q), so the committed
+            # front is the slab's leading [: block_len]; drop it, keeping only the tail.
+            # _committed_S_q now tracks the absolute position of self.keys[..., 0, :];
+            # attend()/get_seq_length() recover total length as _committed_S_q + slab len.
             keys = keys[..., block_len:, :].contiguous()
             values = values[..., block_len:, :].contiguous()
 

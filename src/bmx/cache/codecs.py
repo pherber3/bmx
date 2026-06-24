@@ -77,14 +77,26 @@ def _rotate(M: torch.Tensor, seed: int) -> torch.Tensor:
         return M @ Q.T
 
 
+@functools.lru_cache(maxsize=16)
+def _hadamard_signs(C: int, seed: int) -> torch.Tensor:
+    """Cached ±1 sign vector for the Hadamard rotation (CPU, by (C, seed)).
+
+    Identical values to the inline form used by randomized_hadamard at quantize
+    time; cached because _unrotate runs per dequantized block (per decode step, per
+    layer) — re-seeding a Generator + randint each call is wasted work at long
+    context. Shared/read-only; callers .to(target) for dtype/device.
+    """
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(0, 2, (C,), generator=g) * 2 - 1
+
+
 def _unrotate(M_rot: torch.Tensor, seed: int) -> torch.Tensor:
     """Inverse rotation (Hadamard is self-inverse up to same signs; QR needs Q)."""
     C = M_rot.shape[-1]
     if is_power_of_2(C):
         # randomized_hadamard is H @ diag(signs) @ x; inverse is diag(signs) @ H @ x
         # but H^{-1} = H (orthonormal), so: signs * H @ M_rot
-        g = torch.Generator().manual_seed(seed)
-        signs = (torch.randint(0, 2, (C,), generator=g) * 2 - 1).to(M_rot)
+        signs = _hadamard_signs(C, seed).to(M_rot)
         from bmx.quant.hadamard import fwht
 
         return fwht(M_rot) * signs
