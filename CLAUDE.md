@@ -72,18 +72,23 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   used LongBench Code; that closes the coding-task question.)
 - Fused dequant-attention (Phases 1+2, closed positive): `PackedStreamingCache`
   stores packed codes resident + chunked dequant-attention at decode (the
-  memory-critical path) + flash SDPA at prefill (the O(S²)-online-softmax bug
-  found on first CUDA run, fixed `c1fc279`). VM census confirms the k2b
-  compression is real at runtime: resident @128k = chunked 64.1 GiB ≈ fp16 63.3,
-  vs dense_stream 83.5 (chunked saves ~19 GiB, growing linearly with context) —
-  the second dense KV copy is eliminated. Batched 128k sweep unblocked; Triton
-  (Phase 3) NOT required to clear the ceiling — `docs/2026-06-23-kernel-census-results.md`,
-  spec/plan `docs/superpowers/{specs,plans}/2026-06-23-fused-dequant-attention*`.
+  memory-critical path) + flash SDPA at prefill. Two real bugs found on first CUDA
+  run + fixed: the O(S²)-online-softmax-at-prefill (`c1fc279`), and a prefill-mask
+  bug — a custom AttentionInterface impl ALSO needs an AttentionMaskInterface mask
+  fn or it runs maskless (fell back to is_causal=True, wrong for the cached
+  two-block prefill → garbage logits); fixed by registering `sdpa_mask`
+  (`cf21d06`). VM census: k2b resident @128k = 64.1 GiB ≈ fp16 63.3 vs dense 83.5
+  (chunked drops the 2nd dense KV copy, saving grows linearly w/ context). The
+  **batched 3-arm × 3-depth 128k NIAH sweep completed via the packed path** (the
+  run that OOMs on dense): k2b mean recall 7.94 ≈ healthy (quality parity also
+  A/B-confirmed vs dense at 64k). Triton (Phase 3) NOT required to clear the
+  ceiling. `docs/2026-06-23-kernel-census-results.md`, spec/plan
+  `docs/superpowers/{specs,plans}/2026-06-23-fused-dequant-attention*`.
 - **Open (engineering, not science):** Triton fused kernel (Phase 3, gated — only
-  for a deployment speed/RSS claim, not needed to unblock the sweep); the batched
-  128k sweep itself (multiple arms co-resident, now that single-stream headroom is
-  proven); the authoritative SOTA-model VM run (real-text + planted needle,
-  `--model-name`).
+  for a deployment speed/RSS claim); a WIDER batched 128k sweep (more arms/seqs
+  co-resident) may need the prefill mask materialization trimmed — the mask fix
+  raised packed peak to ~94.7 GiB, thin margin; the authoritative SOTA-model VM run
+  (real-text + planted needle, `--model-name`).
 
 ## Conventions (everything assumes them)
 
