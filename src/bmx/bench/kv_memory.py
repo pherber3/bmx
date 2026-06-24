@@ -67,6 +67,96 @@ def _packed_bytes(c: KVMemCase) -> int:
     return int(entries * (c.bpe_k + c.bpe_v) / 8)
 
 
+def _kv_read_bytes_per_step(case: KVMemCase) -> int:
+    """KV bytes streamed from HBM for ONE decode step (read all cached K+V)."""
+    entries = case.n_layer * case.h_kv * case.seq_len * case.d_head
+    if case.path == "fp16":
+        return entries * 2 * 2  # K and V, 2 bytes each
+    # packed: codes at (bpe_k+bpe_v)/8 bytes/entry + the fp16 recent window resident
+    packed = int(entries * (case.bpe_k + case.bpe_v) / 8)
+    window = 2 * case.n_layer * case.h_kv * case.recent_window * case.d_head * 2
+    return packed + window
+
+
+def _dequant_flops_per_step(case: KVMemCase) -> int:
+    """Rough dequant arithmetic per decode step (packed paths only).
+
+    ~O(1) ops per dequantized element (multiply by scale, + low-rank addend).
+    fp16 path does no dequant.
+    """
+    if case.path == "fp16":
+        return 0
+    entries = case.n_layer * case.h_kv * case.seq_len * case.d_head
+    return entries * 4  # unpack + scale + accumulate; small constant, honest order
+
+
+def predict_decode_latency(
+    case: KVMemCase, *, hbm_bandwidth_bytes_per_s: float
+) -> dict:
+    """Memory-bound decode step latency = bytes/bandwidth, + dequant compute.
+
+    Honest model: decode is memory-bound (~0.5 FLOP/byte), so step time is
+    dominated by (weights + KV read) / bandwidth. Dequant FLOPs are "free" only
+    while they stay under the bandwidth time; compute_bound_flag marks when they
+    don't.
+    """
+    kv_read = _kv_read_bytes_per_step(case)
+    weight = case.weights_bytes
+    bandwidth_time = (weight + kv_read) / hbm_bandwidth_bytes_per_s
+    # Dequant time uses a conservative peak-flops divisor; refined per-GPU at measure time.
+    dequant_flops = _dequant_flops_per_step(case)
+    # peak_flops_per_s injected via decode_speedup_curve; here assume free unless overridden.
+    dequant_time = 0.0
+    return {
+        "kv_read_bytes": kv_read,
+        "weight_bytes": weight,
+        "bandwidth_time_s": bandwidth_time,
+        "dequant_compute_time_s": dequant_time,
+        "predicted_step_latency_s": bandwidth_time + dequant_time,
+        "compute_bound_flag": False,
+        "_dequant_flops": dequant_flops,
+    }
+
+
+def decode_speedup_curve(
+    fp16_case: KVMemCase,
+    packed_case: KVMemCase,
+    *,
+    hbm_bandwidth_bytes_per_s: float,
+    peak_flops_per_s: float,
+) -> dict:
+    """Predicted decode speedup (UPPER BOUND) + crossover sequence length.
+
+    speedup_upper_bound = fp16 step bytes / packed step bytes (latency proxy).
+    The real speedup is <= this: dequant compute and any int8-vs-fp16 bandwidth
+    differential only ADD to the packed path. crossover_seq_len is where the
+    packed KV read equals the fixed weight stream (below it weights dominate and
+    compression barely helps; above it KV dominates and it approaches the ratio).
+    """
+    f = predict_decode_latency(
+        fp16_case, hbm_bandwidth_bytes_per_s=hbm_bandwidth_bytes_per_s
+    )
+    p = predict_decode_latency(
+        packed_case, hbm_bandwidth_bytes_per_s=hbm_bandwidth_bytes_per_s
+    )
+    fp16_bytes = f["weight_bytes"] + f["kv_read_bytes"]
+    packed_bytes = p["weight_bytes"] + p["kv_read_bytes"]
+    speedup = fp16_bytes / packed_bytes
+    # dequant honesty flag: compute time vs bandwidth time at this operating point.
+    dequant_time = p["_dequant_flops"] / peak_flops_per_s
+    compute_bound = dequant_time > p["bandwidth_time_s"]
+    # crossover: packed KV-read-per-token * S == weights.
+    entries_per_tok = packed_case.n_layer * packed_case.h_kv * packed_case.d_head
+    packed_bytes_per_tok = entries_per_tok * (packed_case.bpe_k + packed_case.bpe_v) / 8
+    crossover = packed_case.weights_bytes / packed_bytes_per_tok
+    return {
+        "speedup_upper_bound": speedup,
+        "crossover_seq_len": crossover,
+        "compute_bound_flag": compute_bound,
+        "dequant_compute_time_s": dequant_time,
+    }
+
+
 def predict_peak(case: KVMemCase) -> dict:
     assert case.path in ("fp16", "dense_stream", "chunked"), case.path
     one_copy = _one_fp16_copy_bytes(case)
