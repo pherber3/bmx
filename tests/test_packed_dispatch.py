@@ -57,25 +57,23 @@ def _run_decode_step(model, input_ids, k_spec, v_spec):
 # ---------------------------------------------------------------------------
 
 
-def test_fallback_used_on_no_cuda():
-    """With TRITON_AVAILABLE=False (the local reality), attend decode produces
-    EXACTLY the chunked_dequant_attention result.
+def test_fallback_used_on_no_cuda(monkeypatch):
+    """With TRITON_AVAILABLE=False, attend decode produces EXACTLY the
+    chunked_dequant_attention result (the capability-absence fallback path).
 
     We confirm the dispatch chooses the chunked path by:
       - Running generate through PackedStreamingCache (which calls attend internally).
       - Running the SAME generate through StreamingQuantizedCache (reference).
       - Asserting token equality (existing parity test pattern).
 
-    This is sufficient: the existing parity tests already confirm chunked is correct,
-    and TRITON_AVAILABLE=False on this machine so the dispatch CAN ONLY use chunked.
+    Force TRITON_AVAILABLE=False via monkeypatch so this exercises the fallback
+    path on EVERY machine (AMD/no-CUDA AND the CUDA VM) — the prior version
+    asserted no-CUDA and so failed on the VM where Triton is present.
     """
     import bmx.cache.packed_streaming as ps_mod
 
-    # Confirm local reality: TRITON_AVAILABLE must be False on this AMD box.
-    assert not ps_mod.TRITON_AVAILABLE, (
-        "TRITON_AVAILABLE=True on this machine — this test assumes CPU/AMD "
-        "(no CUDA/Triton). The fallback path is the ONLY path here."
-    )
+    # Force the capability-absence path regardless of the host's real CUDA/Triton.
+    monkeypatch.setattr(ps_mod, "TRITON_AVAILABLE", False)
 
     model = tiny_llama()
     input_ids = ids(vocab=97, seq=12, seed=7)
