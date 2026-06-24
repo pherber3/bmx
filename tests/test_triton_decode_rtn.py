@@ -1,0 +1,178 @@
+"""CUDA-gated bit-exact test for the Triton RTN decode online-softmax kernel.
+
+Skips entirely on non-CUDA machines (AMD dev box, CI without GPU).
+On the VM (CUDA available):
+  - Verifies TRITON_AVAILABLE is True (fail loud if Triton not installed).
+  - Runs triton_decode_attention vs naive_dense_attention (oracle) on matching
+    packed inputs, asserts max_abs < 1e-2 (expect much tighter, ~fp16 rounding).
+
+Skip reason is printed verbosely so the VM operator knows WHY it was skipped
+if they accidentally run the suite on a non-CUDA box.
+"""
+
+import pytest
+import torch
+
+cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Triton decode kernel — VM/CUDA only (skipping on non-CUDA host)",
+)
+
+
+# ---------------------------------------------------------------------------
+# Helper: move a packed-block list's dict tensors to CUDA
+# ---------------------------------------------------------------------------
+
+
+def _blocks_cuda(blocks: list) -> list:
+    """Move each packed dict's tensors to CUDA; keep start/end ints unchanged."""
+    out = []
+    for packed, start, end in blocks:
+        packed_cuda = {
+            k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in packed.items()
+        }
+        out.append((packed_cuda, start, end))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Smoke test: import + TRITON_AVAILABLE gate
+# ---------------------------------------------------------------------------
+
+
+def test_triton_module_imports_with_available_flag():
+    """Module must import cleanly on AMD/no-CUDA with TRITON_AVAILABLE=False."""
+    from bmx.cache.triton_dequant_attention import TRITON_AVAILABLE  # noqa: F401
+
+    # On non-CUDA hosts TRITON_AVAILABLE is False — that is the correct state.
+    # On a CUDA host with Triton installed it should be True.
+    # Either way, the import must not raise.
+    assert isinstance(TRITON_AVAILABLE, bool)
+
+
+def test_require_triton_raises_without_cuda():
+    """_require_triton() must raise RuntimeError when TRITON_AVAILABLE is False."""
+    import bmx.cache.triton_dequant_attention as mod
+
+    original = mod.TRITON_AVAILABLE
+    try:
+        mod.TRITON_AVAILABLE = False
+        with pytest.raises(RuntimeError, match="TRITON_AVAILABLE"):
+            mod._require_triton()
+    finally:
+        mod.TRITON_AVAILABLE = original
+
+
+# ---------------------------------------------------------------------------
+# Bit-exact oracle comparison (CUDA-only)
+# ---------------------------------------------------------------------------
+
+
+@cuda
+def test_triton_rtn_decode_matches_oracle():
+    """triton_decode_attention must match naive_dense_attention to fp16 tolerance.
+
+    Uses rtn_token arm (the default streaming path), no RoPE, no tail.
+    Oracle runs on CPU copies of the same packed data; Triton kernel runs on CUDA.
+    Asserts max_abs < 1e-2; expect much tighter (~2e-4 at fp16).
+    """
+    from bmx.cache.chunked_attention import attention_diff, naive_dense_attention
+    from bmx.cache.triton_dequant_attention import (
+        TRITON_AVAILABLE,
+        triton_decode_attention,
+    )
+
+    assert TRITON_AVAILABLE, (
+        "TRITON_AVAILABLE=False on a CUDA box — Triton not installed correctly. "
+        "Install with: pip install triton"
+    )
+
+    from tests.factories import tiny_packed_blocks
+
+    torch.manual_seed(42)
+    n_q_heads, n_q_groups, d, blk, n_blocks = 8, 4, 64, 64, 4
+    q, kb_cpu, vb_cpu, kw = tiny_packed_blocks(
+        n_q_heads=n_q_heads,
+        n_q_groups=n_q_groups,
+        n_q=1,
+        d=d,
+        blk=blk,
+        n_blocks=n_blocks,
+    )
+
+    # Oracle on CPU (matches tiny_packed_blocks defaults: no rope, no tail)
+    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+
+    # Triton kernel on CUDA
+    q_cuda = q.cuda()
+    kb_cuda = _blocks_cuda(kb_cpu)
+    vb_cuda = _blocks_cuda(vb_cpu)
+    # rope_cos/sin are None for rtn_token without rope; k_tail/v_tail are None.
+    out_cuda = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **oracle_kwargs)
+
+    # Compare on CPU (move Triton result back)
+    out_cpu = out_cuda.cpu()
+    diff = attention_diff(out_cpu, ref_cpu)
+    assert diff["max_abs"] < 1e-2, (
+        f"Triton decode kernel drifted from oracle: {diff}. "
+        "If max_abs >= 1e-2 investigate the kernel — do NOT loosen this tolerance."
+    )
+
+
+@cuda
+def test_triton_rtn_decode_matches_oracle_prerope():
+    """Same as above but with k_pre_rope=True (RoPE applied inside the loop)."""
+    from bmx.cache.chunked_attention import attention_diff, naive_dense_attention
+    from bmx.cache.triton_dequant_attention import triton_decode_attention
+
+    from tests.factories import tiny_packed_blocks_prerope
+
+    torch.manual_seed(7)
+    n_q_heads, n_q_groups, d, blk, n_blocks = 8, 4, 64, 64, 4
+    q, kb_cpu, vb_cpu, kw = tiny_packed_blocks_prerope(
+        n_q_heads=n_q_heads,
+        n_q_groups=n_q_groups,
+        d=d,
+        blk=blk,
+        n_blocks=n_blocks,
+    )
+
+    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+
+    # Move to CUDA: q, kb, vb, plus rope tensors
+    q_cuda = q.cuda()
+    kb_cuda = _blocks_cuda(kb_cpu)
+    vb_cuda = _blocks_cuda(vb_cpu)
+    kw_cuda = dict(oracle_kwargs)
+    if kw_cuda.get("rope_cos") is not None:
+        kw_cuda["rope_cos"] = kw_cuda["rope_cos"].cuda()
+    if kw_cuda.get("rope_sin") is not None:
+        kw_cuda["rope_sin"] = kw_cuda["rope_sin"].cuda()
+
+    out_cuda = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **kw_cuda)
+    out_cpu = out_cuda.cpu()
+    diff = attention_diff(out_cpu, ref_cpu)
+    assert diff["max_abs"] < 1e-2, (
+        f"Triton decode kernel (pre-RoPE) drifted from oracle: {diff}. "
+        "Investigate — do NOT loosen tolerance."
+    )
+
+
+@cuda
+def test_triton_decode_asserts_n_q_eq_1():
+    """triton_decode_attention must raise if n_q != 1 (prefill guard)."""
+    from bmx.cache.triton_dequant_attention import triton_decode_attention
+
+    from tests.factories import tiny_packed_blocks
+
+    _, kb_cpu, vb_cpu, kw = tiny_packed_blocks(
+        n_q_heads=4, n_q_groups=2, n_q=1, d=32, blk=32, n_blocks=2
+    )
+    q_bad = torch.randn(4, 3, 32).cuda()  # n_q=3, not 1
+    kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
+    kb_cuda = _blocks_cuda(kb_cpu)
+    vb_cuda = _blocks_cuda(vb_cpu)
+    with pytest.raises(AssertionError, match="decode-only"):
+        triton_decode_attention(q_bad, kb_cuda, vb_cuda, **kwargs)
