@@ -418,7 +418,7 @@ if TRITON_AVAILABLE:
             # k1/k2 are static slices of the in-register reconstructed K (BLK, D);
             # q likewise. scores = sum over both halves — never recombine to (BLK, D),
             # so no tl.cat needed. Verified bit-exact (4.8e-7) vs apply_rope.
-            half = d // 2
+            half: tl.constexpr = d // 2
             h_idx = tl.arange(0, half)  # (half,)
             o1 = b_idx[:, None] * d + h_idx[None, :]  # (BLK, half) first-half offsets
             o2 = b_idx[:, None] * d + (h_idx + half)[None, :]  # (BLK, half) second
