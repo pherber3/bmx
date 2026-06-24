@@ -2163,6 +2163,491 @@ def fused_decode_attention_packed(
     return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
 
 
+# ---------------------------------------------------------------------------
+# Phase 3a.5: FULL k2b fused decode — the real recipe, all dequant in-kernel.
+#
+#   K = lowrank_rtn_channel @3b: Us @ Vfac.T + RTN residual, keys PRE-RoPE ->
+#       RoPE applied in-kernel on the reconstructed K (ported from the proven
+#       per-block _k2b_softmax_block_kernel). All per-head, no cross-head coupling.
+#   V = turboquant_mse @2b: codebook gather + Hadamard unrotate (FWHT over the
+#       full C=h_kv*d row) + per-row norms. The unrotate COUPLES heads, so it
+#       can't run inside a per-head decode program. KEY TRICK (verified exact,
+#       scratch_fwht_defer_check.py): the FWHT is linear over C and the softmax
+#       weights act on the sequence axis, so they COMMUTE:
+#         o = Σ_s p[s]·V_real[s,:] = signs ⊙ H·( Σ_s (p[s]·norms[s])·M_quant[s,:] )
+#       The decode kernel accumulates the PER-HEAD raw-codebook value
+#         acc_pre[head,:] = Σ_s (p[s]·norms[s])·M_quant[s, head_cols]
+#       (M_quant = cb[idx]/√C, pure per-channel gather — fits the per-head kernel);
+#       the FWHT+signs run ONCE per query head in the merge epilogue over the
+#       assembled full-C row. O(S·C·logC) -> O(C·logC). Survives split-KV merge
+#       (linear commutes). norms[s] folds into p̃=p·norms; lse stays Σp (unweighted).
+#
+# Resident storage stays PACKED throughout (Us/Vfac/res int8 for K; int16 indices
+# + norms for V) — no dense KV copy.
+# ---------------------------------------------------------------------------
+
+if TRITON_AVAILABLE:
+
+    @triton.jit(do_not_specialize=["seq_len", "num_splits"])
+    def _fused_decode_k2b_kernel(
+        # Query: (h_kv, n_q_groups, d)
+        q_ptr,
+        # K factors (lowrank_rtn_channel), stacked per block:
+        #   Us:        (max_blocks, blk, rank)            fp16  (shared across heads)
+        #   Vfac:      (max_blocks, h_kv*d, rank)         fp16
+        #   res_int:   (max_blocks, h_kv*d, blk)          int8  (RTN residual codes)
+        #   res_scale: (max_blocks, h_kv*d, blk//k_group) fp16
+        us_ptr,
+        vfac_ptr,
+        res_int_ptr,
+        res_scale_ptr,
+        # V factors (turboquant_mse), stacked per block:
+        #   v_idx:  (max_blocks, blk, h_kv*d) int16  (codebook indices)
+        #   v_norm: (max_blocks, blk, 1)      fp16   (per-row norms)
+        v_idx_ptr,
+        v_norm_ptr,
+        # Codebook (2**vbits,) fp32 — tiny, loaded into registers.
+        cb_ptr,
+        # RoPE tables for the WHOLE sequence: (max_S, d) fp16 (sliced per block).
+        cos_ptr,
+        sin_ptr,
+        # Partials (pre-normalization, pre-FWHT):
+        #   acc_part: (num_splits, h_kv, G, d) fp32 — Σ p̃·M_quant (raw gather)
+        #   m_part / lse_part: (num_splits, h_kv, G) fp32
+        acc_part_ptr,
+        m_part_ptr,
+        lse_part_ptr,
+        seq_len,
+        num_splits,
+        scale,
+        sqrt_c,  # 1/√C scale folded into the codebook gather (M_quant = cb[idx]/√C)
+        h_kv: tl.constexpr,
+        blk_size: tl.constexpr,
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,
+        rank: tl.constexpr,
+        k_group: tl.constexpr,
+        vbits: tl.constexpr,  # turboquant V bits (codebook size 2**vbits)
+        BLK_POW2: tl.constexpr,
+        HAS_ROPE: tl.constexpr,
+    ):
+        """k2b fused decode: in-kernel lowrank-K + RoPE + deferred-FWHT V accumulation.
+
+        Per (kv, split) program: reconstruct K (Us@Vfac.T + RTN residual + RoPE),
+        score via GEMV (rank/d may be <16 in tests -> multiply+sum, not tl.dot),
+        and accumulate the PER-HEAD raw V value Σ p̃·M_quant (p̃=p·norms). The FWHT
+        unrotate is deferred to the merge epilogue (see module comment).
+        """
+        kv = tl.program_id(0)
+        s = tl.program_id(1)
+        d_idx = tl.arange(0, d)
+        gp_idx = tl.arange(0, n_q_groups)  # query heads in this kv group (no pad: GEMV)
+        r_idx = tl.arange(0, BLK_POW2)
+        row_real = r_idx < blk_size
+        rank_idx = tl.arange(0, rank)
+        n_kg: tl.constexpr = blk_size // k_group  # RTN residual groups along blk
+        C: tl.constexpr = h_kv * d
+
+        raw = (seq_len + num_splits - 1) // num_splits
+        tokens_per_split = ((raw + blk_size - 1) // blk_size) * blk_size
+        split_start = s * tokens_per_split
+        split_end = tl.minimum(split_start + tokens_per_split, seq_len)
+        first_block = split_start // blk_size
+        last_block = (split_end + blk_size - 1) // blk_size
+
+        # Per-head query rows (G, d).
+        q_off = (kv * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]
+        q_rows = tl.load(q_ptr + q_off).to(tl.float32)  # (G, d)
+
+        m = tl.full((n_q_groups,), float("-inf"), tl.float32)
+        lse = tl.zeros((n_q_groups,), tl.float32)
+        acc = tl.zeros((n_q_groups, d), tl.float32)  # Σ p̃·M_quant per head
+
+        # rotate_half permutation+sign matrix (D,D), built once (RoPE).
+        half: tl.constexpr = d // 2
+        j_is_first = d_idx < half
+        src_for_j = tl.where(j_is_first, d_idx + half, d_idx - half)
+        sign_for_j = tl.where(j_is_first, -1.0, 1.0)
+        P = tl.where(d_idx[:, None] == src_for_j[None, :], sign_for_j[None, :], 0.0)
+
+        for blk in range(first_block, last_block):
+            row_abs = blk * blk_size + r_idx  # (BLK_POW2,)
+            tile_mask = (row_abs < split_end) & row_real
+
+            # --- K lowrank: Us (blk, rank) @ Vfac[head] (d, rank).T -> (blk, d) ---
+            us = tl.load(
+                us_ptr
+                + blk * blk_size * rank
+                + r_idx[:, None] * rank
+                + rank_idx[None, :],
+                mask=row_real[:, None],
+                other=0.0,
+            ).to(tl.float32)  # (BLK_POW2, rank)
+            vfac = tl.load(
+                vfac_ptr
+                + blk * C * rank
+                + (kv * d + d_idx)[:, None] * rank
+                + rank_idx[None, :]
+            ).to(tl.float32)  # (d, rank)
+            k_low = tl.sum(us[:, None, :] * vfac[None, :, :], axis=2)  # (BLK_POW2, d)
+
+            # --- K RTN residual: res_int (d, blk) int8 * per-group scale -> (blk,d) ---
+            res = tl.load(
+                res_int_ptr
+                + blk * C * blk_size
+                + (kv * d + d_idx)[:, None] * blk_size
+                + r_idx[None, :],
+                mask=row_real[None, :],
+                other=0,
+            ).to(tl.float32)  # (d, BLK_POW2)
+            res_sc = tl.load(
+                res_scale_ptr
+                + blk * C * n_kg
+                + (kv * d + d_idx)[:, None] * n_kg
+                + (r_idx[None, :] // k_group),
+                mask=row_real[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (d, BLK_POW2)
+            k_res = tl.trans(res * res_sc)  # (BLK_POW2, d)
+            k = k_low + k_res  # (BLK_POW2, d) pre-RoPE
+
+            if HAS_ROPE:
+                cos = tl.load(
+                    cos_ptr + row_abs[:, None] * d + d_idx[None, :],
+                    mask=row_real[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                sin = tl.load(
+                    sin_ptr + row_abs[:, None] * d + d_idx[None, :],
+                    mask=row_real[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                rot = tl.sum(k[:, :, None] * P[None, :, :], axis=1)  # (BLK_POW2, d)
+                k = k * cos + rot * sin
+
+            # scores[g, b] = scale * Σ_dd q[g,dd]*k[b,dd]  (GEMV, rank/d may be <16)
+            scores = tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
+            scores = tl.where(
+                tile_mask[None, :], scores, float("-inf")
+            )  # (G, BLK_POW2)
+
+            m_new = tl.maximum(m, tl.max(scores, axis=1))
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(scores - m_new[:, None])  # (G, BLK_POW2)
+            lse = lse * alpha + tl.sum(p, axis=1)  # unweighted denom (Σ p)
+
+            # --- V deferred: M_quant[b, head_cols] = cb[idx]/√C ; p̃ = p*norms ---
+            v_norm = tl.load(
+                v_norm_ptr + blk * blk_size + r_idx,
+                mask=row_real,
+                other=0.0,
+            ).to(tl.float32)  # (BLK_POW2,) per-row norm
+            v_idx = tl.load(
+                v_idx_ptr
+                + blk * blk_size * C
+                + r_idx[:, None] * C
+                + (kv * d + d_idx)[None, :],
+                mask=row_real[:, None],
+                other=0,
+            ).to(tl.int32)  # (BLK_POW2, d) codebook indices for this head
+            m_quant = tl.load(cb_ptr + v_idx).to(tl.float32) * sqrt_c  # (BLK_POW2, d)
+            p_tilde = p * v_norm[None, :]  # (G, BLK_POW2)
+            acc = acc * alpha[:, None] + tl.sum(
+                p_tilde[:, :, None] * m_quant[None, :, :], axis=1
+            )  # (G, d)
+            m = m_new
+
+        head_row = s * h_kv + kv
+        acc_off = (head_row * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]
+        tl.store(acc_part_ptr + acc_off, acc)
+        ml_off = head_row * n_q_groups + gp_idx
+        tl.store(m_part_ptr + ml_off, m)
+        tl.store(lse_part_ptr + ml_off, lse)
+
+    @triton.jit
+    def _fused_merge_k2b_kernel(
+        acc_part_ptr,  # (num_splits, h_kv, G, d) fp32 — Σ p̃·M_quant per head
+        m_part_ptr,
+        lse_part_ptr,
+        signs_ptr,  # (C,) fp32 ±1 — Hadamard signs
+        out_ptr,  # (h_kv, G, d) fp16
+        num_splits,
+        h_kv: tl.constexpr,
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,
+        C: tl.constexpr,  # = h_kv * d
+        LOGC: tl.constexpr,  # log2(C)
+    ):
+        """Merge splits + deferred FWHT unrotate, per QUERY HEAD (grid = n_q_groups).
+
+        For query head g: combine the num_splits partials of EVERY kv head into the
+        full (C,) accumulator row (assembling all h_kv heads' d-column blocks), run
+        ONE orthonormal FWHT over C + sign flip (the unrotate), normalize by the
+        merged lse, and scatter back to each (kv, g, d) output slot.
+
+        The online-softmax denom uses the UNWEIGHTED lse (norms already folded into
+        the numerator via p̃ in the decode kernel).
+        """
+        g = tl.program_id(0)  # query head within each kv group
+        c_idx = tl.arange(0, C)  # full-row channel index
+        kv_of_c = c_idx // d  # which kv head each channel belongs to
+        dd_of_c = c_idx % d  # channel within that head
+
+        # Global max + merged lse PER kv head (the softmax is per (kv,g), and each
+        # channel c belongs to head kv_of_c[c]); gather per-channel via kv_of_c.
+        m_glob = tl.full((C,), float("-inf"), tl.float32)
+        for s in range(num_splits):
+            hr = s * h_kv + kv_of_c  # (C,) head_row per channel's kv head
+            m_s = tl.load(m_part_ptr + hr * n_q_groups + g)  # (C,)
+            m_glob = tl.maximum(m_glob, m_s)
+
+        l_acc = tl.zeros((C,), tl.float32)
+        row = tl.zeros((C,), tl.float32)  # Σ_s scale_s * acc_pre[s, kv_of_c, g, dd]
+        for s in range(num_splits):
+            hr = s * h_kv + kv_of_c  # (C,)
+            ml = hr * n_q_groups + g
+            m_s = tl.load(m_part_ptr + ml)
+            lse_s = tl.load(lse_part_ptr + ml)
+            sc = tl.exp(m_s - m_glob)  # (C,)
+            l_acc += lse_s * sc
+            acc_s = tl.load(
+                acc_part_ptr + (hr * n_q_groups + g) * d + dd_of_c
+            )  # (C,) acc_pre channel
+            row += acc_s * sc
+
+        # row now = Σ_s p̃·M_quant merged, laid out over the FULL C axis. Apply the
+        # deferred unrotate: signs ⊙ FWHT(row), then normalize by the merged lse.
+        # FWHT (Sylvester, LOGC butterfly stages) — port of fwht_butterfly_ref.
+        h = 1
+        for _stage in tl.static_range(LOGC):
+            # pair (lo, hi) with hi = lo + h; lo are channels where (c // h) is even.
+            partner = tl.where((c_idx // h) % 2 == 0, c_idx + h, c_idx - h)  # (C,)
+            # gather partner values via a (C,C) selection (C is small: h_kv*d).
+            partner_val = tl.sum(
+                tl.where(c_idx[None, :] == partner[:, None], row[None, :], 0.0), axis=1
+            )  # (C,) = row[partner[c]]
+            row = tl.where((c_idx // h) % 2 == 0, row + partner_val, partner_val - row)
+            # NB: lo' = a+b = row_lo + row_hi ; hi' = a-b = row_lo - row_hi.
+            # For lo (even): partner=hi, partner_val=row_hi -> row+partner_val = a+b ✓
+            # For hi (odd):  partner=lo, partner_val=row_lo -> partner_val-row = a-b ✓
+            h = h * 2
+        signs = tl.load(signs_ptr + c_idx).to(tl.float32)
+        row = row / tl.sqrt(C.to(tl.float32)) * signs  # orthonormal FWHT + unrotate
+
+        # Normalize by merged lse (per channel's kv head) and store.
+        out_val = row / l_acc  # (C,)
+        out_off = (kv_of_c * n_q_groups + g) * d + dd_of_c  # (C,) -> (h_kv,G,d) slot
+        tl.store(out_ptr + out_off, out_val.to(tl.float16))
+
+
+def build_kv_stacked_k2b(
+    k_blocks: list,
+    v_blocks: list,
+    *,
+    max_blocks: int,
+    h_kv: int,
+    blk_size: int,
+    d: int,
+    device: torch.device | str = "cuda",
+):
+    """Pre-stack k2b packed factors (lowrank_rtn_channel K + turboquant_mse V).
+
+    Returns a dict of device tensors the k2b fused kernel consumes:
+      us:        (max_blocks, blk, rank)            fp16
+      vfac:      (max_blocks, h_kv*d, rank)         fp16
+      res_int:   (max_blocks, h_kv*d, blk)          int8
+      res_scale: (max_blocks, h_kv*d, blk//k_group) fp16
+      v_idx:     (max_blocks, blk, h_kv*d)          int16
+      v_norm:    (max_blocks, blk, 1)               fp16
+    plus rank, k_group (read off block 0).
+    """
+    C = h_kv * d
+    rank = k_blocks[0][0]["Us"].shape[1]
+    res_scale0 = k_blocks[0][0]["res_scale"]  # (C, n_groups, 1)
+    n_kg = res_scale0.shape[1]
+    k_group = blk_size // n_kg
+
+    us = torch.zeros(max_blocks, blk_size, rank, dtype=torch.float16, device=device)
+    vfac = torch.zeros(max_blocks, C, rank, dtype=torch.float16, device=device)
+    res_int = torch.zeros(max_blocks, C, blk_size, dtype=torch.int8, device=device)
+    res_scale = torch.zeros(max_blocks, C, n_kg, dtype=torch.float16, device=device)
+    v_idx = torch.zeros(max_blocks, blk_size, C, dtype=torch.int16, device=device)
+    v_norm = torch.zeros(max_blocks, blk_size, 1, dtype=torch.float16, device=device)
+
+    for i, ((kp, _ks, _ke), (vp, _vs, _ve)) in enumerate(zip(k_blocks, v_blocks)):
+        assert i < max_blocks
+        us[i] = kp["Us"].to(device).to(torch.float16)
+        vfac[i] = kp["V"].to(device).to(torch.float16)
+        res_int[i] = kp["res_Q_int"].to(device)
+        res_scale[i] = kp["res_scale"].squeeze(-1).to(device).to(torch.float16)
+        v_idx[i] = vp["indices"].to(device).to(torch.int16)
+        v_norm[i] = vp["norms"].to(device).to(torch.float16)
+
+    return {
+        "us": us,
+        "vfac": vfac,
+        "res_int": res_int,
+        "res_scale": res_scale,
+        "v_idx": v_idx,
+        "v_norm": v_norm,
+        "rank": rank,
+        "k_group": k_group,
+    }
+
+
+def fused_decode_attention_k2b(
+    q: torch.Tensor,
+    stacks: dict,
+    seq_len: int,
+    *,
+    n_q_groups: int,
+    scale: float,
+    vbits: int,
+    v_seed: int,
+    rope_cos: torch.Tensor | None,
+    rope_sin: torch.Tensor | None,
+    num_splits: int | None = None,
+    k_tail: torch.Tensor | None = None,
+    v_tail: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Full k2b fused decode (lowrank+RTN+RoPE K, turboquant V via deferred FWHT).
+
+    stacks: from build_kv_stacked_k2b. rope_cos/sin: (max_S, d) tables (None -> no
+    RoPE, i.e. keys not pre-RoPE). The fp16 recent-window tail is merged in PyTorch.
+    """
+    _require_triton()
+    from bmx.cache.codecs import _hadamard_signs, gaussian_codebook
+
+    n_q_heads, n_q, d = q.shape
+    assert n_q == 1, "decode-only"
+    h_kv = n_q_heads // n_q_groups
+    C = h_kv * d
+    blk_size = stacks["us"].shape[1]
+    max_blocks = stacks["us"].shape[0]
+    assert seq_len <= max_blocks * blk_size
+    rank = stacks["rank"]
+    k_group = stacks["k_group"]
+
+    if num_splits is None:
+        num_splits = pick_num_splits(seq_len, blk_size, h_kv)
+    num_splits = max(1, int(num_splits))
+    blk_pow2 = 1
+    while blk_pow2 < blk_size:
+        blk_pow2 *= 2
+    logc = 0
+    while (1 << logc) < C:
+        logc += 1
+    assert (1 << logc) == C, f"C={C} must be a power of 2 for the in-kernel FWHT"
+
+    cb = gaussian_codebook(vbits).to(q.device, torch.float32)
+    signs = _hadamard_signs(C, v_seed).to(q.device, torch.float32)
+    sqrt_c = 1.0 / math.sqrt(C)
+    has_rope = rope_cos is not None
+
+    q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
+    acc_part = torch.empty(
+        num_splits, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
+    )
+    m_part = torch.empty(
+        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+    )
+    lse_part = torch.empty(
+        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+    )
+
+    cos_arg = (
+        rope_cos.to(q.device, torch.float16).contiguous() if has_rope else stacks["us"]
+    )
+    sin_arg = (
+        rope_sin.to(q.device, torch.float16).contiguous() if has_rope else stacks["us"]
+    )
+
+    _fused_decode_k2b_kernel[(h_kv, num_splits)](
+        q_kv,
+        stacks["us"],
+        stacks["vfac"],
+        stacks["res_int"],
+        stacks["res_scale"],
+        stacks["v_idx"],
+        stacks["v_norm"],
+        cb,
+        cos_arg,
+        sin_arg,
+        acc_part,
+        m_part,
+        lse_part,
+        int(seq_len),
+        int(num_splits),
+        float(scale),
+        float(sqrt_c),
+        h_kv=h_kv,
+        blk_size=blk_size,
+        d=d,
+        n_q_groups=n_q_groups,
+        rank=rank,
+        k_group=k_group,
+        vbits=vbits,
+        BLK_POW2=blk_pow2,
+        HAS_ROPE=has_rope,
+    )
+
+    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
+    _fused_merge_k2b_kernel[(n_q_groups,)](
+        acc_part,
+        m_part,
+        lse_part,
+        signs,
+        out,
+        int(num_splits),
+        h_kv=h_kv,
+        d=d,
+        n_q_groups=n_q_groups,
+        C=C,
+        LOGC=logc,
+    )
+    out = out.view(n_q_heads, 1, d)
+
+    if k_tail is None or k_tail.shape[1] == 0:
+        return out
+
+    # Tail: the merge kernel already normalized `out`; to fold the tail we need the
+    # packed region's pre-normalization (acc, m, lse) too. Recompute the merged
+    # packed partial in PyTorch from the kernel partials (cheap: h_kv*G*d), apply
+    # the deferred FWHT there, then online-softmax-merge with the dense tail.
+    from bmx.quant.hadamard import fwht
+
+    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
+    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
+    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
+    # Merge the packed splits WITHOUT normalization -> (n_q_heads,1,d) acc_pre, lse, m.
+    stacked_m = torch.stack([mm.float() for mm in ms], 0)  # (S,H,1,1)
+    m_g = stacked_m.amax(0, keepdim=True)
+    sc = torch.exp(stacked_m - m_g)  # (S,H,1,1)
+    acc_pre = (torch.stack([a.float() for a in accs], 0) * sc).sum(0)  # (H,1,d)
+    lse_p = (torch.stack([lz.float() for lz in lses], 0) * sc).sum(0)  # (H,1,1)
+    m_p = m_g.squeeze(0)  # (H,1,1)
+    # Apply deferred FWHT+signs per query head over the full C row.
+    acc_pre_c = (
+        acc_pre.reshape(h_kv, n_q_groups, d).permute(1, 0, 2).reshape(n_q_groups, C)
+    )  # (G, C) — assemble full row per query head
+    sgn = _hadamard_signs(C, v_seed).to(acc_pre_c)
+    acc_v = (fwht(acc_pre_c) * sgn).reshape(n_q_groups, h_kv, d).permute(1, 0, 2)
+    acc_v = acc_v.reshape(n_q_heads, 1, d)  # (n_q_heads,1,d) pre-norm V numerator
+
+    # Dense tail partial.
+    kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
+    vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
+    qf = q.float()
+    st = torch.einsum("hqd,hkd->hqk", qf, kt) * scale
+    mt = st.amax(-1, keepdim=True)
+    pt = torch.exp(st - mt)
+    lse_t = pt.sum(-1, keepdim=True)
+    acc_t = torch.einsum("hqk,hkd->hqd", pt, vt)
+    return _merge_partials([acc_v, acc_t], [m_p, mt], [lse_p, lse_t]).view(
+        n_q_heads, 1, d
+    )
+
+
 def build_kv_stacked(
     k_blocks: list,
     v_blocks: list,
