@@ -162,3 +162,82 @@ def test_no_silent_swallow(monkeypatch):
             model(decode_ids, past_key_values=cache, use_cache=True)
 
     cache.detach()
+
+
+# ---------------------------------------------------------------------------
+# Test 3: k2b+pre_rope=True falls back to chunked even when TRITON_AVAILABLE=True
+# ---------------------------------------------------------------------------
+
+
+def test_k2b_pre_rope_falls_back_to_chunked(monkeypatch):
+    """The canonical k2b config (lowrank_rtn_channel + pre_rope=True) must fall
+    back to chunked_dequant_attention even when TRITON_AVAILABLE=True.
+
+    The Triton kernel raises NotImplementedError for in-kernel RoPE on lowrank
+    keys (capability-not-yet-implemented).  The guard in attend() must divert
+    BEFORE the kernel is called, routing to chunked instead.
+
+    This test:
+      - Monkeypatches TRITON_AVAILABLE=True (simulates CUDA/Triton present).
+      - Leaves triton_decode_attention as a stub that raises _SentinelError.
+      - Runs a full prefill + decode with k2b + pre_rope=True.
+      - Asserts NO error is raised (the guard diverted to chunked).
+      - Asserts the chunked output matches the StreamingQuantizedCache reference
+        (confirming the right path ran and produced correct output).
+
+    FAILS before Fix 1 (the kernel would be called and raise NotImplementedError).
+    PASSES after Fix 1 (the guard diverts to chunked before the kernel is touched).
+    """
+    from bmx.cache.streaming import StreamingQuantizedCache
+
+    # Canonical k2b config: lowrank_rtn_channel + pre_rope=True + bits=3, rank=16, group=64
+    # This is the config that crashed the VM (the gap that hid this bug).
+    k_spec = CacheCodecSpec(
+        arm="lowrank_rtn_channel", bits=3, rank=16, group=64, pre_rope=True
+    )
+    v_spec = CacheCodecSpec(arm="turboquant_mse", bits=2)
+
+    def _raise_sentinel(*args, **kwargs):
+        raise _SentinelError(
+            "triton_decode_attention called for k2b+pre_rope — guard missing"
+        )
+
+    # Patch TRITON_AVAILABLE=True + replace kernel with sentinel that would crash.
+    monkeypatch.setattr(ps_mod, "TRITON_AVAILABLE", True)
+    monkeypatch.setattr(ps_mod, "triton_decode_attention", _raise_sentinel)
+
+    model = tiny_llama()
+    input_ids = ids(vocab=97, seq=12, seed=5)
+
+    # Reference: StreamingQuantizedCache (chunked path, unpatched).
+    ref_cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    ref_cache.attach(model)
+    with torch.no_grad():
+        ref_out = model.generate(
+            input_ids,
+            max_new_tokens=3,
+            do_sample=False,
+            use_cache=True,
+            past_key_values=ref_cache,
+        )
+    ref_cache.detach()
+
+    # Under test: PackedStreamingCache with TRITON_AVAILABLE=True but k2b+pre_rope guard.
+    # Must NOT raise _SentinelError (guard diverts before sentinel is called).
+    packed_cache = PackedStreamingCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    packed_cache.attach(model)
+    with torch.no_grad():
+        packed_out = model.generate(
+            input_ids,
+            max_new_tokens=3,
+            do_sample=False,
+            use_cache=True,
+            past_key_values=packed_cache,
+        )
+    packed_cache.detach()
+
+    # Output must match reference (chunked path ran correctly).
+    assert torch.equal(packed_out, ref_out), (
+        "k2b+pre_rope fallback output diverged from StreamingQuantizedCache reference. "
+        "The guard diverted to chunked but chunked produced wrong output."
+    )

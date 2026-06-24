@@ -97,15 +97,21 @@ def predict_decode_latency(
 
     Honest model: decode is memory-bound (~0.5 FLOP/byte), so step time is
     dominated by (weights + KV read) / bandwidth. Dequant FLOPs are "free" only
-    while they stay under the bandwidth time; compute_bound_flag marks when they
-    don't.
+    while they stay under the bandwidth time.
+
+    compute_bound_flag is None here — it requires peak_flops_per_s to compute,
+    which is not available at this level. The flag is computed correctly by
+    decode_speedup_curve, which receives the FLOP/s budget.
+    dequant_compute_time_s is 0.0 (dequant assumed free at this level of analysis).
     """
     kv_read = _kv_read_bytes_per_step(case)
     weight = case.weights_bytes
     bandwidth_time = (weight + kv_read) / hbm_bandwidth_bytes_per_s
     # Dequant time uses a conservative peak-flops divisor; refined per-GPU at measure time.
     dequant_flops = _dequant_flops_per_step(case)
-    # peak_flops_per_s injected via decode_speedup_curve; here assume free unless overridden.
+    # peak_flops_per_s not available here; dequant assumed free (0.0).
+    # compute_bound_flag requires peak_flops_per_s — not computed at this level.
+    # Use decode_speedup_curve for the flag (it receives the FLOP/s budget).
     dequant_time = 0.0
     return {
         "kv_read_bytes": kv_read,
@@ -113,7 +119,7 @@ def predict_decode_latency(
         "bandwidth_time_s": bandwidth_time,
         "dequant_compute_time_s": dequant_time,
         "predicted_step_latency_s": bandwidth_time + dequant_time,
-        "compute_bound_flag": False,
+        "compute_bound_flag": None,
         "_dequant_flops": dequant_flops,
     }
 

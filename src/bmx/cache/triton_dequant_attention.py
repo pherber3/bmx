@@ -1,78 +1,14 @@
 """Triton fused dequant-attention DECODE kernel (k2b recipe).
 
-Stage 3a: Serial-over-blocks online-softmax decode, correctness-first skeleton.
-Stage 3b: Split-KV decode parallelism + autotune.
-Stage 3c: In-kernel k2b unpack — lowrank keys (tl.dot(Us, V_fac.T) + RTN
-    residual) and Lloyd-codebook value gather (cb[indices]/sqrt(C)), with
-    PyTorch _unrotate applied to V per block before the contraction kernel.
+Provides: Triton online-softmax decode kernel + graphable split-KV path +
+dispatch helpers.  Two kernel paths: RTN arms (dense K/V from Python dequant)
+and k2b (lowrank_rtn_channel K unpacked in-kernel; turboquant_mse V dequanted
+in Python and passed dense).  Imports cleanly with TRITON_AVAILABLE=False
+(AMD/no-CUDA dev box); kernel verified on VM.
 
-Deliberate staging (do not collapse prematurely):
-  3a (base): DEQUANT stays in PyTorch per block (reuse dequant_packed +
-      from_matrix + apply_rope).  ONLY the online-softmax QK^T·V contraction
-      runs in Triton.  Isolates the kernel skeleton so it is independently
-      bit-exact vs naive_dense_attention before any in-kernel unpacking.
-  3b (this stage): Split the KV block list across num_splits parallel program
-      groups, each computing a partial (acc_i, m_i, lse_i), then a reduction
-      kernel merges them via the standard online-softmax combine.  Adds
-      @triton.autotune + do_not_specialize on the block-count runtime arg.
-  3c (this stage): Move k2b unpack into Triton.  Two kernel paths:
-      - RTN arms (3a/3b path unchanged): Python dequant → dense K/V →
-        _online_softmax_block_kernel.
-      - k2b arm (lowrank_rtn_channel K + turboquant_mse V):
-          K: in-kernel lowrank tl.dot(Us, V_fac.T) + RTN residual dequant.
-          V: Python codebook gather + /sqrt(C) + _unrotate (FWHT, deferred
-             from kernel — see NOTE below) + * norms → dense V passed to
-             _k2b_softmax_block_kernel for the contraction.
-        NOTE: Full in-kernel FWHT for V is a DEFERRED optimisation (3c+).
-        The Hadamard _unrotate is O(C log C) but is a subtle-bug magnet as an
-        in-kernel FWHT.  Per-block-per-decode it is negligible vs the
-        memory-bandwidth saving on K.  Revisit only if VM profiling shows it
-        as a hot path.
-
-v_group / v_seed (3c): K and V may be on different arms with different
-    seed/group.  triton_decode_attention now accepts v_group / v_seed kwargs
-    (both default to k's values for back-compat with 3a/3b RTN-only tests).
-
-Carry strategy: (acc, m, lse) are Python/PyTorch tensors carried between
-per-block Triton kernel launches.  For decode (n_q==1) the blocks are small
-relative to the per-launch overhead, but correctness is the goal here;
-fusing the KV-block loop is a 3c concern.
-
-GQA: q is (n_q_heads, 1, d), kv is (h_kv, blk, d).
-  n_q_groups = n_q_heads // h_kv.
-  The kernel avoids repeat_interleave by viewing q as (h_kv, n_q_groups, 1, d)
-  and iterating: for each KV head g, launch a sub-kernel over the n_q_groups
-  query heads that share it.  In this 3a skeleton we do this in the Python
-  loop (one Triton launch per KV head per block), which is correct and simple.
-  A single fused launch per block is a 3b optimisation.
-
-Correctness bar: max_abs vs naive_dense_attention < 1e-2 (expect much tighter,
-near fp16 rounding ~2e-4).  If it drifts, fix the kernel — do NOT loosen.
-
-HARDWARE NOTE: Triton/CUDA not available on this AMD dev box.  The module
-imports cleanly with TRITON_AVAILABLE=False.  The @triton.jit kernel is
-verified on VM (Task 6 batch).  Concerns flagged in the report.
-
-SPLIT-KV MERGE CORRECTNESS (3b — the one invariant that MUST hold):
-  Each split stores pre-normalization (acc_i, m_i, lse_i):
-    - m_i   = running max of softmax exponent for split i (fp32)
-    - lse_i = sum of exp(score - m_i) for split i (NOT log-normalized; raw sum)
-    - acc_i = sum of exp(score - m_i) * v for split i (NOT divided by lse_i)
-  Merge across splits (base-e, the online-softmax combine):
-    m   = max_i(m_i)
-    l   = sum_i(lse_i * exp(m_i - m))
-    out = sum_i(acc_i * exp(m_i - m)) / l
-  Identity at num_splits=1:
-    m   = m_0
-    l   = lse_0 * exp(m_0 - m_0) = lse_0 * 1 = lse_0
-    out = acc_0 * exp(0) / lse_0 = acc_0 / lse_0
-  This is EXACTLY the 3a final division: acc / lse — bit-identical.
-  At >1 splits: the combine is exactly online_softmax_update applied across splits.
-
-BASE-E CONSISTENCY: 3a kernel uses natural exp throughout (no exp2/log2 trick).
-  The 3b split kernel and merge kernel MUST also use base-e.  DO NOT import a
-  base-2 merge formula — that is a silent correctness trap (same class as the
-  3a base-e/base-2 issue flagged in the 3a report).
+Usage: call triton_decode_attention(q, k_blocks, v_blocks, k_arm=..., ...).
+Design rationale and staged-build ledger:
+  docs/superpowers/specs/2026-06-24-triton-decode-kernel-design.md
 """
 
 from __future__ import annotations
@@ -95,6 +31,39 @@ except ImportError:
     tl = None  # type: ignore[assignment]
 
 
+# ---------------------------------------------------------------------------
+# Staged-build ledger + correctness invariants (see spec for full rationale)
+# ---------------------------------------------------------------------------
+#
+# Staged build (do not collapse prematurely):
+#   3a: Python dequant per block; only online-softmax contraction in Triton.
+#       Isolates kernel skeleton for bit-exact verification vs naive_dense_attention.
+#   3b: Split-KV decode parallelism + @triton.autotune + do_not_specialize on
+#       block-count arg.
+#   3c: In-kernel k2b unpack — lowrank K via tl.dot(Us, V_fac.T) + RTN residual;
+#       turboquant_mse V dequanted in Python (_unrotate stays Python, deferred 3c+).
+#   3c+: Full in-kernel FWHT for V (deferred — subtle-bug magnet; negligible cost
+#        vs memory-bandwidth saving on K; revisit only if VM profiling demands it).
+#
+# v_group / v_seed (3c): K and V may differ in seed/group; both accepted as kwargs
+#   (default to K's values for back-compat with 3a/3b RTN-only tests).
+#
+# GQA carry: (acc, m, lse) Python tensors between per-block Triton launches;
+#   fusing the KV-block loop is a 3c+ concern.
+#
+# Correctness bar: max_abs vs naive_dense_attention < 1e-2 (expect ~2e-4 at fp16).
+#   Do NOT loosen — fix the kernel if it drifts.
+#
+# Split-KV merge invariant (3b — must hold):
+#   Each split stores pre-normalization (acc_i, m_i, lse_i), merged as:
+#     m = max_i(m_i);  l = sum_i(lse_i * exp(m_i - m));
+#     out = sum_i(acc_i * exp(m_i - m)) / l
+#   At num_splits=1 this reduces to acc_0 / lse_0 (bit-identical to 3a).
+#
+# Base-e consistency: ALL kernels and merge use natural exp — do NOT mix base-2.
+#   A base-2 merge formula is a silent correctness trap (class of bug flagged in
+#   the 3a report).
+#
 # ---------------------------------------------------------------------------
 # Capability guard — fail loud; NO silent fallback (fallback is Task 4).
 # ---------------------------------------------------------------------------
@@ -315,7 +284,7 @@ if TRITON_AVAILABLE:
         m_ptr,
         lse_ptr,
         scale,
-        n_blocks_in_split,  # do_not_specialize — prevents recompile per seq_len  # noqa: ARG001
+        n_blocks_in_split,  # intentionally unused in kernel body — exists only as a do_not_specialize autotune-specialization guard (prevents recompile when seq_len changes)  # noqa: ARG001
         d: tl.constexpr,
         n_q_groups: tl.constexpr,  # noqa: ARG001
         blk: tl.constexpr,  # actual block size (NOT autotuned — matches packed block)
@@ -538,26 +507,11 @@ def _v_dequant_turboquant_mse(
 ) -> torch.Tensor:
     """Dequant one turboquant_mse V block → (h_kv, blk, d) dense fp16.
 
-    Sequence:
-      1. Gather codebook:  M_quant = cb[indices.long()] / sqrt(C)
-      2. Unrotate (FWHT or matmul — stays Python, see module docstring):
-                           M_recon = _unrotate(M_quant, seed)
-      3. Scale by norms:   V_dense = M_recon * norms
-
-    Delegates to codecs._turboquant_mse_dequant for the core sequence.
-    The _unrotate step (FWHT) is deliberately kept in Python for 3c —
-    in-kernel FWHT is a deferred optimisation (see 3c+ note in module doc).
-
-    Args:
-        vpacked: packed dict with keys 'indices' (S,C) int16, 'norms' (S,1),
-                 'bits' int.
-        h_kv:    number of KV heads (for from_matrix layout conversion).
-        v_seed:  seed for the _unrotate Hadamard rotation (V's own seed).
-        device:  target device.
-        dtype:   target dtype (fp16).
-
-    Returns:
-        (h_kv, blk, d) fp16 dense V block, ready to pass to kernel as v_ptr.
+    Delegates to codecs._turboquant_mse_dequant (codebook gather + _unrotate +
+    scale by norms), then converts from (S, C) matrix layout to (h_kv, blk, d)
+    via from_matrix.  The _unrotate (FWHT) is deliberately kept in Python —
+    in-kernel FWHT is a deferred 3c+ optimisation (see staged-build ledger above).
+    Note: codebook dtype is fp32 inside _turboquant_mse_dequant; cast to fp16 here.
     """
     # Deferred imports: codecs is not imported at module top (circular-import
     # avoidance — codecs → collect → triton_dequant_attention would cycle).

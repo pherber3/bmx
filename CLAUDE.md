@@ -24,7 +24,7 @@ rotation, two-stage quantization, BM-decomposition notes).
 ## Commands
 
 ```bash
-uv run pytest -q                  # ≈ 50 s; expected: 243 passed, 1 xfailed
+uv run pytest -q                  # ≈ 50 s; expected: 322 passed, 16 skipped, 1 xfailed
 uv run python experiments/<x>.py --help   # tyro CLIs; tuples space-separated
 uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024
                                   # regenerates results/cache/* (gitignored)

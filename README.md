@@ -49,7 +49,7 @@ re-check.
 ## Quickstart
 
     uv sync
-    uv run pytest -q                      # 243 passed, 1 xfailed (intentional)
+    uv run pytest -q                      # 322 passed, 16 skipped, 1 xfailed (intentional)
     uv run python experiments/k1_cache_census.py --help   # tyro CLIs everywhere
 
 Experiments run on CPU except where noted (this repo was developed against an
