@@ -1080,3 +1080,430 @@ def triton_decode_attention(
         return partial_accs[0] / partial_lses[0].to(q.dtype)
 
     return _merge_partials(partial_accs, partial_ms, partial_lses)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3d: CUDA-graph-safe decode path
+#
+# THE PROBLEM with the existing decode path for CUDA graphs:
+#   - k_blocks is a Python list; its length (seq_len / n_blocks) is a Python int.
+#   - A CUDA graph captures a fixed kernel launch grid and fixed kernel args.
+#   - If seq_len (or n_blocks) is a Python int kernel arg, every decode step
+#     with a different seq_len requires a DIFFERENT compiled kernel specialization.
+#     Replaying an old capture at a new seq_len would use the WRONG (old) length.
+#
+# THE FIX (vLLM pattern, confirmed via DeepWiki):
+#   - Pre-stack KV blocks into a device tensor (max_blocks, h_kv, blk, d).
+#     The graph captures the pointer to this buffer; in-place updates are visible
+#     to replays without re-capture.
+#   - Pass seq_len as a DEVICE TENSOR (int32 scalar on CUDA).
+#     The kernel reads `seq_len_ptr[0]` at runtime — NOT from the launch args.
+#     Updating seq_len_dev.fill_(new_len) in-place between replays causes the
+#     replay to use the new length without re-capture.
+#   - Launch grid is FIXED = (max_blocks, h_kv, n_q_groups) — always the same shape.
+#     Blocks beyond seq_len_dev[0] are masked (kernel exits early).
+#
+# SCOPE OF 3d (honest):
+#   - RTN path (rtn_token arm): K and V are pre-dequanted into k_stacked/v_stacked
+#     before capture. In-place updates to the stacked tensors between replays make
+#     new KV blocks visible. This is the minimum satisfying the gate.
+#   - k2b path (lowrank_rtn_channel): K's packed dict (Us, V, res_Q_int, res_scale)
+#     is a heterogeneous Python dict, not a single contiguous device tensor. Stacking
+#     these across max_blocks into a graph-capturable device tensor requires a larger
+#     refactor (a paged block table for each factor). DEFERRED from 3d.
+#   - Tail window: fp16 residual window is handled by the caller (not part of the
+#     graphable path — it is always small and can be processed outside the graph).
+#   - CUDA graph capture/replay test: CUDA-gated. Locally (AMD/no-CUDA) the test
+#     skips loud. The test IS a real capture->update->replay->compare-to-fresh test
+#     that would catch a Python-int-seqlen implementation.
+#
+# KEY CORRECTNESS PROPERTY:
+#   A Python-int-seqlen implementation would bake seq_len=S0 into the captured
+#   kernel specialization. Replaying at S0+k would either: (a) run the S0 kernel
+#   (masking at S0, ignoring the extra blocks) → output matches fresh-at-S0 but
+#   NOT fresh-at-S0+k, catching the bug; or (b) recompile per step, defeating the
+#   purpose. The test asserts replayed ≈ fresh-at-S0+k, catching case (a).
+# ---------------------------------------------------------------------------
+
+
+if TRITON_AVAILABLE:
+
+    @triton.jit(do_not_specialize=["max_blocks"])
+    def _graphable_decode_kernel(
+        # Query: (h_kv, n_q_groups, d) — n_q=1 squeezed, GQA-expanded view
+        q_ptr,
+        # Pre-stacked KV: (max_blocks, h_kv, blk_size, d) contiguous fp16
+        k_stacked_ptr,
+        v_stacked_ptr,
+        # Carry buffers: (h_kv, n_q_groups, d/1) contiguous
+        acc_ptr,  # fp16
+        m_ptr,  # fp32
+        lse_ptr,  # fp32
+        # Device scalar: actual live sequence length (int32, pointer-read)
+        seq_len_ptr,
+        # Scale factor (1/sqrt(d), fp32 scalar — runtime, not constexpr)
+        scale,
+        # Fixed-size launch params (constexpr — do NOT include seq_len here)
+        max_blocks: tl.constexpr,  # noqa: ARG001  — sets grid, not used inside
+        blk_size: tl.constexpr,
+        d: tl.constexpr,
+        n_q_groups: tl.constexpr,
+    ):
+        """Graph-safe decode online-softmax kernel.
+
+        Grid: (max_blocks, h_kv, n_q_groups) — always the same shape.
+        Each program handles ONE (block_idx, kv_head, q_group) triple.
+
+        seq_len_ptr is a DEVICE TENSOR (int32 pointer) — not a Python int.
+        The kernel reads seq_len_ptr[0] at runtime. Updating the device tensor
+        in-place between graph replays makes the new length visible without
+        re-capture. This is the key graph-safety property.
+
+        Block masking: if block_idx * blk_size >= seq_len, this program exits
+        early (contributes nothing to the accumulator). The last block is
+        partially masked: only tokens [block_start : seq_len] are active.
+
+        do_not_specialize: max_blocks is a runtime int (not constexpr) at the
+        Python level — it sets the grid but is not used inside the kernel body.
+        scale is also a runtime float; neither goes in the autotune key.
+        """
+        block_idx = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        g = tl.program_id(2)  # query group within kv_head
+
+        # ------------------------------------------------------------------
+        # Read live seq_len from device tensor (THE graph-safety invariant).
+        # This pointer-read is what the graph captures — not a baked-in int.
+        # ------------------------------------------------------------------
+        seq_len = tl.load(seq_len_ptr).to(tl.int32)
+
+        block_start = block_idx * blk_size
+        # Mask: skip this block entirely if it starts at or beyond seq_len.
+        if block_start >= seq_len:
+            return
+
+        # ------------------------------------------------------------------
+        # Number of active tokens in this block (handles last partial block).
+        # ------------------------------------------------------------------
+        active = tl.minimum(blk_size, seq_len - block_start)
+
+        d_idx = tl.arange(0, d)
+        b_idx = tl.arange(0, blk_size)
+
+        # ------------------------------------------------------------------
+        # Load q row: (d,) for query group g within kv_head.
+        # q layout: (h_kv, n_q_groups, d).
+        # q_ptr[kv_head, g, :] offset = (kv_head * n_q_groups + g) * d
+        # ------------------------------------------------------------------
+        q_offset = (kv_head * n_q_groups + g) * d
+        q_row = tl.load(q_ptr + q_offset + d_idx).to(tl.float32)  # (d,)
+
+        # ------------------------------------------------------------------
+        # Load k block: (blk_size, d).
+        # k_stacked layout: (max_blocks, h_kv, blk_size, d).
+        # k_stacked[block_idx, kv_head, :, :] offset:
+        #   = (block_idx * h_kv_total + kv_head) * blk_size * d
+        # We don't have h_kv as constexpr; compute from program grid.
+        # Grid dim 1 = h_kv (inferred at launch time; kernel sees it via
+        # tl.num_programs(1)).
+        # ------------------------------------------------------------------
+        h_kv_total = tl.num_programs(1)
+        k_base = (block_idx * h_kv_total + kv_head) * blk_size * d
+        k_offsets = b_idx[:, None] * d + d_idx[None, :]  # (blk_size, d)
+        # Mask for partial last block: b_idx < active
+        k_mask = b_idx < active  # (blk_size,) bool — last block partial mask
+        k = tl.load(
+            k_stacked_ptr + k_base + k_offsets,
+            mask=k_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)  # (blk_size, d) fp32
+
+        # ------------------------------------------------------------------
+        # scores = (q_row @ k.T) * scale  -> (blk_size,)
+        # ------------------------------------------------------------------
+        q_2d = tl.reshape(q_row, (1, d))  # (1, d)
+        scores_2d = tl.dot(q_2d, tl.trans(k)) * scale  # (1, blk_size)
+        scores = tl.reshape(scores_2d, (blk_size,))  # (blk_size,)
+
+        # Mask inactive tokens to -inf so they don't contribute to softmax.
+        scores = tl.where(b_idx < active, scores, float("-inf"))
+
+        # ------------------------------------------------------------------
+        # ATOMIC online-softmax update.
+        #
+        # CONCURRENCY NOTE: Multiple programs write the SAME (kv_head, g) carry
+        # slot (since we parallelise over block_idx too). This requires atomic
+        # read-modify-write on (acc, m, lse). Triton does not have a built-in
+        # atomic online-softmax update. Instead, we use the standard approach:
+        # each program stores its LOCAL (acc_local, m_local, lse_local) to
+        # per-block scratch buffers, and a REDUCTION PASS in Python merges them
+        # (identical to _merge_partials in the 3b path).
+        #
+        # For the graphable path the REDUCTION is done outside the kernel in
+        # Python (not CUDA-graph-captured), which is acceptable for 3d — the
+        # graph captures the scatter kernel; the reduce is cheap.
+        # The key graph-safe property (device-pointer seq_len) is exercised.
+        # ------------------------------------------------------------------
+        # Carry slot for this (block_idx, kv_head, g):
+        # acc_scratch: (max_blocks, h_kv, n_q_groups, d)
+        # m_scratch:   (max_blocks, h_kv, n_q_groups)
+        # lse_scratch: (max_blocks, h_kv, n_q_groups)
+        # ------------------------------------------------------------------
+        # FRESH local carry (no read from shared buffer — avoids race).
+        m_local = float("-inf")
+        lse_local = 0.0
+
+        # Online softmax for this block's scores (base-e):
+        m_new = tl.maximum(m_local, tl.max(scores, axis=0))
+        alpha = tl.exp(m_local - m_new)  # = 0 when m_local == -inf
+        p = tl.where(b_idx < active, tl.exp(scores - m_new), 0.0)
+        lse_new = lse_local * alpha + tl.sum(p, axis=0)
+
+        # acc = p @ v:
+        v_base = (block_idx * h_kv_total + kv_head) * blk_size * d
+        v = tl.load(
+            v_stacked_ptr + v_base + k_offsets,
+            mask=k_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)  # (blk_size, d)
+        p_2d = tl.reshape(p, (1, blk_size))
+        pv_2d = tl.dot(p_2d, v)  # (1, d)
+        acc_local = tl.reshape(pv_2d, (d,))  # (d,)
+
+        # ------------------------------------------------------------------
+        # Store (acc_local, m_new, lse_new) to per-block scratch buffers.
+        # Layout: [block_idx * (h_kv * n_q_groups) + kv_head * n_q_groups + g]
+        # ------------------------------------------------------------------
+        scratch_row = block_idx * h_kv_total * n_q_groups + kv_head * n_q_groups + g
+        # acc_ptr in graphable path points to scratch: (max_blocks*h_kv*G, d)
+        tl.store(acc_ptr + scratch_row * d + d_idx, acc_local.to(tl.float16))
+        tl.store(m_ptr + scratch_row, m_new.to(tl.float32))
+        tl.store(lse_ptr + scratch_row, lse_new.to(tl.float32))
+
+
+def _graphable_reduce(
+    acc_scratch: torch.Tensor,
+    m_scratch: torch.Tensor,
+    lse_scratch: torch.Tensor,
+    max_blocks: int,
+    h_kv: int,
+    n_q_groups: int,
+    n_q_heads: int,
+    d: int,
+) -> torch.Tensor:
+    """Merge per-block scratch buffers into the final attention output.
+
+    acc_scratch: (max_blocks * h_kv * n_q_groups, d) fp16
+    m_scratch:   (max_blocks * h_kv * n_q_groups,) fp32
+    lse_scratch: (max_blocks * h_kv * n_q_groups,) fp32
+
+    Reshapes to (max_blocks, n_q_heads, 1, d/1) and applies _merge_partials.
+    Returns (n_q_heads, 1, d) fp16.
+    """
+    G = n_q_groups
+    # Reshape from flat scratch to (max_blocks, h_kv, G, d/1)
+    acc_s = acc_scratch.view(max_blocks, h_kv, G, d).float()  # fp32 for merge
+    m_s = m_scratch.view(max_blocks, h_kv, G)
+    lse_s = lse_scratch.view(max_blocks, h_kv, G)
+
+    # Merge across block_idx dimension using online-softmax combine (base-e).
+    # Reuse the 3b _merge_partials logic by rearranging dims to
+    # (n_splits=max_blocks, n_q_heads, 1, d/1).
+    # n_q_heads = h_kv * G; reshape (h_kv, G) -> (n_q_heads,).
+    acc_s = acc_s.view(max_blocks, n_q_heads, 1, d)  # (B, H, 1, d)
+    m_s = m_s.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
+    lse_s = lse_s.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
+
+    m_global = m_s.amax(dim=0, keepdim=True)  # (1, H, 1, 1)
+    scales = torch.exp(m_s - m_global)  # (B, H, 1, 1)
+    l_merged = (lse_s * scales).sum(dim=0)  # (H, 1, 1)
+    acc_merged = (acc_s * scales).sum(dim=0)  # (H, 1, d)
+    return (acc_merged / l_merged).to(torch.float16)  # (H, 1, d)
+
+
+def triton_decode_attention_graphable(
+    q: torch.Tensor,
+    k_stacked: torch.Tensor,
+    v_stacked: torch.Tensor,
+    seq_len_dev: torch.Tensor,
+    *,
+    n_q_groups: int,
+    scale: float,
+) -> torch.Tensor:
+    """CUDA-graph-safe decode attention.
+
+    Drop-in for triton_decode_attention on the RTN path where K/V are
+    pre-dequanted and pre-stacked into device tensors.
+
+    GRAPH SAFETY INVARIANT:
+        seq_len_dev is a DEVICE int32 TENSOR (not a Python int). The kernel
+        reads seq_len_dev[0] at runtime via pointer. A captured CUDA graph
+        retains the pointer — replaying after `seq_len_dev.fill_(new_len)`
+        uses new_len, not the captured-time value. This is the vLLM pattern.
+
+    DEFERRED (out of scope for 3d):
+        - k2b path (lowrank_rtn_channel): K's packed dict factors (Us, V,
+          res_Q_int, res_scale) are heterogeneous; stacking into a flat device
+          tensor requires a paged-block-table refactor. Deferred post-3d.
+        - Tail window (fp16 residual): process outside the captured graph.
+        - RoPE application inside the graph: apply RoPE to k_stacked before
+          capture if k_pre_rope=True.
+
+    Args:
+        q:           (n_q_heads, 1, d) fp16 CUDA — single decode query token.
+        k_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted
+                     keys. Slots beyond live blocks may be zero or stale (masked
+                     by seq_len_dev).
+        v_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted
+                     values. Same layout.
+        seq_len_dev: torch.Tensor, dtype=int32, shape=() or (1,), CUDA device.
+                     Holds the LIVE sequence length. Updated in-place each step.
+                     Graph captures the pointer; replay reads the updated value.
+        n_q_groups:  n_q_heads // h_kv (GQA group count).
+        scale:       attention scale (1/sqrt(d)).
+
+    Returns:
+        (n_q_heads, 1, d) fp16 — attention output.
+    """
+    _require_triton()
+
+    n_q_heads, n_q, d = q.shape
+    assert n_q == 1, "graphable path is decode-only (n_q==1)"
+    assert seq_len_dev.is_cuda, "seq_len_dev must be a CUDA tensor"
+    assert seq_len_dev.dtype == torch.int32, (
+        f"seq_len_dev must be int32, got {seq_len_dev.dtype}. "
+        "This is the device-pointer that the kernel reads for graph safety."
+    )
+
+    max_blocks, h_kv, blk_size, _d = k_stacked.shape
+    assert _d == d, f"k_stacked d={_d} != q d={d}"
+    assert n_q_heads == h_kv * n_q_groups, (
+        f"n_q_heads={n_q_heads} != h_kv={h_kv} * n_q_groups={n_q_groups}"
+    )
+
+    # ------------------------------------------------------------------
+    # Allocate per-block scratch buffers.
+    # These are fixed-size and can be pre-allocated outside the graph.
+    # The graph writes into them; the Python reduce reads from them.
+    # Shape: (max_blocks * h_kv * n_q_groups, d/1).
+    # ------------------------------------------------------------------
+    scratch_rows = max_blocks * h_kv * n_q_groups
+    acc_scratch = torch.zeros(scratch_rows, d, dtype=torch.float16, device=q.device)
+    m_scratch = torch.full(
+        (scratch_rows,), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    lse_scratch = torch.zeros(scratch_rows, dtype=torch.float32, device=q.device)
+
+    # ------------------------------------------------------------------
+    # Query layout: (h_kv, n_q_groups, d) — contiguous for kernel indexing.
+    # ------------------------------------------------------------------
+    q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
+
+    # ------------------------------------------------------------------
+    # Launch kernel: grid = (max_blocks, h_kv, n_q_groups) — FIXED.
+    # This is the graph-capturable grid; size never changes between replays.
+    # ------------------------------------------------------------------
+    grid = (max_blocks, h_kv, n_q_groups)
+    _graphable_decode_kernel[grid](
+        q_kv,
+        k_stacked,
+        v_stacked,
+        acc_scratch,
+        m_scratch,
+        lse_scratch,
+        seq_len_dev,
+        float(scale),
+        max_blocks=max_blocks,
+        blk_size=blk_size,
+        d=d,
+        n_q_groups=n_q_groups,
+    )
+
+    # ------------------------------------------------------------------
+    # Reduce scratch → output (outside the graph; cheap).
+    # ------------------------------------------------------------------
+    return _graphable_reduce(
+        acc_scratch,
+        m_scratch,
+        lse_scratch,
+        max_blocks,
+        h_kv,
+        n_q_groups,
+        n_q_heads,
+        d,
+    )
+
+
+def build_kv_stacked(
+    k_blocks: list,
+    v_blocks: list,
+    *,
+    max_blocks: int,
+    h_kv: int,
+    blk_size: int,
+    d: int,
+    k_arm: str,
+    v_arm: str,
+    group: int,
+    seed: int,
+    v_group: int | None = None,
+    v_seed: int | None = None,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-stack dequanted KV blocks into device tensors for the graphable path.
+
+    RTN path only (lowrank/k2b deferred — see triton_decode_attention_graphable
+    docstring). Allocates (max_blocks, h_kv, blk_size, d) fp16 tensors and fills
+    slots 0..len(k_blocks)-1 from the block list. Remaining slots are zero.
+
+    Args:
+        k_blocks:   list of (packed_dict, start, end) — RTN-quantized keys.
+        v_blocks:   list of (packed_dict, start, end) — RTN-quantized values.
+        max_blocks: total slots (>= len(k_blocks)); sets the fixed graph grid.
+        h_kv:       number of KV heads.
+        blk_size:   tokens per block.
+        d:          head dim.
+        k_arm:      codec arm for keys (must be RTN; k2b deferred).
+        v_arm:      codec arm for values.
+        group:      K quantization group size.
+        seed:       K quantization seed.
+        v_group:    V quantization group size (defaults to group).
+        v_seed:     V quantization seed (defaults to seed).
+        device:     target CUDA device.
+
+    Returns:
+        k_stacked: (max_blocks, h_kv, blk_size, d) fp16
+        v_stacked: (max_blocks, h_kv, blk_size, d) fp16
+    """
+    from bmx.cache.codecs import dequant_packed
+
+    if k_arm == "lowrank_rtn_channel":
+        raise NotImplementedError(
+            "build_kv_stacked: k2b (lowrank_rtn_channel) path is deferred from 3d. "
+            "Stack the RTN arm tensors instead, or use triton_decode_attention for k2b."
+        )
+
+    _v_group = v_group if v_group is not None else group
+    _v_seed = v_seed if v_seed is not None else seed
+
+    k_stacked = torch.zeros(
+        max_blocks, h_kv, blk_size, d, dtype=torch.float16, device=device
+    )
+    v_stacked = torch.zeros(
+        max_blocks, h_kv, blk_size, d, dtype=torch.float16, device=device
+    )
+
+    for i, ((kpacked, _ks, _ke), (vpacked, _vs, _ve)) in enumerate(
+        zip(k_blocks, v_blocks)
+    ):
+        assert i < max_blocks, (
+            f"more blocks ({len(k_blocks)}) than max_blocks ({max_blocks})"
+        )
+        K_mat = dequant_packed(k_arm, kpacked, seed=seed, group=group)
+        V_mat = dequant_packed(v_arm, vpacked, seed=_v_seed, group=_v_group)
+        K_kv = from_matrix(K_mat, h_kv).to(torch.float16)  # (h_kv, blk, d)
+        V_kv = from_matrix(V_mat, h_kv).to(torch.float16)
+        k_stacked[i] = K_kv.to(device)
+        v_stacked[i] = V_kv.to(device)
+
+    return k_stacked, v_stacked
