@@ -2432,7 +2432,9 @@ if TRITON_AVAILABLE:
             # For hi (odd):  partner=lo, partner_val=row_lo -> partner_val-row = a-b ✓
             h = h * 2
         signs = tl.load(signs_ptr + c_idx).to(tl.float32)
-        row = row / tl.sqrt(C.to(tl.float32)) * signs  # orthonormal FWHT + unrotate
+        # C is constexpr -> (C + 0.0) is a constexpr float; tl.sqrt of it is the
+        # orthonormal FWHT normalizer (1/√C). (C.to(...) fails: constexpr int.)
+        row = row / tl.sqrt(C + 0.0) * signs  # orthonormal FWHT + unrotate
 
         # Normalize by merged lse (per channel's kv head) and store.
         out_val = row / l_acc  # (C,)
