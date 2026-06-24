@@ -2201,18 +2201,21 @@ if TRITON_AVAILABLE:
         vfac_ptr,
         res_int_ptr,
         res_scale_ptr,
-        # V factors (turboquant_mse), stacked per block:
+        # V factors (turboquant_mse PER-HEAD), stacked per block:
         #   v_idx:  (max_blocks, blk, h_kv*d) int16  (codebook indices)
-        #   v_norm: (max_blocks, blk, 1)      fp16   (per-row norms)
+        #   v_norm: (max_blocks, blk, h_kv)   fp16   (per-(row,head) norms)
         v_idx_ptr,
         v_norm_ptr,
-        # Codebook (2**vbits,) fp32 — tiny, loaded into registers.
+        # Codebook (2**vbits,) fp32 — tiny. Per-head d-Hadamard matrix (d,d) fp32
+        # + per-channel signs (d,) for the in-kernel unrotate (V = norm·signs·(H·Mq)).
         cb_ptr,
+        hmat_ptr,
+        vsigns_ptr,
         # RoPE tables for the WHOLE sequence: (max_S, d) fp16 (sliced per block).
         cos_ptr,
         sin_ptr,
-        # Partials (pre-normalization, pre-FWHT):
-        #   acc_part: (num_splits, h_kv, G, d) fp32 — Σ p̃·M_quant (raw gather)
+        # Partials (pre-normalization):
+        #   acc_part: (num_splits, h_kv, G, d) fp32 — normalized-numerator Σ p·V
         #   m_part / lse_part: (num_splits, h_kv, G) fp32
         acc_part_ptr,
         m_part_ptr,
@@ -2220,7 +2223,7 @@ if TRITON_AVAILABLE:
         seq_len,
         num_splits,
         scale,
-        sqrt_c,  # 1/√C scale folded into the codebook gather (M_quant = cb[idx]/√C)
+        sqrt_d,  # 1/√d scale folded into the codebook gather (M_quant = cb[idx]/√d)
         h_kv: tl.constexpr,
         blk_size: tl.constexpr,
         d: tl.constexpr,
@@ -2269,6 +2272,13 @@ if TRITON_AVAILABLE:
         src_for_j = tl.where(j_is_first, d_idx + half, d_idx - half)
         sign_for_j = tl.where(j_is_first, -1.0, 1.0)
         P = tl.where(d_idx[:, None] == src_for_j[None, :], sign_for_j[None, :], 0.0)
+
+        # Per-head V unrotate operators, loaded once: the (d,d) orthonormal Hadamard
+        # matrix and the per-channel signs (V = norm · signs ⊙ (H_d · M_quant)).
+        hmat = tl.load(hmat_ptr + d_idx[:, None] * d + d_idx[None, :]).to(
+            tl.float32
+        )  # (d, d)
+        vsigns = tl.load(vsigns_ptr + d_idx).to(tl.float32)  # (d,)
 
         for blk in range(first_block, last_block):
             row_abs = blk * blk_size + r_idx  # (BLK_POW2,)
@@ -2334,14 +2344,19 @@ if TRITON_AVAILABLE:
             m_new = tl.maximum(m, tl.max(scores, axis=1))
             alpha = tl.exp(m - m_new)
             p = tl.exp(scores - m_new[:, None])  # (G, BLK_POW2)
-            lse = lse * alpha + tl.sum(p, axis=1)  # unweighted denom (Σ p)
+            lse = lse * alpha + tl.sum(p, axis=1)  # denom (Σ p)
 
-            # --- V deferred: M_quant[b, head_cols] = cb[idx]/√C ; p̃ = p*norms ---
+            # --- V: PER-HEAD turboquant dequant, fully in-register over this head's
+            # d columns. V[b, dd] = norm[b] · (vsigns[dd] · (H_d · M_quant[b,:])[dd]),
+            # M_quant[b,dd] = cb[idx[b,dd]]/√d. The d-point Hadamard is a (d,d) matmul
+            # (d>=16 -> tl.dot); per-head means NO cross-head coupling (the cross-head
+            # full-C Hadamard could not fuse — QuaRot/SpinQuant use per-head exactly
+            # for this). v_norm is per-(row, head).
             v_norm = tl.load(
-                v_norm_ptr + blk * blk_size + r_idx,
+                v_norm_ptr + blk * blk_size * h_kv + r_idx * h_kv + kv,
                 mask=row_real,
                 other=0.0,
-            ).to(tl.float32)  # (BLK_POW2,) per-row norm
+            ).to(tl.float32)  # (BLK_POW2,) per-row norm for THIS head
             v_idx = tl.load(
                 v_idx_ptr
                 + blk * blk_size * C
@@ -2350,11 +2365,13 @@ if TRITON_AVAILABLE:
                 mask=row_real[:, None],
                 other=0,
             ).to(tl.int32)  # (BLK_POW2, d) codebook indices for this head
-            m_quant = tl.load(cb_ptr + v_idx).to(tl.float32) * sqrt_c  # (BLK_POW2, d)
-            p_tilde = p * v_norm[None, :]  # (G, BLK_POW2)
-            acc = acc * alpha[:, None] + tl.sum(
-                p_tilde[:, :, None] * m_quant[None, :, :], axis=1
-            )  # (G, d)
+            m_quant = tl.load(cb_ptr + v_idx).to(tl.float32) * sqrt_d  # (BLK_POW2, d)
+            # H_d · M_quant rows (orthonormal d-Hadamard via (d,d) matmul; d>=16 ok),
+            # then per-channel signs and the per-row norm -> dequantized V (BLK_POW2,d).
+            v = tl.dot(m_quant, hmat) * vsigns[None, :] * v_norm[:, None]
+            # p@v via GEMV (multiply+sum) — G=n_q_groups may be <16 so no tl.dot here.
+            pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)  # (G, d)
+            acc = acc * alpha[:, None] + pv
             m = m_new
 
         head_row = s * h_kv + kv
@@ -2375,7 +2392,11 @@ def build_kv_stacked_k2b(
     d: int,
     device: torch.device | str = "cuda",
 ):
-    """Pre-stack k2b packed factors (lowrank_rtn_channel K + turboquant_mse V).
+    """Pre-stack k2b packed factors (lowrank_rtn_channel K + PER-HEAD turboquant V).
+
+    K blocks: standard lowrank_rtn_channel packed dicts (Us, V, res_Q_int, res_scale).
+    V blocks: PER-HEAD turboquant dicts — {"indices": (blk, h_kv*d) int16,
+              "norms": (blk, h_kv) fp16} from _turboquant_mse_perhead_packed.
 
     Returns a dict of device tensors the k2b fused kernel consumes:
       us:        (max_blocks, blk, rank)            fp16
@@ -2383,7 +2404,7 @@ def build_kv_stacked_k2b(
       res_int:   (max_blocks, h_kv*d, blk)          int8
       res_scale: (max_blocks, h_kv*d, blk//k_group) fp16
       v_idx:     (max_blocks, blk, h_kv*d)          int16
-      v_norm:    (max_blocks, blk, 1)               fp16
+      v_norm:    (max_blocks, blk, h_kv)            fp16  (per-(row,head) norms)
     plus rank, k_group (read off block 0).
     """
     C = h_kv * d
@@ -2397,7 +2418,7 @@ def build_kv_stacked_k2b(
     res_int = torch.zeros(max_blocks, C, blk_size, dtype=torch.int8, device=device)
     res_scale = torch.zeros(max_blocks, C, n_kg, dtype=torch.float16, device=device)
     v_idx = torch.zeros(max_blocks, blk_size, C, dtype=torch.int16, device=device)
-    v_norm = torch.zeros(max_blocks, blk_size, 1, dtype=torch.float16, device=device)
+    v_norm = torch.zeros(max_blocks, blk_size, h_kv, dtype=torch.float16, device=device)
 
     for i, ((kp, _ks, _ke), (vp, _vs, _ve)) in enumerate(zip(k_blocks, v_blocks)):
         assert i < max_blocks
@@ -2406,7 +2427,7 @@ def build_kv_stacked_k2b(
         res_int[i] = kp["res_Q_int"].to(device)
         res_scale[i] = kp["res_scale"].squeeze(-1).to(device).to(torch.float16)
         v_idx[i] = vp["indices"].to(device).to(torch.int16)
-        v_norm[i] = vp["norms"].to(device).to(torch.float16)
+        v_norm[i] = vp["norms"].to(device).to(torch.float16)  # (blk, h_kv)
 
     return {
         "us": us,
@@ -2435,23 +2456,26 @@ def fused_decode_attention_k2b(
     k_tail: torch.Tensor | None = None,
     v_tail: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Full k2b fused decode (lowrank+RTN+RoPE K, turboquant V via deferred FWHT).
+    """Full k2b fused decode: in-kernel lowrank+RTN+RoPE K and PER-HEAD turboquant V.
 
-    stacks: from build_kv_stacked_k2b. rope_cos/sin: (max_S, d) tables (None -> no
-    RoPE, i.e. keys not pre-RoPE). The fp16 recent-window tail is merged in PyTorch.
+    V uses the per-head Hadamard codec (build_kv_stacked_k2b), so its unrotate is a
+    per-head d-point Hadamard done IN-KERNEL (a (d,d) matmul) — no cross-head
+    coupling, no o_proj surgery. rope_cos/sin: (max_S, d) tables (None -> keys not
+    pre-RoPE). The fp16 recent-window tail is merged in PyTorch.
     """
     _require_triton()
     from bmx.cache.codecs import _hadamard_signs, gaussian_codebook
+    from bmx.quant.hadamard import fwht
 
     n_q_heads, n_q, d = q.shape
     assert n_q == 1, "decode-only"
     h_kv = n_q_heads // n_q_groups
-    C = h_kv * d
     blk_size = stacks["us"].shape[1]
     max_blocks = stacks["us"].shape[0]
     assert seq_len <= max_blocks * blk_size
     rank = stacks["rank"]
     k_group = stacks["k_group"]
+    assert (d & (d - 1)) == 0, f"d={d} must be a power of 2 for the per-head Hadamard"
 
     if num_splits is None:
         num_splits = pick_num_splits(seq_len, blk_size, h_kv)
@@ -2459,10 +2483,14 @@ def fused_decode_attention_k2b(
     blk_pow2 = 1
     while blk_pow2 < blk_size:
         blk_pow2 *= 2
-    assert (C & (C - 1)) == 0, f"C={C} must be a power of 2 for the FWHT unrotate"
 
     cb = gaussian_codebook(vbits).to(q.device, torch.float32)
-    sqrt_c = 1.0 / math.sqrt(C)  # M_quant = cb[idx] / √C, folded into the gather
+    sqrt_d = 1.0 / math.sqrt(d)  # M_quant = cb[idx] / √d (per-head rotation)
+    # Per-head (d,d) orthonormal Hadamard matrix + per-channel signs for the unrotate.
+    # _unrotate(x) = fwht(x) * signs; as a matrix, H_d = fwht(I_d), so the row-wise
+    # unrotate is x @ H_d.T * signs. fwht is symmetric, so H_d.T = H_d.
+    hmat = fwht(torch.eye(d, dtype=torch.float32, device=q.device))  # (d,d)
+    vsigns = _hadamard_signs(d, v_seed).to(q.device, torch.float32)  # (d,)
     has_rope = rope_cos is not None
 
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
@@ -2492,6 +2520,8 @@ def fused_decode_attention_k2b(
         stacks["v_idx"],
         stacks["v_norm"],
         cb,
+        hmat,
+        vsigns,
         cos_arg,
         sin_arg,
         acc_part,
@@ -2500,7 +2530,7 @@ def fused_decode_attention_k2b(
         int(seq_len),
         int(num_splits),
         float(scale),
-        float(sqrt_c),
+        float(sqrt_d),
         h_kv=h_kv,
         blk_size=blk_size,
         d=d,
@@ -2512,43 +2542,26 @@ def fused_decode_attention_k2b(
         HAS_ROPE=has_rope,
     )
 
-    # --- Merge epilogue (PyTorch): combine splits, apply the DEFERRED FWHT once ---
-    # The decode kernel did all the bandwidth-bound work (lowrank K + RoPE + the
-    # per-head Σ p̃·M_quant V accumulation). The unrotate is a single (n_q_heads, C)
-    # FWHT+signs per step — tiny, O(C·logC) per query head, done here in PyTorch.
-    # (An in-kernel FWHT over the full C=h_kv*d row needs a (C,C) register gather per
-    # butterfly stage, which blows up Triton compile; the defer math already gives
-    # the O(S·C·logC)->O(C·logC) win, so the final transform belongs out of the hot
-    # loop. Cf. QuaRot, which folds it into W_o offline — a future option.)
-    from bmx.quant.hadamard import fwht
-
-    # Merge the packed splits WITHOUT normalization -> (n_q_heads,1,d) acc_pre, lse, m.
-    stacked_m = m_part.reshape(num_splits, n_q_heads, 1, 1).float()  # (S,H,1,1)
-    m_g = stacked_m.amax(0, keepdim=True)  # (1,H,1,1)
-    sc = torch.exp(stacked_m - m_g)  # (S,H,1,1)
-    acc_pre = (acc_part.reshape(num_splits, n_q_heads, 1, d).float() * sc).sum(
-        0
-    )  # (H,1,d)
-    lse_p = (lse_part.reshape(num_splits, n_q_heads, 1, 1).float() * sc).sum(
-        0
-    )  # (H,1,1)
-    m_p = m_g.squeeze(0)  # (H,1,1)
-
-    # Deferred FWHT+signs per query head over the full C row, then normalize.
-    # head index = kv*G + g (the kernel's partial layout); assemble (G, C) where the
-    # G query heads each gather all h_kv kv-heads' d-column blocks in kv-major order.
-    acc_pre_c = (
-        acc_pre.reshape(h_kv, n_q_groups, d).permute(1, 0, 2).reshape(n_q_groups, C)
-    )  # (G, C)
-    sgn = _hadamard_signs(C, v_seed).to(acc_pre_c)
-    acc_v = (fwht(acc_pre_c) * sgn).reshape(n_q_groups, h_kv, d).permute(1, 0, 2)
-    acc_v = acc_v.reshape(n_q_heads, 1, d)  # (n_q_heads,1,d) pre-norm V numerator
-
+    # V is fully dequanted in-kernel (per-head) — acc_part/m_part/lse_part are the
+    # standard online-softmax partials, so the standard merge applies (no FWHT here).
     if k_tail is None or k_tail.shape[1] == 0:
-        return (acc_v / lse_p).to(torch.float16).view(n_q_heads, 1, d)
+        out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
+        _fused_merge_kernel[(h_kv,)](
+            acc_part,
+            m_part,
+            lse_part,
+            out,
+            int(num_splits),
+            h_kv=h_kv,
+            d=d,
+            n_q_groups=n_q_groups,
+        )
+        return out.view(n_q_heads, 1, d)
 
-    # Tail present: online-softmax-merge the packed partial (acc_v, m_p, lse_p) with
-    # the dense fp16 recent-window tail.
+    # Tail: online-softmax-merge the split partials + the dense fp16 recent window.
+    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
+    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
+    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
     kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
     vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
     qf = q.float()
@@ -2557,9 +2570,10 @@ def fused_decode_attention_k2b(
     pt = torch.exp(st - mt)
     lse_t = pt.sum(-1, keepdim=True)
     acc_t = torch.einsum("hqk,hkd->hqd", pt, vt)
-    return _merge_partials([acc_v, acc_t], [m_p, mt], [lse_p, lse_t]).view(
-        n_q_heads, 1, d
-    )
+    accs.append(acc_t)
+    ms.append(mt)
+    lses.append(lse_t)
+    return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
 
 
 def build_kv_stacked(

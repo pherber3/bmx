@@ -594,6 +594,58 @@ def _turboquant_mse_dequant(
     return M_recon * norms
 
 
+# ---------------------------------------------------------------------------
+# Per-head turboquant_mse (QuaRot/SpinQuant-style block-diagonal rotation)
+#
+# The standard turboquant_mse rotates the FULL (S, C) row with one C-wide
+# Hadamard, which couples all heads — fine for chunked dequant, but it blocks a
+# fused per-head decode kernel (the unrotate would need all C channels, and under
+# GQA each query head has its own softmax, so neither an o_proj-fold nor a
+# per-head accumulation recovers it cleanly).
+#
+# The per-head variant rotates each d_head block INDEPENDENTLY (Hadamard over d,
+# per-head norms), so V dequant is fully per-head: the fused kernel does a
+# d_head-point FWHT in-register, no cross-head traffic, no o_proj surgery. The
+# turboquant distortion bound (√3·π/2·4^−b) is dimension-independent in the
+# constant and the Beta→Gaussian concentration is excellent at d=128, so per-head
+# is quality-equivalent to full-C (see brain consult / QuaRot/SpinQuant precedent).
+# ---------------------------------------------------------------------------
+
+
+def _turboquant_mse_perhead_packed(
+    M: torch.Tensor, bits: int, seed: int, h: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-head turboquant pack. (S, C=h*d) -> (indices int16 (S,C), norms (S,h)).
+
+    Rotates each of the h d-blocks independently (Hadamard over d); norms are
+    per-(row, head) so each head's d-block is self-contained.
+    """
+    S, C = M.shape
+    d = C // h
+    Mh = M.reshape(S, h, d)  # (S, h, d) — per-head blocks
+    norms = Mh.norm(dim=2).clamp_min(1e-12).half().float()  # (S, h) per-head norm
+    Mh_unit = Mh / norms[:, :, None]  # (S, h, d)
+    Mh_rot = _rotate(Mh_unit.reshape(S * h, d), seed).reshape(S, h, d)  # per-d-block rot
+    cb = gaussian_codebook(bits).to(M.device)
+    sqrt_d = math.sqrt(d)
+    mid = (cb[:-1] + cb[1:]) / 2
+    indices = torch.bucketize(Mh_rot * sqrt_d, mid).to(torch.int16).reshape(S, C)
+    return indices, norms
+
+
+def _turboquant_mse_perhead_dequant(
+    indices: torch.Tensor, norms: torch.Tensor, bits: int, seed: int, h: int
+) -> torch.Tensor:
+    """Inverse of _turboquant_mse_perhead_packed. (S,C),(S,h) -> (S,C)."""
+    S, C = indices.shape
+    d = C // h
+    cb = gaussian_codebook(bits).to(norms.device)
+    sqrt_d = math.sqrt(d)
+    Mh_quant = (cb[indices.long()] / sqrt_d).reshape(S, h, d)  # (S, h, d)
+    Mh_recon = _unrotate(Mh_quant.reshape(S * h, d), seed).reshape(S, h, d)
+    return (Mh_recon * norms[:, :, None]).reshape(S, C)
+
+
 def quantize_packed(
     arm: str,
     M: torch.Tensor,
