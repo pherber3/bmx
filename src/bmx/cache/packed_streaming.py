@@ -539,18 +539,17 @@ class PackedStreamingLayer(DynamicLayer):
         # decode that dequants int8 RTN codes IN-KERNEL (packed-resident, no dense
         # copy) — ~3000x vs chunked, compression preserved. Applies when K and V
         # are plain rtn_token (the packed-stack layout build_kv_stacked_packed
-        # assumes) and K is post-RoPE (this kernel has no in-kernel RoPE — k2b /
-        # pre-RoPE stay on the per-block triton path below). The fp16 recent-window
-        # tail is folded in via the online-softmax merge.
+        # assumes) and K is post-RoPE (this kernel has no in-kernel RoPE — the k2b
+        # in-kernel-RoPE recipe takes the fused-k2b path below). The fp16
+        # recent-window tail is folded in via the online-softmax merge.
         #
-        # PRODUCTION FOLLOW-UP (#1 perf item): stacks are rebuilt from the committed
-        # pages on EVERY decode step here (O(total_context) host->device copy per
-        # token => quadratic over a generation). This is correct but is the dominant
-        # remaining inefficiency for a serving deployment. The kernel already consumes
-        # exactly the paged-KV block-table layout, so the fix is to maintain the stack
-        # tensors incrementally — append each newly-flushed page into a persistent
-        # device-resident block table instead of restacking. Research wiring keeps the
-        # per-call rebuild for simplicity; a serving integration must do incremental.
+        # Stacked-KV is maintained INCREMENTALLY by _PagedStacks: each newly-flushed
+        # page is appended to a persistent device-resident buffer (O(page)/step),
+        # NOT rebuilt from all committed pages every decode step (which was
+        # O(total_context)/step => quadratic over a generation). The kernel reads a
+        # [:n_blocks] view of that buffer — this IS the paged-KV block-table layout a
+        # serving engine maintains. (Equivalence to from-scratch build is gated by
+        # test_paged_stacks_*_incremental_equals_rebuild.)
         # The fused kernel assumes a UNIFORM stored-block length (it pads the row
         # dim to the next power of 2 internally, so blk need not be pow2). The
         # geometric flush schedule normally emits equal-length blocks; on the rare
