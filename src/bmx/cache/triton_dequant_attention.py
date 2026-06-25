@@ -30,6 +30,20 @@ def _next_pow2(n: int) -> int:
     return p
 
 
+def _pick_block_n(blk_size: int, cap: int = 64) -> int:
+    """KV tile size for the fused decode loop: the largest power of 2 that is <= cap
+    AND divides blk_size, so each tile lies within one stored block (contiguous) and
+    is small enough to fit shared memory regardless of how large blk_size is (the
+    cache flushes the whole prefill as one stored block of thousands of tokens)."""
+    bn = 1
+    p = 2
+    while p <= cap and p <= blk_size:
+        if blk_size % p == 0:
+            bn = p
+        p *= 2
+    return bn
+
+
 @functools.lru_cache(maxsize=16)
 def _hadamard_matrix(d: int, device: str, dtype: torch.dtype) -> torch.Tensor:
     """Orthonormal (d,d) Walsh-Hadamard matrix H_d = fwht(I_d), cached per
@@ -1992,17 +2006,19 @@ if TRITON_AVAILABLE:
         n_q_groups: tl.constexpr,
         k_group: tl.constexpr,  # RTN group size for K (scale along d)
         v_group: tl.constexpr,  # RTN group size for V
-        BLK_POW2: tl.constexpr,  # next pow2 >= blk_size (legal tl.arange row dim)
+        BLOCK_N: tl.constexpr,  # KV tile rows per loop iter (small pow2; divides blk_size)
         GPAD: tl.constexpr,  # G padded up to >=16 so tl.dot's M dim is legal
         USE_DOT: tl.constexpr,  # tl.dot path (dims>=16) vs broadcast cube (tiny test)
     ):
         """Split-KV decode online-softmax, dequanting int8 RTN codes IN-KERNEL.
 
-        Identical skeleton + grid to _fused_decode_kernel, but each block's K/V is
-        loaded as int8 codes (blk, d) + per-group fp16 scale (blk, d//group) and
-        dequanted in-register: deq[r,dd] = code[r,dd] * scale[r, dd//group], via the
-        reshape-broadcast idiom. Resident storage stays PACKED (the compression is
-        preserved); int8 is half the bytes of fp16 so the bandwidth ceiling is ~2x.
+        Flash-attention tiling: walks its token range in FIXED BLOCK_N-row tiles
+        (BLOCK_N small + power of 2), NOT one stored block at a time. The cache
+        flushes the whole prefill as one large stored block (thousands of tokens);
+        loading that block whole would blow shared memory. BLOCK_N divides blk_size
+        (both multiples of the RTN/lowrank group), so each tile lies within ONE
+        stored block -> contiguous loads. K/V are int8 codes + per-group fp16 scale,
+        dequanted in-register (reshape-broadcast). Packed-resident, no dense copy.
         """
         kv = tl.program_id(0)
         s = tl.program_id(1)
@@ -2011,34 +2027,23 @@ if TRITON_AVAILABLE:
         gp_valid = gp_idx < n_q_groups
         n_kg: tl.constexpr = d // k_group  # K scale groups along d
         n_vg: tl.constexpr = d // v_group  # V scale groups along d
-        # 2D loads (BLK_POW2 rows x d cols): each axis is a power of 2 (BLK_POW2 =
-        # next pow2 of the real block length blk_size; d is pow2 for real models),
-        # so tl.arange is legal even when blk_size is NOT a power of 2 (the geometric
-        # flush schedule emits arbitrary block lengths). Rows >= blk_size are masked
-        # out. This replaces the flat tl.arange(blk*d) which required blk*d be pow2.
-        r_idx = tl.arange(0, BLK_POW2)  # (BLK_POW2,) padded row index
-        row_real = r_idx < blk_size  # (BLK_POW2,) real rows of this block
+        n_idx = tl.arange(0, BLOCK_N)  # (BLOCK_N,) tile-local row index
         kg_idx = tl.arange(0, n_kg)
         vg_idx = tl.arange(0, n_vg)
 
+        # This split's token range, rounded to BLOCK_N so tiles never straddle the
+        # split boundary (the last split's tail is masked by split_end).
         raw = (seq_len + num_splits - 1) // num_splits
-        tokens_per_split = ((raw + blk_size - 1) // blk_size) * blk_size
+        tokens_per_split = ((raw + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
         split_start = s * tokens_per_split
         split_end = tl.minimum(split_start + tokens_per_split, seq_len)
-        first_block = split_start // blk_size
-        last_block = (split_end + blk_size - 1) // blk_size
 
         head_stride = h_kv * blk_size * d  # advance one stored block (codes)
         kv_head_off = kv * blk_size * d  # this head within a stored block (codes)
-        sc_head_stride_k = h_kv * blk_size * n_kg  # scale strides (smaller inner dim)
+        sc_head_stride_k = h_kv * blk_size * n_kg
         sc_kv_off_k = kv * blk_size * n_kg
         sc_head_stride_v = h_kv * blk_size * n_vg
         sc_kv_off_v = kv * blk_size * n_vg
-
-        # 2D row-major offsets within one stored block (one head):
-        code_off = r_idx[:, None] * d + d_idx[None, :]  # (BLK_POW2, d) codes
-        k_sc_off = r_idx[:, None] * n_kg + kg_idx[None, :]  # (BLK_POW2, n_kg)
-        v_sc_off = r_idx[:, None] * n_vg + vg_idx[None, :]  # (BLK_POW2, n_vg)
 
         q_off = (kv * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]  # (GPAD, d)
         q_rows = tl.load(q_off + q_ptr, mask=gp_valid[:, None], other=0.0).to(
@@ -2049,62 +2054,68 @@ if TRITON_AVAILABLE:
         lse = tl.zeros((GPAD,), tl.float32)
         acc = tl.zeros((GPAD, d), tl.float32)
 
-        for blk in range(first_block, last_block):
-            code_base = blk * head_stride + kv_head_off  # scalar
-            row_abs = blk * blk_size + r_idx
-            tile_mask = (row_abs < split_end) & row_real  # (BLK_POW2,)
+        n_tiles = (split_end - split_start + BLOCK_N - 1) // BLOCK_N
+        for t in range(n_tiles):
+            tok0 = split_start + t * BLOCK_N  # first absolute token of this tile
+            tok = tok0 + n_idx  # (BLOCK_N,) absolute token indices
+            tile_mask = tok < split_end  # (BLOCK_N,) valid tokens
+            # Each tile lies within ONE stored block (BLOCK_N | blk_size): the stored
+            # block + row offset for this whole tile come from tok0.
+            blk = tok0 // blk_size  # stored block index (scalar)
+            row0 = tok0 - blk * blk_size  # tile's first row within that block (scalar)
+            r = row0 + n_idx  # (BLOCK_N,) row within the stored block
 
-            # --- K: 2D int8 code load (rows padded+masked) + per-group scale ---
+            code_base = blk * head_stride + kv_head_off
+            code_off = r[:, None] * d + d_idx[None, :]  # (BLOCK_N, d)
+            k_sc_off = r[:, None] * n_kg + kg_idx[None, :]  # (BLOCK_N, n_kg)
+            v_sc_off = r[:, None] * n_vg + vg_idx[None, :]  # (BLOCK_N, n_vg)
+
+            # --- K: int8 codes + per-group scale, dequant in-register ---
             k_code = tl.load(
                 k_codes_ptr + code_base + code_off,
-                mask=row_real[:, None],
+                mask=tile_mask[:, None],
                 other=0,
                 eviction_policy="evict_first",
-            ).to(tl.float32)  # (BLK_POW2, d)
+            ).to(tl.float32)  # (BLOCK_N, d)
             k_sc = tl.load(
                 k_scales_ptr + (blk * sc_head_stride_k + sc_kv_off_k) + k_sc_off,
-                mask=row_real[:, None],
+                mask=tile_mask[:, None],
                 other=0.0,
                 eviction_policy="evict_first",
-            ).to(tl.float32)  # (BLK_POW2, n_kg)
-            # Dequant: deq[r,dd] = code[r,dd] * scale[r, dd//group]. reshape the d
-            # axis to (n_kg, group), broadcast the per-group scale, reshape back.
+            ).to(tl.float32)  # (BLOCK_N, n_kg)
             k = tl.reshape(
-                tl.reshape(k_code, (BLK_POW2, n_kg, k_group)) * k_sc[:, :, None],
-                (BLK_POW2, d),
-            )  # (BLK_POW2, d) dequant
+                tl.reshape(k_code, (BLOCK_N, n_kg, k_group)) * k_sc[:, :, None],
+                (BLOCK_N, d),
+            )  # (BLOCK_N, d) dequant
 
             if USE_DOT:
-                scores = tl.dot(q_rows, tl.trans(k)) * scale  # (GPAD, BLK_POW2)
+                scores = tl.dot(q_rows, tl.trans(k)) * scale  # (GPAD, BLOCK_N)
             else:
                 scores = tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
             scores = tl.where(tile_mask[None, :], scores, float("-inf"))
 
-            m_tile = tl.max(scores, axis=1)
-            m_new = tl.maximum(m, m_tile)
+            m_new = tl.maximum(m, tl.max(scores, axis=1))
             alpha = tl.exp(m - m_new)
             p = tl.exp(scores - m_new[:, None])
             lse = lse * alpha + tl.sum(p, axis=1)
 
-            # --- V: 2D int8 code load + per-group scale, dequant in-register ---
+            # --- V: int8 codes + per-group scale, dequant in-register ---
             v_code = tl.load(
                 v_codes_ptr + code_base + code_off,
-                mask=row_real[:, None],
+                mask=tile_mask[:, None],
                 other=0,
                 eviction_policy="evict_first",
-            ).to(tl.float32)  # (BLK_POW2, d)
+            ).to(tl.float32)  # (BLOCK_N, d)
             v_sc = tl.load(
                 v_scales_ptr + (blk * sc_head_stride_v + sc_kv_off_v) + v_sc_off,
-                mask=row_real[:, None],
+                mask=tile_mask[:, None],
                 other=0.0,
                 eviction_policy="evict_first",
-            ).to(tl.float32)  # (BLK_POW2, n_vg)
+            ).to(tl.float32)  # (BLOCK_N, n_vg)
             v = tl.reshape(
-                tl.reshape(v_code, (BLK_POW2, n_vg, v_group)) * v_sc[:, :, None],
-                (BLK_POW2, d),
-            )  # (BLK_POW2, d) dequant
-            # Zero masked rows so they don't contribute to p@v (p is already 0 there
-            # via scores=-inf -> exp=0, so v rows are multiplied by 0; safe either way).
+                tl.reshape(v_code, (BLOCK_N, n_vg, v_group)) * v_sc[:, :, None],
+                (BLOCK_N, d),
+            )  # (BLOCK_N, d) dequant
 
             if USE_DOT:
                 pv = tl.dot(p, v)  # (GPAD, d)
@@ -2173,10 +2184,10 @@ def fused_decode_attention_packed(
     num_splits = max(1, int(num_splits))
 
     gpad = _next_pow2(max(16, n_q_groups))
-    blk_pow2 = _next_pow2(blk_size)
-    # tl.dot needs M,N,K>=16: M=GPAD>=16, N=BLK_POW2, K=d. d<16 only in the tiny
-    # offline test (-> broadcast cube). BLK_POW2>=16 for real flush blocks.
-    use_dot = blk_pow2 >= 16 and d >= 16
+    block_n = _pick_block_n(blk_size)  # KV tile rows (<= 64, divides blk_size)
+    # tl.dot needs M,N,K>=16: M=GPAD>=16, N=BLOCK_N, K=d. d<16 / BLOCK_N<16 only on
+    # the tiny offline test (-> broadcast cube fallback). Real models: d=128, BLOCK_N=64.
+    use_dot = block_n >= 16 and d >= 16
 
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
     acc_part = torch.empty(
@@ -2207,7 +2218,7 @@ def fused_decode_attention_packed(
         n_q_groups=n_q_groups,
         k_group=k_group,
         v_group=v_group,
-        BLK_POW2=blk_pow2,
+        BLOCK_N=block_n,
         GPAD=gpad,
         USE_DOT=use_dot,
     )
@@ -2288,7 +2299,7 @@ if TRITON_AVAILABLE:
         rank: tl.constexpr,
         k_group: tl.constexpr,
         vbits: tl.constexpr,  # turboquant V bits (codebook size 2**vbits)
-        BLK_POW2: tl.constexpr,
+        BLOCK_N: tl.constexpr,  # KV tile rows per loop iter (small pow2; divides blk_size)
         HAS_ROPE: tl.constexpr,
     ):
         """k2b fused decode: in-kernel lowrank-K + RoPE + per-head turboquant-V.
@@ -2305,18 +2316,18 @@ if TRITON_AVAILABLE:
         s = tl.program_id(1)
         d_idx = tl.arange(0, d)
         gp_idx = tl.arange(0, n_q_groups)  # query heads in this kv group (no pad: GEMV)
-        r_idx = tl.arange(0, BLK_POW2)
-        row_real = r_idx < blk_size
+        n_idx = tl.arange(0, BLOCK_N)  # (BLOCK_N,) tile-local row index
         rank_idx = tl.arange(0, rank)
         n_kg: tl.constexpr = blk_size // k_group  # RTN residual groups along blk
         C: tl.constexpr = h_kv * d
 
+        # Flash-attention tiling: walk the token range in fixed BLOCK_N tiles, NOT one
+        # (giant) stored block at a time. BLOCK_N | blk_size so each tile is within one
+        # stored block (contiguous) + small enough for SMEM regardless of blk_size.
         raw = (seq_len + num_splits - 1) // num_splits
-        tokens_per_split = ((raw + blk_size - 1) // blk_size) * blk_size
+        tokens_per_split = ((raw + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
         split_start = s * tokens_per_split
         split_end = tl.minimum(split_start + tokens_per_split, seq_len)
-        first_block = split_start // blk_size
-        last_block = (split_end + blk_size - 1) // blk_size
 
         # Per-head query rows (G, d).
         q_off = (kv * n_q_groups + gp_idx)[:, None] * d + d_idx[None, :]
@@ -2342,97 +2353,95 @@ if TRITON_AVAILABLE:
         )  # (d, d)
         vsigns = tl.load(vsigns_ptr + d_idx).to(tl.float32)  # (d,)
 
-        for blk in range(first_block, last_block):
-            row_abs = blk * blk_size + r_idx  # (BLK_POW2,)
-            tile_mask = (row_abs < split_end) & row_real
+        n_tiles = (split_end - split_start + BLOCK_N - 1) // BLOCK_N
+        for t in range(n_tiles):
+            tok0 = split_start + t * BLOCK_N  # first absolute token of this tile
+            tok = tok0 + n_idx  # (BLOCK_N,) absolute token indices
+            tile_mask = tok < split_end  # (BLOCK_N,) valid tokens
+            blk = tok0 // blk_size  # stored block index (scalar; tile within one block)
+            r = (
+                tok0 - blk * blk_size
+            ) + n_idx  # (BLOCK_N,) row within the stored block
 
-            # --- K lowrank: Us (blk, rank) @ Vfac[head] (d, rank).T -> (blk, d) ---
+            # --- K lowrank: Us (BLOCK_N, rank) @ Vfac[head] (d, rank).T -> (BLOCK_N,d) ---
             us = tl.load(
-                us_ptr
-                + blk * blk_size * rank
-                + r_idx[:, None] * rank
-                + rank_idx[None, :],
-                mask=row_real[:, None],
+                us_ptr + blk * blk_size * rank + r[:, None] * rank + rank_idx[None, :],
+                mask=tile_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)  # (BLK_POW2, rank)
+            ).to(tl.float32)  # (BLOCK_N, rank)
             vfac = tl.load(
                 vfac_ptr
                 + blk * C * rank
                 + (kv * d + d_idx)[:, None] * rank
                 + rank_idx[None, :]
             ).to(tl.float32)  # (d, rank)
-            # tl.dot (BLK_POW2, rank) @ (rank, d) — dims >=16 for real k2b; avoids the
-            # (BLK_POW2, d, rank) broadcast cube (512KB transient -> SMEM blowout).
-            k_low = tl.dot(us, tl.trans(vfac))  # (BLK_POW2, d)
+            k_low = tl.dot(us, tl.trans(vfac))  # (BLOCK_N, d)
 
-            # --- K RTN residual: res_int (d, blk) int8 * per-group scale -> (blk,d) ---
+            # --- K RTN residual: res_int (d, blk) int8 * per-group scale -> (BLOCK_N,d) ---
             res = tl.load(
                 res_int_ptr
                 + blk * C * blk_size
                 + (kv * d + d_idx)[:, None] * blk_size
-                + r_idx[None, :],
-                mask=row_real[None, :],
+                + r[None, :],
+                mask=tile_mask[None, :],
                 other=0,
-            ).to(tl.float32)  # (d, BLK_POW2)
+            ).to(tl.float32)  # (d, BLOCK_N)
             res_sc = tl.load(
                 res_scale_ptr
                 + blk * C * n_kg
                 + (kv * d + d_idx)[:, None] * n_kg
-                + (r_idx[None, :] // k_group),
-                mask=row_real[None, :],
+                + (r[None, :] // k_group),
+                mask=tile_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)  # (d, BLK_POW2)
-            k_res = tl.trans(res * res_sc)  # (BLK_POW2, d)
-            k = k_low + k_res  # (BLK_POW2, d) pre-RoPE
+            ).to(tl.float32)  # (d, BLOCK_N)
+            k_res = tl.trans(res * res_sc)  # (BLOCK_N, d)
+            k = k_low + k_res  # (BLOCK_N, d) pre-RoPE
 
             if HAS_ROPE:
                 cos = tl.load(
-                    cos_ptr + row_abs[:, None] * d + d_idx[None, :],
-                    mask=row_real[:, None],
+                    cos_ptr + tok[:, None] * d + d_idx[None, :],
+                    mask=tile_mask[:, None],
                     other=0.0,
                 ).to(tl.float32)
                 sin = tl.load(
-                    sin_ptr + row_abs[:, None] * d + d_idx[None, :],
-                    mask=row_real[:, None],
+                    sin_ptr + tok[:, None] * d + d_idx[None, :],
+                    mask=tile_mask[:, None],
                     other=0.0,
                 ).to(tl.float32)
-                rot = tl.dot(k, P)  # (BLK_POW2, d) = k @ P (rotate_half); avoids cube
+                rot = tl.dot(k, P)  # (BLOCK_N, d) = k @ P (rotate_half); avoids cube
                 k = k * cos + rot * sin
 
             # scores[g, b] = scale * Σ_dd q[g,dd]*k[b,dd]. GEMV (multiply+sum): G=
             # n_q_groups may be <16 so no tl.dot on the G axis (k @ q.T would need M=G).
             scores = tl.sum(q_rows[:, None, :] * k[None, :, :], axis=2) * scale
-            scores = tl.where(
-                tile_mask[None, :], scores, float("-inf")
-            )  # (G, BLK_POW2)
+            scores = tl.where(tile_mask[None, :], scores, float("-inf"))  # (G, BLOCK_N)
 
             m_new = tl.maximum(m, tl.max(scores, axis=1))
             alpha = tl.exp(m - m_new)
-            p = tl.exp(scores - m_new[:, None])  # (G, BLK_POW2)
+            p = tl.exp(scores - m_new[:, None])  # (G, BLOCK_N)
             lse = lse * alpha + tl.sum(p, axis=1)  # denom (Σ p)
 
             # --- V: PER-HEAD turboquant dequant, fully in-register over this head's
             # d columns. V[b, dd] = norm[b] · (vsigns[dd] · (H_d · M_quant[b,:])[dd]),
             # M_quant[b,dd] = cb[idx[b,dd]]/√d. The d-point Hadamard is a (d,d) matmul
-            # (d>=16 -> tl.dot); per-head means NO cross-head coupling (the cross-head
-            # full-C Hadamard could not fuse — QuaRot/SpinQuant use per-head exactly
-            # for this). v_norm is per-(row, head).
+            # (d>=16 -> tl.dot); per-head means NO cross-head coupling (QuaRot/SpinQuant
+            # use per-head exactly for this). v_norm is per-(row, head).
             v_norm = tl.load(
-                v_norm_ptr + blk * blk_size * h_kv + r_idx * h_kv + kv,
-                mask=row_real,
+                v_norm_ptr + blk * blk_size * h_kv + r * h_kv + kv,
+                mask=tile_mask,
                 other=0.0,
-            ).to(tl.float32)  # (BLK_POW2,) per-row norm for THIS head
+            ).to(tl.float32)  # (BLOCK_N,) per-row norm for THIS head
             v_idx = tl.load(
                 v_idx_ptr
                 + blk * blk_size * C
-                + r_idx[:, None] * C
+                + r[:, None] * C
                 + (kv * d + d_idx)[None, :],
-                mask=row_real[:, None],
+                mask=tile_mask[:, None],
                 other=0,
-            ).to(tl.int32)  # (BLK_POW2, d) codebook indices for this head
-            m_quant = tl.load(cb_ptr + v_idx).to(tl.float32) * sqrt_d  # (BLK_POW2, d)
+            ).to(tl.int32)  # (BLOCK_N, d) codebook indices for this head
+            m_quant = tl.load(cb_ptr + v_idx).to(tl.float32) * sqrt_d  # (BLOCK_N, d)
             # H_d · M_quant rows (orthonormal d-Hadamard via (d,d) matmul; d>=16 ok),
-            # then per-channel signs and the per-row norm -> dequantized V (BLK_POW2,d).
+            # then per-channel signs and the per-row norm -> dequantized V (BLOCK_N,d).
             v = tl.dot(m_quant, hmat) * vsigns[None, :] * v_norm[:, None]
             # p@v via GEMV (multiply+sum) — G=n_q_groups may be <16 so no tl.dot here.
             pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)  # (G, d)
@@ -2544,7 +2553,7 @@ def fused_decode_attention_k2b(
     if num_splits is None:
         num_splits = pick_num_splits(seq_len, blk_size, h_kv)
     num_splits = max(1, int(num_splits))
-    blk_pow2 = _next_pow2(blk_size)
+    block_n = _pick_block_n(blk_size)  # KV tile rows (<= 64, divides blk_size)
 
     cb = gaussian_codebook(vbits).to(q.device, torch.float32)
     sqrt_d = 1.0 / math.sqrt(d)  # M_quant = cb[idx] / √d (per-head rotation)
@@ -2599,7 +2608,7 @@ def fused_decode_attention_k2b(
         rank=rank,
         k_group=k_group,
         vbits=vbits,
-        BLK_POW2=blk_pow2,
+        BLOCK_N=block_n,
         HAS_ROPE=has_rope,
     )
 
