@@ -795,6 +795,7 @@ def quantize_cache(
     topk_k: int = 0,
     prefill_fit_len: int = 0,
     h_kv: int = 0,
+    h_heads: int = 0,
 ) -> tuple[torch.Tensor, float]:
     """Compress (S, C) fp32 matrix M with the specified arm.
 
@@ -835,6 +836,9 @@ def quantize_cache(
     h_kv : int
         Number of KV heads; used by lowrank_blockdiagwaterfill_channel to reshape
         channels into per-head blocks.
+    h_heads : int
+        Number of KV heads for per-head split arms (turboquant_mse_perhead); 0 = full-C.
+        Ignored by other arms.
 
     Returns
     -------
@@ -854,6 +858,7 @@ def quantize_cache(
             group=group,
             rank=rank,
             svd_factors=svd_factors,
+            h_heads=h_heads,
         )
         return dequant_packed(arm, packed, seed=seed, group=group), bpe
     elif arm == "lowrank_waterfill_channel":
@@ -965,5 +970,6 @@ def quantize_kv_layout(
         seed=spec.seed,
         group=spec.group,
         rank=spec.rank,
+        h_heads=h,
     )
     return from_matrix(M_hat, h), bpe

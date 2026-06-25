@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+from bmx.cache.codecs import dequant_packed, quantize_kv_layout, quantize_packed
+from bmx.cache.collect import from_matrix, to_matrix
 from bmx.cache.packed_streaming import PackedStreamingCache
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
@@ -198,6 +200,47 @@ def test_fused_packed_generate_matches_streaming_cuda():
     )
 
 
+def test_perhead_v_codec_bit_parity_streaming_vs_packed():
+    """turboquant_mse_perhead V: reference path (quantize_kv_layout) and packed path
+    (quantize_packed + dequant_packed + from_matrix) must produce bit-identical
+    dequantized tensors and equal bpe after CHANGE 1 threads h_heads through
+    quantize_cache/quantize_kv_layout.
+
+    Before the fix, quantize_kv_layout defaulted h_heads=0 → h=1 (full-C Hadamard),
+    while _pack_v_block passed h_heads=h_kv (per-head Hadamard) — a silent divergence.
+    This test is the exact-parity gate that the 5e-2 logit test could not provide.
+    """
+    torch.manual_seed(42)
+    h_kv, S, d = 2, 128, 32
+    v_spec = CacheCodecSpec(arm="turboquant_mse_perhead", bits=2)
+
+    # V tensor: (h_kv, S, d) in fp16 (cache storage dtype), cast to fp32 for codecs
+    V_fp16 = torch.randn(h_kv, S, d, dtype=torch.float16)
+    V_fp32 = V_fp16.float()
+
+    # --- Reference path (streaming.py / ppl_eval.py): quantize_kv_layout ---
+    V_ref_hat, ref_bpe = quantize_kv_layout(V_fp32, v_spec)
+
+    # --- Packed path (_pack_v_block in packed_streaming.py) ---
+    M = to_matrix(V_fp32)  # (S, h_kv*d)
+    packed, pack_bpe = quantize_packed(
+        "turboquant_mse_perhead",
+        M,
+        bits=v_spec.bits,
+        seed=v_spec.seed,
+        h_heads=h_kv,
+    )
+    M_hat = dequant_packed("turboquant_mse_perhead", packed, seed=v_spec.seed)
+    V_pack_hat = from_matrix(M_hat, h_kv)
+
+    assert torch.equal(V_pack_hat, V_ref_hat), (
+        f"turboquant_mse_perhead reference vs packed paths diverged: "
+        f"max_abs={(V_pack_hat - V_ref_hat).abs().max():.2e}. "
+        "h_heads is not being threaded through quantize_cache → quantize_kv_layout."
+    )
+    assert ref_bpe == pack_bpe, f"bpe mismatch: reference={ref_bpe}, packed={pack_bpe}"
+
+
 def _k2b_perhead():
     """The REAL recipe with the per-head Hadamard V (the fused-k2b kernel's arm).
 
@@ -243,6 +286,9 @@ def test_fused_k2b_generate_matches_streaming_cuda():
     ref = _decode_logits(StreamingQuantizedCache)
     fused = _decode_logits(PackedStreamingCache)
     max_abs = (ref - fused).abs().max().item()
+    # Codec is now identical on both sides (both use per-head Hadamard after CHANGE 1).
+    # Residual diff is fused-kernel tf32 tensor-core math vs chunked fp32 reference,
+    # so atol=0 exact parity is not expected here; 5e-2 covers the tf32 drift.
     assert max_abs < 5e-2, (
         f"fused-k2b decode logits diverged from streaming: max_abs={max_abs} "
         "(fused_decode_attention_k2b in packed_streaming.attend)"
