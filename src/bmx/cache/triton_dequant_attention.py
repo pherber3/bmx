@@ -1347,8 +1347,13 @@ def _finalize_decode(
     fine. Partial layout (num_splits, h_kv, G, ...) flattens to head index kv*G+g,
     matching q's (h_kv, G) order.
     """
-    h_kv, n_q_groups_, d = acc_part.shape[1], acc_part.shape[2], acc_part.shape[3]
-    n_q_heads = h_kv * n_q_groups_
+    # acc_part is (num_splits, h_kv, n_q_groups, d) — its group axis equals the
+    # n_q_groups parameter by construction (asserted here to keep them in lockstep).
+    h_kv, d = acc_part.shape[1], acc_part.shape[3]
+    assert acc_part.shape[2] == n_q_groups, (
+        f"partial group axis {acc_part.shape[2]} != n_q_groups {n_q_groups}"
+    )
+    n_q_heads = h_kv * n_q_groups
 
     if k_tail is None or k_tail.shape[1] == 0:
         out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
