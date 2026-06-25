@@ -39,6 +39,138 @@ from bmx.decomp.lrs import truncated_svd
 _ATTN_NAME = "chunked_dequant"
 
 
+def _next_capacity(need: int, have: int) -> int:
+    """Doubling growth: smallest power-of-two-ish capacity >= need, >= have."""
+    cap = max(have, 1)
+    while cap < need:
+        cap *= 2
+    return cap
+
+
+class _PagedStacks:
+    """Persistent device-resident stacked-KV buffer with O(page) incremental append.
+
+    The fused decode kernels read a leading ``(max_blocks, ...)`` slot axis where
+    slot ``i`` holds committed page ``i`` (build_kv_stacked_{packed,k2b}). Rebuilding
+    that from all committed pages on every decode step is O(total_context) host->device
+    copy per token — quadratic over a generation (the #1 production-perf item).
+
+    This buffer keeps the stacked tensors resident on-device and grows them in place:
+    when ``n`` committed pages exist but only ``k < n`` are already stacked, it builds
+    ONLY the ``n - k`` new slots (via the same builder, the single source of per-slot
+    truth) and copies them into the persistent tensors, doubling capacity when needed.
+    The kernel then reads a ``[:n]`` view — no per-call rebuild.
+
+    ``build_fn`` is the matching ``build_kv_stacked_*`` and returns either a tuple of
+    tensors (packed: k_codes/v_codes/k_scales/v_scales) or a dict (k2b). The buffer is
+    agnostic: it stacks each tensor field along dim 0 and carries any non-tensor dict
+    entries (rank, k_group) verbatim from the latest build.
+    """
+
+    def __init__(self, build_fn, build_kwargs: dict):
+        self._build_fn = build_fn
+        self._build_kwargs = (
+            build_kwargs  # everything except the block lists + max_blocks
+        )
+        self._n_stacked = 0  # committed pages already materialized into the buffer
+        self._cap = 0  # slot capacity of the resident tensors
+        self._is_dict = False
+        self._buf: list[torch.Tensor] | dict | None = None  # resident tensors
+        self._meta: dict = {}  # non-tensor dict entries (rank, k_group) for the k2b dict
+
+    @staticmethod
+    def _tensors(built):
+        """Normalize a builder result to (list_of_tensors, meta_dict, is_dict)."""
+        if isinstance(built, dict):
+            tensors = {k: v for k, v in built.items() if torch.is_tensor(v)}
+            meta = {k: v for k, v in built.items() if not torch.is_tensor(v)}
+            return tensors, meta, True
+        return list(built), {}, False
+
+    def _alloc(self, sample, cap: int, device):
+        """Allocate resident tensors with slot capacity ``cap`` from a sample build."""
+        if self._is_dict:
+            self._buf = {
+                k: torch.zeros((cap, *t.shape[1:]), dtype=t.dtype, device=device)
+                for k, t in sample.items()
+            }
+        else:
+            self._buf = [
+                torch.zeros((cap, *t.shape[1:]), dtype=t.dtype, device=device)
+                for t in sample
+            ]
+        self._cap = cap
+
+    def _grow(self, cap: int):
+        """Grow capacity to ``cap``, preserving the already-stacked slots."""
+        if self._is_dict:
+            new = {}
+            for k, t in self._buf.items():
+                nt = torch.zeros((cap, *t.shape[1:]), dtype=t.dtype, device=t.device)
+                nt[: self._n_stacked] = t[: self._n_stacked]
+                new[k] = nt
+            self._buf = new
+        else:
+            new = []
+            for t in self._buf:
+                nt = torch.zeros((cap, *t.shape[1:]), dtype=t.dtype, device=t.device)
+                nt[: self._n_stacked] = t[: self._n_stacked]
+                new.append(nt)
+            self._buf = new
+        self._cap = cap
+
+    def _copy_in(self, built, start: int, count: int):
+        """Copy the first ``count`` slots of a fresh build into slots [start:start+count]."""
+        if self._is_dict:
+            for k, t in built.items():
+                self._buf[k][start : start + count] = t[:count]
+        else:
+            for j, t in enumerate(built):
+                self._buf[j][start : start + count] = t[:count]
+
+    def view(self, k_blocks: list, v_blocks: list, device):
+        """Return the kernel-ready stacks sliced to len(k_blocks), appending new pages.
+
+        Builds ONLY the pages not yet stacked (incremental). Returns the same type the
+        builder returns (tuple or dict), sliced to the live page count.
+        """
+        n = len(k_blocks)
+        assert n > 0, "no committed pages to stack"
+
+        if n < self._n_stacked:
+            # Pages were dropped (cache reset / detach without clearing) — restack.
+            self._n_stacked = 0
+            self._cap = 0
+            self._buf = None
+
+        if self._n_stacked < n:
+            new_k = k_blocks[self._n_stacked : n]
+            new_v = v_blocks[self._n_stacked : n]
+            count = len(new_k)
+            built = self._build_fn(
+                new_k, new_v, max_blocks=count, device=device, **self._build_kwargs
+            )
+            tensors, meta, is_dict = self._tensors(built)
+            self._meta = meta
+            if self._buf is None:
+                self._is_dict = is_dict
+                self._alloc(tensors, _next_capacity(n, 0), device)
+            elif n > self._cap:
+                self._grow(_next_capacity(n, self._cap))
+            self._copy_in(tensors, self._n_stacked, count)
+            self._n_stacked = n
+
+        if self._is_dict:
+            return {**{k: t[:n] for k, t in self._buf.items()}, **self._meta}
+        return tuple(t[:n] for t in self._buf)
+
+    def reset(self):
+        self._n_stacked = 0
+        self._cap = 0
+        self._buf = None
+        self._meta = {}
+
+
 def chunked_attention_forward(
     module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs
 ):
@@ -118,6 +250,12 @@ class PackedStreamingLayer(DynamicLayer):
         # Packed block lists: list of (packed_dict, start, end).
         self._k_blocks: list[tuple[dict, int, int]] = []
         self._v_blocks: list[tuple[dict, int, int]] = []
+
+        # Persistent device-resident stacked-KV buffers for the fused decode kernels.
+        # Built lazily on the first decode (need q's device + spec dims); appended one
+        # page at a time thereafter (O(page)/step instead of O(context)/step rebuild).
+        self._packed_stacks: _PagedStacks | None = None
+        self._k2b_stacks: _PagedStacks | None = None
 
         # Frozen subspace for lowrank_rtn_channel K (same I1 fix as streaming.py).
         self._frozen_svd: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -433,16 +571,19 @@ class PackedStreamingLayer(DynamicLayer):
             blk = self._k_blocks[0][2] - self._k_blocks[0][1]  # block length
             n_blocks = len(self._k_blocks)
             seq_len_packed = n_blocks * blk
-            k_codes, v_codes, k_scales, v_scales = build_kv_stacked_packed(
-                self._k_blocks,
-                self._v_blocks,
-                max_blocks=n_blocks,
-                h_kv=self._h_kv,
-                blk_size=blk,
-                d=q.shape[2],
-                group=self.k_spec.group,
-                v_group=self.v_spec.group,
-                device=q.device,
+            if self._packed_stacks is None:
+                self._packed_stacks = _PagedStacks(
+                    build_kv_stacked_packed,
+                    dict(
+                        h_kv=self._h_kv,
+                        blk_size=blk,
+                        d=q.shape[2],
+                        group=self.k_spec.group,
+                        v_group=self.v_spec.group,
+                    ),
+                )
+            k_codes, v_codes, k_scales, v_scales = self._packed_stacks.view(
+                self._k_blocks, self._v_blocks, q.device
             )
             return fused_decode_attention_packed(
                 q,
@@ -493,15 +634,12 @@ class PackedStreamingLayer(DynamicLayer):
         if fused_k2b_ok:
             blk = self._k_blocks[0][2] - self._k_blocks[0][1]
             n_blocks = len(self._k_blocks)
-            stacks = build_kv_stacked_k2b(
-                self._k_blocks,
-                self._v_blocks,
-                max_blocks=n_blocks,
-                h_kv=self._h_kv,
-                blk_size=blk,
-                d=q.shape[2],
-                device=q.device,
-            )
+            if self._k2b_stacks is None:
+                self._k2b_stacks = _PagedStacks(
+                    build_kv_stacked_k2b,
+                    dict(h_kv=self._h_kv, blk_size=blk, d=q.shape[2]),
+                )
+            stacks = self._k2b_stacks.view(self._k_blocks, self._v_blocks, q.device)
             return fused_decode_attention_k2b(
                 q,
                 stacks,

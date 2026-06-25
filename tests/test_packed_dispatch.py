@@ -245,3 +245,117 @@ def test_k2b_pre_rope_falls_back_to_chunked(monkeypatch):
         "k2b+pre_rope fallback output diverged from StreamingQuantizedCache reference. "
         "The guard diverted to chunked but chunked produced wrong output."
     )
+
+
+# ---------------------------------------------------------------------------
+# _PagedStacks: incremental append must equal from-scratch build (the I3 fix).
+# Fully CPU-testable — the correctness gate for the production stacked-KV buffer.
+# ---------------------------------------------------------------------------
+
+
+def _packed_rtn_blocks(n_blocks, h_kv, blk, d, group, seed=0):
+    """Build n_blocks of (rtn_token packed dict, start, end) for K and V."""
+    from bmx.cache.codecs import quantize_packed
+    from bmx.cache.collect import to_matrix
+
+    torch.manual_seed(seed)
+    k_blocks, v_blocks = [], []
+    for i in range(n_blocks):
+        s, e = i * blk, (i + 1) * blk
+        kM = to_matrix(torch.randn(h_kv, blk, d))
+        vM = to_matrix(torch.randn(h_kv, blk, d))
+        kp, _ = quantize_packed("rtn_token", kM, bits=4, group=group, seed=seed)
+        vp, _ = quantize_packed("rtn_token", vM, bits=4, group=group, seed=seed)
+        k_blocks.append((kp, s, e))
+        v_blocks.append((vp, s, e))
+    return k_blocks, v_blocks
+
+
+def _k2b_perhead_blocks(n_blocks, h_kv, blk, d, rank, group, seed=0):
+    """Build n_blocks of (lowrank_rtn_channel K, turboquant_mse_perhead V) blocks."""
+    from bmx.cache.codecs import quantize_packed
+    from bmx.cache.collect import to_matrix
+
+    torch.manual_seed(seed)
+    k_blocks, v_blocks = [], []
+    for i in range(n_blocks):
+        s, e = i * blk, (i + 1) * blk
+        kM = to_matrix(torch.randn(h_kv, blk, d))
+        vM = to_matrix(torch.randn(h_kv, blk, d))
+        kp, _ = quantize_packed(
+            "lowrank_rtn_channel", kM, bits=3, group=group, rank=rank, seed=seed
+        )
+        vp, _ = quantize_packed(
+            "turboquant_mse_perhead", vM, bits=2, seed=seed, h_heads=h_kv
+        )
+        k_blocks.append((kp, s, e))
+        v_blocks.append((vp, s, e))
+    return k_blocks, v_blocks
+
+
+def test_paged_stacks_packed_incremental_equals_rebuild():
+    """_PagedStacks.view appended page-by-page must equal build_kv_stacked_packed
+    from scratch — bit-identical. This is the I3 production-buffer correctness gate
+    (incremental O(page) append vs the O(context) per-call rebuild it replaces)."""
+    from bmx.cache.packed_streaming import _PagedStacks
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_packed
+
+    h_kv, blk, d, group, n = 2, 16, 8, 8, 5
+    k_blocks, v_blocks = _packed_rtn_blocks(n, h_kv, blk, d, group, seed=3)
+
+    buf = _PagedStacks(
+        build_kv_stacked_packed,
+        dict(h_kv=h_kv, blk_size=blk, d=d, group=group, v_group=group),
+    )
+    # Append one page at a time (mirrors flush-then-decode), then a multi-page jump.
+    for upto in (1, 2, 3, 5):
+        inc = buf.view(k_blocks[:upto], v_blocks[:upto], torch.device("cpu"))
+        ref = build_kv_stacked_packed(
+            k_blocks[:upto],
+            v_blocks[:upto],
+            max_blocks=upto,
+            h_kv=h_kv,
+            blk_size=blk,
+            d=d,
+            group=group,
+            v_group=group,
+            device="cpu",
+        )
+        assert len(inc) == len(ref) == 4
+        for a, b in zip(inc, ref):
+            assert torch.equal(a, b), (
+                f"packed incremental != rebuild at n={upto} "
+                f"(max_abs={(a.float() - b.float()).abs().max():.2e})"
+            )
+
+
+def test_paged_stacks_k2b_incremental_equals_rebuild():
+    """_PagedStacks.view (k2b dict path) appended page-by-page must equal
+    build_kv_stacked_k2b from scratch — every tensor field bit-identical and the
+    non-tensor meta (rank, k_group) preserved."""
+    from bmx.cache.packed_streaming import _PagedStacks
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_k2b
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 4
+    k_blocks, v_blocks = _k2b_perhead_blocks(n, h_kv, blk, d, rank, group, seed=7)
+
+    buf = _PagedStacks(build_kv_stacked_k2b, dict(h_kv=h_kv, blk_size=blk, d=d))
+    for upto in (1, 2, 4):
+        inc = buf.view(k_blocks[:upto], v_blocks[:upto], torch.device("cpu"))
+        ref = build_kv_stacked_k2b(
+            k_blocks[:upto],
+            v_blocks[:upto],
+            max_blocks=upto,
+            h_kv=h_kv,
+            blk_size=blk,
+            d=d,
+            device="cpu",
+        )
+        assert set(inc) == set(ref)
+        for key in ref:
+            if torch.is_tensor(ref[key]):
+                assert torch.equal(inc[key], ref[key]), (
+                    f"k2b incremental != rebuild for '{key}' at n={upto}"
+                )
+            else:
+                assert inc[key] == ref[key], f"k2b meta '{key}' mismatch at n={upto}"
