@@ -84,6 +84,19 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   A/B-confirmed vs dense at 64k). Triton (Phase 3) NOT required to clear the
   ceiling. `docs/2026-06-23-kernel-census-results.md`, spec/plan
   `docs/superpowers/{specs,plans}/2026-06-23-fused-dequant-attention*`.
+- Triton fused decode kernel (Phase 3, branch `feat/triton-decode-kernel`, NOT yet
+  merged): single-launch split-KV decode that dequants packed codes IN-KERNEL — RTN
+  (`fused_decode_attention_packed`) + the real k2b recipe (`fused_decode_attention_k2b`:
+  in-kernel lowrank-K + RoPE + per-head turboquant-V Hadamard). Uniform PAGE=128 paged
+  layout in both caches; `_PagedStacks` maintains the device-resident block table
+  incrementally. Eval on real Llama-3.1-8B reproduces the NIAH frontier (k2b_ph
+  recall_full 6.98/7.46/8.89 vs 6.94/7.41/8.98). Final review (MERGE AFTER FIXES) +
+  external audit both cleared; remaining merge gate is ONE GH200 CUDA re-verify.
+  **Debloat:** the dead dense `fused_decode_attention`, the unwired graphable CUDA-graph
+  path, and the obsolete `hadamard_kernel_ref` were DELETED (commit `7b07552`, −1559 net) —
+  if a future task needs CUDA-graph capture or an in-kernel FWHT, the removed code +
+  exact recovery steps are in `docs/2026-06-24-decode-path-debloat-removal.md` (recover
+  from parent `93751eb`). `docs/2026-06-24-triton-decode-results.md`.
 - **Open (engineering, not science):** Triton fused kernel (Phase 3, gated — only
   for a deployment speed/RSS claim); a WIDER batched 128k sweep (more arms/seqs
   co-resident) may need the prefill mask materialization trimmed — the mask fix
