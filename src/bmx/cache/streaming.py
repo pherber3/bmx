@@ -106,6 +106,11 @@ class StreamingQuantizedLayer(DynamicLayer):
         # Precomputed per-instance constants (avoid re-evaluating each update step).
         self._passthrough = k_spec.arm == "fp16" and v_spec.arm == "fp16"
         self._g = k_spec.group if k_spec.arm in S_DIVISIBILITY_ARMS else 1
+        # PAGE: fixed flush-block size (paged-KV layout). MUST match
+        # PackedStreamingLayer._page exactly so the two caches flush identical
+        # uniform PAGE-token blocks -> bit-for-bit parity (the shared-schedule
+        # contract). Multiple of _g; default 128.
+        self._page = max(self._g, (128 // self._g) * self._g) if self._g > 1 else 128
         # RoPE cos/sin: one growing (max_S, d_head) table, extended per flush block
         # (covered length is self._rope_cos.shape[0]).
         self._rope_cos: torch.Tensor | None = None
@@ -224,11 +229,12 @@ class StreamingQuantizedLayer(DynamicLayer):
         cache_dtype = keys.dtype
         S = keys.shape[2]  # (1, h_kv, S, d)
         W = self.recent_window
-        g = self._g
 
-        # Compute the new committed length: largest multiple of g that leaves
-        # at least W recent tokens in the fp16 window.
-        new_S_q = compute_flush_schedule(S, W, g)
+        # Compute the new committed length: largest multiple of PAGE that leaves
+        # at least W recent tokens in the fp16 window. Flushing on the PAGE grid
+        # (not _g) makes every committed block exactly PAGE tokens — the uniform
+        # paged layout, identical to PackedStreamingLayer (shared-schedule parity).
+        new_S_q = compute_flush_schedule(S, W, self._page)
 
         if new_S_q <= 0:
             # Nothing to quantize yet — whole cache stays fp16 this step.
@@ -275,60 +281,55 @@ class StreamingQuantizedLayer(DynamicLayer):
                 ) / total_entries
             return self.keys, self.values
 
-        # --- A new block [_committed_S_q : new_S_q] is ready to flush. ---
-        # Quantize it ONCE, from pristine source, and append to the frozen prefix.
+        # --- New region [_committed_S_q : new_S_q] is ready to flush. ---
+        # Emit it as uniform PAGE-token blocks (matching PackedStreamingLayer): each
+        # page quantized ONCE from pristine source and appended to the frozen prefix.
+        for pg0 in range(self._committed_S_q, new_S_q, self._page):
+            block_start = pg0
+            block_end = pg0 + self._page
+            block_len = self._page
 
-        block_start = self._committed_S_q
-        block_end = new_S_q
-        block_len = block_end - block_start
+            # --- Quantize K page ---
+            if self.k_spec.pre_rope:
+                assert self._k_pre is not None, (
+                    "k_spec.pre_rope=True but no captured pre-RoPE keys; "
+                    "call cache.attach(model) before prefill"
+                )
+                local_start = block_start - self._k_pre_offset
+                local_end = block_end - self._k_pre_offset
+                k_block_pre = self._k_pre[
+                    :, local_start:local_end, :
+                ].float()  # (h_kv, PAGE, d)
+                k_block_post, codec_bpe_k = self._quantize_k_block_pre_rope(
+                    k_block_pre, block_start, block_end
+                )
+                k_block_post = k_block_post.to(cache_dtype)
+            else:
+                # Post-RoPE keys: the page is already RoPE'd at its correct positions
+                # inside `keys`; pristine because it was in the fp16 tail until now.
+                k_block_fp32 = keys.squeeze(0)[..., block_start:block_end, :].float()
+                k_block_post_raw, codec_bpe_k = self._quantize_matrix(
+                    k_block_fp32, self.k_spec
+                )
+                k_block_post = k_block_post_raw.to(cache_dtype)
 
-        # --- Quantize K block ---
-        if self.k_spec.pre_rope:
-            assert self._k_pre is not None, (
-                "k_spec.pre_rope=True but no captured pre-RoPE keys; "
-                "call cache.attach(model) before prefill"
-            )
-            # _k_pre is indexed from _k_pre_offset in absolute positions.
-            # Absolute positions [block_start, block_end) -> local indices:
-            local_start = block_start - self._k_pre_offset
-            local_end = block_end - self._k_pre_offset
-            k_block_pre = self._k_pre[
-                :, local_start:local_end, :
-            ].float()  # (h_kv, block_len, d)
-            k_block_post, codec_bpe_k = self._quantize_k_block_pre_rope(
-                k_block_pre, block_start, block_end
-            )
-            k_block_post = k_block_post.to(cache_dtype)
-        else:
-            # Post-RoPE keys: the block is already RoPE'd at its correct positions
-            # inside `keys` from super().update. The block at [block_start:block_end]
-            # is pristine because it was in the fp16 tail until now.
-            k_block_fp32 = keys.squeeze(0)[..., block_start:block_end, :].float()
-            k_block_post_raw, codec_bpe_k = self._quantize_matrix(
-                k_block_fp32, self.k_spec
-            )
-            k_block_post = k_block_post_raw.to(cache_dtype)
+            # --- Quantize V page (pristine fp16 in the tail until now) ---
+            v_block_fp32 = values.squeeze(0)[..., block_start:block_end, :].float()
+            v_block_raw, codec_bpe_v = self._quantize_matrix(v_block_fp32, self.v_spec)
+            v_block = v_block_raw.to(cache_dtype)
 
-        # --- Quantize V block ---
-        # values from super().update() accumulates pristine fp16 from DynamicLayer.
-        # The block [block_start:block_end] was in the fp16 tail last step, so it
-        # is pristine fp16 (never quantized). Quantize it exactly once now.
-        v_block_fp32 = values.squeeze(0)[..., block_start:block_end, :].float()
-        v_block_raw, codec_bpe_v = self._quantize_matrix(v_block_fp32, self.v_spec)
-        v_block = v_block_raw.to(cache_dtype)
+            # --- Append page to frozen prefix ---
+            if self._q_prefix_k is None:
+                self._q_prefix_k = k_block_post
+                self._q_prefix_v = v_block
+            else:
+                self._q_prefix_k = torch.cat([self._q_prefix_k, k_block_post], dim=-2)
+                self._q_prefix_v = torch.cat([self._q_prefix_v, v_block], dim=-2)
 
-        # --- Append new block to frozen prefix ---
-        if self._q_prefix_k is None:
-            self._q_prefix_k = k_block_post
-            self._q_prefix_v = v_block
-        else:
-            self._q_prefix_k = torch.cat([self._q_prefix_k, k_block_post], dim=-2)
-            self._q_prefix_v = torch.cat([self._q_prefix_v, v_block], dim=-2)
-
-        # --- Accumulate honest bits ---
-        block_entries = block_len * self._h_kv * self._d_head
-        self._quant_bits_k += codec_bpe_k * block_entries
-        self._quant_bits_v += codec_bpe_v * block_entries
+            # --- Accumulate honest bits ---
+            block_entries = block_len * self._h_kv * self._d_head
+            self._quant_bits_k += codec_bpe_k * block_entries
+            self._quant_bits_v += codec_bpe_v * block_entries
 
         # --- Update committed counter ---
         self._committed_S_q = new_S_q

@@ -23,7 +23,9 @@ def tiny_llama():
         hidden_size=32,
         intermediate_size=64,
         vocab_size=97,
-        max_position_embeddings=64,
+        # 512 so tests can exceed the 128-token PAGE flush threshold (the cache now
+        # commits on a fixed 128-token page grid; flushing needs PAGE+recent_window).
+        max_position_embeddings=512,
     )
     torch.manual_seed(1)
     return LlamaForCausalLM(cfg).eval()
@@ -41,7 +43,7 @@ def tiny_llama_d32():
         hidden_size=64,
         intermediate_size=128,
         vocab_size=97,
-        max_position_embeddings=128,
+        max_position_embeddings=512,  # exceed the 128-token PAGE flush threshold
     )
     torch.manual_seed(1)
     return LlamaForCausalLM(cfg).eval()

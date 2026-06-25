@@ -51,10 +51,10 @@ def test_packed_generate_matches_streaming():
 
 
 def test_packed_generate_matches_streaming_long_prefill():
-    # seq=48 > recent_window=32 so a block flushes during prefill, exercising the
-    # committed-blocks causal path that the seq=12 test never reaches.
+    # seq=200 > PAGE(128)+recent_window(32) so a 128-token page flushes during prefill,
+    # exercising the committed-blocks causal path + slab prune the seq=12 test misses.
     model = tiny_llama()
-    input_ids = ids(vocab=97, seq=48, seed=11)
+    input_ids = ids(vocab=97, seq=200, seed=11)
     k_spec, v_spec = _k2b()
     ref_cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
     ref_cache.attach(model)
@@ -77,16 +77,19 @@ def test_packed_generate_matches_streaming_long_prefill():
             use_cache=True,
             past_key_values=packed,
         )
-    # Verify resident slab is bounded (tail-only, not full S).
+    # Verify resident slab is bounded (tail-only, not full S) — committed tokens live
+    # only as packed pages. After PAGE flushing the slab is the un-committed tail,
+    # bounded by recent_window + PAGE (the most that can accumulate before the next
+    # page boundary).
     layer0 = packed.layers[0]
-    total_seq = 48 + 20  # prefill + new tokens
+    total_seq = 200 + 20  # prefill + new tokens
     slab_len = layer0.keys.shape[2]
     assert slab_len < total_seq, (
         f"Slab not pruned: keys.shape[2]={slab_len} >= total_seq={total_seq}"
     )
-    assert slab_len <= layer0.recent_window + layer0._g + 1, (
+    assert slab_len <= layer0.recent_window + layer0._page + 1, (
         f"Slab too large: {slab_len} > recent_window({layer0.recent_window})"
-        f" + g({layer0._g}) + 1"
+        f" + PAGE({layer0._page}) + 1"
     )
     packed.detach()
     assert torch.equal(out, ref)

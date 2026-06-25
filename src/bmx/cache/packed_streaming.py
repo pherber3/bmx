@@ -134,6 +134,14 @@ class PackedStreamingLayer(DynamicLayer):
         )
         # Group-alignment constant (same as StreamingQuantizedLayer._g).
         self._g = k_spec.group if k_spec.arm in S_DIVISIBILITY_ARMS else 1
+        # PAGE: fixed flush-block size (production paged-KV layout). Committing in
+        # uniform PAGE-token blocks (instead of one giant prefill block) is what the
+        # fused decode kernel needs (it stacks (n_pages, PAGE, ...) + tiles PAGE by
+        # BLOCK_N) AND is quality-correct for k2b (per-PAGE lowrank factor fits the
+        # local subspace better than one factor over thousands of tokens — brain/
+        # FlashInfer CSR + DeepSeek-V4 HCA=128 precedent). Must be a multiple of _g so
+        # each page satisfies the codec's S % group == 0; default 128 (= 2*64).
+        self._page = max(self._g, (128 // self._g) * self._g) if self._g > 1 else 128
 
     def stash_pre_rope(self, out: torch.Tensor) -> None:
         """Called by the k_proj hook: append captured pre-RoPE keys.
@@ -248,47 +256,63 @@ class PackedStreamingLayer(DynamicLayer):
         # _committed_S_q is the absolute position of slab[..., 0, :] after pruning.
         S = self._committed_S_q + keys.shape[2]  # total tokens in sequence
         W = self.recent_window
-        new_S_q = compute_flush_schedule(S, W, self._g)
+        # Flush on the PAGE grid (not _g): commit only up to the largest PAGE-multiple
+        # that leaves >= W recent tokens fp16, so EVERY committed block is exactly
+        # PAGE tokens -> uniform paged layout for the fused kernel + per-PAGE codec
+        # factors. (Reuses compute_flush_schedule with g=PAGE.)
+        new_S_q = compute_flush_schedule(S, W, self._page)
 
         if new_S_q > self._committed_S_q:
-            block_start = self._committed_S_q
-            block_end = new_S_q
-            block_len = block_end - block_start
-            # block_start == old _committed_S_q == the slab's absolute start, so the
-            # newly-committed block is the slab's leading [: block_len] in BOTH K and
-            # V, and the slab prune below trims exactly that. (Invariant of the flush
-            # schedule: each flush commits the front of the un-flushed slab.)
+            commit_start = self._committed_S_q
+            commit_end = new_S_q
+            committed_len = commit_end - commit_start  # multiple of PAGE
 
-            # --- Pack K block ---
-            if self.k_spec.pre_rope:
-                assert self._k_pre is not None, (
-                    "k_spec.pre_rope=True but no pre-RoPE keys captured; "
-                    "call cache.attach(model) before prefill"
-                )
-                local_start = block_start - self._k_pre_offset
-                local_end = block_end - self._k_pre_offset
-                k_block_pre = self._k_pre[:, local_start:local_end, :].float()
-                kpacked = self._pack_k_block(k_block_pre, block_start, block_end)
-            else:
-                # Post-RoPE: block was pristine fp16 tail until now (same as streaming.py).
-                k_block_fp32 = keys.squeeze(0)[..., :block_len, :].float()
-                M = to_matrix(k_block_fp32)
-                kpacked, _ = quantize_packed(
-                    self.k_spec.arm,
-                    M,
-                    bits=self.k_spec.bits,
-                    group=self.k_spec.group,
-                    rank=self.k_spec.rank,
-                    seed=self.k_spec.seed,
-                )
+            # Emit uniform PAGE-sized blocks across [commit_start, commit_end). Each
+            # page is packed independently (its own codec metadata / lowrank factor).
+            for pg0 in range(commit_start, commit_end, self._page):
+                block_start = pg0
+                block_end = pg0 + self._page
+                block_len = self._page
+                # slab-local offset of this page's front (slab starts at commit_start).
+                slab_off = block_start - commit_start
 
-            # --- Pack V block (leading [: block_len] of the slab, same as K) ---
-            v_block_fp32 = values.squeeze(0)[..., :block_len, :].float()
-            vpacked = self._pack_v_block(v_block_fp32)
+                # --- Pack K page ---
+                if self.k_spec.pre_rope:
+                    assert self._k_pre is not None, (
+                        "k_spec.pre_rope=True but no pre-RoPE keys captured; "
+                        "call cache.attach(model) before prefill"
+                    )
+                    local_start = block_start - self._k_pre_offset
+                    local_end = block_end - self._k_pre_offset
+                    k_block_pre = self._k_pre[:, local_start:local_end, :].float()
+                    kpacked = self._pack_k_block(k_block_pre, block_start, block_end)
+                else:
+                    # Post-RoPE: page is pristine fp16 in the slab until now.
+                    k_block_fp32 = keys.squeeze(0)[
+                        ..., slab_off : slab_off + block_len, :
+                    ].float()
+                    M = to_matrix(k_block_fp32)
+                    kpacked, _ = quantize_packed(
+                        self.k_spec.arm,
+                        M,
+                        bits=self.k_spec.bits,
+                        group=self.k_spec.group,
+                        rank=self.k_spec.rank,
+                        seed=self.k_spec.seed,
+                    )
 
-            self._k_blocks.append((kpacked, block_start, block_end))
-            self._v_blocks.append((vpacked, block_start, block_end))
-            self._committed_S_q = block_end
+                # --- Pack V page ---
+                v_block_fp32 = values.squeeze(0)[
+                    ..., slab_off : slab_off + block_len, :
+                ].float()
+                vpacked = self._pack_v_block(v_block_fp32)
+
+                self._k_blocks.append((kpacked, block_start, block_end))
+                self._v_blocks.append((vpacked, block_start, block_end))
+
+            block_end = commit_end  # for the prune logic below
+            block_len = committed_len
+            self._committed_S_q = commit_end
 
             # --- C3: Prune _k_pre to free committed positions ---
             if self.k_spec.pre_rope and self._k_pre is not None:
