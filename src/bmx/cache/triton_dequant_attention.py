@@ -333,6 +333,7 @@ if TRITON_AVAILABLE:
         d: tl.constexpr,
         n_q_groups: tl.constexpr,  # noqa: ARG001
         blk: tl.constexpr,  # actual block size (NOT autotuned — matches packed block)
+        BLK_POW2: tl.constexpr,  # next pow2 >= blk (tl.arange needs pow2; rows>=blk masked)
         rank: tl.constexpr,  # lowrank rank (small, e.g. 16–64)
         group: tl.constexpr,  # RTN group size
         HAS_ROPE: tl.constexpr,  # apply in-kernel RoPE to reconstructed K (pre-RoPE keys)
@@ -357,7 +358,11 @@ if TRITON_AVAILABLE:
         """
         g = tl.program_id(0)  # query head index within this KV head
         d_idx = tl.arange(0, d)
-        b_idx = tl.arange(0, blk)
+        # Pad the block-row dim to a power of 2 (tl.arange requires pow2); rows >= blk
+        # are masked out of every load + the scores. The geometric flush schedule
+        # emits non-pow2 block lengths on real models, so blk itself is NOT pow2.
+        b_idx = tl.arange(0, BLK_POW2)
+        b_valid = b_idx < blk  # (BLK_POW2,) real rows of this block
         r_idx = tl.arange(0, rank)
         n_groups = blk // group
 
@@ -370,8 +375,10 @@ if TRITON_AVAILABLE:
         # In-kernel K lowrank reconstruction
         # Step 1: Load Us block (BLK, RANK) — row-major (blk × rank)
         # ------------------------------------------------------------------
-        us_offsets = b_idx[:, None] * rank + r_idx[None, :]  # (BLK, RANK)
-        us_block = tl.load(us_ptr + us_offsets).to(tl.float32)  # (BLK, RANK)
+        us_offsets = b_idx[:, None] * rank + r_idx[None, :]  # (BLK_POW2, RANK)
+        us_block = tl.load(us_ptr + us_offsets, mask=b_valid[:, None], other=0.0).to(
+            tl.float32
+        )  # (BLK_POW2, RANK)
 
         # Step 2: Load V factor (D, RANK) — stored row-major (d × rank)
         vfac_offsets = d_idx[:, None] * rank + r_idx[None, :]  # (D, RANK)
@@ -392,8 +399,10 @@ if TRITON_AVAILABLE:
         # res_scale layout: (D, N_GROUPS) fp16 → scale[d_i, g_j] = res_scale_ptr[d_i*n_groups + g_j]
         # Dequant: for each (d_i, b_j): Q_int[d_i, b_j] * scale[d_i, b_j // group]
         # ------------------------------------------------------------------
-        res_offsets = d_idx[:, None] * blk + b_idx[None, :]  # (D, BLK)
-        res_int = tl.load(res_ptr + res_offsets).to(tl.float32)  # (D, BLK) fp32
+        res_offsets = d_idx[:, None] * blk + b_idx[None, :]  # (D, BLK_POW2)
+        res_int = tl.load(res_ptr + res_offsets, mask=b_valid[None, :], other=0.0).to(
+            tl.float32
+        )  # (D, BLK_POW2) fp32
 
         # Load scales per (D, BLK): for each (d_i, b_j), use res_scale[d_i, b_j // group].
         # Directly compute load offsets as d_i * n_groups + b_j // group.
@@ -401,10 +410,10 @@ if TRITON_AVAILABLE:
         # Each b_j in [0, BLK) maps to group index b_j // group in [0, N_GROUPS).
         res_scale_expanded_offsets = (
             d_idx[:, None] * n_groups + b_idx[None, :] // group
-        )  # (D, BLK) int
-        res_scale_expanded = tl.load(res_scale_ptr + res_scale_expanded_offsets).to(
-            tl.float32
-        )  # (D, BLK) fp32 — scale broadcast per group
+        )  # (D, BLK_POW2) int
+        res_scale_expanded = tl.load(
+            res_scale_ptr + res_scale_expanded_offsets, mask=b_valid[None, :], other=0.0
+        ).to(tl.float32)  # (D, BLK_POW2) fp32 — scale broadcast per group
 
         # RTN dequant: element-wise multiply codes by their group scale
         res_dequant_d_b = res_int * res_scale_expanded  # (D, BLK) fp32
@@ -438,12 +447,16 @@ if TRITON_AVAILABLE:
             # tensors (shift up / shift down) selected by the column's half, all in
             # registers. cos/sin are loaded full-width (BLK, D). Verified vs apply_rope.
             half = d // 2
-            cos = tl.load(cos_ptr + b_idx[:, None] * d + d_idx[None, :]).to(
-                tl.float32
-            )  # (BLK, D)
-            sin = tl.load(sin_ptr + b_idx[:, None] * d + d_idx[None, :]).to(
-                tl.float32
-            )  # (BLK, D)
+            cos = tl.load(
+                cos_ptr + b_idx[:, None] * d + d_idx[None, :],
+                mask=b_valid[:, None],
+                other=0.0,
+            ).to(tl.float32)  # (BLK_POW2, D)
+            sin = tl.load(
+                sin_ptr + b_idx[:, None] * d + d_idx[None, :],
+                mask=b_valid[:, None],
+                other=0.0,
+            ).to(tl.float32)  # (BLK_POW2, D)
             # k shifted by +half (cols d/2..d-1 brought to 0..d/2-1) and -half.
             # Build via full-width multiply with a one-hot-ish reduction: rot[:,j] =
             # sum_jj k[:,jj] * P[jj,j] where P is the rotate_half permutation+sign.
@@ -462,9 +475,11 @@ if TRITON_AVAILABLE:
             P = tl.where(
                 jj[:, None] == src_for_j[None, :], sign_for_j[None, :], 0.0
             )  # (D_src, D_out)
-            rot = tl.sum(k[:, :, None] * P[None, :, :], axis=1)  # (BLK, D_out)
-            k = k * cos + rot * sin  # (BLK, D)
-        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK,)
+            rot = tl.sum(k[:, :, None] * P[None, :, :], axis=1)  # (BLK_POW2, D_out)
+            k = k * cos + rot * sin  # (BLK_POW2, D)
+        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (BLK_POW2,)
+        # Mask padded rows (>= blk) to -inf so they vanish in the softmax.
+        scores = tl.where(b_valid, scores, float("-inf"))  # (BLK_POW2,)
 
         # ------------------------------------------------------------------
         # Online softmax update (base-e):
@@ -480,12 +495,14 @@ if TRITON_AVAILABLE:
         # ------------------------------------------------------------------
         # Accumulator update: acc_new = acc_old * alpha + p @ v  (D,)
         # ------------------------------------------------------------------
-        v_offsets = b_idx[:, None] * d + d_idx[None, :]  # (BLK, D)
-        v = tl.load(v_ptr + v_offsets).to(tl.float32)  # (BLK, D)
+        v_offsets = b_idx[:, None] * d + d_idx[None, :]  # (BLK_POW2, D)
+        v = tl.load(v_ptr + v_offsets, mask=b_valid[:, None], other=0.0).to(
+            tl.float32
+        )  # (BLK_POW2, D)
 
         acc_old = tl.load(acc_ptr + g * d + d_idx).to(tl.float32)  # (D,)
 
-        # pv[dd] = sum_b p[b]*v[b,dd]  → (D,)  (GEMV multiply+sum, not tl.dot)
+        # pv[dd] = sum_b p[b]*v[b,dd]  → (D,)  (GEMV multiply+sum; p=0 for padded rows)
         pv = tl.sum(p[:, None] * v, axis=0)  # (D,)
 
         acc_new = acc_old * alpha + pv  # (D,)
@@ -786,6 +803,7 @@ def _k2b_block_kernel_launch(
             d=d,
             n_q_groups=n_q_groups,
             blk=blk,
+            BLK_POW2=_next_pow2(blk),
             rank=rank,
             group=k_group,
             HAS_ROPE=has_rope,
