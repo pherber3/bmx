@@ -457,14 +457,22 @@ class PackedStreamingLayer(DynamicLayer):
         # packed-resident, no dense copy. Applies when K=lowrank_rtn_channel and
         # V=turboquant_mse_perhead (the per-head Hadamard codec the kernel needs).
         # The k2b fused kernel uses tl.dot for lowrank-K, rotate_half, and the V
-        # Hadamard, so it needs d>=16, rank>=16, and d a power of 2 (the per-head
-        # Hadamard). Real models satisfy this (d=128, rank>=16); tiny/incompatible
-        # configs fall back to the per-block triton path below (which handles d<16).
+        # Hadamard, so it needs d>=16, rank>=16, d a power of 2 (the per-head
+        # Hadamard), and rank + n_q_groups each a power of 2 (tl.arange precondition).
+        # Real models satisfy these (d=128, rank=16/32, n_q_groups=4); tiny or
+        # non-standard configs fall back to chunked_dequant_attention below.
+        # The retired per-block _k2b_softmax_block_kernel had a (BLK_POW2,D,RANK) cube
+        # hazard and was unreachable under the PAGE=128 uniform flush; chunked is the
+        # documented fallback for non-fused k2b configs.
         d_head = q.shape[2]
+        rank = self.k_spec.rank or 0
         k2b_dims_ok = (
             d_head >= 16
             and (d_head & (d_head - 1)) == 0
-            and (self.k_spec.rank or 0) >= 16
+            and rank >= 16
+            and (rank & (rank - 1)) == 0
+            and n_q_groups > 0
+            and (n_q_groups & (n_q_groups - 1)) == 0
         )
         fused_k2b_ok = (
             is_decode
@@ -501,7 +509,16 @@ class PackedStreamingLayer(DynamicLayer):
                 v_tail=v_tail,
             )
 
-        if TRITON_AVAILABLE and is_decode and q.is_cuda:
+        # k2b configs that didn't pass fused_k2b_ok (dim mismatch, non-pow2 rank /
+        # n_q_groups, non-CUDA, or non-uniform blocks) route directly to chunked.
+        # The retired per-block _k2b_softmax_block_kernel is deleted; chunked is the
+        # safe, correct fallback for all non-fused k2b cases.
+        if (
+            TRITON_AVAILABLE
+            and is_decode
+            and q.is_cuda
+            and self.k_spec.arm != "lowrank_rtn_channel"
+        ):
             return triton_decode_attention(
                 q,
                 self._k_blocks,
