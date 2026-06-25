@@ -18,6 +18,7 @@ import math
 
 import torch
 
+from bmx.cache.codecs import _hadamard_signs, dequant_packed, gaussian_codebook
 from bmx.cache.collect import from_matrix
 from bmx.cache.rope import apply_rope
 
@@ -67,55 +68,42 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Staged-build ledger + correctness invariants (see spec for full rationale)
+# Correctness invariants (see spec for full rationale)
 # ---------------------------------------------------------------------------
 #
-# Staged build (do not collapse prematurely):
-#   3a: Python dequant per block; only online-softmax contraction in Triton.
-#       Isolates kernel skeleton for bit-exact verification vs naive_dense_attention.
-#   3b: Split-KV decode parallelism + @triton.autotune + do_not_specialize on
-#       block-count arg.
-#   3c: In-kernel k2b unpack — lowrank K via tl.dot(Us, V_fac.T) + RTN residual;
-#       turboquant_mse V dequanted in Python (_unrotate stays Python, deferred 3c+).
-#   3c+: Full in-kernel FWHT for V (deferred — subtle-bug magnet; negligible cost
-#        vs memory-bandwidth saving on K; revisit only if VM profiling demands it).
-#
-# v_group / v_seed (3c): K and V may differ in seed/group; both accepted as kwargs
-#   (default to K's values for back-compat with 3a/3b RTN-only tests).
-#
-# GQA carry: (acc, m, lse) Python tensors between per-block Triton launches;
-#   fusing the KV-block loop is a 3c+ concern.
+# v_group / v_seed: K and V may use different seed/group; both are accepted as
+#   kwargs (default to K's values when omitted, for the RTN-only callers).
 #
 # Correctness bar: max_abs vs naive_dense_attention < 1e-2 (expect ~2e-4 at fp16).
 #   Do NOT loosen — fix the kernel if it drifts.
 #
-# Split-KV merge invariant (3b — must hold):
+# Split-KV merge invariant (must hold):
 #   Each split stores pre-normalization (acc_i, m_i, lse_i), merged as:
 #     m = max_i(m_i);  l = sum_i(lse_i * exp(m_i - m));
 #     out = sum_i(acc_i * exp(m_i - m)) / l
-#   At num_splits=1 this reduces to acc_0 / lse_0 (bit-identical to 3a).
+#   At num_splits=1 this reduces to acc_0 / lse_0 (bit-identical to the serial path).
 #
-# Base-e consistency: ALL kernels and merge use natural exp — do NOT mix base-2.
-#   A base-2 merge formula is a silent correctness trap (class of bug flagged in
-#   the 3a report).
+# Base-e consistency: ALL kernels and the merge use natural exp — do NOT mix
+#   base-2. A base-2 merge formula is a silent correctness trap.
 #
 # ---------------------------------------------------------------------------
-# Capability guard — fail loud; NO silent fallback (fallback is Task 4).
+# Capability guard — fail loud; NO silent fallback.
 # ---------------------------------------------------------------------------
 
 
 def _require_triton() -> None:
     """Raise if Triton + CUDA are not available.
 
-    The caller (dispatcher, Task 4) is responsible for routing to
-    chunked_dequant_attention when this raises.  This module never falls back
-    silently — a silent fallback would hide a missing capability.
+    PackedStreamingLayer.attend checks TRITON_AVAILABLE before calling into this
+    module and routes to chunked_dequant_attention otherwise; this guard makes a
+    missing capability fail loud rather than fall back silently.
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError(
             "triton_decode_attention requires Triton + CUDA. "
             "TRITON_AVAILABLE=False on this machine (no CUDA or Triton not "
-            "installed). Callers must dispatch to chunked_dequant_attention."
+            "installed). PackedStreamingLayer.attend dispatches to "
+            "chunked_dequant_attention in that case."
         )
 
 
@@ -151,9 +139,9 @@ def _require_triton() -> None:
 #   lse_new = lse_old * alpha + sum(p)
 #   acc_new = acc_old * alpha + p @ v    (1, D)
 #
-# For 3a/3b we do NOT tile over D (one kernel launch loads the full D-slice).
+# We do NOT tile over D (one kernel launch loads the full D-slice).
 #
-# 3b AUTOTUNE NOTE:
+# AUTOTUNE NOTE:
 #   @triton.autotune wraps the kernel with a configs list; key=["d","n_q_groups"]
 #   so Triton specializes on head dim + GQA groups (hardware-characteristic),
 #   NOT on seq_len / block count (which changes every decode step).
@@ -208,7 +196,7 @@ if TRITON_AVAILABLE:
         """Online-softmax step for ONE query head over ONE (blk, D) K/V block.
 
         Grid: (n_q_groups,) — each program is one query head within the KV head.
-        Correctness-first (3a/3b): one query row at a time, full D loaded, no tiling.
+        One query row at a time, full D loaded, no tiling.
 
         BLK (autotune tile) is INDEPENDENT of blk (the actual block length): autotune
         picks BLK from a config list (64, 128, ...), so BLK may be LARGER than blk.
@@ -307,8 +295,8 @@ def _online_block_kernel_launch(
 
     GQA loop: one Triton launch per KV head, grid=(n_q_groups,) so each
     program handles one query head.  Carry (acc, m, lse) flow in PyTorch
-    tensors between launches.  Correctness-first for 3a; fusing KV heads
-    into one launch is a 3b concern.
+    tensors between launches.  (The fused kernels below fuse the KV-block loop
+    into a single launch; this per-block path is the non-fused fallback.)
 
     Args:
         q:                  (n_q_heads, 1, d) fp16
@@ -375,7 +363,7 @@ def _online_block_kernel_launch(
 
 
 # ---------------------------------------------------------------------------
-# Split-KV helpers: partition + merge (3b)
+# Split-KV helpers: partition + merge
 # ---------------------------------------------------------------------------
 
 
@@ -419,7 +407,7 @@ def _merge_partials(
         m   = m_0
         l   = lse_0 * exp(m_0 - m_0) = lse_0
         out = acc_0 * 1 / lse_0 = acc_0 / lse_0
-        => Bit-identical to 3a's final division `acc / lse`.
+        => Bit-identical to the serial path's final division `acc / lse`.
 
     AT MULTIPLE SPLITS:
         This is exactly online_softmax_update applied across the split axis,
@@ -427,7 +415,7 @@ def _merge_partials(
 
     BASE-E NOTE: partial_lse is the raw unnormalized sum-of-softmax-weights
     (lse in online_softmax_update — not the log of that sum).  The correction
-    exp(m_i - m) is base-e.  Do NOT use exp2/log2 here (3a kernel is base-e).
+    exp(m_i - m) is base-e.  Do NOT use exp2/log2 here (all kernels are base-e).
 
     Args:
         partial_accs:  list of (n_q_heads, 1, d) fp32/fp16 — pre-normalized acc
@@ -447,7 +435,7 @@ def _merge_partials(
     m_global = ms.amax(dim=0, keepdim=True)  # (1, H, 1, 1)
 
     # Rescaling factors per split: exp(m_i - m_global)
-    scales = torch.exp(ms - m_global)  # (S, H, 1, 1) — base-e, matches 3a
+    scales = torch.exp(ms - m_global)  # (S, H, 1, 1) — base-e
 
     # Merged denominator: sum_i(lse_i * exp(m_i - m))
     l_merged = (lses * scales).sum(dim=0)  # (H, 1, 1)
@@ -455,7 +443,7 @@ def _merge_partials(
     # Merged numerator: sum_i(acc_i * exp(m_i - m))  — (S, H, 1, d) * (S, H, 1, 1)
     acc_merged = (accs * scales).sum(dim=0)  # (H, 1, d)
 
-    # Normalize and return in fp16 (matches 3a's `acc / lse.to(q.dtype)`)
+    # Normalize and return in fp16 (`acc / lse.to(q.dtype)`)
     return (acc_merged / l_merged).to(torch.float16)
 
 
@@ -484,23 +472,29 @@ def triton_decode_attention(
     v_group: int | None = None,
     v_seed: int | None = None,
 ) -> torch.Tensor:
-    """Triton decode attention: online-softmax over packed KV blocks.
+    """Triton decode attention: online-softmax over packed KV blocks (RTN only).
+
+    NON-FUSED FALLBACK path. The deployment dispatch (PackedStreamingLayer.attend)
+    prefers the single-launch fused kernels (fused_decode_attention_packed /
+    _k2b); it only reaches this per-block path for RTN configs that miss the fused
+    gate (non-uniform blocks — which the uniform PAGE flush makes rare). k2b is
+    rejected here (assert below) — it uses the fused k2b kernel or chunked.
 
     Same call shape as chunked_dequant_attention (minus query_abs_start —
     this is decode-only, n_q==1).  Produces (n_q_heads, n_q, d).
 
-    Stage 3a: dequant stays in PyTorch (dequant_packed + from_matrix +
+    Dequant stays in PyTorch (dequant_packed + from_matrix +
     apply_rope); only the online-softmax contraction runs in Triton.
     Each block:  PyTorch dequant -> Triton _online_softmax_block_kernel.
     Carry (acc, m, lse) flows between launches in Python/PyTorch tensors.
 
-    Stage 3b (num_splits > 1):
+    Split-KV (num_splits > 1):
     The block list is partitioned into num_splits contiguous ranges.  Each
-    split runs the 3a serial-online-softmax independently, producing a partial
+    split runs the serial online-softmax independently, producing a partial
     (acc_i, m_i, lse_i) with acc_i NOT yet divided by lse_i.  _merge_partials
     then combines them via the standard online-softmax combine (base-e).
 
-    num_splits=1 (default) is BACK-COMPATIBLE with 3a: the merge with a single
+    num_splits=1 (default) is the serial path: the merge with a single
     partial reduces exactly to acc_0 / lse_0 (see _merge_partials docstring).
 
     RTN-only: this dispatcher handles rtn_token / rtn_channel / rotate_rtn_token
@@ -509,10 +503,10 @@ def triton_decode_attention(
     fallback — it is rejected here by an assert (see body).
 
     v_group / v_seed: allow K and V to use different quantization params.
-    When not provided, they default to group / seed (3a/3b back-compat).
+    When not provided, they default to group / seed.
 
     GQA: one Triton launch per KV head per block (fusing into one launch
-    per block is a 3c optimisation).
+    per block is a possible optimisation).
 
     Args:
         q:          (n_q_heads, 1, d) fp16 — single decode query token
@@ -530,8 +524,8 @@ def triton_decode_attention(
         n_q_groups: n_q_heads // h_kv (GQA group count)
         scale:      attention scale, typically 1/sqrt(d)
         num_splits: number of KV-block splits for decode parallelism (default 1).
-                    1 = 3a serial path (back-compatible, bit-identical to 3a).
-                    >1 = 3b split path: partition blocks, merge partials.
+                    1 = serial path.
+                    >1 = split-KV path: partition blocks, merge partials.
                     The tail block (k_tail/v_tail) is always processed in split 0.
         v_group:    V quantization group size (defaults to group if None).
                     Allows K and V to use different packed formats.
@@ -541,7 +535,6 @@ def triton_decode_attention(
         (n_q_heads, 1, d) fp16 attention output.
     """
     _require_triton()
-    from bmx.cache.codecs import dequant_packed
 
     n_q_heads, n_q, d = q.shape
     assert n_q == 1, (
@@ -550,7 +543,7 @@ def triton_decode_attention(
     )
     h_kv = n_q_heads // n_q_groups
 
-    # Resolve V params — default to K's for 3a/3b back-compat
+    # Resolve V params — default to K's when omitted
     _v_group = v_group if v_group is not None else group
     _v_seed = v_seed if v_seed is not None else seed
 
@@ -579,7 +572,7 @@ def triton_decode_attention(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dequantize one RTN KV block pair → (K_kv, V_kv) on q's device, fp16.
 
-        Full Python dequant for both K and V (3a/3b RTN arms). Packed codes are
+        Full Python dequant for both K and V (RTN arms). Packed codes are
         stored CPU-resident in the cache (to save GPU memory), so dequant_packed/
         from_matrix produce CPU tensors — move to q.device for the kernel (a CPU
         pointer to a Triton kernel raises "cannot be accessed").
@@ -602,7 +595,7 @@ def triton_decode_attention(
     def _run_split(
         kb_split: list, vb_split: list, with_tail: bool
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the 3a/3c serial online-softmax over one split's blocks.
+        """Run the serial online-softmax over one split's blocks.
 
         Returns pre-normalization (acc, m, lse) — do NOT divide acc by lse here.
         The caller (_merge_partials) handles the final normalization.
@@ -646,15 +639,15 @@ def triton_decode_attention(
         return acc, m, lse
 
     # ------------------------------------------------------------------
-    # num_splits=1 fast path: 3a-compatible serial loop (back-compat)
+    # num_splits=1 fast path: serial loop
     # ------------------------------------------------------------------
     if num_splits == 1:
         acc, _m, lse = _run_split(k_blocks, v_blocks, with_tail=True)
-        # 3a-identical normalization path (preserves bit-identity for num_splits=1)
+        # serial normalization path (bit-identical at num_splits=1)
         return acc / lse.to(q.dtype)
 
     # ------------------------------------------------------------------
-    # num_splits>1: split-KV parallel path (3b)
+    # num_splits>1: split-KV parallel path
     # ------------------------------------------------------------------
     splits = _partition_blocks(k_blocks, v_blocks, num_splits)
 
@@ -691,379 +684,30 @@ def triton_decode_attention(
 
 
 # ---------------------------------------------------------------------------
-# Stage 3d: CUDA-graph-safe decode path
+# FUSED decode kernel — single launch, internal KV-block loop.
 #
-# THE PROBLEM with the existing decode path for CUDA graphs:
-#   - k_blocks is a Python list; its length (seq_len / n_blocks) is a Python int.
-#   - A CUDA graph captures a fixed kernel launch grid and fixed kernel args.
-#   - If seq_len (or n_blocks) is a Python int kernel arg, every decode step
-#     with a different seq_len requires a DIFFERENT compiled kernel specialization.
-#     Replaying an old capture at a new seq_len would use the WRONG (old) length.
-#
-# THE FIX (vLLM pattern, confirmed via DeepWiki):
-#   - Pre-stack KV blocks into a device tensor (max_blocks, h_kv, blk, d).
-#     The graph captures the pointer to this buffer; in-place updates are visible
-#     to replays without re-capture.
-#   - Pass seq_len as a DEVICE TENSOR (int32 scalar on CUDA).
-#     The kernel reads `seq_len_ptr[0]` at runtime — NOT from the launch args.
-#     Updating seq_len_dev.fill_(new_len) in-place between replays causes the
-#     replay to use the new length without re-capture.
-#   - Launch grid is FIXED = (max_blocks, h_kv, n_q_groups) — always the same shape.
-#     Blocks beyond seq_len_dev[0] are masked (kernel exits early).
-#
-# SCOPE OF 3d (honest):
-#   - RTN path (rtn_token arm): K and V are pre-dequanted into k_stacked/v_stacked
-#     before capture. In-place updates to the stacked tensors between replays make
-#     new KV blocks visible. This is the minimum satisfying the gate.
-#   - k2b path (lowrank_rtn_channel): K's packed dict (Us, V, res_Q_int, res_scale)
-#     is a heterogeneous Python dict, not a single contiguous device tensor. Stacking
-#     these across max_blocks into a graph-capturable device tensor requires a larger
-#     refactor (a paged block table for each factor). DEFERRED from 3d.
-#   - Tail window: fp16 residual window is handled by the caller (not part of the
-#     graphable path — it is always small and can be processed outside the graph).
-#   - CUDA graph capture/replay test: CUDA-gated. Locally (AMD/no-CUDA) the test
-#     skips loud. The test IS a real capture->update->replay->compare-to-fresh test
-#     that would catch a Python-int-seqlen implementation.
-#
-# KEY CORRECTNESS PROPERTY:
-#   A Python-int-seqlen implementation would bake seq_len=S0 into the captured
-#   kernel specialization. Replaying at S0+k would either: (a) run the S0 kernel
-#   (masking at S0, ignoring the extra blocks) → output matches fresh-at-S0 but
-#   NOT fresh-at-S0+k, catching the bug; or (b) recompile per step, defeating the
-#   purpose. The test asserts replayed ≈ fresh-at-S0+k, catching case (a).
-# ---------------------------------------------------------------------------
-
-
-if TRITON_AVAILABLE:
-
-    @triton.jit(do_not_specialize=["h_kv"])
-    def _graphable_decode_kernel(
-        # Query: (h_kv, n_q_groups, d) — n_q=1 squeezed, GQA-expanded view
-        q_ptr,
-        # Pre-stacked KV: (max_blocks, h_kv, blk_size, d) contiguous fp16
-        k_stacked_ptr,
-        v_stacked_ptr,
-        # Carry buffers: (h_kv, n_q_groups, d/1) contiguous
-        acc_ptr,  # fp16
-        m_ptr,  # fp32
-        lse_ptr,  # fp32
-        # Device scalar: actual live sequence length (int32, pointer-read)
-        seq_len_ptr,
-        # Scale factor (1/sqrt(d), fp32 scalar — runtime, not constexpr)
-        scale,
-        # h_kv: runtime int (do_not_specialize) — passed explicitly to avoid
-        # tl.num_programs(1) which is grid-padding-dependent on some hardware.
-        h_kv,
-        # Fixed-size launch params (constexpr — do NOT include seq_len here)
-        blk_size: tl.constexpr,
-        d: tl.constexpr,
-        n_q_groups: tl.constexpr,
-    ):
-        """Graph-safe decode online-softmax kernel.
-
-        Grid: (max_blocks, h_kv, n_q_groups) — always the same shape.
-        Each program handles ONE (block_idx, kv_head, q_group) triple.
-
-        seq_len_ptr is a DEVICE TENSOR (int32 pointer) — not a Python int.
-        The kernel reads seq_len_ptr[0] at runtime. Updating the device tensor
-        in-place between graph replays makes the new length visible without
-        re-capture. This is the key graph-safety property.
-
-        Block masking: if block_idx * blk_size >= seq_len, this program exits
-        early (contributes nothing to the accumulator). The last block is
-        partially masked: only tokens [block_start : seq_len] are active.
-
-        do_not_specialize: h_kv is a runtime int (not constexpr) — passed
-        explicitly so the stride computation is deterministic and not
-        grid-padding-dependent (avoids tl.num_programs(1) assumptions).
-        scale is also a runtime float; neither goes in the autotune key.
-        """
-        block_idx = tl.program_id(0)
-        kv_head = tl.program_id(1)
-        g = tl.program_id(2)  # query group within kv_head
-
-        # ------------------------------------------------------------------
-        # Read live seq_len from device tensor (THE graph-safety invariant).
-        # This pointer-read is what the graph captures — not a baked-in int.
-        # ------------------------------------------------------------------
-        seq_len = tl.load(seq_len_ptr).to(tl.int32)
-
-        block_start = block_idx * blk_size
-        # Mask: skip this block entirely if it starts at or beyond seq_len.
-        if block_start >= seq_len:
-            return
-
-        # ------------------------------------------------------------------
-        # Number of active tokens in this block (handles last partial block).
-        # ------------------------------------------------------------------
-        active = tl.minimum(blk_size, seq_len - block_start)
-
-        d_idx = tl.arange(0, d)
-        b_idx = tl.arange(0, blk_size)
-
-        # ------------------------------------------------------------------
-        # Load q row: (d,) for query group g within kv_head.
-        # q layout: (h_kv, n_q_groups, d).
-        # q_ptr[kv_head, g, :] offset = (kv_head * n_q_groups + g) * d
-        # ------------------------------------------------------------------
-        q_offset = (kv_head * n_q_groups + g) * d
-        q_row = tl.load(q_ptr + q_offset + d_idx).to(tl.float32)  # (d,)
-
-        # ------------------------------------------------------------------
-        # Load k block: (blk_size, d).
-        # k_stacked layout: (max_blocks, h_kv, blk_size, d).
-        # k_stacked[block_idx, kv_head, :, :] offset:
-        #   = (block_idx * h_kv + kv_head) * blk_size * d
-        # h_kv is passed explicitly (do_not_specialize) — deterministic stride,
-        # not grid-padding-dependent (avoids tl.num_programs(1) assumption).
-        # ------------------------------------------------------------------
-        k_base = (block_idx * h_kv + kv_head) * blk_size * d
-        k_offsets = b_idx[:, None] * d + d_idx[None, :]  # (blk_size, d)
-        # Mask for partial last block: b_idx < active
-        k_mask = b_idx < active  # (blk_size,) bool — last block partial mask
-        k = tl.load(
-            k_stacked_ptr + k_base + k_offsets,
-            mask=k_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)  # (blk_size, d) fp32
-
-        # ------------------------------------------------------------------
-        # scores[b] = (sum_dd q[dd]*k[b,dd]) * scale  -> (blk_size,)  (GEMV
-        # multiply+sum, not tl.dot — no >=16 min-dim constraint).
-        # ------------------------------------------------------------------
-        scores = tl.sum(q_row[None, :] * k, axis=1) * scale  # (blk_size,)
-
-        # Mask inactive tokens to -inf so they don't contribute to softmax.
-        scores = tl.where(b_idx < active, scores, float("-inf"))
-
-        # ------------------------------------------------------------------
-        # ATOMIC online-softmax update.
-        #
-        # CONCURRENCY NOTE: Multiple programs write the SAME (kv_head, g) carry
-        # slot (since we parallelise over block_idx too). This requires atomic
-        # read-modify-write on (acc, m, lse). Triton does not have a built-in
-        # atomic online-softmax update. Instead, we use the standard approach:
-        # each program stores its LOCAL (acc_local, m_local, lse_local) to
-        # per-block scratch buffers, and a REDUCTION PASS in Python merges them
-        # (identical to _merge_partials in the 3b path).
-        #
-        # For the graphable path the REDUCTION is done outside the kernel in
-        # Python (not CUDA-graph-captured), which is acceptable for 3d — the
-        # graph captures the scatter kernel; the reduce is cheap.
-        # The key graph-safe property (device-pointer seq_len) is exercised.
-        # ------------------------------------------------------------------
-        # Carry slot for this (block_idx, kv_head, g):
-        # acc_scratch: (max_blocks, h_kv, n_q_groups, d)
-        # m_scratch:   (max_blocks, h_kv, n_q_groups)
-        # lse_scratch: (max_blocks, h_kv, n_q_groups)
-        # ------------------------------------------------------------------
-        # FRESH local carry (no read from shared buffer — avoids race).
-        m_local = float("-inf")
-        lse_local = 0.0
-
-        # Online softmax for this block's scores (base-e):
-        m_new = tl.maximum(m_local, tl.max(scores, axis=0))
-        alpha = tl.exp(m_local - m_new)  # = 0 when m_local == -inf
-        p = tl.where(b_idx < active, tl.exp(scores - m_new), 0.0)
-        lse_new = lse_local * alpha + tl.sum(p, axis=0)
-
-        # acc = p @ v:
-        v_base = (block_idx * h_kv + kv_head) * blk_size * d
-        v = tl.load(
-            v_stacked_ptr + v_base + k_offsets,
-            mask=k_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)  # (blk_size, d)
-        # acc[dd] = sum_b p[b]*v[b,dd]  (GEMV multiply+sum, not tl.dot)
-        acc_local = tl.sum(p[:, None] * v, axis=0)  # (d,)
-
-        # ------------------------------------------------------------------
-        # Store (acc_local, m_new, lse_new) to per-block scratch buffers.
-        # Layout: [block_idx * (h_kv * n_q_groups) + kv_head * n_q_groups + g]
-        # ------------------------------------------------------------------
-        scratch_row = block_idx * h_kv * n_q_groups + kv_head * n_q_groups + g
-        # acc_ptr in graphable path points to scratch: (max_blocks*h_kv*G, d)
-        tl.store(acc_ptr + scratch_row * d + d_idx, acc_local.to(tl.float16))
-        tl.store(m_ptr + scratch_row, m_new.to(tl.float32))
-        tl.store(lse_ptr + scratch_row, lse_new.to(tl.float32))
-
-
-def _graphable_reduce(
-    acc_scratch: torch.Tensor,
-    m_scratch: torch.Tensor,
-    lse_scratch: torch.Tensor,
-    max_blocks: int,
-    h_kv: int,  # noqa: ARG001 — kept for call-site symmetry; folded into n_q_heads
-    n_q_groups: int,  # noqa: ARG001 — kept for call-site symmetry; folded into n_q_heads
-    n_q_heads: int,
-    d: int,
-) -> torch.Tensor:
-    """Merge per-block scratch buffers into the final attention output.
-
-    acc_scratch: (max_blocks * h_kv * n_q_groups, d) fp16
-    m_scratch:   (max_blocks * h_kv * n_q_groups,) fp32
-    lse_scratch: (max_blocks * h_kv * n_q_groups,) fp32
-
-    Reshapes to (max_blocks, n_q_heads, 1, d/1) and applies _merge_partials.
-    Returns (n_q_heads, 1, d) fp16.
-    """
-    # Reshape flat scratch → (max_blocks, n_q_heads, 1, d/1) so each split is
-    # a (n_q_heads, 1, d/1) slice — the shape _merge_partials expects.
-    # n_q_heads = h_kv * n_q_groups; (h_kv, G) dims are already folded in.
-    acc_s = acc_scratch.view(max_blocks, n_q_heads, 1, d)  # (B, H, 1, d)
-    m_s = m_scratch.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
-    lse_s = lse_scratch.view(max_blocks, n_q_heads, 1, 1)  # (B, H, 1, 1)
-    return _merge_partials(
-        list(acc_s.unbind(0)), list(m_s.unbind(0)), list(lse_s.unbind(0))
-    )
-
-
-def triton_decode_attention_graphable(
-    q: torch.Tensor,
-    k_stacked: torch.Tensor,
-    v_stacked: torch.Tensor,
-    seq_len_dev: torch.Tensor,
-    *,
-    n_q_groups: int,
-    scale: float,
-) -> torch.Tensor:
-    """CUDA-graph-safe decode attention.
-
-    Drop-in for triton_decode_attention on the RTN path where K/V are
-    pre-dequanted and pre-stacked into device tensors.
-
-    GRAPH SAFETY INVARIANT:
-        seq_len_dev is a DEVICE int32 TENSOR (not a Python int). The kernel
-        reads seq_len_dev[0] at runtime via pointer. A captured CUDA graph
-        retains the pointer — replaying after `seq_len_dev.fill_(new_len)`
-        uses new_len, not the captured-time value. This is the vLLM pattern.
-
-    DEFERRED (out of scope for 3d):
-        - k2b path (lowrank_rtn_channel): K's packed dict factors (Us, V,
-          res_Q_int, res_scale) are heterogeneous; stacking into a flat device
-          tensor requires a paged-block-table refactor. Deferred post-3d.
-        - Tail window (fp16 residual): process outside the captured graph.
-        - RoPE application inside the graph: apply RoPE to k_stacked before
-          capture if k_pre_rope=True.
-
-    Args:
-        q:           (n_q_heads, 1, d) fp16 CUDA — single decode query token.
-        k_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted
-                     keys. Slots beyond live blocks may be zero or stale (masked
-                     by seq_len_dev).
-        v_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted
-                     values. Same layout.
-        seq_len_dev: torch.Tensor, dtype=int32, shape=() or (1,), CUDA device.
-                     Holds the LIVE sequence length. Updated in-place each step.
-                     Graph captures the pointer; replay reads the updated value.
-        n_q_groups:  n_q_heads // h_kv (GQA group count).
-        scale:       attention scale (1/sqrt(d)).
-
-    Returns:
-        (n_q_heads, 1, d) fp16 — attention output.
-    """
-    _require_triton()
-
-    n_q_heads, n_q, d = q.shape
-    assert n_q == 1, "graphable path is decode-only (n_q==1)"
-    # dtype guard BEFORE device guard so a CPU tensor with wrong dtype gets
-    # the dtype error — enabling an offline CPU test for the int32 requirement.
-    assert seq_len_dev.dtype == torch.int32, (
-        f"seq_len_dev must be int32, got {seq_len_dev.dtype}. "
-        "This is the device-pointer that the kernel reads for graph safety."
-    )
-    assert seq_len_dev.is_cuda, "seq_len_dev must be a CUDA tensor"
-
-    max_blocks, h_kv, blk_size, _d = k_stacked.shape
-    assert _d == d, f"k_stacked d={_d} != q d={d}"
-    assert n_q_heads == h_kv * n_q_groups, (
-        f"n_q_heads={n_q_heads} != h_kv={h_kv} * n_q_groups={n_q_groups}"
-    )
-
-    # ------------------------------------------------------------------
-    # Allocate per-block scratch buffers.
-    # These are fixed-size and can be pre-allocated outside the graph.
-    # The graph writes into them; the Python reduce reads from them.
-    # Shape: (max_blocks * h_kv * n_q_groups, d/1).
-    # ------------------------------------------------------------------
-    scratch_rows = max_blocks * h_kv * n_q_groups
-    acc_scratch = torch.zeros(scratch_rows, d, dtype=torch.float16, device=q.device)
-    m_scratch = torch.full(
-        (scratch_rows,), float("-inf"), dtype=torch.float32, device=q.device
-    )
-    lse_scratch = torch.zeros(scratch_rows, dtype=torch.float32, device=q.device)
-
-    # ------------------------------------------------------------------
-    # Query layout: (h_kv, n_q_groups, d) — contiguous for kernel indexing.
-    # ------------------------------------------------------------------
-    q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
-
-    # ------------------------------------------------------------------
-    # Launch kernel: grid = (max_blocks, h_kv, n_q_groups) — FIXED.
-    # This is the graph-capturable grid; size never changes between replays.
-    # ------------------------------------------------------------------
-    grid = (max_blocks, h_kv, n_q_groups)
-    _graphable_decode_kernel[grid](
-        q_kv,
-        k_stacked,
-        v_stacked,
-        acc_scratch,
-        m_scratch,
-        lse_scratch,
-        seq_len_dev,
-        float(scale),
-        h_kv,
-        blk_size=blk_size,
-        d=d,
-        n_q_groups=n_q_groups,
-    )
-
-    # ------------------------------------------------------------------
-    # Reduce scratch → output (outside the graph; cheap).
-    # ------------------------------------------------------------------
-    return _graphable_reduce(
-        acc_scratch,
-        m_scratch,
-        lse_scratch,
-        max_blocks,
-        h_kv,
-        n_q_groups,
-        n_q_heads,
-        d,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Phase 3a: FUSED decode kernel — single launch, internal KV-block loop.
-#
-# THE REWRITE. The per-block Python launch loop (triton_decode_attention,
-# _online_block_kernel_launch) is the dominant suboptimality: n_blocks * h_kv
-# launches per decode step, carry threaded through PyTorch between launches.
-# Baseline (results/k3_triton_decode/...1767dcf): ~1.6x SLOWER than chunked
-# PyTorch at every context (launch overhead dominates).
-#
-# This fused kernel does ONE launch and loops over ALL KV blocks INTERNALLY,
-# carrying (m, lse, acc) in fp32 registers, one output write. Design grounded in
-# the brain consult (personal-brain both layers + deepwiki flashinfer/vLLM/triton;
-# see SDD ledger "VM PHASE 3a — design locked"):
+# One launch loops over ALL KV blocks INTERNALLY, carrying (m, lse, acc) in fp32
+# registers with one output write (vs the per-block launch path, which pays
+# n_blocks * h_kv launches per decode step and threads the carry through PyTorch).
+# Design:
 #   - GQA GROUP FUSION: each program handles ONE kv_head and ALL n_q_groups query
 #     heads. The KV tile is loaded ONCE per block and reused across the whole group
-#     -> 4x less KV HBM traffic (the KV load IS the whole cost at M=1 decode).
-#     (vLLM "3D kernel": process all Q heads of a KV head together for cache reuse.)
+#     -> n_q_groups x less KV HBM traffic (the KV load IS the whole cost at M=1
+#     decode). (vLLM "3D kernel": process all Q heads of a KV head together.)
 #   - REGISTER CARRY: acc[G, D], m[G], lse[G] live in fp32 registers across the
-#     whole block loop (acc = 4*128 fp32 = 2KB/program, trivial vs 256KB SM regs).
-#     fp16 accumulation over 512-2000 blocks would lose precision (FlashAttention).
+#     whole block loop (acc = 4*128 fp32 = 2KB/program, trivial vs SM reg file).
+#     fp16 accumulation over hundreds-thousands of blocks would lose precision.
 #   - FIRST-BLOCK -inf: m init -inf, lse/acc init 0. On block 0, alpha =
 #     exp(-inf - m_new) = 0 annihilates the garbage init (lse=0*0+sum p,
-#     acc=0*0+pv). No special-case — flashinfer relies on exactly this.
+#     acc=0*0+pv). No special-case needed (the standard flash-attention init).
 #   - 128-bit LDG.E.128 loads are AUTOMATIC from contiguous fp16 D=128 inner axis;
-#     eviction_policy="evict_first" makes KV a read-once L2 stream (read exactly
-#     once per decode step) so it doesn't evict the reused weight working set.
+#     eviction_policy="evict_first" makes KV a read-once L2 stream so it doesn't
+#     evict the reused weight working set.
 #   - GEMV (multiply + tl.sum), NOT tl.dot: decode is M=1, bandwidth-bound; tl.dot
 #     is useless at M=1 and has a min-dim>=16 constraint.
 #
-# num_splits=1 first cut (this kernel). Split-KV (grid z-dim + merge kernel) is
-# 3a.2 — needed for SM utilization at long context (no-split = 32/132 SMs on GH200).
+# Split-KV (grid z-dim + merge kernel) parallelizes across SMs at long context
+# (no-split underutilizes SMs on a large GPU); num_splits=1 is the serial path.
 #
 # Correctness bar: max_abs vs naive_dense_attention < 1e-2 (expect ~2-3e-4 at fp16).
 # ---------------------------------------------------------------------------
@@ -1102,7 +746,7 @@ if TRITON_AVAILABLE:
         num_splits,
         scale,  # fp32 1/sqrt(d)
         h_kv: tl.constexpr,  # number of KV heads (stacked stride; fixed model dim)
-        blk_size: tl.constexpr,  # tokens per stored block (== build_kv_stacked blk)
+        blk_size: tl.constexpr,  # tokens per stored block (== build_kv_stacked_packed blk)
         d: tl.constexpr,
         n_q_groups: tl.constexpr,  # G query heads per KV head (group-fused)
         GPAD: tl.constexpr,  # G padded up to >=16 so tl.dot's M dim is legal
@@ -1389,110 +1033,6 @@ def _finalize_decode(
     return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
 
 
-def fused_decode_attention(
-    q: torch.Tensor,
-    k_stacked: torch.Tensor,
-    v_stacked: torch.Tensor,
-    seq_len: int,
-    *,
-    n_q_groups: int,
-    scale: float,
-    num_splits: int | None = None,
-) -> torch.Tensor:
-    """Fused split-KV decode attention over pre-stacked dense KV.
-
-    The decode kernel launches grid=(h_kv, num_splits): each program walks ONLY
-    its contiguous token slice, group-fusing all n_q_groups query heads (KV tile
-    loaded once per block, reused across the group), carrying (m, lse, acc) in
-    fp32 registers, and writes a PARTIAL. A second tiny merge kernel combines the
-    partials per query head. This replaces the per-block Python launch loop.
-
-    Split-KV gives the device-level parallelism a no-split grid lacks: grid=(h_kv,)
-    is only h_kv programs (8 on GH200's 132 SMs); the split dim fills the machine.
-
-    Args:
-        q:           (n_q_heads, 1, d) fp16 CUDA — single decode query token.
-        k_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted
-                     keys (RoPE already applied if pre-RoPE). See build_kv_stacked.
-        v_stacked:   (max_blocks, h_kv, blk_size, d) fp16 CUDA — pre-dequanted V.
-        seq_len:     live number of KV tokens (<= max_blocks*blk_size). Tokens
-                     beyond seq_len in the last stored block are masked out.
-        n_q_groups:  n_q_heads // h_kv (GQA group count).
-        scale:       attention scale (1/sqrt(d)).
-        num_splits:  KV splits for decode parallelism. None -> pick_num_splits
-                     (SM-aware heuristic). 1 = no-split (single program per head).
-
-    Returns:
-        (n_q_heads, 1, d) fp16 attention output.
-    """
-    _require_triton()
-    n_q_heads, n_q, d = q.shape
-    assert n_q == 1, "fused_decode_attention is decode-only (n_q==1)"
-    max_blocks, h_kv, blk_size, _d = k_stacked.shape
-    assert _d == d, f"k_stacked d={_d} != q d={d}"
-    assert n_q_heads == h_kv * n_q_groups, (
-        f"n_q_heads={n_q_heads} != h_kv={h_kv} * n_q_groups={n_q_groups}"
-    )
-    assert seq_len <= max_blocks * blk_size, (
-        f"seq_len={seq_len} > capacity max_blocks*blk_size={max_blocks * blk_size}"
-    )
-
-    if num_splits is None:
-        num_splits = pick_num_splits(seq_len, blk_size, h_kv)
-    num_splits = max(1, int(num_splits))
-
-    # tl.dot needs M,N,K>=16: pad the GQA group dim up to the next power of 2 >=16,
-    # and use the dot path only when blk_size>=16 and d>=16 too (the tiny offline
-    # test model has d=8 -> falls back to the broadcast cube; real models are d>=64).
-    gpad = _next_pow2(max(16, n_q_groups))
-    use_dot = blk_size >= 16 and d >= 16
-
-    # Query laid out (h_kv, G, d) contiguous so q[kv, g, :] is a clean offset.
-    q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
-
-    # Partial buffers, one per split (pre-normalization). fp32 to avoid loss.
-    acc_part = torch.empty(
-        num_splits, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
-    )
-    m_part = torch.empty(
-        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
-    )
-    lse_part = torch.empty(
-        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
-    )
-
-    _fused_decode_kernel[(h_kv, num_splits)](
-        q_kv,
-        k_stacked,
-        v_stacked,
-        acc_part,
-        m_part,
-        lse_part,
-        int(seq_len),
-        int(num_splits),
-        float(scale),
-        h_kv=h_kv,
-        blk_size=blk_size,
-        d=d,
-        n_q_groups=n_q_groups,
-        GPAD=gpad,
-        USE_DOT=use_dot,
-    )
-
-    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
-    _fused_merge_kernel[(h_kv,)](
-        acc_part,
-        m_part,
-        lse_part,
-        out,
-        int(num_splits),
-        h_kv=h_kv,
-        d=d,
-        n_q_groups=n_q_groups,
-    )
-    return out.view(n_q_heads, 1, d)
-
-
 if TRITON_AVAILABLE:
 
     @triton.autotune(configs=_FUSED_AUTOTUNE_CONFIGS, key=["d", "n_q_groups"])
@@ -1664,17 +1204,16 @@ def fused_decode_attention_packed(
 ) -> torch.Tensor:
     """Fused split-KV decode over PACKED RTN codes — dequant in-kernel, no dense copy.
 
-    Same contract/output as fused_decode_attention but the resident KV stays packed
-    (int8 codes + per-group fp16 scales from build_kv_stacked_packed); the kernel
-    dequants each block in-register. int8 = half the bytes of fp16 -> ~2x the
-    bandwidth-bound ceiling of the dense path.
+    The resident KV stays packed (int8 codes + per-group fp16 scales from
+    build_kv_stacked_packed); the kernel dequants each block in-register. int8 =
+    half the bytes of fp16 -> ~2x the bandwidth-bound ceiling of a dense path.
 
     Args:
         q:         (n_q_heads, 1, d) fp16 CUDA.
         k_codes/v_codes:   (max_blocks, h_kv, blk_size, d) int8 CUDA.
         k_scales/v_scales: (max_blocks, h_kv, blk_size, d//group) fp16 CUDA.
         seq_len:   live KV token count (the PACKED committed region only).
-        n_q_groups, scale: as fused_decode_attention.
+        n_q_groups: GQA query-groups per KV head; scale: 1/sqrt(d) softmax scale.
         k_group/v_group: RTN group sizes (scale granularity along d).
         num_splits: None -> pick_num_splits.
         k_tail/v_tail: optional dense fp16 (h_kv, tail_len, d) recent window NOT in
@@ -1743,7 +1282,7 @@ def fused_decode_attention_packed(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3a.5: FULL k2b fused decode — the real recipe, all dequant in-kernel.
+# FULL k2b fused decode — the real recipe, all dequant in-kernel.
 #
 #   K = lowrank_rtn_channel @3b: Us @ Vfac.T + RTN residual, keys PRE-RoPE ->
 #       RoPE applied in-kernel on the reconstructed K. All per-head, no
@@ -2052,7 +1591,6 @@ def fused_decode_attention_k2b(
     pre-RoPE). The fp16 recent-window tail is merged in PyTorch.
     """
     _require_triton()
-    from bmx.cache.codecs import _hadamard_signs, gaussian_codebook
 
     n_q_heads, n_q, d = q.shape
     assert n_q == 1, "decode-only"
@@ -2133,90 +1671,15 @@ def fused_decode_attention_k2b(
     )
 
 
-def build_kv_stacked(
-    k_blocks: list,
-    v_blocks: list,
-    *,
-    max_blocks: int,
-    h_kv: int,
-    blk_size: int,
-    d: int,
-    k_arm: str,
-    v_arm: str,
-    group: int,
-    seed: int,
-    v_group: int | None = None,
-    v_seed: int | None = None,
-    device: torch.device | str = "cuda",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pre-stack dequanted KV blocks into device tensors for the graphable path.
-
-    RTN path only (lowrank/k2b deferred — see triton_decode_attention_graphable
-    docstring). Allocates (max_blocks, h_kv, blk_size, d) fp16 tensors and fills
-    slots 0..len(k_blocks)-1 from the block list. Remaining slots are zero.
-
-    Args:
-        k_blocks:   list of (packed_dict, start, end) — RTN-quantized keys.
-        v_blocks:   list of (packed_dict, start, end) — RTN-quantized values.
-        max_blocks: total slots (>= len(k_blocks)); sets the fixed graph grid.
-        h_kv:       number of KV heads.
-        blk_size:   tokens per block.
-        d:          head dim.
-        k_arm:      codec arm for keys (must be RTN; k2b deferred).
-        v_arm:      codec arm for values.
-        group:      K quantization group size.
-        seed:       K quantization seed.
-        v_group:    V quantization group size (defaults to group).
-        v_seed:     V quantization seed (defaults to seed).
-        device:     target CUDA device.
-
-    Returns:
-        k_stacked: (max_blocks, h_kv, blk_size, d) fp16
-        v_stacked: (max_blocks, h_kv, blk_size, d) fp16
-    """
-    from bmx.cache.codecs import dequant_packed
-
-    if k_arm == "lowrank_rtn_channel":
-        raise NotImplementedError(
-            "build_kv_stacked: k2b (lowrank_rtn_channel) path is deferred from 3d. "
-            "Stack the RTN arm tensors instead, or use triton_decode_attention for k2b."
-        )
-
-    _v_group = v_group if v_group is not None else group
-    _v_seed = v_seed if v_seed is not None else seed
-
-    k_stacked = torch.zeros(
-        max_blocks, h_kv, blk_size, d, dtype=torch.float16, device=device
-    )
-    v_stacked = torch.zeros(
-        max_blocks, h_kv, blk_size, d, dtype=torch.float16, device=device
-    )
-
-    for i, ((kpacked, _ks, _ke), (vpacked, _vs, _ve)) in enumerate(
-        zip(k_blocks, v_blocks)
-    ):
-        assert i < max_blocks, (
-            f"more blocks ({len(k_blocks)}) than max_blocks ({max_blocks})"
-        )
-        K_mat = dequant_packed(k_arm, kpacked, seed=seed, group=group)
-        V_mat = dequant_packed(v_arm, vpacked, seed=_v_seed, group=_v_group)
-        K_kv = from_matrix(K_mat, h_kv).to(torch.float16)  # (h_kv, blk, d)
-        V_kv = from_matrix(V_mat, h_kv).to(torch.float16)
-        k_stacked[i] = K_kv.to(device)
-        v_stacked[i] = V_kv.to(device)
-
-    return k_stacked, v_stacked
-
-
 # ---------------------------------------------------------------------------
-# Phase 3a.4: PACKED fused decode — dequant int8 RTN codes IN-KERNEL.
+# PACKED fused decode — dequant int8 RTN codes IN-KERNEL.
 #
-# The dense fused kernel above throws away the compression (it consumes dense
-# fp16 KV). This path keeps the resident storage PACKED (int8 codes + per-group
+# A dense decode kernel would consume dense fp16 KV, throwing away the
+# compression. This path keeps the resident storage PACKED (int8 codes + per-group
 # fp16 scales) and dequants in-register inside the fused block loop — so the
 # memory saving is preserved AND, because int8 is HALF the bytes of fp16, the
-# packed kernel's bandwidth-bound ceiling is ~2x the dense one (brain consult:
-# decode is bandwidth-bound, dequant FMA rides in idle ALU slack; the per-group
+# packed kernel's bandwidth-bound ceiling is ~2x the dense one (decode is
+# bandwidth-bound, so the dequant FMA rides in idle ALU slack; the per-group
 # scale does NOT fold through the q.k dot since group<d, so dequant-then-dot).
 #
 # Layout (RTN: rtn_quantize_packed on the (S, h_kv*d) matrix; column c -> head

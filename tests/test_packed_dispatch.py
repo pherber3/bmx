@@ -174,23 +174,22 @@ def test_no_silent_swallow(monkeypatch):
 
 
 def test_k2b_pre_rope_falls_back_to_chunked(monkeypatch):
-    """The canonical k2b config (lowrank_rtn_channel + pre_rope=True) must fall
-    back to chunked_dequant_attention even when TRITON_AVAILABLE=True.
+    """A k2b config with full-C turboquant_mse V (lowrank_rtn_channel + pre_rope)
+    must route to chunked_dequant_attention even when TRITON_AVAILABLE=True.
 
-    The Triton kernel raises NotImplementedError for in-kernel RoPE on lowrank
-    keys (capability-not-yet-implemented).  The guard in attend() must divert
-    BEFORE the kernel is called, routing to chunked instead.
+    Dispatch (attend): fused_packed_ok is False (K arm != rtn_token); fused_k2b_ok
+    is False (V arm is turboquant_mse, not the per-head turboquant_mse_perhead the
+    fused k2b kernel needs); and the per-block triton_decode_attention path is
+    gated off for lowrank_rtn_channel (arm != "lowrank_rtn_channel"). So this config
+    falls through to chunked — the safe fallback for any non-fused k2b config.
 
     This test:
       - Monkeypatches TRITON_AVAILABLE=True (simulates CUDA/Triton present).
-      - Leaves triton_decode_attention as a stub that raises _SentinelError.
-      - Runs a full prefill + decode with k2b + pre_rope=True.
-      - Asserts NO error is raised (the guard diverted to chunked).
+      - Replaces triton_decode_attention with a sentinel that raises if called.
+      - Runs a full prefill + decode with this k2b config.
+      - Asserts NO error is raised (the per-block kernel was never reached).
       - Asserts the chunked output matches the StreamingQuantizedCache reference
         (confirming the right path ran and produced correct output).
-
-    FAILS before Fix 1 (the kernel would be called and raise NotImplementedError).
-    PASSES after Fix 1 (the guard diverts to chunked before the kernel is touched).
     """
     from bmx.cache.streaming import StreamingQuantizedCache
 
