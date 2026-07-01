@@ -133,9 +133,6 @@ def quantized_prefill_ppl(
     assert n_prefill < N, "n_prefill must be < total sequence length"
     assert not v_spec.pre_rope, "pre_rope has no effect on V; set it on k_spec"
 
-    # ------------------------------------------------------------------
-    # Step 1: prefill (or reuse), optionally capturing k_pre via hooks
-    # ------------------------------------------------------------------
     if state is None:
         state = run_prefill(model, input_ids, n_prefill, k_spec.pre_rope)
         cache = state.cache  # freshly built; safe to mutate in place
@@ -156,9 +153,6 @@ def quantized_prefill_ppl(
         cos = cos.float()  # quantize_kv_layout outputs are fp32
         sin = sin.float()
 
-    # ------------------------------------------------------------------
-    # Step 2: quantize and write back into cache
-    # ------------------------------------------------------------------
     # bpe is spec-determined and identical across layers (all layers share
     # (S, C)), so a plain per-layer overwrite suffices.
     bpe_k = bpe_v = float("nan")
@@ -191,9 +185,6 @@ def quantized_prefill_ppl(
         layer.keys = k_hat_fp32.to(cache_dtype).unsqueeze(0)  # (1, h_kv, S, d)
         layer.values = v_hat_fp32.to(cache_dtype).unsqueeze(0)  # (1, h_kv, S, d)
 
-    # ------------------------------------------------------------------
-    # Step 3: teacher-forced continuation forward
-    # ------------------------------------------------------------------
     cont_ids = input_ids[:, n_prefill:]  # (1, M)
     n_eval = cont_ids.shape[1] - 1  # label shift loses first token
 

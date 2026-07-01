@@ -182,12 +182,9 @@ def chunked_attention_forward(
     The dense key/value tensors passed by HF are ignored — attention is computed
     entirely from the packed blocks stored on module._packed_layer.
 
-    Masking (prefill, n_q > 1): the model supplies the exact attention_mask for the
-    cached-prefill case (a 4D (b,1,q,kv) tensor that is NOT equivalent to a plain
-    is_causal=True bottom-right mask). We thread it into the prefill SDPA path and
-    let it do the masking — mirroring stock sdpa_attention_forward, which uses
-    is_causal only when attention_mask is None. Using is_causal=True instead of the
-    model's mask was a real bug: it produced wrong prefill logits at scale.
+    attn_mask (not is_causal) governs masking when provided — see the
+    AttentionMaskInterface registration in packed_streaming.py and
+    docs/2026-06-23-kernel-census-results.md.
     During decode (n_q == 1), no mask is needed — the single query attends to all
     history.
     """
@@ -244,7 +241,7 @@ class PackedStreamingLayer(DynamicLayer):
 
         # Committed block count (how many tokens are packed).
         # Also tracks the absolute position of self.keys[..., 0, :] after slab
-        # pruning (Fix 3) — these two quantities are always equal.
+        # pruning — these two quantities are always equal.
         self._committed_S_q: int = 0
 
         # Packed block lists: list of (packed_dict, start, end).
@@ -257,7 +254,7 @@ class PackedStreamingLayer(DynamicLayer):
         self._packed_stacks: _PagedStacks | None = None
         self._k2b_stacks: _PagedStacks | None = None
 
-        # Frozen subspace for lowrank_rtn_channel K (same I1 fix as streaming.py).
+        # Frozen subspace for lowrank_rtn_channel K (same approach as streaming.py).
         self._frozen_svd: tuple[torch.Tensor, torch.Tensor] | None = None
 
         # Growing RoPE cos/sin tables, extended on each flush.
@@ -299,7 +296,7 @@ class PackedStreamingLayer(DynamicLayer):
                 self.model_config, new_committed - covered, start=covered, device=device
             )
             # Cast once at grow-time to the cache compute dtype (fp16), so the
-            # decode loop doesn't re-cast the slice every block (deferred opt #2).
+            # decode loop doesn't re-cast the slice every block.
             nc, ns = nc.to(torch.float16), ns.to(torch.float16)
             if self._rope_cos is None:
                 self._rope_cos, self._rope_sin = nc, ns
@@ -324,7 +321,7 @@ class PackedStreamingLayer(DynamicLayer):
 
         if spec.arm == "lowrank_rtn_channel":
             if self._frozen_svd is None:
-                # First flush: fit the SVD and freeze V (I1 fix, mirrors streaming.py).
+                # First flush: fit the SVD and freeze V (mirrors streaming.py).
                 Us, V = truncated_svd(M, spec.rank)
                 self._frozen_svd = (Us, V)
             else:
@@ -387,7 +384,7 @@ class PackedStreamingLayer(DynamicLayer):
         Returns (keys, values) for HF bookkeeping; attention routes through
         the registered chunked_attention_forward fn instead.
         """
-        # Let DynamicLayer concatenate the running slab (post-RoPE, pruned after Fix 3).
+        # Let DynamicLayer concatenate the running slab (post-RoPE, pruned below).
         keys, values = super().update(key_states, value_states, *args, **kwargs)
 
         # Total sequence length = committed tokens + current slab length.
@@ -452,7 +449,7 @@ class PackedStreamingLayer(DynamicLayer):
             block_len = committed_len
             self._committed_S_q = commit_end
 
-            # --- C3: Prune _k_pre to free committed positions ---
+            # --- Prune _k_pre to free committed positions ---
             if self.k_spec.pre_rope and self._k_pre is not None:
                 prune_local_end = block_end - self._k_pre_offset
                 if prune_local_end >= self._k_pre.shape[1]:
@@ -462,7 +459,7 @@ class PackedStreamingLayer(DynamicLayer):
                     self._k_pre = self._k_pre[:, prune_local_end:, :].contiguous()
                     self._k_pre_offset = block_end
 
-            # --- Fix 3: Prune fp16 slab to tail-only ---
+            # --- Prune fp16 slab to tail-only ---
             # Committed region lives solely as packed codes in _k_blocks/_v_blocks.
             # The slab started at block_start (== old _committed_S_q), so the committed
             # front is the slab's leading [: block_len]; drop it, keeping only the tail.
@@ -497,8 +494,8 @@ class PackedStreamingLayer(DynamicLayer):
             when provided it (not is_causal) governs masking, matching stock SDPA.
         Returns (n_q_heads, n_q, d).
         """
-        # After Fix 3 (slab pruning), self.keys holds only the tail: the slab starts
-        # at absolute position _committed_S_q, so the tail begins at index 0 of the slab.
+        # self.keys holds only the tail: the slab starts at absolute position
+        # _committed_S_q, so the tail begins at index 0 of the slab.
         k_tail = self.keys.squeeze(0)  # (h_kv, tail_len, d)
         v_tail = self.values.squeeze(0)  # (h_kv, tail_len, d)
         n_q_heads = q.shape[0]
@@ -767,7 +764,7 @@ class PackedStreamingCache(Cache):
         for h in self._handles:
             h.remove()
         self._handles = []
-        # Fix 4: remove the _packed_layer back-reference so the model's attention
+        # Remove the _packed_layer back-reference so the model's attention
         # modules do not hold a circular reference to this cache after detach.
         if self._model is not None:
             for mlayer in resolve_decoder_layers(self._model):

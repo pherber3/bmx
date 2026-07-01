@@ -7,25 +7,18 @@ thin Cache container (StreamingQuantizedCache) that replicates the layer across
 the model. Because the layer never persists the dense dequant, resident state is
 the compressed footprint — real memory by the official cache contract.
 
-Lands in two stages:
-  Stage A (prev commit): fp16 passthrough + the layer/container plumbing. With an
-    fp16 spec the layer delegates to DynamicLayer — gate is bit-identical logits
-    and generation vs a plain default cache.
-  Stage B (this commit): the quantize-on-append path — pre-RoPE K capture + frozen
-    subspace, RoPE-at-read, codec-driven _quantize/_dequantize.
-
-Write-once semantics (Task 10 / C1 fix):
+Write-once semantics:
   Each token's K/V is quantized EXACTLY ONCE at write time from its pristine fp16
   source, and the dequantised result is frozen in _q_prefix_k/_q_prefix_v.
   Re-quantising a dequantised value is the bug (turboquant_mse is non-idempotent:
   per-token norm rescale compounds => V norm explodes over decode steps).
 
-Frozen subspace (Task 10 / I1 fix):
+Frozen subspace:
   For lowrank_rtn_channel K, the channel subspace V is fitted at the FIRST flush
   and reused for all subsequent blocks (_frozen_svd). Per-block Us is computed as
   M_block @ V_frozen (projection onto the frozen subspace).
 
-C3 memory fix:
+Memory pruning:
   After committing a pre-RoPE block to _q_prefix_k, the corresponding columns of
   _k_pre are no longer needed (write-once!). We prune _k_pre to keep only the
   un-flushed tail, tracking the offset (_k_pre_offset) so indexing stays correct.
@@ -83,14 +76,14 @@ class StreamingQuantizedLayer(DynamicLayer):
         self._k_pre: torch.Tensor | None = None
         self._k_pre_offset: int = 0  # absolute position of _k_pre[0] along seq dim
 
-        # Write-once prefix state (Task 10 / C1 fix).
+        # Write-once prefix state.
         # _q_prefix_k/v: frozen dequantized prefix (h, committed_S_q, d); fp16.
         # _committed_S_q: monotonically growing count of quantized tokens.
         self._q_prefix_k: torch.Tensor | None = None
         self._q_prefix_v: torch.Tensor | None = None
         self._committed_S_q: int = 0
 
-        # Frozen subspace (Task 10 / I1 fix): (Us, V) from truncated_svd at first flush.
+        # Frozen subspace: (Us, V) from truncated_svd at first flush.
         # Only used for lowrank_rtn_channel K with pre_rope.
         # V is the (C, rank) channel subspace — frozen across all blocks.
         self._frozen_svd: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -156,7 +149,7 @@ class StreamingQuantizedLayer(DynamicLayer):
             k_hat_pre = k_block_pre
             codec_bpe = 16.0
         elif spec.arm == "lowrank_rtn_channel":
-            # Special path: frozen subspace across blocks (I1 fix).
+            # Frozen subspace across blocks: fit once at first flush, project thereafter.
             M = to_matrix(k_block_pre)  # (block_len, h*d) fp32
             if self._frozen_svd is None:
                 # First flush: fit the SVD and freeze V.
@@ -307,7 +300,7 @@ class StreamingQuantizedLayer(DynamicLayer):
         # --- Update committed counter ---
         self._committed_S_q = new_S_q
 
-        # --- C3: Prune _k_pre to free already-committed positions ---
+        # --- Prune _k_pre to free already-committed positions ---
         # After committing up to new_S_q, positions [_k_pre_offset, new_S_q) are
         # no longer needed. Prune _k_pre to start at new_S_q.
         if self._k_pre is not None and self.k_spec.pre_rope:

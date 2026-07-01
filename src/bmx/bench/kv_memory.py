@@ -109,9 +109,6 @@ def predict_decode_latency(
     bandwidth_time = (weight + kv_read) / hbm_bandwidth_bytes_per_s
     # Dequant time uses a conservative peak-flops divisor; refined per-GPU at measure time.
     dequant_flops = _dequant_flops_per_step(case)
-    # peak_flops_per_s not available here; dequant assumed free (0.0).
-    # compute_bound_flag requires peak_flops_per_s — not computed at this level.
-    # Use decode_speedup_curve for the flag (it receives the FLOP/s budget).
     dequant_time = 0.0
     return {
         "kv_read_bytes": kv_read,

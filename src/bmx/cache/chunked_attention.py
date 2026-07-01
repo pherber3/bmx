@@ -96,9 +96,8 @@ def naive_dense_attention(
     Same call shape as chunked_dequant_attention so they are drop-in comparable.
 
     v_group / v_seed: allow K and V to use different quantization params
-    (added in 3c for k2b oracle tests where K=lowrank_rtn_channel and
-    V=turboquant_mse with different seeds).  Default to group / seed for
-    3a/3b back-compat (single-arm tests use same params for both K and V).
+    (k2b oracle tests use K=lowrank_rtn_channel and V=turboquant_mse with
+    different seeds). Default to group / seed.
     """
     _v_group = v_group if v_group is not None else group
     _v_seed = v_seed if v_seed is not None else seed
@@ -176,12 +175,10 @@ def _prefill_dense_attention(
         V = vt if V is None else torch.cat([V.to(q.dtype), vt], dim=1)
     Kx = K.to(q.dtype).repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, S, d)
     Vx = V.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
-    # Mirror stock sdpa_attention_forward: when the model supplies attn_mask (the
-    # cached-prefill case), it governs masking and is_causal is False; only fall back
-    # to is_causal=True when there is NO mask. Using is_causal=True in place of the
-    # model's mask is WRONG for n_q < n_kv prefill (bottom-right causal != the model's
-    # mask) — it produced garbage prefill logits. attn_mask is 4D (b,1,q,kv); add the
-    # batch dim to q/K/V so the shapes line up.
+    # attn_mask (not is_causal) governs masking when provided — see the
+    # AttentionMaskInterface registration in packed_streaming.py and
+    # docs/2026-06-23-kernel-census-results.md.
+    # attn_mask is 4D (b,1,q,kv); add the batch dim to q/K/V so the shapes line up.
     out = F.scaled_dot_product_attention(
         q.unsqueeze(0),
         Kx.unsqueeze(0),
