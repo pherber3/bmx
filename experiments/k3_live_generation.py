@@ -73,17 +73,11 @@ def run(cfg: Config, model=None, input_ids=None, root: str = "results"):
     if model is None:
         # Real run: download model, tokenizer, and wikitext-2 real text.
         # This path is exercised only on the VM/real run, NOT in CI.
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from experiments._common import load_model_and_tokenizer
 
         from bmx.eval.layer_swap import load_eval_tokens
 
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name, torch_dtype=torch.float16
-        )
-        model = model.to(cfg.device)
-        model.eval()
-
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        model, tokenizer = load_model_and_tokenizer(cfg.model_name, cfg.device)
 
         # Real text: wikitext-2 test split → meaningful live-generation perplexity.
         toks = load_eval_tokens(cfg.model_name, n_tokens=cfg.n_context)

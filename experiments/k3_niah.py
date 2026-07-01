@@ -13,7 +13,6 @@ from __future__ import annotations
 import dataclasses
 
 import pandas as pd
-import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
@@ -52,7 +51,7 @@ def run(cfg: Config, model=None, root: str = "results"):
     haystack = None
     if model is None:
         # Real run (VM): model + tokenizer + Paul Graham essays.
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from experiments._common import load_model_and_tokenizer
 
         from bmx.cache.haystack import load_pg_corpus
         from bmx.cache.niah import (
@@ -63,12 +62,7 @@ def run(cfg: Config, model=None, root: str = "results"):
             rouge1_recall_only,
         )
 
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name, torch_dtype=torch.float16
-        )
-        model = model.to(cfg.device)
-        model.eval()
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        model, tokenizer = load_model_and_tokenizer(cfg.model_name, cfg.device)
         haystack = load_pg_corpus()
 
     run_dir = create_run("k3_niah", cfg, root=root)

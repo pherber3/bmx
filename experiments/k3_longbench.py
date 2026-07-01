@@ -50,16 +50,11 @@ class _StubTok:
 def run(cfg: Config, model=None, root: str = "results"):
     tokenizer = None
     if model is None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from experiments._common import load_model_and_tokenizer
 
         from bmx.cache.longbench import load_longbench_task, longbench_code_score
 
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name, torch_dtype=torch.float16
-        )
-        model = model.to(cfg.device)
-        model.eval()
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        model, tokenizer = load_model_and_tokenizer(cfg.model_name, cfg.device)
 
     if cfg.n_samples is not None:
         print(
