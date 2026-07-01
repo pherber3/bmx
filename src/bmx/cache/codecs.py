@@ -451,32 +451,6 @@ _WATERFILL_ROTATION = {
 }
 
 
-def _turboquant_mse_packed(
-    M: torch.Tensor, bits: int, seed: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """(S,C) -> (indices int16 (S,C), norms fp (S,1)). Codebook from bits+seed."""
-    S, C = M.shape
-    norms = M.norm(dim=1, keepdim=True).clamp_min(1e-12).half().float()
-    M_unit = M / norms
-    M_rot = _rotate(M_unit, seed)
-    cb = gaussian_codebook(bits).to(M.device)
-    sqrt_c = math.sqrt(C)
-    mid = (cb[:-1] + cb[1:]) / 2
-    indices = torch.bucketize(M_rot * sqrt_c, mid).to(torch.int16)
-    return indices, norms
-
-
-def _turboquant_mse_dequant(
-    indices: torch.Tensor, norms: torch.Tensor, bits: int, seed: int, C: int
-) -> torch.Tensor:
-    """Reconstruct from packed turboquant_mse representation."""
-    cb = gaussian_codebook(bits).to(norms.device)
-    sqrt_c = math.sqrt(C)
-    M_quant = cb[indices.long()] / sqrt_c
-    M_recon = _unrotate(M_quant, seed)
-    return M_recon * norms
-
-
 # ---------------------------------------------------------------------------
 # Per-head turboquant_mse (QuaRot/SpinQuant-style block-diagonal rotation)
 #
@@ -529,6 +503,31 @@ def _turboquant_mse_perhead_dequant(
     Mh_quant = (cb[indices.long()] / sqrt_d).reshape(S, h, d)  # (S, h, d)
     Mh_recon = _unrotate(Mh_quant.reshape(S * h, d), seed).reshape(S, h, d)
     return (Mh_recon * norms[:, :, None]).reshape(S, C)
+
+
+# Confirmed 2026-07-01 (kill-or-confirm gate): full-C turboquant is exactly the
+# h=1 case of the perhead codec above. _turboquant_mse_perhead_packed reshapes
+# to (S*h, d) with d = C // h before calling the shared _rotate helper, so at
+# h=1, d == C and _rotate dispatches identically (Hadamard iff C is a power of
+# 2, else the same random_orthogonal fallback) — there is no pow2(d) assertion
+# anywhere in the perhead path. Verified bit-identical via torch.equal for
+# C=128 (pow2), C=96 and C=48 (non-pow2). The two dict schemas
+# ({indices, norms, bits} vs {indices, norms, bits, h}) are preserved by
+# reshaping norms (S,1) <-> (S,h=1) at the call sites in quantize_packed /
+# dequant_packed, not in the shared body.
+def _turboquant_mse_packed(
+    M: torch.Tensor, bits: int, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(S,C) -> (indices int16 (S,C), norms fp (S,1)). Codebook from bits+seed."""
+    indices, norms_h = _turboquant_mse_perhead_packed(M, bits, seed, 1)
+    return indices, norms_h.reshape(M.shape[0], 1)
+
+
+def _turboquant_mse_dequant(
+    indices: torch.Tensor, norms: torch.Tensor, bits: int, seed: int, C: int
+) -> torch.Tensor:
+    """Reconstruct from packed turboquant_mse representation."""
+    return _turboquant_mse_perhead_dequant(indices, norms, bits, seed, 1)
 
 
 def quantize_packed(
