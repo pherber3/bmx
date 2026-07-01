@@ -438,7 +438,7 @@ def test_resolve_text_config_unwraps_multimodal():
     """Qwen3.5/Gemma4 stash head geometry under config.text_config; unwrap it."""
     import types
 
-    from bmx.cache.streaming import resolve_text_config
+    from bmx.cache.hf_compat import resolve_text_config
 
     text = types.SimpleNamespace(
         num_attention_heads=24, num_key_value_heads=4, head_dim=256, hidden_size=5120
@@ -460,7 +460,7 @@ def test_resolve_decoder_layers_across_nestings():
     model.model.layers (Llama), or model.transformer.h (GPT-2)."""
     import types
 
-    from bmx.cache.streaming import resolve_decoder_layers
+    from bmx.cache.hf_compat import resolve_decoder_layers
 
     sentinel = ["L0", "L1", "L2"]
     # Multimodal: model.model.language_model.layers
@@ -482,7 +482,7 @@ def test_resolve_vocab_size_unwraps_multimodal():
     """Qwen3.5/Gemma4 stash vocab_size under config.text_config; unwrap it."""
     import types
 
-    from bmx.cache.streaming import resolve_vocab_size
+    from bmx.cache.hf_compat import resolve_vocab_size
 
     # Multimodal: vocab_size lives under text_config, absent at the top level.
     text = types.SimpleNamespace(num_attention_heads=24, vocab_size=152064)

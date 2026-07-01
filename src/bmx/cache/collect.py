@@ -32,6 +32,8 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
+from bmx.cache.hf_compat import resolve_decoder_layers, resolve_text_config
+
 
 def to_matrix(kv: torch.Tensor) -> torch.Tensor:
     """(h, S, d) cache tensor -> (S, h*d) fp32 matrix (the census/codec layout)."""
@@ -56,7 +58,7 @@ def _get_kv_layer(past_key_values, i: int):
     )
 
 
-def _reshape_heads(out: torch.Tensor, n_head: int, d: int) -> torch.Tensor:
+def reshape_heads(out: torch.Tensor, n_head: int, d: int) -> torch.Tensor:
     """(1, S, n_head*d) projection output -> (n_head, S, d), fp16 contiguous."""
     S = out.shape[1]
     heads = out.reshape(1, S, n_head, d).permute(0, 2, 1, 3).squeeze(0)
@@ -72,9 +74,9 @@ def _register_gpt2_hooks(model, store: dict, n_q_keep: int):
     for i, block in enumerate(model.transformer.h):
 
         def hook(module, inp, out, i=i):
-            q = _reshape_heads(out[..., :n_embd], h, d)
+            q = reshape_heads(out[..., :n_embd], h, d)
             store[f"layer{i}.q"] = q[:, -n_q_keep:, :].contiguous()
-            store[f"layer{i}.k_pre"] = _reshape_heads(
+            store[f"layer{i}.k_pre"] = reshape_heads(
                 out[..., n_embd : 2 * n_embd], h, d
             )
 
@@ -84,8 +86,6 @@ def _register_gpt2_hooks(model, store: dict, n_q_keep: int):
 
 def _register_qkproj_hooks(model, store: dict, n_q_keep: int):
     """Hooks on q_proj/k_proj (Llama-family); returns (handles, n_layer)."""
-    from bmx.cache.streaming import resolve_decoder_layers, resolve_text_config
-
     cfg = resolve_text_config(model.config)  # unwrap multimodal text_config
     h = cfg.num_attention_heads
     h_kv = getattr(cfg, "num_key_value_heads", h)
@@ -96,21 +96,19 @@ def _register_qkproj_hooks(model, store: dict, n_q_keep: int):
     for i, layer in enumerate(layers):
 
         def q_hook(module, inp, out, i=i):
-            q = _reshape_heads(out, h, d)
+            q = reshape_heads(out, h, d)
             store[f"layer{i}.q"] = q[:, -n_q_keep:, :].contiguous()
 
         def k_hook(module, inp, out, i=i):
-            store[f"layer{i}.k_pre"] = _reshape_heads(out, h_kv, d)
+            store[f"layer{i}.k_pre"] = reshape_heads(out, h_kv, d)
 
         handles.append(layer.self_attn.q_proj.register_forward_hook(q_hook))
         handles.append(layer.self_attn.k_proj.register_forward_hook(k_hook))
     return handles, len(layers)
 
 
-def _register_hooks(model, store: dict, n_q_keep: int):
+def register_hooks(model, store: dict, n_q_keep: int):
     """Structural dispatch: probe for the attention wiring, not model_type."""
-    from bmx.cache.streaming import resolve_decoder_layers
-
     if hasattr(model, "transformer") and hasattr(model.transformer.h[0].attn, "c_attn"):
         return _register_gpt2_hooks(model, store, n_q_keep)
     try:
@@ -145,7 +143,7 @@ def collect_cache(
     assert input_ids.shape[0] == 1, "Batch dim must be 1."
 
     store: dict[str, torch.Tensor] = {}
-    handles, n_layer = _register_hooks(model, store, n_q_keep)
+    handles, n_layer = register_hooks(model, store, n_q_keep)
     try:
         with torch.no_grad():
             outputs = model(input_ids, use_cache=True)

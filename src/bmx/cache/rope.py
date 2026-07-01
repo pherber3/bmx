@@ -13,6 +13,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from bmx.cache.hf_compat import resolve_text_config
+
 
 def rope_cos_sin(
     config, S: int, *, start: int = 0, device=None
@@ -29,8 +31,6 @@ def rope_cos_sin(
 
     Raises ValueError if the config has no rotary embedding (e.g. GPT2Config).
     """
-    from bmx.cache.streaming import resolve_text_config
-
     config = resolve_text_config(config)  # unwrap multimodal text_config
     if not hasattr(config, "rope_parameters"):
         raise ValueError(

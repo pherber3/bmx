@@ -27,6 +27,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.live_eval import live_generation_ppl
 from bmx.cache.needle import (
     build_needle_ids,
@@ -34,7 +35,6 @@ from bmx.cache.needle import (
     needle_retrieved_from_ids,
 )
 from bmx.cache.recipes import spec_pair
-from bmx.cache.streaming import resolve_vocab_size
 
 
 @dataclasses.dataclass

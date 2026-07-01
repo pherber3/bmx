@@ -38,7 +38,7 @@ import dataclasses
 import torch
 
 from bmx.cache.codecs import quantize_kv_layout
-from bmx.cache.collect import _register_hooks
+from bmx.cache.collect import register_hooks
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec  # re-export; was defined here
 
@@ -76,7 +76,7 @@ def run_prefill(
     handles: list = []
 
     if capture_pre_rope:
-        handles, _ = _register_hooks(model, k_pre_store, n_q_keep=1)
+        handles, _ = register_hooks(model, k_pre_store, n_q_keep=1)
 
     try:
         with torch.no_grad():

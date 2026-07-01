@@ -33,8 +33,9 @@ import math
 import torch
 import torch.nn.functional as F
 
+from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.specs import CacheCodecSpec
-from bmx.cache.streaming import StreamingQuantizedCache, resolve_vocab_size
+from bmx.cache.streaming import StreamingQuantizedCache
 
 
 def compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, float]:

@@ -16,13 +16,13 @@ import pandas as pd
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.live_eval import compression_for
 from bmx.cache.niah import (
     build_niah_ids_synthetic,
     niah_recall_argmax,
 )
 from bmx.cache.recipes import spec_pair
-from bmx.cache.streaming import resolve_vocab_size
 
 
 @dataclasses.dataclass

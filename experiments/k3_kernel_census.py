@@ -23,9 +23,10 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.packed_streaming import PackedStreamingCache
 from bmx.cache.recipes import spec_pair
-from bmx.cache.streaming import StreamingQuantizedCache, resolve_vocab_size
+from bmx.cache.streaming import StreamingQuantizedCache
 
 
 @dataclasses.dataclass

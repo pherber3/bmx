@@ -25,15 +25,15 @@ from bmx.cache.triton_dequant_attention import (
     fused_decode_attention_packed,
     triton_decode_attention,
 )
-from bmx.cache.collect import _reshape_heads, to_matrix
-from bmx.cache.rope import rope_cos_sin
-from bmx.cache.specs import CacheCodecSpec
-from bmx.cache.streaming import (
-    compute_flush_schedule,
+from bmx.cache.collect import reshape_heads, to_matrix
+from bmx.cache.hf_compat import (
     model_config_n_layers,
     resolve_decoder_layers,
     resolve_text_config,
 )
+from bmx.cache.rope import rope_cos_sin
+from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.streaming import compute_flush_schedule
 from bmx.decomp.lrs import truncated_svd
 
 _ATTN_NAME = "chunked_dequant"
@@ -286,7 +286,7 @@ class PackedStreamingLayer(DynamicLayer):
 
         out: (1, S, h_kv*d) -> reshaped to (h_kv, S, d) fp16, concatenated.
         """
-        block = _reshape_heads(out, self._h_kv, self._d_head)  # (h_kv, S, d)
+        block = reshape_heads(out, self._h_kv, self._d_head)  # (h_kv, S, d)
         self._k_pre = (
             block if self._k_pre is None else torch.cat([self._k_pre, block], dim=1)
         )
