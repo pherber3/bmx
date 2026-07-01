@@ -1,6 +1,5 @@
-"""CacheCodecSpec lives in cache.specs and is re-exported from ppl_eval."""
+"""CacheCodecSpec defaults (the codec-spec contract every arm builds on)."""
 
-from bmx.cache.ppl_eval import CacheCodecSpec as SpecFromPpl
 from bmx.cache.specs import CacheCodecSpec
 
 
@@ -14,7 +13,3 @@ def test_spec_defaults():
         0,
         False,
     )
-
-
-def test_ppl_eval_reexports_same_class():
-    assert SpecFromPpl is CacheCodecSpec

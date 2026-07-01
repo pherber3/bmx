@@ -89,3 +89,8 @@ The original debloat removed the dense path's launcher (`fused_decode_attention`
 builder (`build_kv_stacked`) but missed the kernel body itself. `_fused_decode_kernel`
 (~165 lines) was deleted in the follow-up cleanup. Recovery: same as above — parent
 commit `93751eb` contains the full dense path including this kernel.
+
+Note for anyone recovering: code taken from `93751eb` predates the 2026-07-01 cleanup
+(`query_abs_start` → `is_prefill`, module extractions, and the per-block decode path
+removal) — reconcile signatures against current `chunked_attention.py` /
+`packed_streaming.py` before wiring it back in.
