@@ -548,7 +548,8 @@ def triton_decode_attention(
     # served by the fused split-KV kernel (fused_decode_attention_k2b) under the
     # PAGE=128 uniform-paged layout, or by the chunked PyTorch fallback for
     # non-fused configs — never here.
-    # (A retired _k2b_softmax_block_kernel variant lived here; see docs/2026-06-24-decode-path-debloat-removal.md.)
+    # (A retired _k2b_softmax_block_kernel variant lived here;
+    # see docs/2026-06-24-decode-path-debloat-removal.md.)
     assert k_arm != "lowrank_rtn_channel", (
         "triton_decode_attention is RTN-only; route lowrank_rtn_channel (k2b) "
         "through fused_decode_attention_k2b or the chunked fallback"

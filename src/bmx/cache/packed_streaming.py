@@ -595,7 +595,8 @@ class PackedStreamingLayer(DynamicLayer):
         # Hadamard), and rank + n_q_groups each a power of 2 (tl.arange precondition).
         # Real models satisfy these (d=128, rank=16/32, n_q_groups=4); tiny or
         # non-standard configs fall back to chunked_dequant_attention below.
-        # (A retired _k2b_softmax_block_kernel variant lived here; see docs/2026-06-24-decode-path-debloat-removal.md.)
+        # (A retired _k2b_softmax_block_kernel variant lived here;
+        # see docs/2026-06-24-decode-path-debloat-removal.md.)
         d_head = q.shape[2]
         rank = self.k_spec.rank or 0
         k2b_dims_ok = (
@@ -640,7 +641,8 @@ class PackedStreamingLayer(DynamicLayer):
 
         # k2b configs that didn't pass fused_k2b_ok (dim mismatch, non-pow2 rank /
         # n_q_groups, non-CUDA, or non-uniform blocks) route directly to chunked.
-        # (A retired _k2b_softmax_block_kernel variant lived here; see docs/2026-06-24-decode-path-debloat-removal.md.)
+        # (A retired _k2b_softmax_block_kernel variant lived here;
+        # see docs/2026-06-24-decode-path-debloat-removal.md.)
         if (
             TRITON_AVAILABLE
             and is_decode
