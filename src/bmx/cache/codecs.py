@@ -1,22 +1,24 @@
-"""KV-cache codecs: six compression arms at honestly matched bits.
+"""KV-cache codecs: the arm registry, honest-bpe accounting, and dispatch.
 
-Public API
-----------
-CACHE_ARMS : tuple[str, ...]
-    All supported arm names.
+Arms are registered in `_ARM_TABLE` (name -> `_ArmTraits`); `CACHE_ARMS`,
+`S_DIVISIBILITY_ARMS`, and `_SPLIT_ARMS` are all derived from that one table,
+so adding/removing an arm never requires hand-syncing multiple lists.
 
-quantize_cache(arm, M, *, bits, seed=0, group=64, rank=0) -> (M_hat, bpe)
-    Compress (S, C) fp32 matrix M with the given arm and return the
-    dequantized approximation plus the *honest* bits-per-entry (ALL metadata
-    included; seed-generated rotations/sketches cost 0 stored bits).
+Every arm reports an honest bits-per-entry (bpe): ALL metadata is counted
+(codebook-free rotations aside, which are seed-generated and cost 0 stored
+bits) — scales, per-channel/per-head norms, low-rank factors, and tier maps
+all go into the number, never just the payload bit-width.
 
-gaussian_codebook(bits, ...) -> Tensor  [module-level, lru_cache]
-    1-D Lloyd-Max codebook for quantizing coordinates of unit-norm vectors.
+Streaming-path arms (`_SPLIT_ARMS`) additionally expose a packed split,
+`quantize_packed`/`dequant_packed`, used by the token-by-token cache; for
+those arms `quantize_cache` is literally `dequant_packed ∘ quantize_packed`.
+Non-split (waterfill) arms only support the whole-matrix `quantize_cache`
+path.
 
-qjl_reconstruct(R, seed) -> R_hat
-    Unbiased QJL linear reconstruction; exported for unit-testing.
+See `quantize_cache`'s docstring for the per-arm parameter reference.
 """
 
+import dataclasses
 import functools
 import math
 
@@ -30,37 +32,33 @@ from bmx.quant.rtn import rtn_dequantize_packed, rtn_quantize, rtn_quantize_pack
 # Public arm registry
 # ---------------------------------------------------------------------------
 
-CACHE_ARMS = (
-    "rtn_token",
-    "rtn_channel",
-    "rotate_rtn_token",
-    "turboquant_mse",
-    "turboquant_mse_perhead",
-    "turboquant_prod",
-    "lowrank_rtn_channel",
-    "lowrank_waterfill_channel",
-    "lowrank_eigwaterfill_channel",
-    "lowrank_randwaterfill_channel",
-    "lowrank_topkwaterfill_channel",
-    "lowrank_blockdiagwaterfill_channel",
-    "lowrank_frozenwaterfill_channel",
-    "lowrank_oraclewaterfill_channel",
-)
 
+@dataclasses.dataclass(frozen=True)
+class _ArmTraits:
+    s_divisible: bool = False  # codec asserts S % group == 0 (streaming alignment)
+    packed: bool = False  # has a quantize_packed/dequant_packed split
+
+
+_ARM_TABLE: dict[str, _ArmTraits] = {
+    "rtn_token": _ArmTraits(packed=True),
+    "rtn_channel": _ArmTraits(s_divisible=True, packed=True),
+    "rotate_rtn_token": _ArmTraits(packed=True),
+    "turboquant_mse": _ArmTraits(packed=True),
+    "turboquant_mse_perhead": _ArmTraits(packed=True),
+    "turboquant_prod": _ArmTraits(packed=True),
+    "lowrank_rtn_channel": _ArmTraits(s_divisible=True, packed=True),
+    "lowrank_waterfill_channel": _ArmTraits(s_divisible=True),
+    "lowrank_eigwaterfill_channel": _ArmTraits(s_divisible=True),
+    "lowrank_randwaterfill_channel": _ArmTraits(s_divisible=True),
+    "lowrank_topkwaterfill_channel": _ArmTraits(s_divisible=True),
+    "lowrank_blockdiagwaterfill_channel": _ArmTraits(s_divisible=True),
+    "lowrank_frozenwaterfill_channel": _ArmTraits(s_divisible=True),
+    "lowrank_oraclewaterfill_channel": _ArmTraits(s_divisible=True),
+}
+
+CACHE_ARMS = tuple(_ARM_TABLE)
 # Arms whose codec asserts S % group == 0 (used by streaming.py for alignment).
-S_DIVISIBILITY_ARMS = frozenset(
-    {
-        "rtn_channel",
-        "lowrank_rtn_channel",
-        "lowrank_waterfill_channel",
-        "lowrank_eigwaterfill_channel",
-        "lowrank_randwaterfill_channel",
-        "lowrank_topkwaterfill_channel",
-        "lowrank_blockdiagwaterfill_channel",
-        "lowrank_frozenwaterfill_channel",
-        "lowrank_oraclewaterfill_channel",
-    }
-)
+S_DIVISIBILITY_ARMS = frozenset(a for a, t in _ARM_TABLE.items() if t.s_divisible)
 
 
 # ---------------------------------------------------------------------------
@@ -411,17 +409,8 @@ def _lowrank_rotwaterfill_channel(
 # Packed split: quantize_packed / dequant_packed
 # ---------------------------------------------------------------------------
 
-_SPLIT_ARMS = frozenset(
-    {
-        "rtn_token",
-        "rtn_channel",
-        "rotate_rtn_token",
-        "turboquant_mse",
-        "turboquant_mse_perhead",
-        "turboquant_prod",
-        "lowrank_rtn_channel",
-    }
-)
+# Arms with a quantize_packed/dequant_packed split (the streaming path).
+_SPLIT_ARMS = frozenset(a for a, t in _ARM_TABLE.items() if t.packed)
 
 # Waterfill dispatch: arm name -> _lowrank_rotwaterfill_channel's rotation mode.
 _WATERFILL_ROTATION = {
