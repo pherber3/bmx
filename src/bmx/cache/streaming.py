@@ -132,10 +132,6 @@ class StreamingQuantizedLayer(DynamicLayer):
             block if self._k_pre is None else torch.cat([self._k_pre, block], dim=1)
         )
 
-    def _quantize_matrix(self, kv_fp32: torch.Tensor, spec: CacheCodecSpec):
-        """(h,S,d) fp32 -> (dequantized (h,S,d) fp32, bpe). fp16 spec is identity."""
-        return quantize_kv_layout(kv_fp32, spec)
-
     def _quantize_k_block_pre_rope(
         self,
         k_block_pre: torch.Tensor,
@@ -189,7 +185,7 @@ class StreamingQuantizedLayer(DynamicLayer):
             k_hat_pre = from_matrix(M_hat, h)  # (h_kv, block_len, d)
         else:
             # General path (rtn_channel, rtn_token, rotate_rtn_token, turboquant_*).
-            k_hat_pre, codec_bpe = self._quantize_matrix(k_block_pre, spec)
+            k_hat_pre, codec_bpe = quantize_kv_layout(k_block_pre, spec)
 
         # Extend the growing RoPE table to cover [covered, new_committed), then
         # slice this block's positions [committed, new_committed).
@@ -212,15 +208,6 @@ class StreamingQuantizedLayer(DynamicLayer):
 
         return k_block_post, codec_bpe
 
-    def _group_size(self) -> int:
-        """Binding group size for S-alignment.
-
-        Only rtn_channel and lowrank_rtn_channel assert S % group == 0.
-        All other arms have no S-divisibility constraint, so g=1 (quantize
-        everything except the fp16 window without any alignment restriction).
-        """
-        return self._g
-
     def update(self, key_states, value_states, *args, **kwargs):
         # Let DynamicLayer concat + return the full (post-RoPE) keys/values.
         keys, values = super().update(key_states, value_states, *args, **kwargs)
@@ -240,25 +227,6 @@ class StreamingQuantizedLayer(DynamicLayer):
         # (not _g) makes every committed block exactly PAGE tokens — the uniform
         # paged layout, identical to PackedStreamingLayer (shared-schedule parity).
         new_S_q = compute_flush_schedule(S, W, self._page)
-
-        if new_S_q <= 0:
-            # Nothing to quantize yet — whole cache stays fp16 this step.
-            # Reassemble from (potentially empty) prefix + full fp16 slab.
-            # When _committed_S_q == 0, prefix is empty and we just use the full slab.
-            if self._q_prefix_k is None:
-                self.keys = keys
-                self.values = values
-            else:
-                # Prefix exists but no new flush; tail = everything after committed.
-                k_tail = keys.squeeze(0)[..., self._committed_S_q :, :]
-                v_tail = values.squeeze(0)[..., self._committed_S_q :, :]
-                k_hat = torch.cat([self._q_prefix_k, k_tail.to(cache_dtype)], dim=-2)
-                v_hat = torch.cat([self._q_prefix_v, v_tail.to(cache_dtype)], dim=-2)
-                self.keys = k_hat.unsqueeze(0)
-                self.values = v_hat.unsqueeze(0)
-            self.bpe_k = 16.0
-            self.bpe_v = 16.0
-            return self.keys, self.values
 
         if new_S_q <= self._committed_S_q:
             # No new block to flush — prefix is unchanged. Just reassemble.
@@ -313,14 +281,14 @@ class StreamingQuantizedLayer(DynamicLayer):
                 # Post-RoPE keys: the page is already RoPE'd at its correct positions
                 # inside `keys`; pristine because it was in the fp16 tail until now.
                 k_block_fp32 = keys.squeeze(0)[..., block_start:block_end, :].float()
-                k_block_post_raw, codec_bpe_k = self._quantize_matrix(
+                k_block_post_raw, codec_bpe_k = quantize_kv_layout(
                     k_block_fp32, self.k_spec
                 )
                 k_block_post = k_block_post_raw.to(cache_dtype)
 
             # --- Quantize V page (pristine fp16 in the tail until now) ---
             v_block_fp32 = values.squeeze(0)[..., block_start:block_end, :].float()
-            v_block_raw, codec_bpe_v = self._quantize_matrix(v_block_fp32, self.v_spec)
+            v_block_raw, codec_bpe_v = quantize_kv_layout(v_block_fp32, self.v_spec)
             v_block = v_block_raw.to(cache_dtype)
 
             # --- Append page to frozen prefix ---
