@@ -62,6 +62,33 @@ S_DIVISIBILITY_ARMS = frozenset(a for a, t in _ARM_TABLE.items() if t.s_divisibl
 
 
 # ---------------------------------------------------------------------------
+# Honest-bpe metadata terms — the audit surface for "ALL metadata counted".
+# Every arm's bpe is payload bits + a sum of these named terms; the expressions
+# are the scientific record and must not be re-derived or reassociated.
+# ---------------------------------------------------------------------------
+
+
+def scale_bits(group: int) -> float:
+    """fp16 groupwise-RTN scale: one fp16 per `group` entries."""
+    return 16.0 / group
+
+
+def norm_bits(h: int, C: int) -> float:
+    """fp16 per-row norms, `h` per row of C channels (h=1: one full-row norm)."""
+    return 16.0 * h / C
+
+
+def factor_bits(rank: int, S: int, C: int) -> float:
+    """fp16 low-rank factors Us (S×r) + V (C×r), amortized per entry."""
+    return 16.0 * rank * (S + C) / (S * C)
+
+
+def tier_bits(tiers: tuple[int, ...], S: int) -> float:
+    """Per-channel tier map: ceil(log2(n_tiers)) bits per channel, amortized."""
+    return math.ceil(math.log2(len(tiers))) / S
+
+
+# ---------------------------------------------------------------------------
 # Helper: rotation / unrotation over the channel dim
 # ---------------------------------------------------------------------------
 
@@ -398,9 +425,9 @@ def _lowrank_rotwaterfill_channel(
         rot_bits = (16.0 * d / S) if charge_rotation else 0.0
 
     M_hat = L + R_hat
-    scale_term = 16.0 / group
-    factor_term = 16.0 * rank * (S + C) / (S * C)
-    tier_term = math.ceil(math.log2(len(tiers))) / S
+    scale_term = scale_bits(group)
+    factor_term = factor_bits(rank, S, C)
+    tier_term = tier_bits(tiers, S)
     bpe = mean_payload + scale_term + factor_term + tier_term + rot_bits
     return M_hat, bpe
 
@@ -528,16 +555,18 @@ def quantize_packed(
     S, C = M.shape
     if arm == "rtn_token":
         Q_int, scale = rtn_quantize_packed(M, bits, group)
-        return {"Q_int": Q_int, "scale": scale}, bits + 16.0 / group
+        return {"Q_int": Q_int, "scale": scale}, bits + scale_bits(group)
     if arm == "rtn_channel":
         Q_int, scale = rtn_quantize_packed(M.mT, bits, group)
-        return {"Q_int": Q_int, "scale": scale}, bits + 16.0 / group
+        return {"Q_int": Q_int, "scale": scale}, bits + scale_bits(group)
     if arm == "rotate_rtn_token":
         Q_int, scale = rtn_quantize_packed(_rotate(M, seed), bits, group)
-        return {"Q_int": Q_int, "scale": scale}, bits + 16.0 / group
+        return {"Q_int": Q_int, "scale": scale}, bits + scale_bits(group)
     if arm == "turboquant_mse":
         indices, norms = _turboquant_mse_packed(M, bits, seed)
-        return {"indices": indices, "norms": norms, "bits": bits}, bits + 16.0 / C
+        return {"indices": indices, "norms": norms, "bits": bits}, bits + norm_bits(
+            1, C
+        )
     if arm == "turboquant_mse_perhead":
         # Per-head (block-diagonal d_head Hadamard) turboquant — fuses into the
         # per-head decode kernel (no cross-head coupling). norms are per-(row, head).
@@ -548,7 +577,7 @@ def quantize_packed(
         indices, norms = _turboquant_mse_perhead_packed(M, bits, seed, h)
         # bpe: bits/elem + 16 (fp16 norm) per (head's d) channels = bits + 16/(C/h).
         return {"indices": indices, "norms": norms, "bits": bits, "h": h}, (
-            bits + 16.0 * h / C
+            bits + norm_bits(h, C)
         )
     if arm == "turboquant_prod":
         assert bits >= 2, f"turboquant_prod requires bits >= 2, got {bits}"
@@ -566,6 +595,7 @@ def quantize_packed(
             "qjl_signs": signs.to(torch.int8),
             "qjl_norms": r_norms,
         }
+        # payload + 1 sign bit + two fp16 norm vectors (mse + qjl) = 2 * norm_bits(1, C)
         return packed, (bits - 1) + 1 + 32.0 / C
     # lowrank_rtn_channel
     assert rank > 0, f"lowrank_rtn_channel requires rank > 0, got {rank}"
@@ -580,7 +610,7 @@ def quantize_packed(
     L = Us_stored @ V_stored.mT
     R = M - L
     res_Q_int, res_scale = rtn_quantize_packed(R.mT, bits, group)
-    bpe = bits + 16.0 / group + 16.0 * rank * (S + C) / (S * C)
+    bpe = bits + scale_bits(group) + factor_bits(rank, S, C)
     return {
         "Us": Us_stored,
         "V": V_stored,

@@ -994,3 +994,14 @@ def test_frozen_vs_oracle_detects_drift():
     assert lg_orac_d <= lg_froz_d + 1e-9, (
         f"oracle did not beat frozen under drift: {lg_orac_d} vs {lg_froz_d}"
     )
+
+
+def test_bpe_term_helpers_are_the_audit_surface():
+    # The named metadata terms: one place to audit "ALL metadata counted".
+    from bmx.cache.codecs import factor_bits, norm_bits, scale_bits, tier_bits
+
+    assert scale_bits(64) == 16.0 / 64
+    assert norm_bits(1, 128) == 16.0 / 128
+    assert norm_bits(8, 1024) == 16.0 * 8 / 1024
+    assert factor_bits(16, 256, 1024) == 16.0 * 16 * (256 + 1024) / (256 * 1024)
+    assert tier_bits((0, 2, 3, 4), 256) == 2 / 256  # ceil(log2(4)) = 2
