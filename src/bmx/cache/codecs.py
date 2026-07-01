@@ -207,52 +207,6 @@ def gaussian_codebook(
 
 
 # ---------------------------------------------------------------------------
-# Arm 1: rtn_token
-# ---------------------------------------------------------------------------
-
-
-def _rtn_token(M: torch.Tensor, bits: int, group: int) -> tuple[torch.Tensor, float]:
-    """Groupwise symmetric RTN along channel dim per token."""
-    S, C = M.shape
-    assert C % group == 0, f"C={C} not divisible by group={group}"
-    M_hat = rtn_quantize(M, bits, group)
-    bpe = bits + 16.0 / group
-    return M_hat, bpe
-
-
-# ---------------------------------------------------------------------------
-# Arm 2: rtn_channel
-# ---------------------------------------------------------------------------
-
-
-def _rtn_channel(M: torch.Tensor, bits: int, group: int) -> tuple[torch.Tensor, float]:
-    """KIVI-style: symmetric RTN along the token dim per channel."""
-    S, C = M.shape
-    assert S % group == 0, f"S={S} not divisible by group={group}"
-    M_hat = rtn_quantize(M.mT, bits, group).mT
-    bpe = bits + 16.0 / group
-    return M_hat, bpe
-
-
-# ---------------------------------------------------------------------------
-# Arm 3: rotate_rtn_token
-# ---------------------------------------------------------------------------
-
-
-def _rotate_rtn_token(
-    M: torch.Tensor, bits: int, group: int, seed: int
-) -> tuple[torch.Tensor, float]:
-    """QuaRot-style: rotate channels, quantize per-token, rotate back."""
-    S, C = M.shape
-    assert C % group == 0, f"C={C} not divisible by group={group}"
-    M_rot = _rotate(M, seed)
-    M_rot_hat = rtn_quantize(M_rot, bits, group)
-    M_hat = _unrotate(M_rot_hat, seed)
-    bpe = bits + 16.0 / group
-    return M_hat, bpe
-
-
-# ---------------------------------------------------------------------------
 # QJL public helper
 # ---------------------------------------------------------------------------
 
@@ -298,47 +252,6 @@ def qjl_reconstruct(R: torch.Tensor, seed: int) -> torch.Tensor:
     R_hat = r_norms_stored * scale * (signs @ G)
 
     return R_hat
-
-
-# ---------------------------------------------------------------------------
-# Arm 6: lowrank_rtn_channel
-# ---------------------------------------------------------------------------
-
-
-def _lowrank_rtn_channel(
-    M: torch.Tensor,
-    bits: int,
-    group: int,
-    rank: int,
-    svd_factors: tuple | None = None,
-) -> tuple[torch.Tensor, float]:
-    """Low-rank + quantized residual (K1-margin arm)."""
-    S, C = M.shape
-    assert rank > 0, f"lowrank_rtn_channel requires rank > 0, got {rank}"
-    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
-    assert S % group == 0, f"S={S} not divisible by group={group}"
-
-    # Low-rank approximation — optionally skip truncated_svd when factors are
-    # pre-computed (e.g., reused across a bits sweep for the same (M, rank)).
-    if svd_factors is not None:
-        Us, V = svd_factors
-    else:
-        Us, V = truncated_svd(M, rank)  # Us: (S, rank), V: (C, rank)
-
-    # fp16 roundtrip for honest stored-precision
-    Us_stored = Us.half().float()
-    V_stored = V.half().float()
-    L = Us_stored @ V_stored.mT  # (S, C)
-
-    # Residual quantized per channel (rtn_channel)
-    R = M - L
-    R_hat, _ = _rtn_channel(R, bits, group)
-
-    M_hat = L + R_hat
-
-    # bpe = b + 16/group + 16*rank*(S+C)/(S*C)
-    bpe = bits + 16.0 / group + 16.0 * rank * (S + C) / (S * C)
-    return M_hat, bpe
 
 
 # ---------------------------------------------------------------------------
