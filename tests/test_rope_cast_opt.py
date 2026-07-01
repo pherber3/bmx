@@ -33,9 +33,7 @@ def test_prerope_decode_matches_oracle_with_precast_table():
         n_q_heads=8, n_q_groups=4, d=16, blk=8, n_blocks=3
     )
     out = chunked_dequant_attention(q, kb, vb, **kw)
-    ref = naive_dense_attention(
-        q, kb, vb, **{k: v for k, v in kw.items() if k != "query_abs_start"}
-    )
+    ref = naive_dense_attention(q, kb, vb, **kw)
     diff = attention_diff(out, ref)
     # The RoPE-cast change contributes 0 additional drift (fp16→fp32 promotion
     # in the mixed-dtype multiply is exact).  Residual ~2.4e-07 is

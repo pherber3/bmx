@@ -101,15 +101,14 @@ def test_triton_rtn_decode_matches_oracle():
     )
 
     # Oracle on CPU (matches tiny_packed_blocks defaults: no rope, no tail)
-    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
-    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **kw)
 
     # Triton kernel on CUDA
     q_cuda = q.cuda()
     kb_cuda = _blocks_cuda(kb_cpu)
     vb_cuda = _blocks_cuda(vb_cpu)
     # rope_cos/sin are None for rtn_token without rope; k_tail/v_tail are None.
-    out_cuda = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **oracle_kwargs)
+    out_cuda = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **kw)
 
     # Compare on CPU (move Triton result back)
     out_cpu = out_cuda.cpu()
@@ -138,14 +137,13 @@ def test_triton_rtn_decode_matches_oracle_prerope():
         n_blocks=n_blocks,
     )
 
-    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
-    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **kw)
 
     # Move to CUDA: q, kb, vb, plus rope tensors
     q_cuda = q.cuda()
     kb_cuda = _blocks_cuda(kb_cpu)
     vb_cuda = _blocks_cuda(vb_cpu)
-    kw_cuda = dict(oracle_kwargs)
+    kw_cuda = dict(kw)
     if kw_cuda.get("rope_cos") is not None:
         kw_cuda["rope_cos"] = kw_cuda["rope_cos"].cuda()
     if kw_cuda.get("rope_sin") is not None:
@@ -171,11 +169,10 @@ def test_triton_decode_asserts_n_q_eq_1():
         n_q_heads=4, n_q_groups=2, n_q=1, d=32, blk=32, n_blocks=2
     )
     q_bad = torch.randn(4, 3, 32).cuda()  # n_q=3, not 1
-    kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
     kb_cuda = _blocks_cuda(kb_cpu)
     vb_cuda = _blocks_cuda(vb_cpu)
     with pytest.raises(AssertionError, match="decode-only"):
-        triton_decode_attention(q_bad, kb_cuda, vb_cuda, **kwargs)
+        triton_decode_attention(q_bad, kb_cuda, vb_cuda, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -232,15 +229,14 @@ def test_triton_split_kv_matches_oracle(num_splits, n_blocks):
     )
 
     # Oracle: naive_dense_attention on CPU (no num_splits concept; full softmax).
-    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
-    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **kw)
 
     # Triton split-KV on CUDA.
     q_cuda = q.cuda()
     kb_cuda = _blocks_cuda(kb_cpu)
     vb_cuda = _blocks_cuda(vb_cpu)
     out_cuda = triton_decode_attention(
-        q_cuda, kb_cuda, vb_cuda, num_splits=num_splits, **oracle_kwargs
+        q_cuda, kb_cuda, vb_cuda, num_splits=num_splits, **kw
     )
     out_cpu = out_cuda.cpu()
 
@@ -290,18 +286,14 @@ def test_triton_split_kv_num_splits_1_bit_identical_to_3a():
         blk=blk,
         n_blocks=n_blocks,
     )
-    oracle_kwargs = {k: v for k, v in kw.items() if k != "query_abs_start"}
-
     q_cuda = q.cuda()
     kb_cuda = _blocks_cuda(kb_cpu)
     vb_cuda = _blocks_cuda(vb_cpu)
 
     # 3a default path: no num_splits kwarg (uses the default=1 shortcut).
-    out_default = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **oracle_kwargs)
+    out_default = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, **kw)
     # 3b explicit num_splits=1: must follow the identical code branch.
-    out_split1 = triton_decode_attention(
-        q_cuda, kb_cuda, vb_cuda, num_splits=1, **oracle_kwargs
-    )
+    out_split1 = triton_decode_attention(q_cuda, kb_cuda, vb_cuda, num_splits=1, **kw)
 
     # Bit-identical: num_splits=1 IS the 3a path — same tensors, not just close.
     assert torch.equal(out_default, out_split1), (
@@ -310,7 +302,7 @@ def test_triton_split_kv_num_splits_1_bit_identical_to_3a():
     )
 
     # Also confirm both agree with the oracle (catches a broken serial path).
-    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **oracle_kwargs)
+    ref_cpu = naive_dense_attention(q, kb_cpu, vb_cpu, **kw)
     diff = attention_diff(out_split1.cpu(), ref_cpu)
     assert diff["max_abs"] < 1e-2, (
         f"num_splits=1 drifted from oracle: {diff}. "

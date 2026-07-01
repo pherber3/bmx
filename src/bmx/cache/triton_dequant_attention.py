@@ -477,7 +477,7 @@ def triton_decode_attention(
     gate (non-uniform blocks — which the uniform PAGE flush makes rare). k2b is
     rejected here (assert below) — it uses the fused k2b kernel or chunked.
 
-    Same call shape as chunked_dequant_attention (minus query_abs_start —
+    Same call shape as chunked_dequant_attention (minus is_prefill —
     this is decode-only, n_q==1).  Produces (n_q_heads, n_q, d).
 
     Dequant stays in PyTorch (dequant_packed + from_matrix +

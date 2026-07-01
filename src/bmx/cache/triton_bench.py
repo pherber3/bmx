@@ -82,7 +82,7 @@ def _oracle_attn_kwargs(kwargs: dict) -> dict:
     """Strip keys that naive_dense_attention does not accept.
 
     naive_dense_attention's signature is a strict subset of
-    chunked_dequant_attention's — it has no query_abs_start, attn_mask,
+    chunked_dequant_attention's — it has no is_prefill, attn_mask,
     v_group, or v_seed. Callers can pass the full chunked kwargs dict here;
     this strips the extras so the oracle call doesn't TypeError.
     """
@@ -253,7 +253,7 @@ def run_decode_ledger(
                 "length>, or call run_decode_ledger once per seq_len."
             )
 
-    # naive_dense_attention does not accept query_abs_start / attn_mask / v_group /
+    # naive_dense_attention does not accept is_prefill / attn_mask / v_group /
     # v_seed — strip them so callers can pass full chunked kwargs unchanged.
     _oracle_kwargs = _oracle_attn_kwargs(attn_kwargs)
 
@@ -276,7 +276,7 @@ def run_decode_ledger(
     # ── Step 1: measure fp16 baseline latency (for measured_speedup ratio) ────
     # Only needed for the timing_seq_len row; compute once unconditionally since
     # it is cheap and we need it as the denominator regardless.
-    # oracle baseline uses filtered kwargs (no query_abs_start etc.)
+    # oracle baseline uses filtered kwargs (no is_prefill etc.)
     fp16_ms = _time_variant(
         naive_dense_attention,
         q,

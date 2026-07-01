@@ -82,7 +82,6 @@ def _make_blocks_for_seqlen(cfg: Config, seq_len: int, device: str):
         v_tail=None,
         n_q_groups=cfg.n_q_groups,
         scale=cfg.d**-0.5,
-        query_abs_start=None,
     )
     if device == "cuda":
         q = q.cuda()
@@ -109,9 +108,7 @@ def main(cfg: Config) -> None:
     if device == "cuda":
         from bmx.cache.triton_dequant_attention import triton_decode_attention
 
-        # triton_decode_attention does not take query_abs_start (decode-only); strip it.
         def _triton(q, kb, vb, **kw):
-            kw = {k: v for k, v in kw.items() if k != "query_abs_start"}
             return triton_decode_attention(q, kb, vb, **kw)
 
         variants["triton_fused"] = _triton

@@ -75,7 +75,7 @@ def _broken_variant(q, k_blocks, v_blocks, **kwargs):
     """Returns oracle * 1.5 — catastrophically wrong, guaranteed to fail the gate.
 
     We call naive_dense_attention (the oracle) then corrupt the output.
-    naive_dense_attention does not accept query_abs_start / attn_mask etc.,
+    naive_dense_attention does not accept is_prefill / attn_mask etc.,
     so strip extras before forwarding (same strip the bench module applies).
     """
     from bmx.cache.chunked_attention import naive_dense_attention

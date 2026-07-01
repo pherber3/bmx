@@ -209,7 +209,7 @@ def chunked_dequant_attention(
     v_tail,
     n_q_groups,
     scale,
-    query_abs_start: int | None = None,
+    is_prefill: bool = False,
     v_group: int | None = None,
     v_seed: int | None = None,
     attn_mask=None,
@@ -221,10 +221,9 @@ def chunked_dequant_attention(
     [start,end) before the contraction. k_tail/v_tail: (h_kv, tail_len, d) fp16
     recent window (post-RoPE for K). Returns (n_q_heads, n_q, d).
 
-    query_abs_start: prefill flag. When not None this is a prefill (n_q > 1) and we
-    delegate to the dense + flash-SDPA path (which applies the model's causal mask
-    via attn_mask). When None this is decode (n_q == 1) and the online-softmax loop
-    runs — no masking needed, the single query attends all cached keys.
+    is_prefill: True during prefill (n_q > 1) — delegates to the dense flash-SDPA
+    path (the model's attn_mask governs causality). False during decode (n_q == 1)
+    — the online-softmax loop runs, no masking needed.
     attn_mask: the model's 4D causal mask, forwarded to the prefill SDPA path.
     v_group / v_seed: dequant params for V blocks; default to group / seed when
     not provided (allows K and V to use different packed formats).
@@ -236,9 +235,8 @@ def chunked_dequant_attention(
 
     # Prefill (n_q > 1) delegates to the dense + flash-SDPA path: the per-block
     # online-softmax below is O(S^2) memory at prefill (each block's score tile is
-    # (heads, n_q=S, blk)), whereas SDPA tiles internally in O(S). query_abs_start is
-    # set iff prefill (per PackedStreamingLayer.attend), so this is the prefill gate.
-    if query_abs_start is not None:
+    # (heads, n_q=S, blk)), whereas SDPA tiles internally in O(S).
+    if is_prefill:
         return _prefill_dense_attention(
             q,
             k_blocks,

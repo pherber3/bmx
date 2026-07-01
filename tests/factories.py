@@ -102,7 +102,6 @@ def tiny_packed_blocks_prerope(*, n_q_heads, n_q_groups, d, blk, n_blocks, seed=
         v_tail=None,
         n_q_groups=n_q_groups,
         scale=d**-0.5,
-        query_abs_start=None,
     )
     return q, k_blocks, v_blocks, kwargs
 
@@ -112,7 +111,7 @@ def tiny_packed_blocks(
 ):
     """Build (q, k_blocks, v_blocks, kwargs) for chunked/naive attention tests.
 
-    Returns rtn_token packed blocks (decode case: n_q=1, query_abs_start=None).
+    Returns rtn_token packed blocks (decode case: n_q=1).
     """
     from bmx.cache.codecs import quantize_packed
     from bmx.cache.collect import to_matrix
@@ -141,6 +140,5 @@ def tiny_packed_blocks(
         v_tail=None,
         n_q_groups=n_q_groups,
         scale=d**-0.5,
-        query_abs_start=None,
     )
     return q, k_blocks, v_blocks, kwargs

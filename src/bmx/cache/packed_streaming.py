@@ -505,20 +505,11 @@ class PackedStreamingLayer(DynamicLayer):
         n_q = q.shape[1]
         n_q_groups = n_q_heads // self._h_kv
 
-        # query_abs_start is the PREFILL GATE for chunked_dequant_attention: set
-        # (not-None) iff this is a prefill (n_q > 1), which makes that fn delegate to
-        # the dense flash-SDPA path. Its integer value is not used for masking — the
-        # model's attn_mask (built via the registered sdpa_mask) handles causality.
-        # (Computed as total_seq_len - n_q = the absolute position of query[0], kept
-        # as a meaningful value in case a future path needs it.)
-        query_abs_start = None
-        if is_causal and n_q > 1:
-            total_seq_len = self._committed_S_q + self.keys.shape[2]
-            query_abs_start = total_seq_len - n_q
+        is_prefill = is_causal and n_q > 1
 
-        # Dispatch: decode (n_q==1, query_abs_start is None) → Triton kernel when
-        # TRITON_AVAILABLE, else chunked PyTorch.  Prefill (n_q>1) always uses
-        # chunked (it delegates to flash-SDPA inside chunked_dequant_attention).
+        # Dispatch: decode (n_q==1) → Triton kernel when TRITON_AVAILABLE, else
+        # chunked PyTorch.  Prefill (n_q>1) always uses chunked (it delegates to
+        # flash-SDPA inside chunked_dequant_attention).
         #
         # FAIL-LOUD RULE: TRITON_AVAILABLE is a CAPABILITY check (Triton+CUDA
         # present).  When True, the kernel call is UNCONDITIONAL — no try/except
@@ -533,7 +524,7 @@ class PackedStreamingLayer(DynamicLayer):
         # are INSTALLED, but the model may still run on CPU (e.g. a CPU model on a CUDA
         # box). The Triton kernel needs CUDA tensors — a CPU q means use the chunked
         # path. (A CPU pointer to a Triton kernel raises "cannot be accessed".)
-        is_decode = query_abs_start is None  # n_q==1
+        is_decode = not is_prefill
 
         # FUSED PACKED fast path (the deployment kernel): single-launch split-KV
         # decode that dequants int8 RTN codes IN-KERNEL (packed-resident, no dense
@@ -693,7 +684,7 @@ class PackedStreamingLayer(DynamicLayer):
             v_tail=v_tail,
             n_q_groups=n_q_groups,
             scale=scaling,
-            query_abs_start=query_abs_start,
+            is_prefill=is_prefill,
             v_group=self.v_spec.group,
             v_seed=self.v_spec.seed,
             attn_mask=attention_mask,

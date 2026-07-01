@@ -24,8 +24,6 @@ def test_gqa_grouped_contraction_matches_oracle():
         n_q_heads=8, n_q_groups=4, n_q=1, d=16, blk=8, n_blocks=3
     )
     out = chunked_dequant_attention(q, kb, vb, **kw)
-    ref = naive_dense_attention(
-        q, kb, vb, **{k: v for k, v in kw.items() if k != "query_abs_start"}
-    )
+    ref = naive_dense_attention(q, kb, vb, **kw)
     diff = attention_diff(out, ref)
     assert diff["max_abs"] < 1e-4, diff
