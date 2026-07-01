@@ -24,7 +24,7 @@ rotation, two-stage quantization, BM-decomposition notes).
 ## Commands
 
 ```bash
-uv run pytest -q                  # ≈ 50 s; expected: 264 passed, 17 skipped, 1 xfailed
+uv run pytest -q                  # ≈ 50 s; expected: 271 passed, 17 skipped, 1 xfailed
 uv run python experiments/<x>.py --help   # tyro CLIs; tuples space-separated
 uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024
                                   # regenerates results/cache/* (gitignored)
@@ -130,7 +130,9 @@ slice_svd, cp, tucker, shared_tucker, lrs. `src/bmx/cache/` — KV program:
 (CACHE_ARMS: rtn token/channel, rotate, turboquant mse/prod, lowrank;
 honest bpe), `rope` (cos/sin from config, apply-at-read), `metrics`
 (per-head logit/output distortion, GQA-aware), `ppl_eval` (quantized-prefill
-perplexity; `run_prefill` state is reusable across arms). `src/bmx/quant/` —
+perplexity; `run_prefill` state is reusable across arms), `recipes` (named
+arm→spec pairs), `generate` (shared generation loop + compression
+accounting), `hf_compat` (model introspection). `src/bmx/quant/` —
 hadamard rotations, groupwise RTN, `breakeven` (the ε > 1−4^(−Δb) instrument),
 `arms` (weight-side pipelines), stats. `src/bmx/stacks/`, `bench/` (Track B
 factored matvec + byte model), `census.py`, `sweep.py`, `artifacts.py`
