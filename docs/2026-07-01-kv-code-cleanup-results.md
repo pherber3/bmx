@@ -87,6 +87,8 @@ implementer, once by the reviewer) before landing. Task 11 required one
 review-driven fix loop (an incidental `CacheCodecSpec` re-export import site
 in `test_ppl_eval.py`) — caught by review, fixed same-task, re-gated clean.
 
+One sanctioned exception to universal bit-identity: `pick_num_splits` now reads the device SM count (Task 2) — bit-identical on the GH200 (132 SMs) and CPU boxes, but on other CUDA devices `num_splits` (and thus split-partial merge order) may differ; the GH200 re-verify covers the authoritative hardware.
+
 ## Deferred (explicitly not in this plan)
 
 | Item | Why deferred |
