@@ -82,3 +82,10 @@ git show 93751eb:src/bmx/cache/triton_dequant_attention.py > /tmp/old_kernel.py
 If `93751eb` has been squashed/lost by a later history rewrite, search any commit on
 the branch before `7b07552` — `git log --oneline --all -- src/bmx/cache/hadamard_kernel_ref.py`
 finds commits that still had a deleted file.
+
+## Addendum (2026-07-01)
+
+The original debloat removed the dense path's launcher (`fused_decode_attention`) and
+builder (`build_kv_stacked`) but missed the kernel body itself. `_fused_decode_kernel`
+(~165 lines) was deleted in the follow-up cleanup. Recovery: same as above — parent
+commit `93751eb` contains the full dense path including this kernel.
