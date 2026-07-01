@@ -22,8 +22,8 @@ from bmx.cache.niah import (
     build_niah_ids_synthetic,
     niah_recall_argmax,
 )
+from bmx.cache.recipes import spec_pair
 from bmx.cache.streaming import resolve_vocab_size
-from experiments.k3_live_generation import _spec_pair
 
 
 @dataclasses.dataclass
@@ -74,7 +74,7 @@ def run(cfg: Config, model=None, root: str = "results"):
     run_dir = create_run("k3_niah", cfg, root=root)
     rows = []
     for arm in cfg.arms:
-        k_spec, v_spec = _spec_pair(arm, cfg)
+        k_spec, v_spec = spec_pair(arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
         for length in cfg.lengths:
             bpe_k, bpe_v, compression = compression_for(model, k_spec, v_spec, length)
             for depth in cfg.depths:

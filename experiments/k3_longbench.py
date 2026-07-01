@@ -20,8 +20,8 @@ from bmx.artifacts import create_run, write_metrics
 from bmx.cache.live_eval import compression_for
 from bmx.cache.longbench import code_sim
 from bmx.cache.niah import generate_through_cache
+from bmx.cache.recipes import spec_pair
 from bmx.cache.streaming import resolve_vocab_size
-from experiments.k3_live_generation import _spec_pair
 
 
 @dataclasses.dataclass
@@ -95,7 +95,7 @@ def run(cfg: Config, model=None, root: str = "results"):
 
     rows = []
     for arm in cfg.arms:
-        k_spec, v_spec = _spec_pair(arm, cfg)
+        k_spec, v_spec = spec_pair(arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
         for task in cfg.tasks:
             bpe_k, bpe_v, compression = compression_for(
                 model, k_spec, v_spec, calib_length[task]

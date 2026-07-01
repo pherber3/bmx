@@ -60,17 +60,18 @@ def test_k2b_matched_variants_parse_and_lower_key_bits():
     # The k2b_k{bits}r{rank} variants exist to match turboquant's compression by
     # dropping the key budget. Pin the parse + the lowered-bits contract so the
     # matched-compression head-to-head can't silently revert to keys@3b.
-    from experiments.k3_live_generation import Config, _spec_pair
+    from bmx.cache.recipes import spec_pair
+    from experiments.k3_live_generation import Config
 
     cfg = Config()
-    k_can, _ = _spec_pair("k2b", cfg)
+    k_can, _ = spec_pair("k2b", rank=cfg.rank, group=cfg.group, seed=cfg.seed)
     assert (k_can.bits, k_can.rank) == (3, cfg.rank)  # canonical: keys@3b
 
-    k8, v8 = _spec_pair("k2b_k2r8", cfg)
+    k8, v8 = spec_pair("k2b_k2r8", rank=cfg.rank, group=cfg.group, seed=cfg.seed)
     assert (k8.arm, k8.bits, k8.rank) == ("lowrank_rtn_channel", 2, 8)
     assert v8.arm == "turboquant_mse" and v8.bits == 2  # V side unchanged
 
-    k16, _ = _spec_pair("k2b_k2r16", cfg)
+    k16, _ = spec_pair("k2b_k2r16", rank=cfg.rank, group=cfg.group, seed=cfg.seed)
     assert (k16.bits, k16.rank) == (2, 16)
 
 

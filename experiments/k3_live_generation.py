@@ -33,7 +33,7 @@ from bmx.cache.needle import (
     needle_retrieved,
     needle_retrieved_from_ids,
 )
-from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.recipes import spec_pair
 from bmx.cache.streaming import resolve_vocab_size
 
 
@@ -55,65 +55,6 @@ class Config:
     Set to False to use the fast batched path (equivalent to old quantized-prefill
     ppl relabelled live; does not measure compounding quant errors).
     Default True so the experiment measures the honest live regime (K3 verdict)."""
-
-
-def _spec_pair(arm: str, cfg: Config):
-    """(k_spec, v_spec) for an arm.
-
-    K2b = lowrank K@3b pre-RoPE + rotate/Lloyd V@2b (the quality-first recipe; spends
-    bits on keys, so it lands LOWER on compression than turboquant). For an apples-to-
-    apples comparison at turboquant's compression, the ``k2b_kNbM`` arms drop the key
-    budget to N bits / rank M: ``k2b_k2r8`` lands at ~7.2x (matched to turboquant_mse's
-    7.9x and kivi's 7.1x), so quality differences there are at equal bits, not bought
-    with extra storage. See the local bpe table in the session notes.
-    """
-    if arm == "fp16":
-        return CacheCodecSpec(arm="fp16"), CacheCodecSpec(arm="fp16")
-    # k2b_ph = canonical k2b but with the PER-HEAD Hadamard V codec
-    # (turboquant_mse_perhead). Quality-equivalent to k2b (full-C V) and the arm the
-    # fused k2b decode kernel runs — use it with --use-packed on CUDA to exercise +
-    # regression-check the fused kernel against the recorded k2b results.
-    if arm == "k2b_ph":
-        return (
-            CacheCodecSpec(
-                arm="lowrank_rtn_channel",
-                bits=3,
-                rank=cfg.rank,
-                group=cfg.group,
-                seed=cfg.seed,
-                pre_rope=True,
-            ),
-            CacheCodecSpec(arm="turboquant_mse_perhead", bits=2, seed=cfg.seed),
-        )
-    if arm == "k2b" or arm.startswith("k2b_k"):
-        # Default canonical k2b: keys@3b, rank=cfg.rank. Parameterized variants
-        # "k2b_k{bits}r{rank}" override the key budget to match compression.
-        bits_k, rank_k = 3, cfg.rank
-        if arm != "k2b":
-            # Parse "k2b_k2r8" -> bits_k=2, rank=8.
-            body = arm[len("k2b_k") :]
-            bits_str, rank_str = body.split("r")
-            bits_k, rank_k = int(bits_str), int(rank_str)
-        return (
-            CacheCodecSpec(
-                arm="lowrank_rtn_channel",
-                bits=bits_k,
-                rank=rank_k,
-                group=cfg.group,
-                seed=cfg.seed,
-                pre_rope=True,
-            ),
-            CacheCodecSpec(arm="turboquant_mse", bits=2, seed=cfg.seed),
-        )
-    if arm in ("turboquant_mse", "turboquant_prod"):
-        s = CacheCodecSpec(arm=arm, bits=2, seed=cfg.seed)
-        return s, s
-    if arm == "kivi":
-        return (
-            CacheCodecSpec(arm="rtn_channel", bits=2, group=cfg.group, seed=cfg.seed),
-            CacheCodecSpec(arm="rtn_token", bits=2, group=cfg.group, seed=cfg.seed),
-        )
-    raise ValueError(f"unknown arm {arm!r}")
 
 
 def _make_ids(cfg: Config, vocab: int):
@@ -163,7 +104,7 @@ def run(cfg: Config, model=None, input_ids=None, root: str = "results"):
 
     rows = []
     for arm in cfg.arms:
-        k_spec, v_spec = _spec_pair(arm, cfg)
+        k_spec, v_spec = spec_pair(arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
         res = live_generation_ppl(
             model,
             input_ids,
