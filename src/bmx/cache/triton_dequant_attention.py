@@ -145,9 +145,9 @@ def _require_triton() -> None:
 #   @triton.autotune wraps the kernel with a configs list; key=["d","n_q_groups"]
 #   so Triton specializes on head dim + GQA groups (hardware-characteristic),
 #   NOT on seq_len / block count (which changes every decode step).
-#   do_not_specialize=["n_blocks_in_split"] prevents per-block-count recompiles
-#   (the AWS 10x TTFT regression).  n_blocks_in_split cannot be tl.constexpr
-#   because it varies per split; it is used only for loop bounds.
+#   do_not_specialize=["blk"] prevents per-block-length recompiles
+#   (the AWS 10x TTFT regression class of bug). blk cannot be tl.constexpr
+#   because the actual block length varies; it is used only for tile masking.
 
 
 if TRITON_AVAILABLE:
@@ -289,7 +289,6 @@ def _online_block_kernel_launch(
     lse: torch.Tensor,
     n_q_groups: int,
     scale: float,
-    n_blocks_in_split: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the Triton online-softmax kernel for one (h_kv, blk, d) K/V block.
 
@@ -307,9 +306,6 @@ def _online_block_kernel_launch(
         lse:                (n_q_heads, 1, 1) fp32 — running lse denominator (in-out)
         n_q_groups:         n_q_heads // h_kv
         scale:              attention scale (1/sqrt(d))
-        n_blocks_in_split:  total blocks in this split (passed to kernel as
-                            do_not_specialize runtime arg; prevents recompile
-                            per seq_len).
 
     Returns updated (acc, m, lse) — same shapes, updated in-place internally.
     """
@@ -340,7 +336,6 @@ def _online_block_kernel_launch(
 
         # Grid = (n_q_groups,): each program is one query head within this KV head.
         # Note: BLK is NOT passed explicitly — autotune provides it.
-        # n_blocks_in_split is a do_not_specialize runtime arg (not constexpr).
         _online_softmax_block_kernel[(n_q_groups,)](
             q_kv,
             k_kv,
@@ -604,9 +599,6 @@ def triton_decode_attention(
         NOTE: Only one split (split 0) receives the tail (avoids double-counting).
         """
         acc, m, lse = _init_carry()
-        n_blocks_in_split = len(kb_split) + (
-            1 if with_tail and k_tail is not None and k_tail.shape[1] > 0 else 0
-        )
 
         for (kpacked, start, end), (vpacked, _vs, _ve) in zip(kb_split, vb_split):
             K_kv, V_kv = _dequant_block(kpacked, vpacked, start, end)
@@ -619,7 +611,6 @@ def triton_decode_attention(
                 lse,
                 n_q_groups,
                 scale,
-                n_blocks_in_split=n_blocks_in_split,
             )
 
         if with_tail and k_tail is not None and k_tail.shape[1] > 0:
@@ -633,7 +624,6 @@ def triton_decode_attention(
                 lse,
                 n_q_groups,
                 scale,
-                n_blocks_in_split=n_blocks_in_split,
             )
 
         return acc, m, lse
@@ -781,7 +771,11 @@ if TRITON_AVAILABLE:
 
 
 def pick_num_splits(
-    seq_len: int, blk_size: int, h_kv: int, n_sms: int = 132, occupancy_mult: int = 2
+    seq_len: int,
+    blk_size: int,
+    h_kv: int,
+    n_sms: int | None = None,
+    occupancy_mult: int = 2,
 ) -> int:
     """Choose num_splits for split-KV decode (brain/vLLM/flashinfer heuristic).
 
@@ -795,7 +789,16 @@ def pick_num_splits(
 
     At ctx <= ~a few blocks num_splits collapses to 1 (the min-work floor) = the
     no-split fast path — correct, since there's no length to parallelize.
+    n_sms=None reads the current device's SM count (GH200 = 132, so behavior there is unchanged); the 132 fallback keeps CPU-only test boxes deterministic.
     """
+    if n_sms is None:
+        n_sms = (
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            if torch.cuda.is_available()
+            else 132
+        )
     n_blocks = max(1, (seq_len + blk_size - 1) // blk_size)
     target = max(1, occupancy_mult * n_sms // max(1, h_kv))  # oversubscribe SMs
     target = min(target, n_blocks, 64)  # min-work floor + cap
