@@ -1,8 +1,8 @@
 import torch
 
+from bmx.cache.generate import generate_through_cache
 from bmx.cache.niah import (
     build_niah_ids_synthetic,
-    generate_through_cache,
     niah_recall_argmax,
     rouge1_recall,
     rouge1_recall_only,

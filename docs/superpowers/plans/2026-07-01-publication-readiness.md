@@ -186,7 +186,7 @@ def test_niah_heatmap_has_aggregate_score(tmp_path):
 - Consumes: the per-arm `_spec_pair` + `compression_for()` machinery already emitting `compression`.
 - Produces: an added `kv_size_bits` column (the honest blended bits-per-entry, K+V averaged) in both experiments' output rows — the exact axis TurboQuant's Table 1 leads with ("KV Size" = 2.5, 3.5, 16).
 
-**Context:** TurboQuant's Table 1 headline axis is **KV Size in bits** (16 for full cache, 2.5/3.5 for their arms). We currently emit `compression` (×-factor). Reviewers of the mirror paper expect the bits column too. `src/bmx/cache/live_eval.py::compression_for()` already computes `(bpe_k, bpe_v, compression)` — surface `kv_size_bits = (bpe_k + bpe_v) / 2` (or the blended average consistent with how compression is derived; verify the exact convention in `compression_for`).
+**Context:** TurboQuant's Table 1 headline axis is **KV Size in bits** (16 for full cache, 2.5/3.5 for their arms). We currently emit `compression` (×-factor). Reviewers of the mirror paper expect the bits column too. `src/bmx/cache/generate.py::compression_for()` already computes `(bpe_k, bpe_v, compression)` — surface `kv_size_bits = (bpe_k + bpe_v) / 2` (or the blended average consistent with how compression is derived; verify the exact convention in `compression_for`).
 
 - [ ] **Step 1: Write the failing test** (NIAH first):
 
@@ -205,7 +205,7 @@ def test_niah_rows_have_kv_size_bits(tmp_path):
 
 - [ ] **Step 2: Run, verify fail.** `uv run pytest tests/test_k3_niah_experiment.py::test_niah_rows_have_kv_size_bits -v` → FAIL (no column).
 
-- [ ] **Step 3: Implement in `k3_niah.py`.** Where the row dict is built with `compression`, also compute `kv_size_bits`. For fp16 (no packed form) hardcode `16.0`; for compressed arms derive from `compression_for()`'s `(bpe_k, bpe_v)`. Confirm the exact return signature in `src/bmx/cache/live_eval.py` before wiring.
+- [ ] **Step 3: Implement in `k3_niah.py`.** Where the row dict is built with `compression`, also compute `kv_size_bits`. For fp16 (no packed form) hardcode `16.0`; for compressed arms derive from `compression_for()`'s `(bpe_k, bpe_v)`. Confirm the exact return signature in `src/bmx/cache/generate.py` before wiring.
 
 - [ ] **Step 4: Run, verify pass.**
 
@@ -413,4 +413,4 @@ uv run python -m experiments.k3_kernel_census --model-name meta-llama/Llama-3.1-
 
 **Type/name consistency:** `kv_size_bits` column name is consistent across Tasks 5, 9, 10. Figure IDs F1–F4 / table IDs T1–T3 are defined in Task 3 and reused in 8/9/10/11/12. `make_figures(df, out_dir)` signature matches the existing `plot_k3_niah.py` contract used in Tasks 4, 8. Task numbering: former Task 7 deleted, but I have NOT renumbered 8–12 in their headers to avoid breaking the many cross-references (F/T IDs and "Task N" mentions); the sequence reads 1–6, then 8–12 with a deletion marker where 7 was. ✓
 
-**Known soft spots (flagged, not hidden):** Task 5 requires confirming the exact return signature of `live_eval.py::compression_for` before wiring — its Step 3 does that. Task 6 requires reading LongBench's `dataset2metric` map + `metrics.py` from the local clone before porting scorers — its Step 1 does that. Task 10 Step 4 is a hard gate: if the reproduced anchor rows don't match TurboQuant's Table 1, the transitive-baseline argument is void and must be root-caused first.
+**Known soft spots (flagged, not hidden):** Task 5 requires confirming the exact return signature of `generate.py::compression_for` before wiring — its Step 3 does that. Task 6 requires reading LongBench's `dataset2metric` map + `metrics.py` from the local clone before porting scorers — its Step 1 does that. Task 10 Step 4 is a hard gate: if the reproduced anchor rows don't match TurboQuant's Table 1, the transitive-baseline argument is void and must be root-caused first.

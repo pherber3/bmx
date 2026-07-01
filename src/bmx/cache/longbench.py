@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 from fuzzywuzzy import fuzz
 
-from bmx.cache.niah import generate_through_cache
+from bmx.cache.generate import generate_through_cache
 from bmx.cache.specs import CacheCodecSpec
 
 # LongBench's prompt templates and max_gen for the code tasks. The templates are exact:

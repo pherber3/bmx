@@ -16,8 +16,8 @@ import pandas as pd
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.generate import compression_for
 from bmx.cache.hf_compat import resolve_vocab_size
-from bmx.cache.live_eval import compression_for
 from bmx.cache.niah import (
     build_niah_ids_synthetic,
     niah_recall_argmax,
@@ -53,11 +53,11 @@ def run(cfg: Config, model=None, root: str = "results"):
         # Real run (VM): model + tokenizer + Paul Graham essays.
         from experiments._common import load_model_and_tokenizer
 
+        from bmx.cache.generate import generate_through_cache
         from bmx.cache.haystack import load_pg_corpus
         from bmx.cache.niah import (
             NEEDLE_TEXT,
             build_niah_prompt,
-            generate_through_cache,
             rouge1_recall,
             rouge1_recall_only,
         )

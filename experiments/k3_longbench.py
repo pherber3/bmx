@@ -17,10 +17,9 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.generate import compression_for, generate_through_cache
 from bmx.cache.hf_compat import resolve_vocab_size
-from bmx.cache.live_eval import compression_for
 from bmx.cache.longbench import code_sim
-from bmx.cache.niah import generate_through_cache
 from bmx.cache.recipes import spec_pair
 
 
