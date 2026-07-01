@@ -676,7 +676,8 @@ def triton_decode_attention(
 
 
 # ---------------------------------------------------------------------------
-# FUSED decode kernels — shared design notes (_fused_decode_packed_kernel, _fused_decode_k2b_kernel)
+# FUSED decode kernels — shared design notes
+# (_fused_decode_packed_kernel, _fused_decode_k2b_kernel)
 #
 # One launch loops over ALL KV blocks INTERNALLY, carrying (m, lse, acc) in fp32
 # registers with one output write (vs the per-block launch path, which pays
@@ -791,7 +792,8 @@ def pick_num_splits(
 
     At ctx <= ~a few blocks num_splits collapses to 1 (the min-work floor) = the
     no-split fast path — correct, since there's no length to parallelize.
-    n_sms=None reads the current device's SM count (GH200 = 132, so behavior there is unchanged); the 132 fallback keeps CPU-only test boxes deterministic.
+    n_sms=None reads the current device's SM count (GH200 = 132, so behavior
+    there is unchanged); the 132 fallback keeps CPU-only test boxes deterministic.
     """
     if n_sms is None:
         n_sms = (

@@ -183,7 +183,8 @@ def chunked_attention_forward(
     entirely from the packed blocks stored on module._packed_layer.
 
     attn_mask (not is_causal) governs masking when provided — see the
-    AttentionMaskInterface registration at the top of this module and docs/2026-06-23-kernel-census-results.md.
+    AttentionMaskInterface registration at the top of this module and
+    docs/2026-06-23-kernel-census-results.md.
     During decode (n_q == 1), no mask is needed — the single query attends to all
     history.
     """
