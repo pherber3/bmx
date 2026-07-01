@@ -1,20 +1,12 @@
 """Haystack filler for the NIAH retrieval metric.
 
-synthetic_filler is deterministic repeated text for tests. load_pg_corpus downloads the
-Paul Graham essays from the HuggingFace dataset for the real run.
+load_pg_corpus downloads the Paul Graham essays from the HuggingFace dataset for the
+real run.
 """
 
 from __future__ import annotations
 
-_FILLER_SENTENCE = "The grass was green and the sky was blue and the day was calm. "
-
 PG_ESSAYS_DATASET = "sgoel9/paul_graham_essays"
-
-
-def synthetic_filler(n_repeats: int) -> str:
-    """Deterministic repeated filler (no download). Used by the offline/CI path."""
-    assert n_repeats > 0, "n_repeats must be positive"
-    return _FILLER_SENTENCE * n_repeats
 
 
 def load_pg_corpus() -> str:

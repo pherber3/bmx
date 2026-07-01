@@ -227,24 +227,3 @@ def generate_through_cache(
                     break
     text = tokenizer.decode(new_ids, skip_special_tokens=True)
     return text.strip() if strip else text
-
-
-def niah_recall_generate(
-    model,
-    tokenizer,
-    prompt_ids: torch.Tensor,
-    n_prefill: int,
-    k_spec: CacheCodecSpec,
-    v_spec: CacheCodecSpec,
-    needle_text: str = NEEDLE_TEXT,
-    max_new_tokens: int = 50,
-) -> float:
-    """Prefill the prompt into the streaming cache, greedy-generate, score ROUGE-1.
-
-    Headline recall (VM/real model). Now a thin wrapper over generate_through_cache so the
-    generate path lives in one place across metrics.
-    """
-    response = generate_through_cache(
-        model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_new_tokens
-    )
-    return rouge1_recall(needle_text, response)

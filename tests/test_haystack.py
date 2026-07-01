@@ -1,12 +1,4 @@
-from bmx.cache.haystack import PG_ESSAYS_DATASET, load_pg_corpus, synthetic_filler
-
-
-def test_synthetic_filler_is_deterministic_and_scales():
-    a = synthetic_filler(10)
-    b = synthetic_filler(10)
-    assert a == b
-    assert len(synthetic_filler(20)) > len(a)
-    assert isinstance(a, str) and len(a) > 0
+from bmx.cache.haystack import PG_ESSAYS_DATASET, load_pg_corpus
 
 
 def test_pg_essays_dataset_id():

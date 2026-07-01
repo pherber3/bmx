@@ -40,7 +40,7 @@ import torch
 from bmx.cache.codecs import quantize_kv_layout
 from bmx.cache.collect import register_hooks
 from bmx.cache.rope import apply_rope, rope_cos_sin
-from bmx.cache.specs import CacheCodecSpec  # re-export; was defined here
+from bmx.cache.specs import CacheCodecSpec
 
 
 @dataclasses.dataclass
@@ -86,18 +86,6 @@ def run_prefill(
             h.remove()
 
     return PrefillState(cache=prefill_out.past_key_values, k_pre=k_pre_store)
-
-
-def _quantize_kv(
-    kv_fp: torch.Tensor,
-    spec: CacheCodecSpec,
-) -> tuple[torch.Tensor, float]:
-    """Quantize (h, S, d) tensor; return (h, S, d) fp32 result and bpe.
-
-    ``kv_fp`` is expected to be fp32.  For ``arm="fp16"``, returns the input
-    unchanged and ``bpe=16.0``.
-    """
-    return quantize_kv_layout(kv_fp, spec)
 
 
 def quantized_prefill_ppl(
@@ -165,7 +153,7 @@ def quantized_prefill_ppl(
         )
         S = cache.layers[0].keys.shape[2]
         cos, sin = rope_cos_sin(model.config, S)
-        cos = cos.float()  # _quantize_kv outputs are fp32
+        cos = cos.float()  # quantize_kv_layout outputs are fp32
         sin = sin.float()
 
     # ------------------------------------------------------------------
@@ -188,16 +176,16 @@ def quantized_prefill_ppl(
             # Use captured k_pre (fp16, shape (h_kv, S, d))
             k_pre_fp16 = k_pre_store[f"layer{i}.k_pre"]  # (h_kv, S, d)
             k_pre_fp32 = k_pre_fp16.float()
-            k_hat_fp32, bpe_k = _quantize_kv(k_pre_fp32, k_spec)
+            k_hat_fp32, bpe_k = quantize_kv_layout(k_pre_fp32, k_spec)
             # Apply RoPE to get post-RoPE quantized keys
             k_hat_fp32 = apply_rope(k_hat_fp32, cos, sin)
         else:
             k_fp32 = keys_orig.squeeze(0).float()  # (h_kv, S, d)
-            k_hat_fp32, bpe_k = _quantize_kv(k_fp32, k_spec)
+            k_hat_fp32, bpe_k = quantize_kv_layout(k_fp32, k_spec)
 
         # --- Value quantization ---
         v_fp32 = vals_orig.squeeze(0).float()  # (h_kv, S, d)
-        v_hat_fp32, bpe_v = _quantize_kv(v_fp32, v_spec)
+        v_hat_fp32, bpe_v = quantize_kv_layout(v_fp32, v_spec)
 
         # --- Write back (cast to original cache dtype, re-add batch dim) ---
         layer.keys = k_hat_fp32.to(cache_dtype).unsqueeze(0)  # (1, h_kv, S, d)
