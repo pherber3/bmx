@@ -1,12 +1,14 @@
-"""Triton fused dequant-attention DECODE kernel (k2b recipe).
+"""Triton fused dequant-attention DECODE kernels.
 
-Provides: Triton online-softmax decode kernel + graphable split-KV path +
-dispatch helpers.  Two kernel paths: RTN arms (dense K/V from Python dequant)
-and k2b (lowrank_rtn_channel K unpacked in-kernel; turboquant_mse V dequanted
-in Python and passed dense).  Imports cleanly with TRITON_AVAILABLE=False
-(AMD/no-CUDA dev box); kernel verified on VM.
+Two single-launch split-KV decode kernels that dequantize packed codes IN-KERNEL:
+  - fused_decode_attention_packed — RTN arms (int8 codes, post-RoPE K).
+  - fused_decode_attention_k2b    — the k2b recipe (lowrank_rtn_channel K
+    reconstructed + RoPE'd in-kernel; per-head turboquant V dequanted in-kernel).
+Plus the per-block launch path (triton_decode_attention) as the non-fused
+fallback for other arms, and _finalize_decode / merge for split-KV combination.
 
-Usage: call triton_decode_attention(q, k_blocks, v_blocks, k_arm=..., ...).
+Imports cleanly with TRITON_AVAILABLE=False (AMD/no-CUDA dev box); kernels are
+verified on the GH200 VM against the naive oracle + end-to-end logit parity.
 Design rationale and staged-build ledger:
   docs/superpowers/specs/2026-06-24-triton-decode-kernel-design.md
 """
@@ -32,10 +34,10 @@ def _next_pow2(n: int) -> int:
 
 
 def _pick_block_n(blk_size: int, cap: int = 64) -> int:
-    """KV tile size for the fused decode loop: the largest power of 2 that is <= cap
-    AND divides blk_size, so each tile lies within one stored block (contiguous) and
-    is small enough to fit shared memory regardless of how large blk_size is (the
-    cache flushes the whole prefill as one stored block of thousands of tokens)."""
+    """KV tile size for the per-block decode loop: the largest power of 2 that is
+    <= cap AND divides blk_size, so each tile lies within one stored block
+    (contiguous load). Blocks are uniform PAGE=128 tokens under the paged layout,
+    so in practice this returns 64; kept general for non-uniform test blocks."""
     bn = 1
     p = 2
     while p <= cap and p <= blk_size:
@@ -545,9 +547,8 @@ def triton_decode_attention(
     # This per-block dispatcher is RTN-only. The k2b arm (lowrank_rtn_channel) is
     # served by the fused split-KV kernel (fused_decode_attention_k2b) under the
     # PAGE=128 uniform-paged layout, or by the chunked PyTorch fallback for
-    # non-fused configs — never here. The retired per-block _k2b_softmax_block_kernel
-    # had a (BLK_POW2,D,RANK) cube hazard and was unreachable once both caches
-    # flush uniform pages; PackedStreamingLayer.attend routes k2b away from this path.
+    # non-fused configs — never here.
+    # (A retired _k2b_softmax_block_kernel variant lived here; see docs/2026-06-24-decode-path-debloat-removal.md.)
     assert k_arm != "lowrank_rtn_channel", (
         "triton_decode_attention is RTN-only; route lowrank_rtn_channel (k2b) "
         "through fused_decode_attention_k2b or the chunked fallback"
