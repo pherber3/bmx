@@ -25,11 +25,49 @@ def test_code_sim_strips_comment_lines():
 
 
 def test_longbench_tasks_registry():
-    assert set(LONGBENCH_TASKS) == {"lcc", "repobench-p"}
-    for t in ("lcc", "repobench-p"):
+    # The 6 TurboQuant Table-1 categories, English datasets only (16 total).
+    expected = {
+        "narrativeqa",
+        "qasper",
+        "multifieldqa_en",
+        "hotpotqa",
+        "2wikimqa",
+        "musique",
+        "gov_report",
+        "qmsum",
+        "multi_news",
+        "trec",
+        "triviaqa",
+        "samsum",
+        "passage_count",
+        "passage_retrieval_en",
+        "lcc",
+        "repobench-p",
+    }
+    assert set(LONGBENCH_TASKS) == expected
+    for t in expected:
         assert "prompt_template" in LONGBENCH_TASKS[t]
         assert isinstance(LONGBENCH_TASKS[t]["max_gen"], int)
         assert "{context}" in LONGBENCH_TASKS[t]["prompt_template"]
+
+
+def test_dataset2metric_and_categories_consistent():
+    from bmx.cache.longbench import CATEGORY2DATASETS, DATASET2METRIC
+
+    # Every registered dataset has a scorer, and vice versa.
+    assert set(DATASET2METRIC) == set(LONGBENCH_TASKS)
+    # Categories partition exactly the registered datasets (no overlap, full cover).
+    flat = [ds for datasets in CATEGORY2DATASETS.values() for ds in datasets]
+    assert set(flat) == set(LONGBENCH_TASKS)
+    assert len(flat) == len(set(flat))
+    assert set(CATEGORY2DATASETS) == {
+        "single_qa",
+        "multi_qa",
+        "summarization",
+        "few_shot",
+        "synthetic",
+        "code",
+    }
 
 
 def test_build_longbench_prompt_shapes():
