@@ -72,6 +72,43 @@ def _dense_kv(blocks, arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin):
     return torch.cat(parts, dim=1) if parts else None
 
 
+def _assemble_dense_kv(
+    k_blocks,
+    v_blocks,
+    *,
+    k_arm,
+    v_arm,
+    group,
+    seed,
+    v_group,
+    v_seed,
+    h_kv,
+    k_pre_rope,
+    rope_cos,
+    rope_sin,
+    k_tail,
+    v_tail,
+    dtype,
+):
+    """Dequant all blocks + fold the fp16 tail -> dense (h_kv, S, d) K and V in `dtype`.
+
+    Shared by the oracle and the prefill-SDPA path. Casting is elementwise, so
+    cast-then-cat vs cat-then-cast are value-identical; this helper standardizes
+    on casting each piece before concatenation.
+    """
+    K = _dense_kv(k_blocks, k_arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin)
+    V = _dense_kv(v_blocks, v_arm, v_group, v_seed, h_kv, False, None, None)
+    if k_tail is not None and k_tail.shape[1] > 0:
+        kt = k_tail.to(dtype)
+        vt = v_tail.to(dtype)
+        K = kt if K is None else torch.cat([K.to(dtype), kt], dim=1)
+        V = vt if V is None else torch.cat([V.to(dtype), vt], dim=1)
+    else:
+        K = K.to(dtype)
+        V = V.to(dtype)
+    return K, V
+
+
 def naive_dense_attention(
     q,
     k_blocks,
@@ -103,21 +140,25 @@ def naive_dense_attention(
     _v_seed = v_seed if v_seed is not None else seed
     n_q_heads = q.shape[0]
     h_kv = n_q_heads // n_q_groups
-    K = _dense_kv(k_blocks, k_arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin)
-    V = _dense_kv(v_blocks, v_arm, _v_group, _v_seed, h_kv, False, None, None)
-    if k_tail is not None and k_tail.shape[1] > 0:
-        K = (
-            k_tail.to(q.dtype)
-            if K is None
-            else torch.cat([K, k_tail.to(q.dtype)], dim=1)
-        )
-        V = (
-            v_tail.to(q.dtype)
-            if V is None
-            else torch.cat([V, v_tail.to(q.dtype)], dim=1)
-        )
-    Kx = K.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
-    Vx = V.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
+    K, V = _assemble_dense_kv(
+        k_blocks,
+        v_blocks,
+        k_arm=k_arm,
+        v_arm=v_arm,
+        group=group,
+        seed=seed,
+        v_group=_v_group,
+        v_seed=_v_seed,
+        h_kv=h_kv,
+        k_pre_rope=k_pre_rope,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        k_tail=k_tail,
+        v_tail=v_tail,
+        dtype=q.dtype,
+    )
+    Kx = K.repeat_interleave(n_q_groups, dim=0)
+    Vx = V.repeat_interleave(n_q_groups, dim=0)
     scores = (q @ Kx.transpose(-1, -2)) * scale
     return torch.softmax(scores, dim=-1) @ Vx
 
@@ -155,26 +196,25 @@ def _prefill_dense_attention(
     path (n_q == 1) keeps the chunked online-softmax — that is the resident-memory
     win and is O(S) there (tiny per-block tiles).
     """
-    K = _dense_kv(
+    K, V = _assemble_dense_kv(
         k_blocks,
-        k_arm,
-        group,
-        seed,
-        q.shape[0] // n_q_groups,
-        k_pre_rope,
-        rope_cos,
-        rope_sin,
+        v_blocks,
+        k_arm=k_arm,
+        v_arm=v_arm,
+        group=group,
+        seed=seed,
+        v_group=v_group,
+        v_seed=v_seed,
+        h_kv=q.shape[0] // n_q_groups,
+        k_pre_rope=k_pre_rope,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        k_tail=k_tail,
+        v_tail=v_tail,
+        dtype=q.dtype,
     )
-    V = _dense_kv(
-        v_blocks, v_arm, v_group, v_seed, q.shape[0] // n_q_groups, False, None, None
-    )
-    if k_tail is not None and k_tail.shape[1] > 0:
-        kt = k_tail.to(q.dtype)
-        vt = v_tail.to(q.dtype)
-        K = kt if K is None else torch.cat([K.to(q.dtype), kt], dim=1)
-        V = vt if V is None else torch.cat([V.to(q.dtype), vt], dim=1)
-    Kx = K.to(q.dtype).repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, S, d)
-    Vx = V.to(q.dtype).repeat_interleave(n_q_groups, dim=0)
+    Kx = K.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, S, d)
+    Vx = V.repeat_interleave(n_q_groups, dim=0)
     # attn_mask (not is_causal) governs masking when provided — see the
     # AttentionMaskInterface registration in packed_streaming.py and
     # docs/2026-06-23-kernel-census-results.md.
