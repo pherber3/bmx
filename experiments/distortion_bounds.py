@@ -117,7 +117,9 @@ def measure_distortions(
     turboquant_prod is skipped at bits < 2 (it burns one bit on QJL).
     """
     X = _source_matrix(source, n_vectors, d, seed, cache_path)
-    # unit-norm each row so absolute distortions match the paper's convention.
+    # Enforce the paper's unit-norm convention at the measurement boundary: the sphere
+    # source is already unit-norm (no-op here), the cache source is not — this is the
+    # single guarantee both paths rely on, so absolute D_mse/D_prod are comparable.
     X = X / X.norm(dim=1, keepdim=True).clamp_min(1e-12)
     n, dd = X.shape
 

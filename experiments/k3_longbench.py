@@ -22,7 +22,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.generate import compression_for, generate_through_cache
+from bmx.cache.generate import avg_bpe, compression_for, generate_through_cache
 from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.longbench import CATEGORY2DATASETS, DATASET2METRIC, code_sim
 from bmx.cache.recipes import spec_pair
@@ -51,12 +51,9 @@ class Config:
     def resolved_tasks(self) -> tuple[str, ...]:
         """Datasets to evaluate: categories expanded (dedup, ordered) else explicit tasks."""
         if self.categories:
-            seen: list[str] = []
-            for cat in self.categories:
-                for ds in CATEGORY2DATASETS[cat]:
-                    if ds not in seen:
-                        seen.append(ds)
-            return tuple(seen)
+            # dict.fromkeys dedupes while preserving first-seen order.
+            flat = [ds for cat in self.categories for ds in CATEGORY2DATASETS[cat]]
+            return tuple(dict.fromkeys(flat))
         return self.tasks
 
 
@@ -161,7 +158,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                     "n_samples": n_used,
                     "bpe_k": bpe_k,
                     "bpe_v": bpe_v,
-                    "kv_size_bits": (bpe_k + bpe_v) / 2,
+                    "kv_size_bits": avg_bpe(bpe_k, bpe_v),
                     "compression": compression,
                     "n_prefill": cfg.n_prefill,
                     "score_kind": score_kind,

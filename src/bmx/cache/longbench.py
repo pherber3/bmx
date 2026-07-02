@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import string
 from collections import Counter
+from functools import lru_cache
 
 import torch
 from fuzzywuzzy import fuzz
@@ -257,17 +258,24 @@ def qa_f1_score(prediction, ground_truth, **kwargs):
     return f1_score(prediction_tokens, ground_truth_tokens)
 
 
+@lru_cache(maxsize=1)
+def _rouge():
+    """One shared Rouge() — it holds only config, so it's safe to reuse across the
+    hundreds of per-item calls in a full LongBench sweep (rebuilding it each call
+    reconstructs its tokenizers/regexes for nothing)."""
+    from rouge import Rouge
+
+    return Rouge()
+
+
 def rouge_score(prediction, ground_truth, **kwargs):
     """ROUGE-L F, range 0–1 (verbatim port of metrics.py::rouge_score).
 
     Uses `from rouge import Rouge`; empty/degenerate inputs raise inside get_scores, caught
     to 0.0. Used by summarization and the samsum few-shot task.
     """
-    from rouge import Rouge
-
-    rouge = Rouge()
     try:
-        scores = rouge.get_scores([prediction], [ground_truth], avg=True)
+        scores = _rouge().get_scores([prediction], [ground_truth], avg=True)
     except:  # noqa: E722 — verbatim port; LongBench catches any get_scores failure to 0.0
         return 0.0
     return scores["rouge-l"]["f"]

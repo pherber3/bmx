@@ -51,8 +51,8 @@ def make_figures(df: pd.DataFrame, out_dir) -> list[Path]:
     # dimension for the D_prod bound: from the data if present, else 128.
     d = int(df["d"].iloc[0]) if "d" in df.columns and len(df) else 128
 
-    bits_grid = sorted(df["bitwidth"].unique())
-    fine = [b + i * 0.05 for b in range(1, 5) for i in range(21)]  # smooth lines
+    # smooth b-grid for the closed-form bound lines (measured points are at integer b)
+    fine = [b + i * 0.05 for b in range(1, 5) for i in range(21)]
 
     fig, (ax_mse, ax_prod) = plt.subplots(1, 2, figsize=(11, 4.2))
     markers = "o^sxDvP*"
@@ -85,7 +85,6 @@ def make_figures(df: pd.DataFrame, out_dir) -> list[Path]:
     ax_mse.set_ylabel(r"$\|x-\hat x\|^2$")
     ax_prod.set_ylabel(r"$\mathbb{E}|\langle y,x\rangle-\langle y,\hat x\rangle|^2$")
 
-    _ = bits_grid  # kept for readability of the intended x-domain
     fig.suptitle("F1 — distortion vs bit-width (TurboQuant Fig-3 parity)")
     fig.tight_layout()
 

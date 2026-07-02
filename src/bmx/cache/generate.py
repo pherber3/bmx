@@ -125,3 +125,12 @@ def compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, f
     bpe_k, bpe_v = cache.bits_per_entry()
     mem = cache.memory_report(seq_len=length)
     return bpe_k, bpe_v, mem["compression"]
+
+
+def avg_bpe(bpe_k: float, bpe_v: float) -> float:
+    """Blended KV bits-per-entry (the TurboQuant Table-1 "KV Size" axis).
+
+    One definition shared by every experiment that reports `kv_size_bits`, so the
+    K/V blend lives in a single place if it ever changes (e.g. size-weighting K vs V).
+    """
+    return (bpe_k + bpe_v) / 2

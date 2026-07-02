@@ -16,7 +16,7 @@ import pandas as pd
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.generate import compression_for
+from bmx.cache.generate import avg_bpe, compression_for
 from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.niah import (
     build_niah_ids_synthetic,
@@ -124,7 +124,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         "recall_kind": recall_kind,
                         "bpe_k": bpe_k,
                         "bpe_v": bpe_v,
-                        "kv_size_bits": (bpe_k + bpe_v) / 2,
+                        "kv_size_bits": avg_bpe(bpe_k, bpe_v),
                         "compression": compression,
                         "n_prefill": cfg.n_prefill,
                         "use_packed": cfg.use_packed,
