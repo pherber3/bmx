@@ -23,7 +23,6 @@ from bmx.cache.triton_dequant_attention import (
     build_kv_stacked_packed,
     fused_decode_attention_k2b,
     fused_decode_attention_packed,
-    triton_decode_attention,
 )
 from bmx.cache.collect import reshape_heads, to_matrix
 from bmx.cache.hf_compat import (
@@ -504,14 +503,18 @@ class PackedStreamingLayer(DynamicLayer):
 
         is_prefill = is_causal and n_q > 1
 
-        # Dispatch: decode (n_q==1) → Triton kernel when TRITON_AVAILABLE, else
-        # chunked PyTorch.  Prefill (n_q>1) always uses chunked (it delegates to
-        # flash-SDPA inside chunked_dequant_attention).
+        # Dispatch: decode (n_q==1) tries the fused Triton fast paths first — fused
+        # packed (plain RTN) and fused k2b (lowrank K + per-head turboquant V) are
+        # the CUDA fast paths. Everything else — including CUDA decode on non-fused
+        # arms, and all prefill (n_q>1) — runs chunked_dequant_attention (the
+        # fp32-accumulating PyTorch reference path; prefill delegates to flash-SDPA
+        # inside it).
         #
         # FAIL-LOUD RULE: TRITON_AVAILABLE is a CAPABILITY check (Triton+CUDA
-        # present).  When True, the kernel call is UNCONDITIONAL — no try/except
-        # that would silently fall back on a kernel error.  A kernel error must
-        # propagate so correctness regressions are never hidden.
+        # present).  When a fused predicate is True, the kernel call is
+        # UNCONDITIONAL — no try/except that would silently fall back on a kernel
+        # error.  A kernel error must propagate so correctness regressions are
+        # never hidden.  This rule now governs the two fused routes only.
         #
         # The k2b (lowrank_rtn_channel K) + pre_rope=True path now applies RoPE to
         # the lowrank-reconstructed K IN-KERNEL (verified vs the chunked reference on
@@ -641,33 +644,11 @@ class PackedStreamingLayer(DynamicLayer):
             )
 
         # k2b configs that didn't pass fused_k2b_ok (dim mismatch, non-pow2 rank /
-        # n_q_groups, non-CUDA, or non-uniform blocks) route directly to chunked.
+        # n_q_groups, non-CUDA, or non-uniform blocks), and any other config that
+        # missed both fused predicates above (CUDA decode on non-fused arms; the
+        # rare non-uniform-block tail), fall through to chunked.
         # (A retired _k2b_softmax_block_kernel variant lived here;
         # see docs/2026-06-24-decode-path-debloat-removal.md.)
-        if (
-            TRITON_AVAILABLE
-            and is_decode
-            and q.is_cuda
-            and self.k_spec.arm != "lowrank_rtn_channel"
-        ):
-            return triton_decode_attention(
-                q,
-                self._k_blocks,
-                self._v_blocks,
-                k_arm=self.k_spec.arm,
-                v_arm=self.v_spec.arm,
-                group=self.k_spec.group,
-                seed=self.k_spec.seed,
-                k_pre_rope=self.k_spec.pre_rope,
-                rope_cos=self._rope_cos,
-                rope_sin=self._rope_sin,
-                k_tail=k_tail,
-                v_tail=v_tail,
-                n_q_groups=n_q_groups,
-                scale=scaling,
-                v_group=self.v_spec.group,
-                v_seed=self.v_spec.seed,
-            )
         return chunked_dequant_attention(
             q,
             self._k_blocks,

@@ -3,11 +3,17 @@
 Two CPU-local tests:
 1. fallback_used_on_no_cuda: TRITON_AVAILABLE=False (the local reality) →
    attend decode returns EXACTLY chunked_dequant_attention's result.
-2. no_silent_swallow: TRITON_AVAILABLE=True (monkeypatched) + triton_decode_attention
+2. no_silent_swallow: TRITON_AVAILABLE=True (monkeypatched) + fused_decode_attention_packed
    raises a sentinel → attend decode RAISES (does NOT silently fall back to chunked).
    This is the KEY test: it would FAIL if someone wrapped the dispatch in try/except.
 
-Both tests run fully on CPU (AMD dev box, no CUDA/Triton).
+Both tests run fully on CPU (AMD dev box, no CUDA/Triton), except test_no_silent_swallow
+which needs a real CUDA branch entry (q.is_cuda) and is skipped otherwise.
+
+The legacy per-block triton_decode_attention fallback was removed (Wave 2 debloat) —
+the fail-loud contract now governs only the two fused entry points
+(fused_decode_attention_packed / fused_decode_attention_k2b); everything else falls
+through to chunked_dequant_attention.
 """
 
 import pytest
@@ -122,32 +128,34 @@ class _SentinelError(RuntimeError):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="dispatch enters the Triton branch only when q.is_cuda — needs CUDA",
+    reason="dispatch enters the fused Triton branch only when q.is_cuda — needs CUDA",
 )
 def test_no_silent_swallow(monkeypatch):
-    """Monkeypatch TRITON_AVAILABLE=True and triton_decode_attention to raise a
-    sentinel error; assert that calling attend decode RAISES that error.
+    """Monkeypatch TRITON_AVAILABLE=True and fused_decode_attention_packed to raise
+    a sentinel error; assert that calling attend decode RAISES that error.
 
     This test FAILS if attend wraps the dispatch in try/except that falls back
     to chunked on error — exactly the silent-swallow trap Task 4 guards against.
 
     CUDA-gated: the dispatch now also requires q.is_cuda (a CPU model on a CUDA
-    box uses chunked), so the model must be on CUDA for the Triton branch to be
-    taken at all.  Patch targets:
+    box uses chunked), so the model must be on CUDA for the fused branch to be
+    taken at all. The RTN specs below (post-RoPE, uniform blocks) satisfy the
+    fused_packed_ok predicate exactly, so attend must call
+    fused_decode_attention_packed.  Patch targets:
       - bmx.cache.packed_streaming.TRITON_AVAILABLE  (the name attend checks)
-      - bmx.cache.packed_streaming.triton_decode_attention  (the name attend calls)
+      - bmx.cache.packed_streaming.fused_decode_attention_packed  (the name attend calls)
     Both are module-level names in packed_streaming, imported at load time.
     """
 
     def _raise_sentinel(*args, **kwargs):
         raise _SentinelError("fake Triton kernel error — must propagate")
 
-    # Set the capability flag to True so the dispatch enters the Triton branch.
+    # Set the capability flag to True so the dispatch enters the fused branch.
     monkeypatch.setattr(ps_mod, "TRITON_AVAILABLE", True)
-    # Replace the kernel with a stub that raises.
-    monkeypatch.setattr(ps_mod, "triton_decode_attention", _raise_sentinel)
+    # Replace the fused-packed kernel with a stub that raises.
+    monkeypatch.setattr(ps_mod, "fused_decode_attention_packed", _raise_sentinel)
 
-    model = tiny_llama().cuda()  # CUDA so q.is_cuda -> the Triton branch is taken
+    model = tiny_llama().cuda()  # CUDA so q.is_cuda -> the fused branch is taken
     k_spec, v_spec = _rtn_specs()
 
     # Prefill only (puts packed blocks in place + prepares the layer for decoding).
@@ -158,8 +166,9 @@ def test_no_silent_swallow(monkeypatch):
         model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
 
     # Now run ONE decode step — this calls attend with n_q==1 (decode).
-    # With TRITON_AVAILABLE=True + q.is_cuda, attend must call triton_decode_attention,
-    # which raises.  If it silently falls back to chunked, no error is raised -> fail.
+    # With TRITON_AVAILABLE=True + q.is_cuda + rtn_token/rtn_token specs,
+    # fused_packed_ok is True, so attend must call fused_decode_attention_packed,
+    # which raises. If it silently falls back to chunked, no error is raised -> fail.
     decode_ids = ids(vocab=97, seq=1, seed=99).cuda()
     with pytest.raises(_SentinelError, match="fake Triton kernel error"):
         with torch.no_grad():
@@ -174,40 +183,46 @@ def test_no_silent_swallow(monkeypatch):
 
 
 def test_k2b_pre_rope_falls_back_to_chunked(monkeypatch):
-    """A k2b config with full-C turboquant_mse V (lowrank_rtn_channel + pre_rope)
-    must route to chunked_dequant_attention even when TRITON_AVAILABLE=True.
+    """A k2b config with full-C turboquant_mse V AND a non-power-of-2 rank
+    (lowrank_rtn_channel + pre_rope) must route to chunked_dequant_attention even
+    when TRITON_AVAILABLE=True.
 
     Dispatch (attend): fused_packed_ok is False (K arm != rtn_token); fused_k2b_ok
-    is False (V arm is turboquant_mse, not the per-head turboquant_mse_perhead the
-    fused k2b kernel needs); and the per-block triton_decode_attention path is
-    gated off for lowrank_rtn_channel (arm != "lowrank_rtn_channel"). So this config
-    falls through to chunked — the safe fallback for any non-fused k2b config.
+    is False for TWO independent reasons — V arm is turboquant_mse, not the
+    per-head turboquant_mse_perhead the fused k2b kernel needs, AND rank=12 is not
+    a power of 2 (k2b_dims_ok requires it, for the in-kernel tl.arange/tl.dot
+    preconditions). Any non-fused config now falls straight through to chunked —
+    the legacy per-block triton_decode_attention fallback was removed (Wave 2).
 
     This test:
       - Monkeypatches TRITON_AVAILABLE=True (simulates CUDA/Triton present).
-      - Replaces triton_decode_attention with a sentinel that raises if called.
+      - Replaces BOTH fused_decode_attention_packed and fused_decode_attention_k2b
+        with sentinels that raise if called.
       - Runs a full prefill + decode with this k2b config.
-      - Asserts NO error is raised (the per-block kernel was never reached).
+      - Asserts NO error is raised (neither fused kernel was ever reached).
       - Asserts the chunked output matches the StreamingQuantizedCache reference
         (confirming the right path ran and produced correct output).
     """
     from bmx.cache.streaming import StreamingQuantizedCache
 
-    # Canonical k2b config: lowrank_rtn_channel + pre_rope=True + bits=3, rank=16, group=64
-    # This is the config that crashed the VM (the gap that hid this bug).
+    # k2b config with a non-pow2 rank (12) AND non-perhead V — two independent
+    # reasons fused_k2b_ok must be False. bits=3, group=64, pre_rope=True is the
+    # config family that crashed the VM (the gap that hid this bug).
     k_spec = CacheCodecSpec(
-        arm="lowrank_rtn_channel", bits=3, rank=16, group=64, pre_rope=True
+        arm="lowrank_rtn_channel", bits=3, rank=12, group=64, pre_rope=True
     )
     v_spec = CacheCodecSpec(arm="turboquant_mse", bits=2)
 
     def _raise_sentinel(*args, **kwargs):
         raise _SentinelError(
-            "triton_decode_attention called for k2b+pre_rope — guard missing"
+            "fused kernel called for k2b+pre_rope non-pow2-rank — guard missing"
         )
 
-    # Patch TRITON_AVAILABLE=True + replace kernel with sentinel that would crash.
+    # Patch TRITON_AVAILABLE=True + replace BOTH fused kernels with sentinels that
+    # would crash if either fused predicate wrongly matched this config.
     monkeypatch.setattr(ps_mod, "TRITON_AVAILABLE", True)
-    monkeypatch.setattr(ps_mod, "triton_decode_attention", _raise_sentinel)
+    monkeypatch.setattr(ps_mod, "fused_decode_attention_packed", _raise_sentinel)
+    monkeypatch.setattr(ps_mod, "fused_decode_attention_k2b", _raise_sentinel)
 
     model = tiny_llama()
     input_ids = ids(vocab=97, seq=12, seed=5)
