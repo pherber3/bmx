@@ -107,8 +107,6 @@ def predict_decode_latency(
     kv_read = _kv_read_bytes_per_step(case)
     weight = case.weights_bytes
     bandwidth_time = (weight + kv_read) / hbm_bandwidth_bytes_per_s
-    # Dequant time uses a conservative peak-flops divisor; refined per-GPU at measure time.
-    dequant_flops = _dequant_flops_per_step(case)
     dequant_time = 0.0
     return {
         "kv_read_bytes": kv_read,
@@ -117,7 +115,6 @@ def predict_decode_latency(
         "dequant_compute_time_s": dequant_time,
         "predicted_step_latency_s": bandwidth_time + dequant_time,
         "compute_bound_flag": None,
-        "_dequant_flops": dequant_flops,
     }
 
 
@@ -146,7 +143,7 @@ def decode_speedup_curve(
     packed_bytes = p["weight_bytes"] + p["kv_read_bytes"]
     speedup = fp16_bytes / packed_bytes
     # dequant honesty flag: compute time vs bandwidth time at this operating point.
-    dequant_time = p["_dequant_flops"] / peak_flops_per_s
+    dequant_time = _dequant_flops_per_step(packed_case) / peak_flops_per_s
     compute_bound = dequant_time > p["bandwidth_time_s"]
     # crossover: packed KV-read-per-token * S == weights.
     entries_per_tok = packed_case.n_layer * packed_case.h_kv * packed_case.d_head
@@ -161,6 +158,9 @@ def decode_speedup_curve(
 
 
 def predict_peak(case: KVMemCase) -> dict:
+    """Analytic peak-memory model for the census paths; its tests pin the MEASURED
+    anchors (92.2 GiB fp16, 99–100 GiB dense-stream OOM) — see
+    docs/2026-06-23-kernel-census-results.md."""
     assert case.path in ("fp16", "dense_stream", "chunked"), case.path
     one_copy = _one_fp16_copy_bytes(case)
 

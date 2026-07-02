@@ -1,6 +1,11 @@
 import math
 
-from bmx.bench.kv_memory import KVMemCase, decode_speedup_curve, predict_decode_latency
+from bmx.bench.kv_memory import (
+    KVMemCase,
+    _dequant_flops_per_step,
+    decode_speedup_curve,
+    predict_decode_latency,
+)
 
 # Llama-3.1-8B constants (match kv_memory.py docstring anchors)
 GiB = 1024**3
@@ -62,7 +67,7 @@ def test_speedup_is_upper_bound_le_byte_ratio():
 
     # 2. An honest latency speedup that includes non-zero dequant time must be STRICTLY
     #    less than the byte ratio — dequant time only adds to the packed path's cost.
-    dequant_time = k2b_info["_dequant_flops"] / PEAK
+    dequant_time = _dequant_flops_per_step(k2b) / PEAK
     assert dequant_time > 0, "dequant_time must be positive for a packed path"
     honest_speedup = (fp16_bytes / BW) / (packed_bytes / BW + dequant_time)
     assert honest_speedup < byte_ratio, (
