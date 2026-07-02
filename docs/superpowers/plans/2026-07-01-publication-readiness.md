@@ -23,7 +23,7 @@ Tasks are ordered so that everything doable **without** the VM comes first (fram
 Copied verbatim from `CLAUDE.md` — every task implicitly includes these:
 
 - **NEVER `git commit` without the user's explicit approval.** Stage, propose a message, stop. No "Co-Authored-By" or any AI attribution, ever.
-- Before any commit: `uv run ruff format .` → `uv run ruff check .` → `uv run pytest -q` — all clean, then re-stage. Expected baseline: **271 passed, 17 skipped, 1 xfailed** (342 on the GH200 with Triton — pre-cleanup figure, not re-verified locally; expect roughly +8 adjustment pending the GH200 re-run, see `docs/2026-07-01-kv-code-cleanup-results.md`).
+- Before any commit: `uv run ruff format .` → `uv run ruff check .` → `uv run pytest -q` — all clean, then re-stage. Expected baseline: **271 passed, 8 skipped, 1 xfailed** (Wave-2 close-out figure, post per-block-path deletion — see `docs/2026-07-01-kv-code-cleanup-results.md`'s `## Wave 2 (same day)` section; 342 on the GH200 with Triton is the pre-cleanup figure, not re-verified locally — expect a downward adjustment tracking the Wave-2 net test delta pending the GH200 re-run).
 - Dependencies only via `uv add` / `uv add --dev`. Never hand-edit `pyproject.toml`.
 - Use the Bash tool (git bash), not PowerShell. Shell cwd resets between turns — `cd /d/Projects/bmx` first in fresh shells.
 - Comparisons align on **total bits / `param_count()`** (all metadata counted), never on rank.

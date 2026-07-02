@@ -115,3 +115,79 @@ Two additional minor items surfaced during the run's per-task roll-up
   `ppl_eval.py`'s own signatures reference the name). Worth a final judgment
   call on whether the test still earns its keep, or should be deleted /
   repointed at `bmx.cache.specs` directly.
+
+## Wave 2 (same day)
+
+**Directive:** the user decided nothing worth doing gets deferred past the
+paper — every remaining item from the review above that had real merit (not
+the merits-rejected ones) got its own task NOW, before the single
+authoritative GH200 re-verify, so that VM run generates artifacts from the
+final, inspection-ready code. Plan:
+`docs/superpowers/plans/2026-07-01-kv-code-cleanup-wave2.md` (9 tasks, branch
+`chore/kv-cleanup`, same commit policy and parity discipline as Wave 1).
+Wave-2 start baseline: 271 passed, 17 skipped, 1 xfailed.
+
+### Per-task ledger
+
+11 commits, `0a9dd2d` (Wave-2 plan-doc commit) → HEAD. Net across the wave:
+**19 files changed, 426 insertions(+), 1072 deletions(-)**
+(`git diff --shortstat 0a9dd2d..HEAD`).
+
+| Task | Commit(s) | Subject | Verdict / count delta |
+|---|---|---|---|
+| W2-1 (trivial trio) | `46bd730`, `9fbf68c`, `453f0ef` | Drop vestigial `ppl_eval` re-export test/import; recovery-doc reconciliation note; over-long comment/docstring line wraps (2 rounds — a review-caught miss, then a controller sweep) | complete, review clean; 270/17/1 (−1 passed, the deleted re-export test) |
+| W2-2 (bpe terms) | `096dfd7` | Name the honest-bpe metadata terms (`scale_bits`/`norm_bits`/`factor_bits`/`tier_bits`) as an expression-identical audit surface; add a pinning test | complete, review clean, 7-hit grep re-verified all call sites argument-identical; 271/17/1 (+1 passed, the new pin) |
+| W2-3 (turboquant merge, kill-or-confirm) | `b4747a7` | Collapse full-C turboquant into the perhead path as `h=1` | **VERDICT: CONFIRM** — bit-path identity verified by the implementer and independently re-verified by the reviewer with a wider sweep (`C ∈ {128, 96, 48, 1, 2, 3}` at internal and public call levels). The controller's own pre-task prediction (that non-power-of-2 `C` would diverge between the full-C and perhead code paths) was **wrong** — the merge is bit-identical across the swept range. Recorded honestly because the gate is what worked, not the prediction. |
+| W2-4 (per-block deletion) | `74c73cd` | Delete the legacy ~570-line per-block Triton decode path (`_online_softmax_block_kernel`, `_online_block_kernel_launch`, `_partition_blocks`, `triton_decode_attention`); fused kernels + chunked fallback cover all configs; fail-loud tests retargeted at the fused entry points | complete, review clean, reviewer reproduced the gate bit-for-bit; **NEW LOCAL BASELINE 271/8/1** (−9 skipped — those tests were skip-gated on the now-deleted per-block path) |
+| W2-5 (bench retarget) | `e011b39` | `k3_triton_decode`'s `triton_fused` variant now measures `fused_decode_attention_packed` directly (stacks prebuilt, honest timing) — the per-block baseline it used to measure is gone | complete, review clean; honest timing + field-for-field mapping + same-fixture oracle all independently verified |
+| W2-6 (module folds) | `597c88d` | Fold `needle.py` + `haystack.py` into `niah.py` — one module per concern (NIAH) | complete, review clean; byte-identity re-verified independently |
+| W2-7 (dedup helper) | `b5d662d` | Extract shared `_assemble_dense_kv` for the oracle and prefill paths (cast-commutes-with-cat, value-identical) | complete, review clean; oracle untouched in value, trace table verified, no test motion |
+| W2-8 (kv_memory hygiene) | `b0ca88f` | `decode_speedup_curve` computes dequant FLOPs directly (drop the `_dequant_flops` private-dict-key smuggle); `predict_peak` gets a one-line role docstring | complete, review clean, `packed_case` arg verified. **STOP-escalation:** implementing the fix required `tests/test_kv_memory_latency.py` to stop reading `k2b_info["_dequant_flops"]` (a private dict key on the object being retired) — the implementer stopped and escalated rather than quietly threading the private key through; the controller approved repointing the test onto `_dequant_flops_per_step(k2b)` directly (same function, same case, identical value, no behavior change). |
+| W2-9 (this close-out) | `56272c2` | Minor sweep: drop the vestigial `C` param from `_turboquant_mse_dequant` (surfaced by W2-3); `_pick_block_n` docstring wording (surfaced by W2-4); recovery-doc explicit SHA (surfaced by W2-4); `niah.py` docstring self-reference (surfaced by W2-6) | complete; full gate green at 271/8/1 both before and after |
+
+### `predict_peak` keep-decision reversal
+
+Wave 1's deferred list (above) originally leaned toward retiring
+`predict_peak` as cosmetic churn. Wave 2 reversed that lean: `predict_peak`'s
+tests pin the *measured* census anchors backing the paper's systems claim
+(92.2 GiB fp16 resident, 99–100 GiB dense-stream OOM, chunked clears the
+ceiling — `docs/2026-06-23-kernel-census-results.md`). Deleting it would
+delete the only place those anchor numbers are pinned in code. The actual
+wart was never `predict_peak` itself — it was `predict_decode_latency`
+smuggling a private `"_dequant_flops"` key through a returned dict for
+`decode_speedup_curve` to finish computing outside the function that owns
+the math. W2-8 fixed the real wart (`decode_speedup_curve` now computes
+dequant FLOPs directly) and gave `predict_peak` a one-line docstring
+declaring its role as a census anchor, kept deliberately.
+
+### Final gate (Wave 2)
+
+```
+uv run ruff format .   → 128 files left unchanged
+uv run ruff check .    → All checks passed!
+uv run pytest -q       → 271 passed, 8 skipped, 1 xfailed  (≈53s)
+```
+
+`CLAUDE.md`'s Commands section and the publication plan's Global Constraints
+baseline line are both updated from 271/17/1 to **271/8/1**. The GH200
+Triton figure (342, carried from the Wave-1 write-up) is left alone — still
+not locally verifiable, and now needs a downward adjustment tracking the
+same net per-block-path-deletion delta on the next VM run, rather than the
+small `+8` bump anticipated after Wave 1.
+
+### Deferred — now empty except merits-rejected items
+
+Every Wave-1 deferred item with real merit got a Wave-2 task (bpe terms →
+W2-2, turboquant merge → W2-3 kill-or-confirm, per-block path deletion →
+W2-4, `predict_peak` → resolved by keeping it with the real wart fixed
+elsewhere in W2-8, needle/haystack folds → W2-6, `_assemble_dense_kv` →
+W2-7, the trivial trio → W2-1). What remains is **only** the items the
+review process rejected on their merits, not deferred for scheduling
+reasons:
+
+| Item | Why rejected |
+|---|---|
+| Unify `StreamingQuantizedLayer`/`PackedStreamingLayer` into one flush engine + storage backends | The per-backend divergence (RoPE-table dtype: streaming slices fp32, packed casts fp16 at grow) is intentional, not accidental duplication — the "redundancy" IS the verification structure (two independently-checkable implementations of related but distinct contracts). Merging would remove a cross-check, not just lines. |
+| Merge the two fused Triton kernels under an `IS_K2B` constexpr | Reviewed and rejected in Wave 1: disjoint dequant bodies + pointer lists; readability regression, zero codegen benefit. Re-affirmed in Wave 2 — no new information changes the verdict. |
+| Experiment `arm` → `recipe` rename | Cosmetic; `arm` is also a load-bearing parquet column name (`LEDGER_COLUMNS`, forbidden-touch in both waves) — renaming the Python-side variable while the column name stays `arm` buys inconsistency, not clarity. |
+| Historical-doc rewrites | `docs/` is a decision record — Wave 1's Global Constraints explicitly forbid rewriting old plans/results to match new identifiers, and that rule carries into Wave 2 unchanged. |
