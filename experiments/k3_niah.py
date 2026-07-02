@@ -54,10 +54,10 @@ def run(cfg: Config, model=None, root: str = "results"):
         from experiments._common import load_model_and_tokenizer
 
         from bmx.cache.generate import generate_through_cache
-        from bmx.cache.haystack import load_pg_corpus
         from bmx.cache.niah import (
             NEEDLE_TEXT,
             build_niah_prompt,
+            load_pg_corpus,
             rouge1_recall,
             rouge1_recall_only,
         )

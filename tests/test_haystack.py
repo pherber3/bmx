@@ -1,4 +1,4 @@
-from bmx.cache.haystack import PG_ESSAYS_DATASET, load_pg_corpus
+from bmx.cache.niah import PG_ESSAYS_DATASET, load_pg_corpus
 
 
 def test_pg_essays_dataset_id():

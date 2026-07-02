@@ -2,7 +2,7 @@
 
 import torch
 
-from bmx.cache.needle import needle_retrieved_from_ids
+from bmx.cache.niah import needle_retrieved_from_ids
 from bmx.cache.specs import CacheCodecSpec
 from factories import tiny_llama
 

@@ -29,7 +29,7 @@ import tyro
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.live_eval import live_generation_ppl
-from bmx.cache.needle import (
+from bmx.cache.niah import (
     build_needle_ids,
     needle_retrieved,
     needle_retrieved_from_ids,
