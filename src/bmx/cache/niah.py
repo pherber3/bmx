@@ -54,7 +54,7 @@ def niah_recall_argmax(
 ) -> bool:
     """True iff the streaming-cache next-token argmax at query_pos equals answer_id.
 
-    Delegates to needle.needle_retrieved by trimming input_ids to query_pos. This is the
+    Delegates to needle_retrieved by trimming input_ids to query_pos. This is the
     offline mechanism gate (deterministic, indexing-correct), not a recall-quality measure.
     """
     return needle_retrieved(

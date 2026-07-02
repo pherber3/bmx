@@ -524,7 +524,7 @@ def _turboquant_mse_packed(
 
 
 def _turboquant_mse_dequant(
-    indices: torch.Tensor, norms: torch.Tensor, bits: int, seed: int, C: int
+    indices: torch.Tensor, norms: torch.Tensor, bits: int, seed: int
 ) -> torch.Tensor:
     """Reconstruct from packed turboquant_mse representation."""
     return _turboquant_mse_perhead_dequant(indices, norms, bits, seed, 1)
@@ -581,7 +581,7 @@ def quantize_packed(
     if arm == "turboquant_prod":
         assert bits >= 2, f"turboquant_prod requires bits >= 2, got {bits}"
         indices, norms = _turboquant_mse_packed(M, bits - 1, seed)
-        M1 = _turboquant_mse_dequant(indices, norms, bits - 1, seed, C)
+        M1 = _turboquant_mse_dequant(indices, norms, bits - 1, seed)
         R = M - M1
         r_norms = R.norm(dim=1, keepdim=True).clamp_min(1e-12).half().float()
         R_unit = R / r_norms
@@ -635,9 +635,8 @@ def dequant_packed(
         M_rot_hat = rtn_dequantize_packed(packed["Q_int"], packed["scale"], group)
         return _unrotate(M_rot_hat, seed)
     if arm == "turboquant_mse":
-        C = packed["indices"].shape[1]
         return _turboquant_mse_dequant(
-            packed["indices"], packed["norms"], packed["bits"], seed, C
+            packed["indices"], packed["norms"], packed["bits"], seed
         )
     if arm == "turboquant_mse_perhead":
         return _turboquant_mse_perhead_dequant(
@@ -646,7 +645,7 @@ def dequant_packed(
     if arm == "turboquant_prod":
         C = packed["mse_indices"].shape[1]
         M1 = _turboquant_mse_dequant(
-            packed["mse_indices"], packed["mse_norms"], packed["bits"] - 1, seed, C
+            packed["mse_indices"], packed["mse_norms"], packed["bits"] - 1, seed
         )
         G = _qjl_sketch(C, seed).to(packed["qjl_norms"])
         signs = packed["qjl_signs"].to(G.dtype)

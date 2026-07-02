@@ -97,5 +97,5 @@ removal) — reconcile signatures against current `chunked_attention.py` /
 
 2026-07-01 Wave 2: the per-block launch path (_online_softmax_block_kernel,
 _online_block_kernel_launch, _partition_blocks, triton_decode_attention) was also
-removed — the fused kernels + chunked fallback cover all configs. Recover from the
-parent of the Wave-2 removal commit if ever needed.
+removed — the fused kernels + chunked fallback cover all configs. Recover from
+`b4747a7` (the parent of the Wave-2 removal commit `74c73cd`) if ever needed.

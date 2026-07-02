@@ -33,7 +33,7 @@ def _next_pow2(n: int) -> int:
 
 
 def _pick_block_n(blk_size: int, cap: int = 64) -> int:
-    """KV tile size for the per-block decode loop: the largest power of 2 that is
+    """KV tile size for the fused kernels' internal block loop: the largest power of 2 that is
     <= cap AND divides blk_size, so each tile lies within one stored block
     (contiguous load). Blocks are uniform PAGE=128 tokens under the paged layout,
     so in practice this returns 64; kept general for non-uniform test blocks."""
