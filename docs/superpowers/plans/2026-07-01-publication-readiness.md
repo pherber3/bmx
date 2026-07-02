@@ -16,7 +16,7 @@ This is **not** a greenfield TDD build. The science is done and the harnesses ex
 - **[FIGURE/CODE]** — extends existing plot or experiment code. Gets the test-first cadence where a test is meaningful (figure smoke tests, schema tests); otherwise a visual-inspection acceptance criterion.
 - **[VM-RUN]** — an authoritative run on the GH200. Deliverable is a committed parquet + a one-paragraph results note. **Blocked on VM access**; the plan assumes access is available (per user decision) and gives exact commands.
 
-Tasks are ordered so that everything doable **without** the VM comes first (framing, figure format, gap-closing), then the VM runs, then the writeup assembly that consumes VM outputs. A worker without a GPU can complete Tasks 1–7 and 12 today.
+Tasks are ordered so that everything doable **without** the VM comes first (framing, figure format, gap-closing), then the VM runs, then the writeup assembly that consumes VM outputs. A worker without a GPU can complete Tasks 1–6, 8, and the framing part of 12 today (Task 7 was deleted — see the marker after Task 6).
 
 ## Global Constraints
 
@@ -45,6 +45,20 @@ From reading arXiv 2504.19874 §4. TurboQuant reports **no memory table and no l
 | Single A100, no memory/latency table | we ADD a resident-memory census + fused kernel (upside) | 11 (writeup) |
 
 **Framing rule for the whole paper (from the user):** the fused-kernel speedup is measured **only against a naive PyTorch chunked baseline** — it is a *systems-feasibility* result (compression is realizable in a single fused decode launch with in-kernel dequant), **not** a competitive-latency claim vs FlashAttention/vLLM. Never state or imply otherwise. It is a "nice-to-have" contribution, not load-bearing.
+
+## Sequencing prerequisite (added 2026-07-01, post-cleanup)
+
+Before this session, a full-repo design review + two parity-preserving cleanup waves ran on `feat/triton-decode-kernel` (24 tasks, net −584 lines; ledger `docs/2026-07-01-kv-code-cleanup-results.md`). Consequences for this plan's ordering:
+
+1. **The branch is 33 commits ahead of origin and NOT pushed.** Pushing is the one blocking practical step before any VM work.
+2. **The GH200 merge-gate re-verify** (the branch's standing merge gate) now validates **both** cleanup waves at once and is the first real firing of the retargeted fail-loud dispatch test. It **must run before VM Tasks 9/10/11**, so the paper's authoritative artifacts (NIAH/LongBench/systems parquets) are generated from the final post-cleanup code, not stale code.
+3. Practical order: **push → GH200 re-verify → then Tasks 9–11.** The no-GPU framing/figure tasks (1–6, 8) and Task 12's framing are unaffected and can proceed now in parallel with the push/re-verify.
+4. **Two sanctioned behavior deltas** from the cleanup, both covered by that re-verify (mention in the C4 systems writeup as known, deliberate changes): non-fused CUDA decode configs now fall back to chunked (non-headline arms only — the deleted per-block path's stragglers); `pick_num_splits` reads the device SM count (GH200-identical).
+
+**Scope additions (2026-07-01, from Task-1 review):**
+- **G8 — full-generation peak memory** (Task 11b): replaces the prefill+4-step census diagnostic with a real generation peak as the C3 headline.
+- **G9 — multi-architecture extension** (Gemma + Qwen3): scoped in `docs/superpowers/specs/2026-07-01-multi-architecture-extension.md`. This is a **separate leg**, decision-deferred until the Llama authoritative runs (Tasks 9–10) land — it is NOT a task in this plan. Order within it: Qwen3-standard first (cheap, Llama-like), Gemma second (hard — partial RoPE + sliding windows).
+- **Methods note (not a weakness):** not middle-truncating LongBench prompts is a deliberate thesis-driven choice that can only make our task harder — state it affirmatively (Task-1 §5 item 5), do not file it under limitations.
 
 ---
 
@@ -170,7 +184,7 @@ def test_niah_heatmap_has_aggregate_score(tmp_path):
 
 - [ ] **Step 4: Run tests, verify pass.** `uv run pytest tests/<file>::test_niah_heatmap_has_aggregate_score -v` → PASS.
 
-- [ ] **Step 5: Ruff + full suite.** `uv run ruff format . && uv run ruff check . && uv run pytest -q` → clean, 264/17/1.
+- [ ] **Step 5: Ruff + full suite.** `uv run ruff format . && uv run ruff check . && uv run pytest -q` → clean, 271/8/1.
 
 - [ ] **Step 6: Commit.** Stage, propose `feat(plots): NIAH heatmap aggregate Score annotation (TurboQuant Fig-4 parity)`. STOP for approval.
 
@@ -183,7 +197,7 @@ def test_niah_heatmap_has_aggregate_score(tmp_path):
 - Test: `tests/test_k3_niah_experiment.py`, `tests/test_k3_longbench_experiment.py`
 
 **Interfaces:**
-- Consumes: the per-arm `_spec_pair` + `compression_for()` machinery already emitting `compression`.
+- Consumes: the per-arm `src/bmx/cache/recipes.py::spec_pair(arm, *, rank, group, seed)` + `src/bmx/cache/generate.py::compression_for()` machinery already emitting `compression`. (Post-cleanup: the old `experiments.k3_live_generation._spec_pair` and the census's duplicate `_specs` are gone — import from `recipes`. Shared model/tokenizer loader now lives in `experiments/_common.py`, so the `kv_size_bits` change is closer to single-site.)
 - Produces: an added `kv_size_bits` column (the honest blended bits-per-entry, K+V averaged) in both experiments' output rows — the exact axis TurboQuant's Table 1 leads with ("KV Size" = 2.5, 3.5, 16).
 
 **Context:** TurboQuant's Table 1 headline axis is **KV Size in bits** (16 for full cache, 2.5/3.5 for their arms). We currently emit `compression` (×-factor). Reviewers of the mirror paper expect the bits column too. `src/bmx/cache/generate.py::compression_for()` already computes `(bpe_k, bpe_v, compression)` — surface `kv_size_bits = (bpe_k + bpe_v) / 2` (or the blended average consistent with how compression is derived; verify the exact convention in `compression_for`).
@@ -300,7 +314,7 @@ def test_distortion_bounds_figure_emitted(tmp_path):
 
 **BLOCKED ON VM ACCESS.** Exact procedure (from `docs/2026-06-20-niah-plan-state.md`, updated with the matched-compression arms from `docs/2026-06-20-longbench-plan-state.md`):
 
-- [ ] **Step 1:** On the GH200: `cd ~/bmx && git pull` (or git-bundle transport per `vm-interaction-guide`), `scripts/vm_setup.sh`, confirm `uv run pytest -q` → 342 passed.
+- [ ] **Step 1:** On the GH200: `cd ~/bmx && git pull` (or git-bundle transport per `vm-interaction-guide`), `scripts/vm_setup.sh`, confirm `uv run pytest -q` passes (expect ~350±5 with Triton — the pre-cleanup 342 is stale after the two cleanup waves; treat the actual GH200 re-verify count as the new baseline). **PREREQUISITE (see "Sequencing prerequisite" section near the top of this plan): the branch's GH200 merge-gate re-verify must have run first, validating both cleanup waves, so these artifacts come from the final code.**
 - [ ] **Step 2:** Run the matched-compression sweep spanning short→long context (the C2 crossover lives at 32k–128k):
 
 ```bash
@@ -361,18 +375,37 @@ Warn: full 6-category sets × 6 arms = many hours / real $. Smoke with `--n-samp
 - Consumes: `experiments/k3_kernel_census.py`, `experiments/k3_triton_decode.py`.
 - Produces: Tables T2 (resident-memory census) + T3 (fused-kernel latency, feasibility framing).
 
-**BLOCKED ON VM ACCESS.** The census + kernel numbers already exist (June 23–24) but predate any Task-5 column changes and should be re-confirmed on the current branch head before they go in a paper.
+**BLOCKED ON VM ACCESS.** The census + kernel numbers already exist (June 23–24) but predate the two cleanup waves and the Task-5 column changes; re-confirm on the current branch head (`235b117` or later) before they go in a paper. **Post-cleanup note:** the legacy per-block Triton path was DELETED (~570 lines); `k3_triton_decode`'s `triton_fused` variant now measures the **real deployment kernel** (`fused_decode_attention_packed`, stacks prebuilt for honest timing), so Step 3 benches fused-vs-chunked directly. The June per-block "baseline" numbers are valid as **historical record only** — do not report them as the current baseline.
 
-- [ ] **Step 1:** VM ready. `git pull` to the current `feat/triton-decode-kernel` head. `uv run pytest -q` → 342 passed.
+- [ ] **Step 1:** VM ready. `git pull` to the current `feat/triton-decode-kernel` head (`235b117`+). `uv run pytest -q` passes (expect ~350±5 with Triton; 342 is the stale pre-cleanup figure — use the actual re-verify count). Same merge-gate prerequisite as Task 9 Step 1.
 - [ ] **Step 2:** Re-run the census to reconfirm the resident table (fp16 / dense_stream / chunked across 4k→128k) and the OOM-vs-completes A/B:
 
 ```bash
 uv run python -m experiments.k3_kernel_census --model-name meta-llama/Llama-3.1-8B-Instruct
 ```
 
-- [ ] **Step 3:** Re-run the Triton decode latency bench (RTN + k2b, splits=32) to reconfirm the speedup table vs chunked.
+- [ ] **Step 3:** Re-run the Triton decode latency bench (RTN + k2b, splits=32) — `pick_num_splits` now reads the device SM count (GH200-identical), and the bench measures the real fused deployment kernel vs the chunked PyTorch path directly.
 - [ ] **Step 4:** Write `docs/2026-07-01-systems-results-final.md` with **T2 reframed as the KV-cache slice** (16 GiB fp16 → ~3 GiB k2b) alongside the total-resident table (with the explicit note that total is masked by fixed weights+activations), the OOM-vs-completes callout, and **T3 explicitly labeled "speedup vs naive PyTorch chunked baseline — a feasibility result, not a competitive-latency claim."**
 - [ ] **Step 5:** Commit back. STOP for approval.
+
+---
+
+### Task 11b: [VM-RUN] Full-generation peak memory (closes G8 — upgrades the census diagnostic)
+
+**Files:**
+- Modify (if needed): `experiments/k3_kernel_census.py` (add a full-generation-peak mode) OR reuse the generation path in `experiments/k3_niah.py` with a peak-memory hook.
+- Create (from VM): `results/k3_kernel_census/<run-id>/` (generation-peak parquet) + append to `docs/2026-07-01-systems-results-final.md`.
+
+**Interfaces:**
+- Consumes: `PackedStreamingCache` generate path + `torch.cuda.max_memory_allocated` reset/read around a real generation.
+- Produces: the **real** peak-memory number that replaces the prefill+4-step diagnostic as the C3 headline (G8, Task-1 §5 item 2).
+
+**BLOCKED ON VM ACCESS.** Rationale (from user, 2026-07-01): reporting a prefill+4-step diagnostic when the real full-generation peak is one measurement away reads as evasive; the real number is what a reviewer wants.
+
+- [ ] **Step 1:** VM ready (same prerequisite as Task 11 Step 1: post-merge-gate re-verify).
+- [ ] **Step 2:** For fp16 (dense) and k2b (packed), at lengths 32k/64k/128k, prefill then **generate 256–512 tokens**, wrapping the whole thing in `torch.cuda.reset_peak_memory_stats()` → generate → `torch.cuda.max_memory_allocated()`. Record peak per (arm, length).
+- [ ] **Step 3:** Confirm the *relative* structure holds: packed peak ≈ fp16 peak (or better), dense_stream balloons; the packed-vs-dense gap holds or widens vs the diagnostic. Note the *absolute* rise vs the prefill+4-step numbers (expected — larger generation transients) and explain it.
+- [ ] **Step 4:** Append the generation-peak table to `docs/2026-07-01-systems-results-final.md`, framed as the headline C3 number with the diagnostic kept as corroboration; keep the KV-slice reframe (16→~3 GiB) as the primary compression claim. Commit back. STOP for approval.
 
 ---
 
