@@ -544,7 +544,7 @@ class PackedStreamingLayer(DynamicLayer):
         # The fused kernel assumes a UNIFORM stored-block length (it pads the row
         # dim to the next power of 2 internally, so blk need not be pow2). The
         # geometric flush schedule normally emits equal-length blocks; on the rare
-        # mixed-length tail we fall back to the per-block triton path below.
+        # mixed-length tail we fall back to chunked_dequant_attention below.
         blocks = self._k_blocks
         uniform_blk = bool(blocks) and len({e - s for _, s, e in blocks}) == 1
 

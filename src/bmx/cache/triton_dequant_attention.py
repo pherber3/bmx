@@ -175,7 +175,7 @@ def _merge_partials(
 # (_fused_decode_packed_kernel, _fused_decode_k2b_kernel)
 #
 # One launch loops over ALL KV blocks INTERNALLY, carrying (m, lse, acc) in fp32
-# registers with one output write (vs the per-block launch path, which pays
+# registers with one output write (vs the retired per-block launch path, which pays
 # n_blocks * h_kv launches per decode step and threads the carry through PyTorch).
 # Design:
 #   - GQA GROUP FUSION: each program handles ONE kv_head and ALL n_q_groups query

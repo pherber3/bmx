@@ -1,14 +1,22 @@
 """Task 4 dispatch tests: PackedStreamingLayer.attend decode routing.
 
-Two CPU-local tests:
+Key tests:
 1. fallback_used_on_no_cuda: TRITON_AVAILABLE=False (the local reality) →
    attend decode returns EXACTLY chunked_dequant_attention's result.
 2. no_silent_swallow: TRITON_AVAILABLE=True (monkeypatched) + fused_decode_attention_packed
    raises a sentinel → attend decode RAISES (does NOT silently fall back to chunked).
    This is the KEY test: it would FAIL if someone wrapped the dispatch in try/except.
+   It needs post-RoPE rtn_token specs on BOTH K and V AND >=1 committed uniform-length
+   page (fused_packed_ok's full predicate) — a too-short prefill silently commits zero
+   blocks and defeats the test without CUDA to reveal it, hence the reachability probe
+   inside the test plus its CPU-runnable companion
+   (no_silent_swallow_fixture_reaches_fused_predicate).
+3. k2b_pre_rope_falls_back_to_chunked: a k2b config must route to chunked even when
+   TRITON_AVAILABLE=True (neither fused predicate matches).
 
-Both tests run fully on CPU (AMD dev box, no CUDA/Triton), except test_no_silent_swallow
-which needs a real CUDA branch entry (q.is_cuda) and is skipped otherwise.
+Most tests run fully on CPU (AMD dev box, no CUDA/Triton); test_no_silent_swallow
+needs a real CUDA branch entry (q.is_cuda) and is skipped otherwise, but its fixture
+is reachability-checked locally by its CPU companion test.
 
 The legacy per-block triton_decode_attention fallback was removed (Wave 2 debloat) —
 the fail-loud contract now governs only the two fused entry points
@@ -139,9 +147,14 @@ def test_no_silent_swallow(monkeypatch):
 
     CUDA-gated: the dispatch now also requires q.is_cuda (a CPU model on a CUDA
     box uses chunked), so the model must be on CUDA for the fused branch to be
-    taken at all. The RTN specs below (post-RoPE, uniform blocks) satisfy the
-    fused_packed_ok predicate exactly, so attend must call
-    fused_decode_attention_packed.  Patch targets:
+    taken at all. The RTN specs below are post-RoPE rtn_token on both K and V —
+    the arm/pre_rope half of fused_packed_ok — but that predicate ALSO requires
+    uniform_blk (>=1 committed page, all the same length): PAGE=128 with the
+    default recent_window=32 means compute_flush_schedule(S, 32, 128) needs
+    S >= 160 to commit anything at all (12 tokens commits zero blocks, which
+    silently makes fused_packed_ok False and defeats this test — see the
+    reachability probe below and the companion CPU test). With seq=160, attend
+    must call fused_decode_attention_packed.  Patch targets:
       - bmx.cache.packed_streaming.TRITON_AVAILABLE  (the name attend checks)
       - bmx.cache.packed_streaming.fused_decode_attention_packed  (the name attend calls)
     Both are module-level names in packed_streaming, imported at load time.
@@ -159,20 +172,75 @@ def test_no_silent_swallow(monkeypatch):
     k_spec, v_spec = _rtn_specs()
 
     # Prefill only (puts packed blocks in place + prepares the layer for decoding).
-    input_ids = ids(vocab=97, seq=12, seed=3).cuda()
+    # seq=160 > PAGE(128) + recent_window(32) so exactly one 128-token page commits
+    # (see docstring above) -- required for uniform_blk / fused_packed_ok to be True.
+    input_ids = ids(vocab=97, seq=160, seed=3).cuda()
     cache = PackedStreamingCache(model.config, k_spec=k_spec, v_spec=v_spec)
     cache.attach(model)
     with torch.no_grad():
         model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
 
+    # Reachability probe: confirm the fixture actually commits >=1 uniform-length
+    # page BEFORE trusting the sentinel assertion below. Without this, a fixture
+    # that commits zero blocks would make fused_packed_ok False, the sentinel
+    # would never fire, and pytest.raises would fail for the WRONG reason (or,
+    # if uniform_blk's `bool(blocks) and ...` happened to look satisfied some
+    # other way, silently pass without ever exercising the fused branch). This
+    # mirrors attend's own `uniform_blk` computation exactly.
+    layer = cache.layers[0]
+    assert len(layer._k_blocks) >= 1, (
+        "fixture committed zero packed blocks -- fused_packed_ok cannot be True; "
+        "raise the prefill length past PAGE(128) + recent_window(32)"
+    )
+    uniform_blk = len({e - s for _, s, e in layer._k_blocks}) == 1
+    assert uniform_blk, (
+        "committed blocks are not uniform length -- fused_packed_ok cannot be True"
+    )
+
     # Now run ONE decode step — this calls attend with n_q==1 (decode).
-    # With TRITON_AVAILABLE=True + q.is_cuda + rtn_token/rtn_token specs,
+    # With TRITON_AVAILABLE=True + q.is_cuda + rtn_token/rtn_token specs + the
+    # reachability probe above confirming >=1 uniform committed page,
     # fused_packed_ok is True, so attend must call fused_decode_attention_packed,
     # which raises. If it silently falls back to chunked, no error is raised -> fail.
     decode_ids = ids(vocab=97, seq=1, seed=99).cuda()
     with pytest.raises(_SentinelError, match="fake Triton kernel error"):
         with torch.no_grad():
             model(decode_ids, past_key_values=cache, use_cache=True)
+
+    cache.detach()
+
+
+def test_no_silent_swallow_fixture_reaches_fused_predicate():
+    """CPU-runnable companion to test_no_silent_swallow.
+
+    test_no_silent_swallow is CUDA-skipped on this dev box, so a broken fixture
+    (e.g. one that commits zero packed blocks) would silently never be caught
+    locally -- it would only explode on the GH200 CUDA re-verify when the
+    sentinel-raise assertion fails for the wrong reason. This test builds the
+    EXACT SAME prefill fixture (same seq len, specs, seeds) on CPU and asserts
+    the block-commit / uniform-length condition directly, giving local evidence
+    that the fixture reaches the fused_packed_ok predicate's uniform_blk half
+    (the CUDA/TRITON_AVAILABLE/arm/pre_rope half needs no runtime check -- it's
+    static from the specs and the .cuda() call).
+    """
+    model = tiny_llama()
+    k_spec, v_spec = _rtn_specs()
+
+    input_ids = ids(vocab=97, seq=160, seed=3)
+    cache = PackedStreamingCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache.attach(model)
+    with torch.no_grad():
+        model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
+
+    layer = cache.layers[0]
+    assert len(layer._k_blocks) >= 1, (
+        "fixture committed zero packed blocks -- fused_packed_ok cannot be True; "
+        "raise the prefill length past PAGE(128) + recent_window(32)"
+    )
+    uniform_blk = len({e - s for _, s, e in layer._k_blocks}) == 1
+    assert uniform_blk, (
+        "committed blocks are not uniform length -- fused_packed_ok cannot be True"
+    )
 
     cache.detach()
 

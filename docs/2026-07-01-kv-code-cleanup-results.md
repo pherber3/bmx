@@ -129,9 +129,10 @@ Wave-2 start baseline: 271 passed, 17 skipped, 1 xfailed.
 
 ### Per-task ledger
 
-11 commits, `0a9dd2d` (Wave-2 plan-doc commit) → HEAD. Net across the wave:
-**19 files changed, 426 insertions(+), 1072 deletions(-)**
-(`git diff --shortstat 0a9dd2d..HEAD`).
+Through `56272c2` (all code + sweep commits, pre-this-close-out doc): 11
+commits, 19 files changed, 426 insertions(+), 1072 deletions(−)
+(`git diff --shortstat 0a9dd2d..56272c2`); the close-out and review-fix
+commits land after that snapshot.
 
 | Task | Commit(s) | Subject | Verdict / count delta |
 |---|---|---|---|
