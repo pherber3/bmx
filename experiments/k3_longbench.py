@@ -134,6 +134,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                     "n_samples": n_used,
                     "bpe_k": bpe_k,
                     "bpe_v": bpe_v,
+                    "kv_size_bits": (bpe_k + bpe_v) / 2,
                     "compression": compression,
                     "n_prefill": cfg.n_prefill,
                     "score_kind": score_kind,

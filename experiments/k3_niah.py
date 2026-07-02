@@ -124,6 +124,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                         "recall_kind": recall_kind,
                         "bpe_k": bpe_k,
                         "bpe_v": bpe_v,
+                        "kv_size_bits": (bpe_k + bpe_v) / 2,
                         "compression": compression,
                         "n_prefill": cfg.n_prefill,
                         "use_packed": cfg.use_packed,

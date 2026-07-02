@@ -42,6 +42,25 @@ def test_k3_longbench_run_emits_parquet(tmp_path):
     assert set(df["score_kind"]) == {"code_sim_offline"}
 
 
+def test_longbench_rows_have_kv_size_bits(tmp_path):
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        tasks=("lcc", "repobench-p"),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+    run_dir = run(cfg, model=model, root=str(tmp_path))
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert "kv_size_bits" in df.columns
+    assert (df["kv_size_bits"] > 0).all()
+    assert (df["kv_size_bits"] <= 16.0 + 1e-6).all()
+    # fp16 K and V are each 16 bpe → average 16.0.
+    fp16 = df[df["arm"] == "fp16"]
+    assert (fp16["kv_size_bits"] == 16.0).all()
+
+
 def test_plot_k3_longbench_makes_pngs(tmp_path):
     import pandas as pd
     from experiments.plots.plot_k3_longbench import make_figures
