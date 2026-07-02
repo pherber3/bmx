@@ -104,3 +104,53 @@ def test_plot_k3_niah_makes_pngs(tmp_path):
     paths = make_figures(df, str(tmp_path))
     assert len(paths) >= 1
     assert all(p.exists() for p in paths)
+
+
+def test_niah_heatmap_has_aggregate_score(tmp_path):
+    import json
+    import math
+
+    import pandas as pd
+
+    from experiments.plots.plot_k3_niah import make_figures
+
+    # k2b cells average 7.5 → score 0.750; fp16 cells average 9.0 → score 0.900.
+    # depth.nunique() > 1 so the heatmap (and its scores) render.
+    df = pd.DataFrame(
+        [
+            {
+                "arm": "k2b",
+                "length": 4096,
+                "depth": 0.25,
+                "recall_full": 7.0,
+                "compression": 4.1,
+            },
+            {
+                "arm": "k2b",
+                "length": 4096,
+                "depth": 0.75,
+                "recall_full": 8.0,
+                "compression": 4.1,
+            },
+            {
+                "arm": "fp16",
+                "length": 4096,
+                "depth": 0.25,
+                "recall_full": 9.0,
+                "compression": 1.0,
+            },
+            {
+                "arm": "fp16",
+                "length": 4096,
+                "depth": 0.75,
+                "recall_full": 9.0,
+                "compression": 1.0,
+            },
+        ]
+    )
+    paths = make_figures(df, str(tmp_path))
+    score_paths = [p for p in paths if p.name == "niah_heatmap_scores.json"]
+    assert len(score_paths) == 1, "niah_heatmap_scores.json not emitted"
+    scores = json.loads(score_paths[0].read_text())
+    assert not math.isnan(scores["k2b"]) and abs(scores["k2b"] - 0.75) < 1e-6
+    assert not math.isnan(scores["fp16"]) and abs(scores["fp16"] - 0.90) < 1e-6
