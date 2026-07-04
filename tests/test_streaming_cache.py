@@ -431,6 +431,80 @@ def test_frozen_subspace_not_refit():
         cache.detach()
 
 
+def test_greedy_decode_no_flush_branch_matches_itself():
+    """Pins the no-flush branch's numerics as a change guard (Task 2 / Wave 3).
+
+    Prefill 100 tokens (all fp16, no flush yet — recent_window=32 default keeps
+    S<=32 unflushed and 100<160 so nothing has committed after prefill), then
+    greedy-decode 64 tokens one at a time. With PAGE=128 and W=32,
+    compute_flush_schedule fires exactly once, at S=160 (decode step 60 of the
+    64): the run exercises BOTH branches (no-flush for most steps, the flush
+    branch exactly once). We probe `_committed_S_q` before/after to confirm the
+    flush actually happened (the Wave-2 lesson: a fixture that never reaches the
+    predicate it claims to test). This test runs a plain forward loop TWICE with
+    fresh caches built from the same seed and asserts the logits are bit-
+    identical to each other — establishing a reproducible baseline the
+    no-flush-branch deletion (this task) must reproduce exactly via torch.equal
+    on the reconstructed K/V, not just the loop's own determinism.
+    """
+    model = tiny_llama()
+    k_spec, v_spec = _k2b_spec()
+    prefill_len = 100
+    n_decode = 64
+    g = torch.Generator().manual_seed(13)
+    input_ids = torch.randint(0, 97, (1, prefill_len + n_decode), generator=g)
+
+    def run():
+        cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+        cache.attach(model)
+        committed_trace = []
+        logits = []
+        try:
+            with torch.no_grad():
+                out = model(
+                    input_ids[:, :prefill_len], past_key_values=cache, use_cache=True
+                )
+                committed_trace.append(cache.layers[0]._committed_S_q)
+                logits.append(out.logits.clone())
+                for t in range(prefill_len, prefill_len + n_decode):
+                    out = model(
+                        input_ids[:, t : t + 1],
+                        past_key_values=cache,
+                        use_cache=True,
+                    )
+                    committed_trace.append(cache.layers[0]._committed_S_q)
+                    logits.append(out.logits.clone())
+        finally:
+            cache.detach()
+        k_post, v = cache.reconstruct_layer(0)
+        return logits, k_post, v, committed_trace
+
+    logits_a, k_a, v_a, trace_a = run()
+
+    # Confirm the flush boundary actually fires during this run (not vacuous):
+    # _committed_S_q must transition 0 -> 128 exactly once, i.e. both values are
+    # observed and 128 first appears strictly after prefill.
+    assert trace_a[0] == 0, f"expected no flush after prefill, got {trace_a[0]}"
+    assert 128 in trace_a, (
+        f"flush never fired (no 128 in trace) — boundary not exercised: {trace_a}"
+    )
+    flush_idx = trace_a.index(128)
+    assert all(c == 0 for c in trace_a[:flush_idx]), (
+        f"flush fired earlier than expected: {trace_a}"
+    )
+    assert all(c == 128 for c in trace_a[flush_idx:]), (
+        f"committed count changed again after first flush: {trace_a}"
+    )
+
+    logits_b, k_b, v_b, trace_b = run()
+
+    assert trace_b == trace_a
+    for la, lb in zip(logits_a, logits_b, strict=True):
+        assert torch.equal(la, lb)
+    assert torch.equal(k_a, k_b)
+    assert torch.equal(v_a, v_b)
+
+
 # --- Multimodal-nesting resolvers (Qwen3.5 / Gemma4 ForConditionalGeneration) ---
 
 

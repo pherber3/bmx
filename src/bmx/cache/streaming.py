@@ -222,19 +222,15 @@ class StreamingQuantizedLayer(DynamicLayer):
         new_S_q = compute_flush_schedule(S, W, self._page)
 
         if new_S_q <= self._committed_S_q:
-            # No new block to flush — prefix is unchanged. Just reassemble.
-            k_tail = keys.squeeze(0)[
-                ..., self._committed_S_q :, :
-            ]  # (h_kv, tail_len, d)
-            v_tail = values.squeeze(0)[..., self._committed_S_q :, :]
-            if self._q_prefix_k is not None:
-                k_hat = torch.cat([self._q_prefix_k, k_tail.to(cache_dtype)], dim=-2)
-                v_hat = torch.cat([self._q_prefix_v, v_tail.to(cache_dtype)], dim=-2)
-                self.keys = k_hat.unsqueeze(0)
-                self.values = v_hat.unsqueeze(0)
-            else:
-                self.keys = keys
-                self.values = values
+            # No new block to flush — prefix is unchanged. `keys`/`values` (from
+            # super().update() above) already equal [prefix | tail | new_token]:
+            # the previous step stored exactly [prefix | tail] as self.keys, and
+            # DynamicLayer's update() concatenated the new token onto that same
+            # storage. Slicing the tail back out and re-catting it onto the
+            # prefix would just reconstruct this identical tensor, so we assign
+            # it directly (bit-identical by construction; cache_dtype is
+            # unchanged here so no dtype cast is even needed).
+            self.keys, self.values = keys, values
             # Recompute blended bpe from accumulated counts.
             tail_len = S - self._committed_S_q
             total_entries = S * self._h_kv * self._d_head
