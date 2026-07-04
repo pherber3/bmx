@@ -28,8 +28,11 @@ def test_k3_longbench_run_emits_parquet(tmp_path):
         "compression",
         "n_prefill",
         "score_kind",
+        "max_prompt_tokens",
+        "longbench_version",
     ):
         assert col in df.columns, f"missing column: {col}"
+    assert set(df["longbench_version"]) == {"v1"}
     # 2 arms × 2 tasks = 4 rows.
     assert len(df) == 4
     assert set(df["arm"]) <= {

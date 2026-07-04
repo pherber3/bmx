@@ -131,22 +131,40 @@ def load_longbench_task(
 ) -> list[dict]:
     """Load LongBench[task]; return up to n_samples items (all if None). VM-only.
 
-    version 'v1' -> THUDM/LongBench. THUDM/LongBench ships as a loader script + data.zip;
-    datasets>=4 no longer runs dataset scripts, so read the task's jsonl out of data.zip
-    directly via huggingface_hub.
+    version 'v1' -> THUDM/LongBench full split (data/{task}.jsonl); the parity-run default.
+    version 'v1_e' -> LongBench-E, the length-uniform subset TurboQuant Table-1 actually
+    evaluates on ("we employ LongBench-E, a subset designed with a more uniform length
+    distribution" — TurboQuant §4; Table-1's caption says LongBench-V1, but the text names E).
+    Same data.zip ships both data/{task}.jsonl and data/{task}_e.jsonl; not every v1 task has
+    an _e file (narrativeqa, musique, qmsum are famously absent) — requesting v1_e for a task
+    with no _e file raises ValueError naming the task, never silently falls back to v1.
+
+    THUDM/LongBench ships as a loader script + data.zip; datasets>=4 no longer runs dataset
+    scripts, so read the task's jsonl out of data.zip directly via huggingface_hub.
     """
     import json
     import zipfile
 
     from huggingface_hub import hf_hub_download
 
-    if version != "v1":
-        raise ValueError(f"unsupported longbench version: {version!r} (only 'v1')")
+    if version == "v1":
+        member = f"data/{task}.jsonl"
+    elif version == "v1_e":
+        member = f"data/{task}_e.jsonl"
+    else:
+        raise ValueError(
+            f"unsupported longbench version: {version!r} (only 'v1', 'v1_e')"
+        )
 
     zip_path = hf_hub_download("THUDM/LongBench", "data.zip", repo_type="dataset")
     items: list[dict] = []
     with zipfile.ZipFile(zip_path) as zf:
-        with zf.open(f"data/{task}.jsonl") as fh:
+        if member not in zf.namelist():
+            raise ValueError(
+                f"longbench task {task!r} has no LongBench-E ('_e') variant "
+                f"(missing {member!r} in data.zip) — no silent fallback to v1"
+            )
+        with zf.open(member) as fh:
             for line in fh:
                 items.append(json.loads(line))
                 if n_samples is not None and len(items) >= n_samples:

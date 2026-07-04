@@ -37,9 +37,11 @@ class Config:
     tasks: tuple[str, ...] = ("lcc", "repobench-p")
     # TurboQuant Table-1 category names; expand to English datasets via CATEGORY2DATASETS.
     categories: tuple[str, ...] = ()
-    longbench_version: str = (
-        "v1"  # loader version; only 'v1' (THUDM/LongBench) supported
-    )
+    # Loader version: 'v1' (THUDM/LongBench full split, parity-run default) or 'v1_e'
+    # (LongBench-E, the length-uniform subset TurboQuant Table-1 actually evaluates on —
+    # see load_longbench_task's docstring). Not every v1 task has an _e file; requesting
+    # 'v1_e' for one raises loudly rather than silently falling back to v1.
+    longbench_version: str = "v1"
     n_samples: int | None = (
         None  # None = full sets (Table-1 comparable); int caps (logged)
     )
@@ -177,6 +179,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                     "max_prompt_tokens": cfg.max_prompt_tokens
                     if cfg.max_prompt_tokens is not None
                     else -1,
+                    "longbench_version": cfg.longbench_version,
                 }
             )
 

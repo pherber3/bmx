@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from bmx.cache.longbench import LONGBENCH_TASKS, build_longbench_prompt, code_sim
@@ -173,3 +174,48 @@ def test_middle_truncation_none_is_noop():
     explicit_none_ids = build_longbench_prompt(tok, item, "lcc", max_prompt_tokens=None)
 
     assert torch.equal(default_ids, explicit_none_ids)
+
+
+# --- Task 1 Part B: LongBench-E subset loading ---
+
+
+def _make_fake_longbench_zip(tmp_path, tasks_with_e):
+    """Build a tiny local data.zip with data/{task}.jsonl and data/{task}_e.jsonl
+    for tasks in tasks_with_e, plus a plain data/{task}.jsonl for 'lcc' (no _e variant)."""
+    import json
+    import zipfile
+
+    zip_path = tmp_path / "data.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("data/lcc.jsonl", json.dumps({"id": "v1-only"}) + "\n")
+        for task in tasks_with_e:
+            zf.writestr(f"data/{task}.jsonl", json.dumps({"id": f"{task}-v1"}) + "\n")
+            zf.writestr(f"data/{task}_e.jsonl", json.dumps({"id": f"{task}-e"}) + "\n")
+    return str(zip_path)
+
+
+def test_load_longbench_task_v1_e_reads_e_file(tmp_path, monkeypatch):
+    import bmx.cache.longbench as lb
+
+    zip_path = _make_fake_longbench_zip(tmp_path, tasks_with_e=["hotpotqa"])
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda *a, **k: zip_path)
+
+    items = lb.load_longbench_task("hotpotqa", None, version="v1_e")
+    assert items == [{"id": "hotpotqa-e"}]
+
+
+def test_load_longbench_task_v1_e_missing_task_fails_loudly(tmp_path, monkeypatch):
+    import bmx.cache.longbench as lb
+
+    zip_path = _make_fake_longbench_zip(tmp_path, tasks_with_e=["hotpotqa"])
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda *a, **k: zip_path)
+
+    with pytest.raises(ValueError, match="lcc"):
+        lb.load_longbench_task("lcc", None, version="v1_e")
+
+
+def test_load_longbench_task_rejects_unknown_version():
+    import bmx.cache.longbench as lb
+
+    with pytest.raises(ValueError, match="bogus"):
+        lb.load_longbench_task("lcc", None, version="bogus")
