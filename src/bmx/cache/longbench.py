@@ -97,17 +97,33 @@ LONGBENCH_TASKS: dict[str, dict] = {
 }
 
 
-def build_longbench_prompt(tokenizer, item: dict, task: str) -> torch.Tensor:
+def build_longbench_prompt(
+    tokenizer, item: dict, task: str, max_prompt_tokens: int | None = None
+) -> torch.Tensor:
     """Apply the task's LongBench prompt template to the item; return (1, L) ids.
 
     LongBench formats dataset2prompt[task].format(**item); for code tasks the context lives in
     item['context']. NO chat/[INST] wrapper: LongBench explicitly skips build_chat for the code
     tasks (lcc, repobench-p are in its exclusion list) — raw template only, even for Instruct
     models.
+
+    max_prompt_tokens mirrors LongBench's pred.py truncation: if the tokenized prompt exceeds
+    the budget, keep the first max_prompt_tokens//2 and last max_prompt_tokens//2 token ids
+    (middle-truncation) and drop the rest — LongBench decodes back to text and re-tokenizes
+    before its chat-wrap step, but this harness has no chat-wrap for any task (see above), so
+    truncating the ids directly is equivalent and avoids a lossy decode/re-encode round trip.
+    None (the default) is a no-op — byte-identical to the pre-truncation behavior, which is the
+    no-truncation variant. TurboQuant (arXiv 2504.19874) §4 states no prompt-truncation budget;
+    31500 is the LongBench-convention fallback (LongBench pred.py middle-truncation) used as the
+    parity-run default in k3_longbench's Config, not baked in here.
     """
     template = LONGBENCH_TASKS[task]["prompt_template"]
     prompt = template.format(**item)
-    return tokenizer(prompt, return_tensors="pt").input_ids
+    ids = tokenizer(prompt, return_tensors="pt").input_ids
+    if max_prompt_tokens is not None and ids.shape[1] > max_prompt_tokens:
+        half = max_prompt_tokens // 2
+        ids = torch.cat([ids[:, :half], ids[:, -half:]], dim=1)
+    return ids
 
 
 def load_longbench_task(
@@ -146,6 +162,7 @@ def longbench_score(
     n_prefill: int,
     k_spec: CacheCodecSpec,
     v_spec: CacheCodecSpec,
+    max_prompt_tokens: int | None = None,
 ) -> float:
     """Generate through the compressed cache, score with the task's LongBench metric.
 
@@ -154,7 +171,7 @@ def longbench_score(
     and classification passes all_classes=item['all_classes']. Works for every registered
     English task (code tasks route to code_sim via DATASET2METRIC).
     """
-    prompt_ids = build_longbench_prompt(tokenizer, item, task)
+    prompt_ids = build_longbench_prompt(tokenizer, item, task, max_prompt_tokens)
     max_gen = LONGBENCH_TASKS[task]["max_gen"]
     response = generate_through_cache(
         model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_gen, strip=False
@@ -177,12 +194,13 @@ def longbench_code_score(
     n_prefill: int,
     k_spec: CacheCodecSpec,
     v_spec: CacheCodecSpec,
+    max_prompt_tokens: int | None = None,
 ) -> float:
     """Build the LongBench prompt, generate through the compressed cache, score code_sim.
 
     Ground truth is item['answers'][0] (LongBench code tasks have a single reference line).
     """
-    prompt_ids = build_longbench_prompt(tokenizer, item, task)
+    prompt_ids = build_longbench_prompt(tokenizer, item, task, max_prompt_tokens)
     max_gen = LONGBENCH_TASKS[task]["max_gen"]
     response = generate_through_cache(
         model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_gen, strip=False

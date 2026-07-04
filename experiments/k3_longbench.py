@@ -43,6 +43,11 @@ class Config:
     n_samples: int | None = (
         None  # None = full sets (Table-1 comparable); int caps (logged)
     )
+    # Middle-truncation budget (LongBench pred.py: keep first/last max_prompt_tokens//2 ids).
+    # TurboQuant (arXiv 2504.19874) §4 states no prompt-truncation budget; 31500 is the
+    # LongBench-convention fallback (LongBench pred.py middle-truncation). None = no-truncation
+    # variant (byte-identical to pre-truncation behavior).
+    max_prompt_tokens: int | None = 31500
     n_prefill: int = 128
     rank: int = 16
     group: int = 64
@@ -102,7 +107,7 @@ def run(cfg: Config, model=None, root: str = "results"):
         if tokenizer is None:
             return 32
         lens = sorted(
-            build_longbench_prompt(tokenizer, it, task).shape[1]
+            build_longbench_prompt(tokenizer, it, task, cfg.max_prompt_tokens).shape[1]
             for it in task_items[task]
         )
         return lens[len(lens) // 2]  # median; equal across arms, so rankings unaffected
@@ -142,7 +147,14 @@ def run(cfg: Config, model=None, root: str = "results"):
                 items = task_items[task]
                 scores = [
                     longbench_score(
-                        model, tokenizer, it, task, cfg.n_prefill, k_spec, v_spec
+                        model,
+                        tokenizer,
+                        it,
+                        task,
+                        cfg.n_prefill,
+                        k_spec,
+                        v_spec,
+                        cfg.max_prompt_tokens,
                     )
                     for it in items
                 ]
@@ -162,6 +174,9 @@ def run(cfg: Config, model=None, root: str = "results"):
                     "compression": compression,
                     "n_prefill": cfg.n_prefill,
                     "score_kind": score_kind,
+                    "max_prompt_tokens": cfg.max_prompt_tokens
+                    if cfg.max_prompt_tokens is not None
+                    else -1,
                 }
             )
 

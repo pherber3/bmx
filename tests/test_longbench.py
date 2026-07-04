@@ -1,3 +1,5 @@
+import torch
+
 from bmx.cache.longbench import LONGBENCH_TASKS, build_longbench_prompt, code_sim
 
 
@@ -111,3 +113,63 @@ def test_code_sim_stripped_indented_scores_less_than_one():
     gt = "        return result"
     stripped_pred = gt.strip()  # simulates what .strip() in generate_through_cache did
     assert code_sim(stripped_pred, gt) < 1.0
+
+
+# --- Task 1: middle-truncation (LongBench pred.py parity) ---
+
+
+class _CountingTok:
+    """Deterministic word-level stub tokenizer: one token id per whitespace-split word.
+
+    `decode` is unused by build_longbench_prompt (no chat-wrap step exists in this repo's
+    harness — see build_longbench_prompt's docstring), so it is intentionally omitted; a
+    call to it would signal an unwanted decode/re-encode round trip.
+    """
+
+    def __call__(self, text, return_tensors=None):
+        import torch
+
+        words = text.split()
+        ids = torch.tensor([[i % 97 for i in range(len(words))]])
+        return type("E", (), {"input_ids": ids})()
+
+
+def test_middle_truncation_keeps_head_and_tail():
+    # 100 "words" -> 100 token ids under the counting stub; truncate to 20.
+    context = " ".join(f"w{i}" for i in range(100))
+    item = {"context": context, "input": "", "answers": [""]}
+    tok = _CountingTok()
+
+    full_ids = build_longbench_prompt(tok, item, "lcc").squeeze(0)
+    n = 20
+    truncated = build_longbench_prompt(tok, item, "lcc", max_prompt_tokens=n).squeeze(0)
+
+    assert truncated.shape[0] == n
+    half = n // 2
+    assert torch.equal(truncated[:half], full_ids[:half])
+    assert torch.equal(truncated[half:], full_ids[-half:])
+
+
+def test_middle_truncation_short_prompt_unchanged():
+    # Prompt tokenizes shorter than the budget -> byte-identical (no-op).
+    context = "short context"
+    item = {"context": context, "input": "", "answers": [""]}
+    tok = _CountingTok()
+
+    full_ids = build_longbench_prompt(tok, item, "lcc")
+    truncated = build_longbench_prompt(tok, item, "lcc", max_prompt_tokens=10_000)
+
+    assert torch.equal(truncated, full_ids)
+
+
+def test_middle_truncation_none_is_noop():
+    # max_prompt_tokens=None (the default) must be byte-identical to omitting the arg —
+    # the live VM run's no-truncation variant depends on this exact parity.
+    context = " ".join(f"w{i}" for i in range(100))
+    item = {"context": context, "input": "", "answers": [""]}
+    tok = _CountingTok()
+
+    default_ids = build_longbench_prompt(tok, item, "lcc")
+    explicit_none_ids = build_longbench_prompt(tok, item, "lcc", max_prompt_tokens=None)
+
+    assert torch.equal(default_ids, explicit_none_ids)
