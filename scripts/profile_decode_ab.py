@@ -141,6 +141,56 @@ def main(cfg: Config) -> None:
     )
     print(f"[parity] streaming == packed over {cfg.n_parity} greedy tokens: OK")
 
+    # --- Path probe: PROVE which decode kernel fires for this arm ------------------
+    # The 2026-07-03 "packed 12x slower" A/B ran turboquant_mse, which routes to
+    # NEITHER fused kernel (chunked fallback) — desk-review finding F0. Counting the
+    # actual calls makes that mistake impossible to repeat silently.
+    import bmx.cache.packed_streaming as _ps
+
+    counts = {"fused_packed": 0, "fused_k2b": 0, "chunked": 0}
+
+    def _wrap(name, fn):
+        def inner(*a, **k):
+            counts[name] += 1
+            return fn(*a, **k)
+
+        return inner
+
+    originals = (
+        _ps.fused_decode_attention_packed,
+        _ps.fused_decode_attention_k2b,
+        _ps.chunked_dequant_attention,
+    )
+    _ps.fused_decode_attention_packed = _wrap("fused_packed", originals[0])
+    _ps.fused_decode_attention_k2b = _wrap("fused_k2b", originals[1])
+    _ps.chunked_dequant_attention = _wrap("chunked", originals[2])
+    try:
+        cache = _fresh_cache("packed", model, cfg)
+        cache.attach(model)
+        with torch.no_grad():
+            model.generate(
+                ids_p,
+                max_new_tokens=4,
+                do_sample=False,
+                use_cache=True,
+                past_key_values=cache,
+            )
+        cache.detach()
+    finally:
+        (
+            _ps.fused_decode_attention_packed,
+            _ps.fused_decode_attention_k2b,
+            _ps.chunked_dequant_attention,
+        ) = originals
+    print(f"[path probe] arm={cfg.arm} decode attend calls: {counts}")
+    n_layers = model.config.num_hidden_layers
+    fused_total = counts["fused_packed"] + counts["fused_k2b"]
+    assert fused_total >= 3 * n_layers, (
+        f"arm {cfg.arm!r} is NOT hitting a fused kernel at decode "
+        f"(counts={counts}) — this A/B would measure the chunked fallback, not the "
+        f"Triton path (the exact F0 mistake). Use k2b_ph or an rtn arm."
+    )
+
     # --- Mode A: the A/B/C table ---------------------------------------------------
     rows = []
     kinds = (["dense"] if not cfg.skip_dense else []) + ["streaming", "packed"]

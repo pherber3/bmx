@@ -10,6 +10,8 @@ StreamingQuantizedCache is the correctness gate.
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 from transformers.cache_utils import Cache, DynamicLayer
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
@@ -649,6 +651,21 @@ class PackedStreamingLayer(DynamicLayer):
         # rare non-uniform-block tail), fall through to chunked.
         # (A retired _k2b_softmax_block_kernel variant lived here;
         # see docs/2026-06-24-decode-path-debloat-removal.md.)
+        if is_decode and q.is_cuda and TRITON_AVAILABLE:
+            # Correct but catastrophically slow at scale: chunked re-dequantizes
+            # EVERY committed page each decode step (~30-70x a fused/dense step at
+            # 8k, x n_layers). Only rtn_token/rtn_token and the k2b_ph pair have
+            # fused decode kernels — other arms (e.g. turboquant_mse full-C) land
+            # here BY DESIGN. Warn once so a benchmark can't silently attribute
+            # this cost to the Triton path (2026-07-04 desk review, finding F0).
+            warnings.warn(
+                f"PackedStreamingCache decode falling back to chunked dequant on "
+                f"CUDA for arms K={self.k_spec.arm!r}/V={self.v_spec.arm!r} — no "
+                f"fused kernel covers this pair; expect ~30-70x slower decode than "
+                f"StreamingQuantizedCache. Use use_packed only with rtn_token or "
+                f"k2b_ph arms, or accept the cost knowingly.",
+                stacklevel=2,
+            )
         return chunked_dequant_attention(
             q,
             self._k_blocks,

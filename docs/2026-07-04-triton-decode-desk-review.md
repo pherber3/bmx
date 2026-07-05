@@ -33,6 +33,34 @@ Two structural reasons the microbench does not predict generation:
 
 ## Findings (file:line, ranked by expected cost)
 
+### F0 — the observed "12× slower" A/B never ran the Triton kernel (arm-coverage gap + silent-slow fallback) — RESOLVES the reported contradiction
+
+The one in-generation A/B on record (2026-07-03-ish, contaminated, other session) ran
+`use_packed=True` with the **`turboquant_mse` arm**. `spec_pair("turboquant_mse")`
+returns K=V=`turboquant_mse` (`src/bmx/cache/recipes.py:63-65`), which fails BOTH fused
+predicates in `PackedStreamingLayer.attend` (`packed_streaming.py:551-559,614-622` —
+fused packed needs `rtn_token`/`rtn_token`; fused k2b needs
+`lowrank_rtn_channel`/`turboquant_mse_perhead`). Every decode step therefore fell
+through to `chunked_dequant_attention`, which re-dequantizes **every committed page,
+every layer, every token** — the O(S)/step path the fused kernel exists to replace.
+
+Magnitude check: the microbench's chunked cost at 8k is ~50–130 ms per layer-call
+(`docs/2026-06-24-triton-decode-results.md`); × 32 layers ≈ 1.6–4.1 s/token. The
+contaminated observation was 5.16 s/token (with ~⅓-GPU contention on top). The numbers
+match; no kernel-wrapper mystery is needed to explain that A/B.
+
+Two corollaries:
+
+- The session's leading hypothesis — "`_PagedStacks` rebuilds stacks every step" — is
+  wrong twice over: `_PagedStacks` has been incremental since the I3 fix (117ab1b),
+  and no stacks were ever built because no fused path fired.
+- The fallback is **correct but silently ~30–70× slower** at decode on CUDA. As of this
+  commit, `attend` emits a one-time `warnings.warn` when a CUDA decode lands on the
+  chunked fallback, naming the uncovered arm pair — so no future benchmark can
+  attribute chunked's cost to the Triton path again. F1–F3 below still stand for the
+  arms the fused kernels DO cover (`rtn_token`, `k2b_ph`); they are the *next* layer of
+  overhead once the right arm is used, and the isolated profile should measure them.
+
 ### F1 — the fp16 tail merge runs in PyTorch on EVERY decode step; the GPU merge kernel is dead code during generation
 
 `_finalize_decode` (`src/bmx/cache/triton_dequant_attention.py:342`) takes the fast
