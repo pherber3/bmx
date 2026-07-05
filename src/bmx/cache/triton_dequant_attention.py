@@ -57,6 +57,25 @@ def _hadamard_matrix(d: int, device: str, dtype: torch.dtype) -> torch.Tensor:
     return fwht(torch.eye(d, dtype=dtype, device=device))
 
 
+@functools.lru_cache(maxsize=16)
+def _codebook_dev(bits: int, device: str) -> torch.Tensor:
+    """fp32 Gaussian Lloyd-Max codebook already resident on `device`, cached per
+    (bits, device). `gaussian_codebook` (codecs.py) is itself lru_cache'd but only
+    on CPU — calling `.to(q.device, torch.float32)` on its result every decode
+    step re-does the H2D copy + allocation per layer per token (desk review F2:
+    docs/2026-07-04-triton-decode-desk-review.md). Cache the device copy too, the
+    same pattern as `_hadamard_matrix` above."""
+    return gaussian_codebook(bits).to(device, torch.float32)
+
+
+@functools.lru_cache(maxsize=16)
+def _signs_dev(d: int, seed: int, device: str) -> torch.Tensor:
+    """fp32 ±1 Hadamard sign vector already resident on `device`, cached per
+    (d, seed, device). Same H2D-per-call issue as `_codebook_dev` (desk review
+    F2) — `_hadamard_signs` is CPU-cached only."""
+    return _hadamard_signs(d, seed).to(device, torch.float32)
+
+
 try:
     import triton
     import triton.language as tl
@@ -947,12 +966,13 @@ def fused_decode_attention_k2b(
     num_splits = max(1, int(num_splits))
     block_n = _pick_block_n(blk_size)  # KV tile rows (<= 64, divides blk_size)
 
-    cb = gaussian_codebook(vbits).to(q.device, torch.float32)
+    cb = _codebook_dev(vbits, str(q.device))
     sqrt_d = 1.0 / math.sqrt(d)  # M_quant = cb[idx] / √d (per-head rotation)
     # Per-head (d,d) orthonormal Hadamard matrix + per-channel signs for the unrotate
-    # (row-wise V = (x @ H_d) * signs * norm). hmat is cached per (d, device, dtype).
+    # (row-wise V = (x @ H_d) * signs * norm). hmat/vsigns cached per (d, device[, seed])
+    # — desk review F2: avoid a fresh H2D copy every layer per decode step.
     hmat = _hadamard_matrix(d, str(q.device), torch.float32)
-    vsigns = _hadamard_signs(d, v_seed).to(q.device, torch.float32)  # (d,)
+    vsigns = _signs_dev(d, v_seed, str(q.device))  # (d,)
     has_rope = rope_cos is not None
 
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
