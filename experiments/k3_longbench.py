@@ -16,8 +16,9 @@ generation against itself — schema and mechanism only, no download.
 from __future__ import annotations
 
 import dataclasses
+import time
+from pathlib import Path
 
-import pandas as pd
 import torch
 import tyro
 
@@ -26,6 +27,14 @@ from bmx.cache.generate import avg_bpe, compression_for, generate_through_cache
 from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.longbench import CATEGORY2DATASETS, DATASET2METRIC, code_sim
 from bmx.cache.recipes import spec_pair
+from experiments._common import (
+    assert_resume_identity,
+    done_pairs,
+    load_shards,
+    pair_key,
+    print_progress,
+    write_shard,
+)
 
 
 @dataclasses.dataclass
@@ -54,6 +63,13 @@ class Config:
     rank: int = 16
     group: int = 64
     seed: int = 0
+    # Resume a crashed/killed run: path to its run_dir. Skips (arm, task) pairs whose
+    # partial/<arm>__<task>.parquet shard already exists; identity-asserted against the
+    # stored config.json + git SHA (mismatch is a hard error, not a warning) so a resumed
+    # run can never mix rows measured under different code/config. Not itself part of the
+    # measured configuration, so it is excluded from that identity check (see
+    # experiments._common.RESUME_EXCLUDED_FIELDS).
+    resume: str | None = None
 
     def resolved_tasks(self) -> tuple[str, ...]:
         """Datasets to evaluate: categories expanded (dedup, ordered) else explicit tasks."""
@@ -72,7 +88,9 @@ class _StubTok:
         return " ".join(str(int(i)) for i in seq)
 
 
-def run(cfg: Config, model=None, root: str = "results"):
+def run(
+    cfg: Config, model=None, root: str = "results", _stop_after_pairs: int | None = None
+):
     tasks = cfg.resolved_tasks()
     tokenizer = None
     if model is None:
@@ -87,7 +105,17 @@ def run(cfg: Config, model=None, root: str = "results"):
             f"[k3_longbench] SUBSAMPLED n_samples={cfg.n_samples} — NOT comparable to Table 1"
         )
 
-    run_dir = create_run("k3_longbench", cfg, root=root)
+    if cfg.resume is not None:
+        run_dir = Path(cfg.resume)
+        assert_resume_identity(run_dir, cfg)
+        skip_pairs = done_pairs(run_dir)
+        print(
+            f"[k3_longbench] resuming {run_dir}: {len(skip_pairs)} pair(s) already done",
+            flush=True,
+        )
+    else:
+        run_dir = create_run("k3_longbench", cfg, root=root)
+        skip_pairs = set()
 
     # A task's dataset is identical across arms; load each once.
     task_items = (
@@ -117,10 +145,23 @@ def run(cfg: Config, model=None, root: str = "results"):
     # Per-task calibration length (depends only on the task's prompts, not the arm).
     calib_length = {task: _calib_length(task) for task in tasks}
 
-    rows = []
+    n_pairs = len(cfg.arms) * len(tasks)
+    pair_i = 0
+    n_completed_this_run = 0
+    start_time = time.monotonic()
     for arm in cfg.arms:
         k_spec, v_spec = spec_pair(arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
         for task in tasks:
+            pair_i += 1
+            key = pair_key(arm, task)
+            if key in skip_pairs:
+                print(
+                    f"[k3_longbench pair {pair_i}/{n_pairs}] arm={arm} task={task} "
+                    "SKIP (resumed)",
+                    flush=True,
+                )
+                continue
+
             bpe_k, bpe_v, compression = compression_for(
                 model, k_spec, v_spec, calib_length[task]
             )
@@ -145,10 +186,20 @@ def run(cfg: Config, model=None, root: str = "results"):
                 )
                 score = code_sim(resp, resp)
                 n_used = 1
+                print_progress(
+                    "k3_longbench sample",
+                    1,
+                    1,
+                    start_time,
+                    arm=arm,
+                    task=task,
+                    score=f"{score:.4f}",
+                )
             else:
                 items = task_items[task]
-                scores = [
-                    longbench_score(
+                scores = []
+                for sample_i, it in enumerate(items, start=1):
+                    s = longbench_score(
                         model,
                         tokenizer,
                         it,
@@ -158,12 +209,19 @@ def run(cfg: Config, model=None, root: str = "results"):
                         v_spec,
                         cfg.max_prompt_tokens,
                     )
-                    for it in items
-                ]
+                    scores.append(s)
+                    if sample_i % 10 == 0 or sample_i == len(items):
+                        print_progress(
+                            f"arm {arm} task {task} sample",
+                            sample_i,
+                            len(items),
+                            start_time,
+                            score=f"{s:.4f}",
+                        )
                 score = sum(scores) / len(scores) if scores else float("nan")
                 n_used = len(items)
 
-            rows.append(
+            pair_rows = [
                 {
                     "arm": arm,
                     "task": task,
@@ -181,9 +239,23 @@ def run(cfg: Config, model=None, root: str = "results"):
                     else -1,
                     "longbench_version": cfg.longbench_version,
                 }
+            ]
+            write_shard(run_dir, pair_rows, arm, task)
+            print(
+                f"[k3_longbench pair {pair_i}/{n_pairs}] arm={arm} task={task} "
+                f"score={score:.4f} DONE (checkpointed)",
+                flush=True,
             )
+            n_completed_this_run += 1
+            if (
+                _stop_after_pairs is not None
+                and n_completed_this_run >= _stop_after_pairs
+            ):
+                raise RuntimeError(
+                    f"injected stop after {n_completed_this_run} pair(s) (test hook)"
+                )
 
-    write_metrics(run_dir, pd.DataFrame(rows))
+    write_metrics(run_dir, load_shards(run_dir))
     return run_dir
 
 

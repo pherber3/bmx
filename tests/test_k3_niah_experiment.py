@@ -1,6 +1,9 @@
 """k3_niah emits a parquet with the expected schema (tiny_llama, offline, no download)."""
 
+import dataclasses
+
 import pandas as pd
+import pytest
 
 from experiments.k3_niah import Config, run
 from factories import tiny_llama
@@ -63,6 +66,63 @@ def test_niah_rows_have_kv_size_bits(tmp_path):
     # fp16 K and V are each 16 bpe → average 16.0.
     fp16 = df[df["arm"] == "fp16"]
     assert (fp16["kv_size_bits"] == 16.0).all()
+
+
+def test_niah_checkpoint_resume(tmp_path):
+    """A killed run leaves per-(arm,length) shards; --resume finishes the rest, no dupes."""
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        lengths=(32, 48),
+        depths=(0.25, 0.5),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+
+    with pytest.raises(RuntimeError, match="injected stop"):
+        run(cfg, model=model, root=str(tmp_path), _stop_after_pairs=1)
+
+    runs = list((tmp_path / "k3_niah").iterdir())
+    assert len(runs) == 1
+    run_dir = runs[0]
+
+    partial_dir = run_dir / "partial"
+    shards = list(partial_dir.glob("*.parquet"))
+    assert len(shards) == 1, "exactly one (arm, length) pair should have checkpointed"
+    assert not (run_dir / "metrics.parquet").exists()
+
+    resume_cfg = dataclasses.replace(cfg, resume=str(run_dir))
+    resumed_dir = run(resume_cfg, model=model, root=str(tmp_path))
+    assert resumed_dir == run_dir
+
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    # 2 arms x 2 lengths x 2 depths = 8 rows; 4 distinct (arm, length) pairs.
+    assert len(df) == 8
+    pairs = list(zip(df["arm"], df["length"]))
+    assert len(set(pairs)) == 4
+    assert len(list(partial_dir.glob("*.parquet"))) == 4
+
+
+def test_niah_resume_rejects_config_mismatch(tmp_path):
+    """Resuming with a changed config field is a hard error, not a silent continue."""
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        lengths=(32, 48),
+        depths=(0.25, 0.5),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+    with pytest.raises(RuntimeError, match="injected stop"):
+        run(cfg, model=model, root=str(tmp_path), _stop_after_pairs=1)
+
+    run_dir = next((tmp_path / "k3_niah").iterdir())
+
+    mismatched_cfg = dataclasses.replace(cfg, rank=8, resume=str(run_dir))
+    with pytest.raises(ValueError, match="(?i)config.*mismatch|mismatch.*config"):
+        run(mismatched_cfg, model=model, root=str(tmp_path))
 
 
 def test_plot_k3_niah_makes_pngs(tmp_path):
