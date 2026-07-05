@@ -5,7 +5,9 @@ Two single-launch split-KV decode kernels that dequantize packed codes IN-KERNEL
   - fused_decode_attention_k2b    — the k2b recipe (lowrank_rtn_channel K
     reconstructed + RoPE'd in-kernel; per-head turboquant V dequanted in-kernel).
 Non-fused configs fall back to chunked_dequant_attention (PyTorch, fp32-
-accumulating). _finalize_decode / _merge_partials handle split-KV combination.
+accumulating). _finalize_decode handles split-KV combination (including the fp16
+recent-window tail, folded in as one extra split via _tail_partial + the same GPU
+merge kernel — desk review F1b, 2026-07-04).
 
 Imports cleanly with TRITON_AVAILABLE=False (AMD/no-CUDA dev box); kernels are
 verified on the GH200 VM against the naive oracle + end-to-end logit parity.
@@ -128,65 +130,62 @@ def _require_triton() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Split-KV helpers: merge
+# Split-KV helpers: tail partial (fp16 recent-window attention, GQA-shaped)
+# ---------------------------------------------------------------------------
+#
+# Online-softmax combine invariants (apply to every merge in this module,
+# kernel or PyTorch — moved here from the deleted `_merge_partials`, which this
+# tail partial now feeds into the SAME GPU `_fused_merge_kernel` used for the
+# no-tail path, desk review F1b):
+#
+#     m   = max_i(m_i)                            # global running max
+#     l   = sum_i(lse_i * exp(m_i - m))           # re-scaled lse sum
+#     out = sum_i(acc_i * exp(m_i - m)) / l       # re-scaled acc sum, normalized
+#
+# CORRECTNESS INVARIANT (num_splits=1, no tail): m=m_0, l=lse_0*exp(0)=lse_0,
+# out=acc_0/lse_0 => bit-identical to the serial path's final division.
+# BASE-E NOTE: lse is the raw unnormalized sum-of-softmax-weights (not its
+# log). The correction exp(m_i - m) is base-e — do NOT mix exp2/log2.
 # ---------------------------------------------------------------------------
 
 
-def _merge_partials(
-    partial_accs: list[torch.Tensor],
-    partial_ms: list[torch.Tensor],
-    partial_lses: list[torch.Tensor],
-) -> torch.Tensor:
-    """Merge per-split (acc_i, m_i, lse_i) into the final normalized output.
+def _tail_partial(
+    q_kv: torch.Tensor,
+    k_tail: torch.Tensor,
+    v_tail: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the fp16 recent-window tail as ONE extra split partial (acc, m, lse).
 
-    Implements the standard online-softmax combine across splits (base-e):
-
-        m   = max_i(m_i)                            # global running max
-        l   = sum_i(lse_i * exp(m_i - m))           # re-scaled lse sum
-        out = sum_i(acc_i * exp(m_i - m)) / l       # re-scaled acc sum, normalized
-
-    CORRECTNESS INVARIANT (num_splits=1):
-        m   = m_0
-        l   = lse_0 * exp(m_0 - m_0) = lse_0
-        out = acc_0 * 1 / lse_0 = acc_0 / lse_0
-        => Bit-identical to the serial path's final division `acc / lse`.
-
-    AT MULTIPLE SPLITS:
-        This is exactly online_softmax_update applied across the split axis,
-        giving the same result as if all blocks had been processed serially.
-
-    BASE-E NOTE: partial_lse is the raw unnormalized sum-of-softmax-weights
-    (lse in online_softmax_update — not the log of that sum).  The correction
-    exp(m_i - m) is base-e.  Do NOT use exp2/log2 here (all kernels are base-e).
+    GQA-shaped: works directly on q's (h_kv, G) grouping, NO repeat_interleave to
+    n_q_heads (the old per-step fallback expanded k_tail/v_tail to n_q_heads first —
+    wasteful; einsum broadcasts the shared kv-head dim across the G query heads for
+    free). This lets the tail partial slot into acc_part/m_part/lse_part at row
+    index `num_splits` (shape (num_splits+1, h_kv, G, ...)) and be merged by the
+    SAME GPU `_fused_merge_kernel` the no-tail path already uses — the old
+    dedicated PyTorch merge (96 per-split views + a separate stack-based combine)
+    is deleted; there is now exactly one merge path (desk review F1b).
 
     Args:
-        partial_accs:  list of (n_q_heads, 1, d) fp32/fp16 — pre-normalized acc
-        partial_ms:    list of (n_q_heads, 1, 1) fp32 — per-split running max
-        partial_lses:  list of (n_q_heads, 1, 1) fp32 — per-split lse denominator
+        q_kv:   (h_kv, G, d) — already fp16/fp32, upcast internally.
+        k_tail: (h_kv, T, d) fp16 dense recent-window keys.
+        v_tail: (h_kv, T, d) fp16 dense recent-window values.
+        scale:  1/sqrt(d) softmax scale.
 
-    Returns:
-        out: (n_q_heads, 1, d) fp16 — merged normalized attention output
+    Returns (acc, m, lse), all fp32:
+        acc: (h_kv, G, d)  — pre-normalized Σ p·V for this split.
+        m:   (h_kv, G)     — running max for this split.
+        lse: (h_kv, G)     — Σ p (unnormalized) for this split.
     """
-    # Stack to (num_splits, n_q_heads, 1, d/1) for vectorized ops.
-    # Keep fp32 throughout to avoid fp16 saturation during accumulation.
-    accs = torch.stack([a.float() for a in partial_accs], dim=0)  # (S, H, 1, d)
-    ms = torch.stack([m.float() for m in partial_ms], dim=0)  # (S, H, 1, 1)
-    lses = torch.stack([lse_t.float() for lse_t in partial_lses], dim=0)  # (S, H, 1, 1)
-
-    # Global max across splits — shape (1, H, 1, 1) -> broadcast over S
-    m_global = ms.amax(dim=0, keepdim=True)  # (1, H, 1, 1)
-
-    # Rescaling factors per split: exp(m_i - m_global)
-    scales = torch.exp(ms - m_global)  # (S, H, 1, 1) — base-e
-
-    # Merged denominator: sum_i(lse_i * exp(m_i - m))
-    l_merged = (lses * scales).sum(dim=0)  # (H, 1, 1)
-
-    # Merged numerator: sum_i(acc_i * exp(m_i - m))  — (S, H, 1, d) * (S, H, 1, 1)
-    acc_merged = (accs * scales).sum(dim=0)  # (H, 1, d)
-
-    # Normalize and return in fp16 (`acc / lse.to(q.dtype)`)
-    return (acc_merged / l_merged).to(torch.float16)
+    qf = q_kv.float()  # (h_kv, G, d)
+    ktf = k_tail.float()  # (h_kv, T, d)
+    vtf = v_tail.float()  # (h_kv, T, d)
+    s = torch.einsum("hgd,htd->hgt", qf, ktf) * scale  # (h_kv, G, T)
+    m = s.amax(dim=-1)  # (h_kv, G)
+    p = torch.exp(s - m.unsqueeze(-1))  # (h_kv, G, T)
+    lse = p.sum(dim=-1)  # (h_kv, G)
+    acc = torch.einsum("hgt,htd->hgd", p, vtf)  # (h_kv, G, d)
+    return acc, m, lse
 
 
 # ---------------------------------------------------------------------------
@@ -343,53 +342,65 @@ def _finalize_decode(
 ) -> torch.Tensor:
     """Merge the split partials into the final (n_q_heads, 1, d) output.
 
-    Shared by every fused decode launcher. No tail -> the GPU merge kernel directly
-    (no PyTorch round-trip). Tail present -> fold the dense fp16 recent window
-    (k_tail/v_tail, <= recent_window tokens) into the split partials via the same
-    base-e online-softmax combine (_merge_partials) in PyTorch — tiny, so PyTorch is
-    fine. Partial layout (num_splits, h_kv, G, ...) flattens to head index kv*G+g,
-    matching q's (h_kv, G) order.
+    Shared by every fused decode launcher. Both the no-tail and tail-present cases
+    now go through the SAME GPU `_fused_merge_kernel` call (desk review F1b — the
+    old tail branch ran a dedicated ~96-view PyTorch merge every decode step, since
+    the streaming schedule makes the tail non-empty on essentially every real
+    step). The caller (each launcher) is responsible for over-allocating
+    acc_part/m_part/lse_part with `num_splits + 1` leading slots whenever a
+    non-empty tail is expected — slot `num_splits` is left for the tail and is
+    never written by the compute kernel (whose grid is `(h_kv, num_splits)`, so its
+    internal `program_id(1)` never reaches that index). `_finalize_decode` computes
+    the tail partial (`_tail_partial`, GQA-shaped, no repeat_interleave) and writes
+    it into slot `num_splits` in place, then calls the merge kernel with the
+    *runtime* split count `num_splits + 1` so its internal loop walks through the
+    tail row too. Partial layout (splits, h_kv, G, ...) flattens to head index
+    kv*G+g, matching q's (h_kv, G) order — identical to the no-tail path.
+
+    Numerics: this is the same online-softmax combine as before (base-e,
+    fp32-throughout) — mathematically identical to the old torch-merge result, but
+    op ORDER changes (GPU kernel accumulation vs a PyTorch stack+reduce), so
+    bitwise logits may differ at fp32-rounding level. The no-tail path is
+    byte-for-byte unchanged (same kernel, same math, same call).
     """
-    # acc_part is (num_splits, h_kv, n_q_groups, d) — its group axis equals the
+    # acc_part is (slots, h_kv, n_q_groups, d) — its group axis equals the
     # n_q_groups parameter by construction (asserted here to keep them in lockstep).
     h_kv, d = acc_part.shape[1], acc_part.shape[3]
     assert acc_part.shape[2] == n_q_groups, (
         f"partial group axis {acc_part.shape[2]} != n_q_groups {n_q_groups}"
     )
     n_q_heads = h_kv * n_q_groups
+    has_tail = k_tail is not None and k_tail.shape[1] > 0
+    out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
 
-    if k_tail is None or k_tail.shape[1] == 0:
-        out = torch.empty(h_kv, n_q_groups, d, dtype=torch.float16, device=q.device)
-        _fused_merge_kernel[(h_kv,)](
-            acc_part,
-            m_part,
-            lse_part,
-            out,
-            int(num_splits),
-            h_kv=h_kv,
-            d=d,
-            n_q_groups=n_q_groups,
+    if not has_tail:
+        merge_splits = num_splits
+    else:
+        assert v_tail is not None, "v_tail required when k_tail is set"
+        assert acc_part.shape[0] >= num_splits + 1, (
+            "acc_part must be over-allocated with num_splits+1 slots when a "
+            "non-empty tail is passed (the launcher's job — see _finalize_decode)"
         )
-        return out.view(n_q_heads, 1, d)
+        q_kv = q.squeeze(1).view(h_kv, n_q_groups, d)  # (h_kv, G, d)
+        acc_t, m_t, lse_t = _tail_partial(
+            q_kv, k_tail.to(q.device), v_tail.to(q.device), scale
+        )
+        acc_part[num_splits] = acc_t
+        m_part[num_splits] = m_t
+        lse_part[num_splits] = lse_t
+        merge_splits = num_splits + 1
 
-    assert v_tail is not None, "v_tail required when k_tail is set"
-    accs = [acc_part[s].reshape(n_q_heads, 1, d) for s in range(num_splits)]
-    ms = [m_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
-    lses = [lse_part[s].reshape(n_q_heads, 1, 1) for s in range(num_splits)]
-
-    # Dense tail partial: (h_kv, tail_len, d) GQA-expanded to (n_q_heads, ...).
-    kt = k_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
-    vt = v_tail.to(q.device, torch.float32).repeat_interleave(n_q_groups, dim=0)
-    qf = q.float()  # (n_q_heads, 1, d)
-    st = torch.einsum("hqd,hkd->hqk", qf, kt) * scale  # (n_q_heads, 1, tail_len)
-    mt = st.amax(dim=-1, keepdim=True)
-    pt = torch.exp(st - mt)
-    lse_t = pt.sum(dim=-1, keepdim=True)
-    acc_t = torch.einsum("hqk,hkd->hqd", pt, vt)  # pre-norm
-    accs.append(acc_t)
-    ms.append(mt)
-    lses.append(lse_t)
-    return _merge_partials(accs, ms, lses).view(n_q_heads, 1, d)
+    _fused_merge_kernel[(h_kv,)](
+        acc_part,
+        m_part,
+        lse_part,
+        out,
+        int(merge_splits),
+        h_kv=h_kv,
+        d=d,
+        n_q_groups=n_q_groups,
+    )
+    return out.view(n_q_heads, 1, d)
 
 
 if TRITON_AVAILABLE:
@@ -577,9 +588,11 @@ def fused_decode_attention_packed(
         num_splits: None -> pick_num_splits.
         k_tail/v_tail: optional dense fp16 (h_kv, tail_len, d) recent window NOT in
             the packed region (the streaming cache keeps the last W tokens lossless).
-            Folded in via the online-softmax merge in PyTorch (tail_len is tiny,
-            <= recent_window; not worth a kernel). When None, the GPU merge kernel
-            is used directly (no PyTorch round-trip).
+            Folded into the SAME GPU split-KV merge as one extra "virtual split"
+            (desk review F1b) — tail_len is tiny (<= recent_window) so computing
+            its partial in PyTorch (_tail_partial) is fine, but the merge itself no
+            longer forks into a separate PyTorch code path. When None/empty, the
+            merge kernel runs over exactly num_splits (unchanged from before).
     Returns (n_q_heads, 1, d) fp16.
     """
     _require_triton()
@@ -594,6 +607,13 @@ def fused_decode_attention_packed(
     if num_splits is None:
         num_splits = pick_num_splits(seq_len, blk_size, h_kv)
     num_splits = max(1, int(num_splits))
+    has_tail = k_tail is not None and k_tail.shape[1] > 0
+    # +1 leading slot for the tail partial (desk review F1b) — the compute kernel
+    # below is launched with grid (h_kv, num_splits) so it only ever writes rows
+    # [0, num_splits); the extra row is written by _finalize_decode's _tail_partial
+    # call and is safe because the merge kernel's row math is driven purely by the
+    # runtime split-count arg it's given, not by the buffer's physical extent.
+    part_slots = num_splits + 1 if has_tail else num_splits
 
     gpad = _next_pow2(max(16, n_q_groups))
     block_n = _pick_block_n(blk_size)  # KV tile rows (<= 64, divides blk_size)
@@ -603,13 +623,13 @@ def fused_decode_attention_packed(
 
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
     acc_part = torch.empty(
-        num_splits, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
+        part_slots, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
     )
     m_part = torch.empty(
-        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+        part_slots, h_kv, n_q_groups, dtype=torch.float32, device=q.device
     )
     lse_part = torch.empty(
-        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+        part_slots, h_kv, n_q_groups, dtype=torch.float32, device=q.device
     )
 
     _fused_decode_packed_kernel[(h_kv, num_splits)](
@@ -947,7 +967,10 @@ def fused_decode_attention_k2b(
     V uses the per-head Hadamard codec (build_kv_stacked_k2b), so its unrotate is a
     per-head d-point Hadamard done IN-KERNEL (a (d,d) matmul) — no cross-head
     coupling, no o_proj surgery. rope_cos/sin: (max_S, d) tables (None -> keys not
-    pre-RoPE). The fp16 recent-window tail is merged in PyTorch.
+    pre-RoPE). The fp16 recent-window tail's partial is computed in PyTorch
+    (_tail_partial) but merged by the same GPU split-KV merge kernel as every other
+    split (desk review F1b) — see fused_decode_attention_packed's docstring for the
+    full tail-slot design.
     """
     _require_triton()
 
@@ -964,6 +987,13 @@ def fused_decode_attention_k2b(
     if num_splits is None:
         num_splits = pick_num_splits(seq_len, blk_size, h_kv)
     num_splits = max(1, int(num_splits))
+    has_tail = k_tail is not None and k_tail.shape[1] > 0
+    # +1 leading slot for the tail partial (desk review F1b) — see the matching
+    # comment in fused_decode_attention_packed for the extra-row safety argument
+    # (the compute kernel's grid is (h_kv, num_splits), so it never touches row
+    # num_splits; the merge kernel's row indexing is driven by its runtime
+    # split-count arg, not the buffer's physical extent).
+    part_slots = num_splits + 1 if has_tail else num_splits
     block_n = _pick_block_n(blk_size)  # KV tile rows (<= 64, divides blk_size)
 
     cb = _codebook_dev(vbits, str(q.device))
@@ -977,13 +1007,13 @@ def fused_decode_attention_k2b(
 
     q_kv = q.squeeze(1).view(h_kv, n_q_groups, d).contiguous()
     acc_part = torch.empty(
-        num_splits, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
+        part_slots, h_kv, n_q_groups, d, dtype=torch.float32, device=q.device
     )
     m_part = torch.empty(
-        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+        part_slots, h_kv, n_q_groups, dtype=torch.float32, device=q.device
     )
     lse_part = torch.empty(
-        num_splits, h_kv, n_q_groups, dtype=torch.float32, device=q.device
+        part_slots, h_kv, n_q_groups, dtype=torch.float32, device=q.device
     )
 
     cos_arg = (
