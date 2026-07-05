@@ -160,10 +160,12 @@ def load_longbench_task(
     items: list[dict] = []
     with zipfile.ZipFile(zip_path) as zf:
         if member not in zf.namelist():
-            raise ValueError(
-                f"longbench task {task!r} has no LongBench-E ('_e') variant "
-                f"(missing {member!r} in data.zip) — no silent fallback to v1"
+            reason = (
+                "has no LongBench-E ('_e') variant — no silent fallback to v1"
+                if version == "v1_e"
+                else "is not in the LongBench data.zip"
             )
+            raise ValueError(f"longbench task {task!r} {reason} (missing {member!r})")
         with zf.open(member) as fh:
             for line in fh:
                 items.append(json.loads(line))
