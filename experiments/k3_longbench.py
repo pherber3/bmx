@@ -59,6 +59,13 @@ class Config:
     # LongBench-convention fallback (LongBench pred.py middle-truncation). None = no-truncation
     # variant (byte-identical to pre-truncation behavior).
     max_prompt_tokens: int | None = 31500
+    # Parity A/B knob for the anchor gate: LongBench's official pred.py applies build_chat
+    # (a chat/[INST] wrapper) for chat/Instruct models on every task except its exclusion
+    # list (few-shot + code — see CHAT_WRAP_EXCLUDED); TurboQuant Table-1 presumably ran
+    # that official flow, so this flag exists to reproduce it, but its harness policy is
+    # unverified. Default False so every number measured so far (all chat_wrap=False)
+    # stays comparable; flip only for an explicit parity run.
+    chat_wrap: bool = False
     n_prefill: int = 128
     rank: int = 16
     group: int = 64
@@ -137,7 +144,9 @@ def run(
         if tokenizer is None:
             return 32
         lens = sorted(
-            build_longbench_prompt(tokenizer, it, task, cfg.max_prompt_tokens).shape[1]
+            build_longbench_prompt(
+                tokenizer, it, task, cfg.max_prompt_tokens, cfg.chat_wrap
+            ).shape[1]
             for it in task_items[task]
         )
         return lens[len(lens) // 2]  # median; equal across arms, so rankings unaffected
@@ -208,6 +217,7 @@ def run(
                         k_spec,
                         v_spec,
                         cfg.max_prompt_tokens,
+                        cfg.chat_wrap,
                     )
                     scores.append(s)
                     if sample_i % 10 == 0 or sample_i == len(items):
@@ -238,6 +248,7 @@ def run(
                     if cfg.max_prompt_tokens is not None
                     else -1,
                     "longbench_version": cfg.longbench_version,
+                    "chat_wrap": cfg.chat_wrap,
                 }
             ]
             write_shard(run_dir, pair_rows, arm, task)

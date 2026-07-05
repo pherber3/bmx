@@ -33,6 +33,7 @@ def test_k3_longbench_run_emits_parquet(tmp_path):
         "score_kind",
         "max_prompt_tokens",
         "longbench_version",
+        "chat_wrap",
     ):
         assert col in df.columns, f"missing column: {col}"
     assert set(df["longbench_version"]) == {"v1"}
@@ -46,6 +47,23 @@ def test_k3_longbench_run_emits_parquet(tmp_path):
         "turboquant_prod",
     }
     assert set(df["score_kind"]) == {"code_sim_offline"}
+
+
+def test_k3_longbench_chat_wrap_defaults_off_and_is_recorded(tmp_path):
+    # Default Config().chat_wrap must be False (comparability with every prior recorded
+    # row), and the value must be threaded into the emitted rows verbatim.
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16",),
+        tasks=("lcc",),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+    assert cfg.chat_wrap is False
+    run_dir = run(cfg, model=model, root=str(tmp_path))
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert (df["chat_wrap"] == False).all()  # noqa: E712 — pandas boolean column comparison
 
 
 def test_longbench_rows_have_kv_size_bits(tmp_path):

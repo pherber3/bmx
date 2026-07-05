@@ -97,33 +97,93 @@ LONGBENCH_TASKS: dict[str, dict] = {
 }
 
 
+# LongBench pred.py skips build_chat (the chat/[INST] wrapper) for few-shot and code tasks,
+# even for chat/Instruct models — wrapping those breaks their formatting (few-shot relies on
+# raw in-context examples immediately preceding the query; code completion relies on the raw
+# template's exact trailing-newline/comment framing). Restricted to our English task set;
+# upstream's full exclusion list also has "lsht" (Chinese few-shot), not registered here.
+CHAT_WRAP_EXCLUDED = {"trec", "triviaqa", "samsum", "lcc", "repobench-p"}
+
+
 def build_longbench_prompt(
-    tokenizer, item: dict, task: str, max_prompt_tokens: int | None = None
+    tokenizer,
+    item: dict,
+    task: str,
+    max_prompt_tokens: int | None = None,
+    chat_wrap: bool = False,
 ) -> torch.Tensor:
     """Apply the task's LongBench prompt template to the item; return (1, L) ids.
 
     LongBench formats dataset2prompt[task].format(**item); for code tasks the context lives in
-    item['context']. NO chat/[INST] wrapper: LongBench explicitly skips build_chat for the code
-    tasks (lcc, repobench-p are in its exclusion list) — raw template only, even for Instruct
-    models.
+    item['context'].
 
     max_prompt_tokens mirrors LongBench's pred.py truncation: if the tokenized prompt exceeds
     the budget, keep the first max_prompt_tokens//2 and last max_prompt_tokens//2 token ids
-    (middle-truncation) and drop the rest — LongBench decodes back to text and re-tokenizes
-    before its chat-wrap step, but this harness has no chat-wrap for any task (see above), so
-    truncating the ids directly is equivalent and avoids a lossy decode/re-encode round trip.
-    None (the default) is a no-op — byte-identical to the pre-truncation behavior, which is the
-    no-truncation variant. TurboQuant (arXiv 2504.19874) §4 states no prompt-truncation budget;
-    31500 is the LongBench-convention fallback (LongBench pred.py middle-truncation) used as the
-    parity-run default in k3_longbench's Config, not baked in here.
+    (middle-truncation) and drop the rest. None (the default) is a no-op — byte-identical to
+    the pre-truncation behavior, which is the no-truncation variant. TurboQuant (arXiv
+    2504.19874) §4 states no prompt-truncation budget; 31500 is the LongBench-convention
+    fallback (LongBench pred.py middle-truncation) used as the parity-run default in
+    k3_longbench's Config, not baked in here.
+
+    chat_wrap (default False, matching every measurement taken so far — changing the default
+    would break comparability with every previously recorded row): when False, or when task is
+    in CHAT_WRAP_EXCLUDED, behavior is exactly the paragraph above — raw template ids, no
+    chat/[INST] wrapper, even for Instruct models. This is LongBench's own pred.py policy for
+    few-shot/code tasks, not a limitation of this harness.
+
+    When chat_wrap=True and task is NOT excluded, mirrors pred.py's exact layering:
+      1. Template-fill (as above) and tokenize -> ids.
+      2. If ids exceed max_prompt_tokens: middle-truncate the ids (same head/tail split as
+         above), then decode the two halves SEPARATELY with skip_special_tokens=True and
+         concatenate the resulting strings. Decoding the halves separately (rather than the
+         whole truncated tensor at once) mirrors pred.py, and matters here because it strips
+         a leading BOS from the second half's decode, so BOS isn't duplicated mid-string when
+         the two halves are concatenated. If ids do NOT exceed the budget (or the budget is
+         None), decode the WHOLE ids once with skip_special_tokens=True. This one-shot decode
+         is provably equivalent to using the original template-filled string directly (both
+         start from the same ids/text and skip_special_tokens=True only strips tokens that
+         were never in the plain template text in the first place), but decoding is done
+         explicitly to keep the "under budget" and "over budget" branches parallel in shape.
+      3. `tokenizer.apply_chat_template([{"role": "user", "content": prompt_text}],
+         add_generation_prompt=True, tokenize=True, return_tensors="pt")` to get the final
+         ids. Llama-3-family chat templates render their own begin-of-text token, so the
+         template's *text* must never be re-tokenized with add_special_tokens=True (that
+         would duplicate BOS) — going through apply_chat_template's tokenize=True path
+         sidesteps that entirely, since it returns ids directly without a second encode pass.
     """
     template = LONGBENCH_TASKS[task]["prompt_template"]
     prompt = template.format(**item)
     ids = tokenizer(prompt, return_tensors="pt").input_ids
-    if max_prompt_tokens is not None and ids.shape[1] > max_prompt_tokens:
+    over_budget = max_prompt_tokens is not None and ids.shape[1] > max_prompt_tokens
+    if over_budget:
         half = max_prompt_tokens // 2
         ids = torch.cat([ids[:, :half], ids[:, -half:]], dim=1)
-    return ids
+
+    if not chat_wrap or task in CHAT_WRAP_EXCLUDED:
+        return ids
+
+    if over_budget:
+        half = max_prompt_tokens // 2
+        first_text = tokenizer.decode(ids[0, :half], skip_special_tokens=True)
+        last_text = tokenizer.decode(ids[0, half:], skip_special_tokens=True)
+        prompt_text = first_text + last_text
+    else:
+        prompt_text = tokenizer.decode(ids[0], skip_special_tokens=True)
+
+    wrapped_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt_text}],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors="pt",
+    )
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is not None:
+        flat = wrapped_ids[0].tolist()
+        assert flat.count(bos_id) <= 1 and (bos_id not in flat or flat[0] == bos_id), (
+            f"expected at most one BOS ({bos_id}) at position 0 after apply_chat_template, "
+            f"got ids starting {flat[:5]}"
+        )
+    return wrapped_ids
 
 
 def load_longbench_task(
@@ -183,6 +243,7 @@ def longbench_score(
     k_spec: CacheCodecSpec,
     v_spec: CacheCodecSpec,
     max_prompt_tokens: int | None = None,
+    chat_wrap: bool = False,
 ) -> float:
     """Generate through the compressed cache, score with the task's LongBench metric.
 
@@ -190,8 +251,13 @@ def longbench_score(
     its first line, the per-item score is max over the item's ground truths (item['answers']),
     and classification passes all_classes=item['all_classes']. Works for every registered
     English task (code tasks route to code_sim via DATASET2METRIC).
+
+    chat_wrap: forwarded to build_longbench_prompt (default off; see its docstring). trec/
+    triviaqa/samsum are in CHAT_WRAP_EXCLUDED so this is a no-op for them regardless.
     """
-    prompt_ids = build_longbench_prompt(tokenizer, item, task, max_prompt_tokens)
+    prompt_ids = build_longbench_prompt(
+        tokenizer, item, task, max_prompt_tokens, chat_wrap
+    )
     max_gen = LONGBENCH_TASKS[task]["max_gen"]
     response = generate_through_cache(
         model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_gen, strip=False
@@ -215,12 +281,19 @@ def longbench_code_score(
     k_spec: CacheCodecSpec,
     v_spec: CacheCodecSpec,
     max_prompt_tokens: int | None = None,
+    chat_wrap: bool = False,
 ) -> float:
     """Build the LongBench prompt, generate through the compressed cache, score code_sim.
 
     Ground truth is item['answers'][0] (LongBench code tasks have a single reference line).
+
+    chat_wrap: forwarded to build_longbench_prompt (default off; see its docstring). Both
+    code tasks (lcc, repobench-p) are in CHAT_WRAP_EXCLUDED, so this is always a no-op here —
+    the parameter exists so callers can pass the flag uniformly across score functions.
     """
-    prompt_ids = build_longbench_prompt(tokenizer, item, task, max_prompt_tokens)
+    prompt_ids = build_longbench_prompt(
+        tokenizer, item, task, max_prompt_tokens, chat_wrap
+    )
     max_gen = LONGBENCH_TASKS[task]["max_gen"]
     response = generate_through_cache(
         model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_gen, strip=False

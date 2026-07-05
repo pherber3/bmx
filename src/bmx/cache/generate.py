@@ -43,6 +43,13 @@ def generate_through_cache(
     few GB. We never read prompt-position logits (only the last one seeds decoding), so keeping
     1 is exact, not an approximation. ``strip`` removes surrounding whitespace (off for
     whitespace-sensitive scorers).
+
+    Chat-wrapped prompts (see ``bmx.cache.longbench.build_longbench_prompt``'s ``chat_wrap``):
+    this loop's EOS handling already stops correctly on ``<|eot_id|>`` (128009) for
+    Llama-3.1-Instruct, chat-wrapped or not — it reads the FULL ``eos_token_id`` set off
+    ``generation_config`` first (a list of ``{128001, 128008, 128009}`` for that model), not
+    just ``tokenizer.eos_token_id`` (which is only 128009 alone). No change needed here for
+    chat-wrap to work.
     """
     prompt_ids = prompt_ids.to(model.device)
     L = prompt_ids.shape[1]

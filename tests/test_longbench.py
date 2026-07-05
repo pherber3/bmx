@@ -122,9 +122,10 @@ def test_code_sim_stripped_indented_scores_less_than_one():
 class _CountingTok:
     """Deterministic word-level stub tokenizer: one token id per whitespace-split word.
 
-    `decode` is unused by build_longbench_prompt (no chat-wrap step exists in this repo's
-    harness — see build_longbench_prompt's docstring), so it is intentionally omitted; a
-    call to it would signal an unwanted decode/re-encode round trip.
+    `decode` is unused by build_longbench_prompt when chat_wrap=False (the default and the
+    only path these truncation tests exercise), so it is intentionally omitted here; a call
+    to it would signal an unwanted decode/re-encode round trip on this path. The chat-wrap
+    path (chat_wrap=True) does decode, and is covered separately by `_ChatCapableTok` below.
     """
 
     def __call__(self, text, return_tensors=None):
@@ -219,3 +220,132 @@ def test_load_longbench_task_rejects_unknown_version():
 
     with pytest.raises(ValueError, match="bogus"):
         lb.load_longbench_task("lcc", None, version="bogus")
+
+
+# --- Task 6: flag-gated chat-wrap (LongBench pred.py build_chat parity) ---
+
+
+class _ChatCapableTok:
+    """Word-level stub tokenizer that also supports decode + apply_chat_template.
+
+    `__call__` mirrors _CountingTok (one token id per whitespace-split word), but ids are
+    offset by 1000 per word-length so decode can invert it deterministically: decode just
+    re-joins the words it remembers having assigned those ids to, in order. bos_token_id is
+    a reserved id (1) prepended to every apply_chat_template output, mimicking Llama-3's
+    template (which embeds the BOS itself) — tests assert build_longbench_prompt never
+    double-prepends it.
+    """
+
+    bos_token_id = 1
+
+    def __call__(self, text, return_tensors=None):
+        import torch
+
+        words = text.split()
+        # Deterministic non-trivial ids so decode can invert them (id = index into a
+        # per-call word list stashed on the instance).
+        self._last_words = words
+        ids = torch.tensor([[100 + i for i in range(len(words))]])
+        return type("E", (), {"input_ids": ids})()
+
+    def decode(self, ids, skip_special_tokens=True):
+        # Inverts __call__: id (100+i) -> self._last_words[i]. Ids outside that range
+        # (e.g. a stray BOS) are dropped when skip_special_tokens=True.
+        seq = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+        words = []
+        for tid in seq:
+            idx = tid - 100
+            if 0 <= idx < len(self._last_words):
+                words.append(self._last_words[idx])
+            elif not skip_special_tokens:
+                words.append(f"<special:{tid}>")
+        return " ".join(words)
+
+    def apply_chat_template(
+        self, messages, add_generation_prompt=True, tokenize=True, return_tensors=None
+    ):
+        import torch
+
+        content = messages[0]["content"]
+        assert messages[0]["role"] == "user"
+        # Simulate a template that renders its own BOS + wrapper markers, then re-runs
+        # the (deterministic) word tokenizer over the wrapped text — mirrors a real chat
+        # template producing fresh ids from wrapped text, not just concatenating old ids.
+        wrapped = f"<|begin|><|user|>{content}<|assistant|>"
+        words = wrapped.split()
+        self._last_words = words
+        body = [100 + i for i in range(len(words))]
+        ids = torch.tensor([[self.bos_token_id] + body])
+        return ids if tokenize else wrapped
+
+
+def _chat_item():
+    return {
+        "context": "def foo():\n    return 1\n",
+        "input": "",
+        "answers": ["    return 1"],
+    }
+
+
+def test_chat_wrap_false_is_byte_identical_to_no_flag():
+    tok = _ChatCapableTok()
+    item = _chat_item()
+    old_ids = build_longbench_prompt(tok, item, "narrativeqa")
+    new_ids = build_longbench_prompt(tok, item, "narrativeqa", chat_wrap=False)
+    assert torch.equal(old_ids, new_ids)
+
+
+def test_chat_wrap_true_excluded_task_matches_unwrapped():
+    # trec is in CHAT_WRAP_EXCLUDED (few-shot) -> chat_wrap=True must be a no-op for it.
+    tok = _ChatCapableTok()
+    item = {
+        "context": "Q: 1 is what?\nA: number\n",
+        "input": "Q: 2?\nA:",
+        "answers": [""],
+    }
+    unwrapped = build_longbench_prompt(tok, item, "trec", chat_wrap=False)
+    wrapped = build_longbench_prompt(tok, item, "trec", chat_wrap=True)
+    assert torch.equal(unwrapped, wrapped)
+
+
+def test_chat_wrap_true_nonexcluded_task_wraps_with_single_bos():
+    tok = _ChatCapableTok()
+    item = _chat_item()
+    ids = build_longbench_prompt(tok, item, "narrativeqa", chat_wrap=True)
+    decoded = tok.decode(ids.squeeze(0), skip_special_tokens=False)
+    assert "<|begin|>" in decoded
+    assert "<|user|>" in decoded
+    assert "<|assistant|>" in decoded
+    # Exactly one BOS, at position 0.
+    ids_list = ids.squeeze(0).tolist()
+    assert ids_list[0] == tok.bos_token_id
+    assert ids_list.count(tok.bos_token_id) == 1
+
+
+def test_chat_wrap_truncation_happens_before_wrap():
+    tok = _ChatCapableTok()
+    # Long context -> the pre-wrap prompt (narrativeqa's template + 60 "tok<i>" context
+    # words) tokenizes to 122 words; a budget of 100 (half=50) keeps template words plus
+    # roughly tok0..tok12 and tok35..tok59 (verified: first-half tail is tok12, second-half
+    # head is tok35), dropping the interior tok13..tok34 range. Middle-truncation must
+    # happen BEFORE the chat markers are applied, so the markers survive and an interior
+    # context word (e.g. tok20) is gone from the decoded, wrapped text.
+    context = " ".join(f"tok{i}" for i in range(60))
+    item = {"context": context, "input": "", "answers": [""]}
+
+    wrapped = build_longbench_prompt(
+        tok, item, "narrativeqa", max_prompt_tokens=100, chat_wrap=True
+    )
+    decoded = tok.decode(wrapped.squeeze(0), skip_special_tokens=False)
+    assert "<|begin|>" in decoded
+    assert "<|user|>" in decoded
+    assert "<|assistant|>" in decoded
+    # An interior word must have been dropped by truncation.
+    assert "tok20" not in decoded
+    # But head and tail context words survive.
+    assert "tok5" in decoded
+    assert "tok40" in decoded
+    # Still exactly one BOS at position 0.
+    ids_list = wrapped.squeeze(0).tolist()
+    assert ids_list[0] == tok.bos_token_id
+    assert ids_list.count(tok.bos_token_id) == 1
