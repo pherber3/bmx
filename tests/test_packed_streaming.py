@@ -5,7 +5,7 @@ import torch
 
 from bmx.cache.codecs import dequant_packed, quantize_kv_layout, quantize_packed
 from bmx.cache.collect import from_matrix, to_matrix
-from bmx.cache.packed_streaming import PackedStreamingCache
+from bmx.cache.packed_streaming import PackedStreamingCache, PackedStreamingLayer
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
 from factories import ids, tiny_llama, tiny_llama_d32
@@ -293,3 +293,61 @@ def test_fused_k2b_generate_matches_streaming_cuda():
         f"fused-k2b decode logits diverged from streaming: max_abs={max_abs} "
         "(fused_decode_attention_k2b in packed_streaming.attend)"
     )
+
+
+def test_uniform_blk_incremental_matches_recomputation():
+    """desk review F3: PackedStreamingLayer maintains self._blk_len/_uniform_blk
+    incrementally at the append site in update() instead of recomputing
+    `len({e - s for _, s, e in self._k_blocks}) == 1` every attend() call. This
+    pins the invariant: after EVERY update() call (i.e. every model forward step,
+    whether or not it flushes a page), the incremental fields must equal what the
+    old set-comprehension would compute from scratch.
+
+    seq=300 (> 2 * PAGE(128) + recent_window) so multiple pages flush across the
+    prefill + a run of decode steps, exercising the append path repeatedly.
+    """
+    model = tiny_llama()
+    input_ids = ids(vocab=97, seq=300, seed=21)
+    k_spec, v_spec = _rtn_specs()  # post-RoPE plain RTN — uniform PAGE blocks
+
+    cache = PackedStreamingCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache.attach(model)
+
+    calls = []
+    orig_update = PackedStreamingLayer.update
+
+    def _checked_update(self, *args, **kwargs):
+        result = orig_update(self, *args, **kwargs)
+        blocks = self._k_blocks
+        expect_uniform = bool(blocks) and len({e - s for _, s, e in blocks}) == 1
+        expect_len = (blocks[-1][2] - blocks[-1][1]) if blocks else None
+        calls.append((self._uniform_blk, expect_uniform, self._blk_len, expect_len))
+        assert self._uniform_blk == expect_uniform, (
+            f"_uniform_blk={self._uniform_blk} != recomputed {expect_uniform} "
+            f"after update() with {len(blocks)} blocks"
+        )
+        assert self._blk_len == expect_len, (
+            f"_blk_len={self._blk_len} != recomputed {expect_len} "
+            f"after update() with {len(blocks)} blocks"
+        )
+        return result
+
+    PackedStreamingLayer.update = _checked_update
+    try:
+        with torch.no_grad():
+            model.generate(
+                input_ids,
+                max_new_tokens=25,
+                do_sample=False,
+                use_cache=True,
+                past_key_values=cache,
+            )
+    finally:
+        PackedStreamingLayer.update = orig_update
+        cache.detach()
+
+    # Sanity: the invariant was actually exercised across multiple flushed pages
+    # (>= 2 committed blocks by the end), not vacuously true on an empty list.
+    assert len(calls) > 0
+    assert cache.layers[0]._blk_len is not None
+    assert len(cache.layers[0]._k_blocks) >= 2

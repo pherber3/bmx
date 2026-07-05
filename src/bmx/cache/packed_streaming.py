@@ -249,6 +249,16 @@ class PackedStreamingLayer(DynamicLayer):
         self._k_blocks: list[tuple[dict, int, int]] = []
         self._v_blocks: list[tuple[dict, int, int]] = []
 
+        # Incremental mirror of `len({e - s for _, s, e in self._k_blocks}) == 1`
+        # (desk review F3: that set-comprehension is O(n_blocks) pure-Python and was
+        # recomputed every decode step in attend() — 1024 blocks x 32 layers at 128k
+        # context). Maintained in lockstep with every _k_blocks mutation (currently
+        # only the append in update(), since pages are never dropped or reordered
+        # once committed): _blk_len is the common block length (None if empty),
+        # _uniform_blk is len(lengths)==1 given >=1 block.
+        self._blk_len: int | None = None
+        self._uniform_blk: bool = False
+
         # Persistent device-resident stacked-KV buffers for the fused decode kernels.
         # Built lazily on the first decode (need q's device + spec dims); appended one
         # page at a time thereafter (O(page)/step instead of O(context)/step rebuild).
@@ -446,6 +456,16 @@ class PackedStreamingLayer(DynamicLayer):
                 self._k_blocks.append((kpacked, block_start, block_end))
                 self._v_blocks.append((vpacked, block_start, block_end))
 
+                # Incremental uniform_blk/blk_len update (F3): the only mutation site
+                # for _k_blocks is this append (pages are committed once, never
+                # dropped/reordered/cropped) — see the invariant note in __init__.
+                new_len = block_end - block_start
+                if self._blk_len is None:
+                    self._blk_len = new_len
+                    self._uniform_blk = True
+                elif new_len != self._blk_len:
+                    self._uniform_blk = False
+
             block_end = commit_end  # for the prune logic below
             block_len = committed_len
             self._committed_S_q = commit_end
@@ -547,8 +567,10 @@ class PackedStreamingLayer(DynamicLayer):
         # dim to the next power of 2 internally, so blk need not be pow2). The
         # geometric flush schedule normally emits equal-length blocks; on the rare
         # mixed-length tail we fall back to chunked_dequant_attention below.
-        blocks = self._k_blocks
-        uniform_blk = bool(blocks) and len({e - s for _, s, e in blocks}) == 1
+        # Old (recomputed every call): bool(blocks) and len({e - s for _, s, e in
+        # blocks}) == 1. Now maintained incrementally at the append site in update()
+        # (desk review F3) — self._uniform_blk mirrors that expression exactly.
+        uniform_blk = self._uniform_blk
 
         fused_packed_ok = (
             is_decode
