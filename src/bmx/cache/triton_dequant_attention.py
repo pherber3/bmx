@@ -863,13 +863,18 @@ if TRITON_AVAILABLE:
         j_is_first = d_idx < half
         src_for_j = tl.where(j_is_first, d_idx + half, d_idx - half)
         sign_for_j = tl.where(j_is_first, -1.0, 1.0)
-        P = tl.where(d_idx[:, None] == src_for_j[None, :], sign_for_j[None, :], 0.0)
+        # fp16 for the tl.dot operand (entries are exactly ±1/0 — lossless in fp16);
+        # all tl.dot ops in this kernel take fp16 operands with fp32 accumulation
+        # (tensor-core rate; the kernel is compute-bound — 2026-07-06 speed pass).
+        P = tl.where(d_idx[:, None] == src_for_j[None, :], sign_for_j[None, :], 0.0).to(
+            tl.float16
+        )
 
         # Per-head V unrotate operators, loaded once: the (d,d) orthonormal Hadamard
         # matrix and the per-channel signs (V = norm · signs ⊙ (H_d · M_quant)).
         hmat = tl.load(hmat_ptr + d_idx[:, None] * d + d_idx[None, :]).to(
-            tl.float32
-        )  # (d, d)
+            tl.float16
+        )  # (d, d) — fp16 dot operand (entries ±1/√d, rel err ~5e-4 « the 1e-2 bar)
         vsigns = tl.load(vsigns_ptr + d_idx).to(tl.float32)  # (d,)
 
         n_tiles = (split_end - split_start + BLOCK_N - 1) // BLOCK_N
@@ -887,14 +892,14 @@ if TRITON_AVAILABLE:
                 us_ptr + blk * blk_size * rank + r[:, None] * rank + rank_idx[None, :],
                 mask=tile_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)  # (BLOCK_N, rank)
+            )  # (BLOCK_N, rank) fp16 — dot operand, fp32 accumulate
             vfac = tl.load(
                 vfac_ptr
                 + blk * C * rank
                 + (kv * d + d_idx)[:, None] * rank
                 + rank_idx[None, :]
-            ).to(tl.float32)  # (d, rank)
-            k_low = tl.dot(us, tl.trans(vfac))  # (BLOCK_N, d)
+            )  # (d, rank) fp16 — dot operand
+            k_low = tl.dot(us, tl.trans(vfac))  # (BLOCK_N, d) fp32 acc
 
             # --- K RTN residual: res_int (d, blk) int8 * per-group scale -> (BLOCK_N,d) ---
             res = tl.load(
@@ -927,7 +932,9 @@ if TRITON_AVAILABLE:
                     mask=tile_mask[:, None],
                     other=0.0,
                 ).to(tl.float32)
-                rot = tl.dot(k, P)  # (BLOCK_N, d) = k @ P (rotate_half); avoids cube
+                # k cast fp16 ONLY for the rotate dot (rel err ~5e-4 on k); the
+                # elementwise k*cos below keeps the fp32 k.
+                rot = tl.dot(k.to(tl.float16), P)  # (BLOCK_N, d) = k @ P (rotate_half)
                 k = k * cos + rot * sin
 
             # scores[g, b] = scale * Σ_dd q[g,dd]*k[b,dd]. GEMV (multiply+sum): G=
@@ -976,10 +983,14 @@ if TRITON_AVAILABLE:
                     mask=tile_mask[:, None],
                     other=0,
                 ).to(tl.int32)  # (BLOCK_N, d) codebook indices for this head
-            m_quant = tl.load(cb_ptr + v_idx).to(tl.float32) * sqrt_d  # (BLOCK_N, d)
+            m_quant = tl.load(cb_ptr + v_idx).to(tl.float16)  # (BLOCK_N, d)
             # H_d · M_quant rows (orthonormal d-Hadamard via (d,d) matmul; d>=16 ok),
             # then per-channel signs and the per-row norm -> dequantized V (BLOCK_N,d).
-            v = tl.dot(m_quant, hmat) * vsigns[None, :] * v_norm[:, None]
+            # fp16 dot operands, fp32 result; the scalar sqrt_d commutes through the
+            # dot and is applied on the fp32 output (multiplying the fp16 operand by
+            # the fp32 scalar arg would silently promote it back to fp32 — Triton
+            # dtype-promotion rule, hit on first compile).
+            v = tl.dot(m_quant, hmat) * sqrt_d * vsigns[None, :] * v_norm[:, None]
             # p@v via GEMV (multiply+sum) — G=n_q_groups may be <16 so no tl.dot here.
             pv = tl.sum(p[:, :, None] * v[None, :, :], axis=1)  # (G, d)
             acc = acc * alpha[:, None] + pv
@@ -1125,14 +1136,19 @@ def fused_decode_attention_k2b(
     # num_splits; the merge kernel's row indexing is driven by its runtime
     # split-count arg, not the buffer's physical extent).
     part_slots = num_splits + 1 if has_tail else num_splits
-    block_n = _pick_block_n(blk_size)  # KV tile rows (<= 64, divides blk_size)
+    # V_PACKED codegen carries extra (BLOCK_N, d) int32 index/byte temporaries; at
+    # production dims (d=128, BLOCK_N=64) that overflowed the GH200's 232KB SMEM
+    # (needed 241664 — first real-dims firing, 2026-07-06; the CUDA pack_v oracle
+    # tests passed only at tiny dims). Cap the KV tile at 32 rows when packed.
+    v_packed = "v_idx_packed" in stacks
+    block_n = _pick_block_n(blk_size, cap=32 if v_packed else 64)
 
     cb = _codebook_dev(vbits, str(q.device))
     sqrt_d = 1.0 / math.sqrt(d)  # M_quant = cb[idx] / √d (per-head rotation)
     # Per-head (d,d) orthonormal Hadamard matrix + per-channel signs for the unrotate
     # (row-wise V = (x @ H_d) * signs * norm). hmat/vsigns cached per (d, device[, seed])
     # — desk review F2: avoid a fresh H2D copy every layer per decode step.
-    hmat = _hadamard_matrix(d, str(q.device), torch.float32)
+    hmat = _hadamard_matrix(d, str(q.device), torch.float16)
     vsigns = _signs_dev(d, v_seed, str(q.device))  # (d,)
     has_rope = rope_cos is not None
 
@@ -1156,10 +1172,9 @@ def fused_decode_attention_k2b(
 
     # W5-2: the stacks dict carries EITHER "v_idx" (int16, default) OR
     # "v_idx_packed" (uint8, pack_v=True build_kv_stacked_k2b) — never both.
-    # Detect which field is present so the launcher works unmodified for old
-    # callers (a plain dict with "v_idx" -> v_packed=False, byte-identical
-    # kernel launch to before this flag existed).
-    v_packed = "v_idx_packed" in stacks
+    # v_packed detected above (it also gates the SMEM-safe BLOCK_N cap); a plain
+    # dict with "v_idx" -> v_packed=False, byte-identical kernel launch to before
+    # the flag existed.
     v_idx_arg = stacks["v_idx_packed"] if v_packed else stacks["v_idx"]
 
     _fused_decode_k2b_kernel[(h_kv, num_splits)](
