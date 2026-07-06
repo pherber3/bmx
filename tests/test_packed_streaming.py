@@ -351,3 +351,245 @@ def test_uniform_blk_incremental_matches_recomputation():
     assert len(calls) > 0
     assert cache.layers[0]._blk_len is not None
     assert len(cache.layers[0]._k_blocks) >= 2
+
+
+# ---------------------------------------------------------------------------
+# W5-1: single-storage pages — block dicts become views into _PagedStacks.
+#
+# _PagedStacks.view() is device-agnostic and directly callable on CPU (it has no
+# CUDA dependency — only the fused Triton kernels it feeds require CUDA), so these
+# tests drive the k2b stacking + re-point path directly instead of going through
+# attend()'s CUDA-gated fused dispatch (q.is_cuda is always False on this box).
+# ---------------------------------------------------------------------------
+
+
+def _k2b_cpu_blocks(n_blocks, h_kv=2, blk=32, d=16, rank=16, group=16, seed=0):
+    """n_blocks of (lowrank_rtn_channel K, turboquant_mse_perhead V) packed dicts,
+    the k2b_ph fused-kernel arm pair, built directly via quantize_packed (no RoPE —
+    this exercises the stacking/re-point plumbing, not RoPE correctness, which is
+    already covered elsewhere)."""
+    torch.manual_seed(seed)
+    k_blocks, v_blocks = [], []
+    for i in range(n_blocks):
+        s, e = i * blk, (i + 1) * blk
+        kM = to_matrix(torch.randn(h_kv, blk, d))
+        vM = to_matrix(torch.randn(h_kv, blk, d))
+        kp, _ = quantize_packed(
+            "lowrank_rtn_channel", kM, bits=3, group=group, rank=rank, seed=seed
+        )
+        vp, _ = quantize_packed(
+            "turboquant_mse_perhead", vM, bits=2, seed=seed, h_heads=h_kv
+        )
+        k_blocks.append((kp, s, e))
+        v_blocks.append((vp, s, e))
+    return k_blocks, v_blocks
+
+
+def _chunked_decode(q, k_blocks, v_blocks, h_kv, group, seed, d):
+    """Minimal decode-mode chunked_dequant_attention call for the k2b arm pair."""
+    from bmx.cache.chunked_attention import chunked_dequant_attention
+
+    n_q_heads = q.shape[0]
+    k_tail = torch.zeros(h_kv, 0, d)
+    v_tail = torch.zeros(h_kv, 0, d)
+    return chunked_dequant_attention(
+        q,
+        k_blocks,
+        v_blocks,
+        k_arm="lowrank_rtn_channel",
+        v_arm="turboquant_mse_perhead",
+        group=group,
+        seed=seed,
+        k_pre_rope=False,
+        rope_cos=None,
+        rope_sin=None,
+        k_tail=k_tail,
+        v_tail=v_tail,
+        n_q_groups=n_q_heads // h_kv,
+        scale=1.0 / (d**0.5),
+        is_prefill=False,
+        v_group=None,
+        v_seed=seed,
+    )
+
+
+def test_k2b_repoint_storage_identity():
+    """After _repoint_k2b_blocks, the two re-pointable fields (K's res_Q_int, V's
+    indices) share storage with the stack buffer — no duplicate allocation survives
+    for those fields. The four cast fields (Us/V/res_scale/norms) are intentionally
+    NOT re-pointed (fp32->fp16 cast in the builder — a view cannot span two dtypes),
+    so they must still be the ORIGINAL block tensors, not stack-buffer views.
+    """
+    from bmx.cache.packed_streaming import PackedStreamingLayer, _PagedStacks
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_k2b
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 3
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=1)
+    orig_res_Q_int = [kp["res_Q_int"] for kp, _, _ in k_blocks]
+    orig_indices = [vp["indices"] for vp, _, _ in v_blocks]
+    orig_Us = [kp["Us"] for kp, _, _ in k_blocks]
+
+    layer = PackedStreamingLayer.__new__(PackedStreamingLayer)
+    layer._k_blocks = k_blocks
+    layer._v_blocks = v_blocks
+    layer._k2b_repointed = 0
+    layer._k2b_repoint_version = -1
+
+    stacks = _PagedStacks(build_kv_stacked_k2b, dict(h_kv=h_kv, blk_size=blk, d=d))
+    stacks.view(k_blocks, v_blocks, torch.device("cpu"))
+    layer._repoint_k2b_blocks(stacks)
+
+    res_int_buf = stacks._buf["res_int"]
+    v_idx_buf = stacks._buf["v_idx"]
+    for i in range(n):
+        kp, _, _ = k_blocks[i]
+        vp, _, _ = v_blocks[i]
+        assert kp["res_Q_int"].untyped_storage().data_ptr() == (
+            res_int_buf.untyped_storage().data_ptr()
+        ), f"block {i}: res_Q_int not re-pointed into the stack buffer"
+        assert vp["indices"].untyped_storage().data_ptr() == (
+            v_idx_buf.untyped_storage().data_ptr()
+        ), f"block {i}: indices not re-pointed into the stack buffer"
+        assert torch.equal(kp["res_Q_int"], orig_res_Q_int[i]), (
+            "re-pointed res_Q_int value changed"
+        )
+        assert torch.equal(vp["indices"], orig_indices[i]), (
+            "re-pointed indices value changed"
+        )
+        # Cast fields (Us/V/res_scale/norms) stay the ORIGINAL block tensors.
+        assert kp["Us"] is orig_Us[i], (
+            "Us was re-pointed despite the builder casting it fp32->fp16"
+        )
+        assert kp["Us"].untyped_storage().data_ptr() != (
+            stacks._buf["us"].untyped_storage().data_ptr()
+        )
+
+
+def test_k2b_repoint_parity_before_after_and_after_grow():
+    """chunked_dequant_attention output over the k2b blocks must be torch.equal:
+    (a) before any re-point, (b) after re-pointing the first stacking, and (c)
+    after a forced _grow (which reallocates the buffer, invalidating the earlier
+    views) followed by a re-point refresh. This is the referee for W5-1: the
+    consumer (chunked_dequant_attention) must see IDENTICAL values whether it
+    reads the original block tensors or the re-pointed stack-buffer views.
+    """
+    from bmx.cache.packed_streaming import PackedStreamingLayer, _PagedStacks
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_k2b
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 2
+    n_q_heads = h_kv * 2  # n_q_groups = 2
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=2)
+    q = torch.randn(n_q_heads, 1, d)
+
+    out_before = _chunked_decode(q, k_blocks, v_blocks, h_kv, group, 2, d)
+
+    layer = PackedStreamingLayer.__new__(PackedStreamingLayer)
+    layer._k_blocks = k_blocks
+    layer._v_blocks = v_blocks
+    layer._k2b_repointed = 0
+    layer._k2b_repoint_version = -1
+
+    stacks = _PagedStacks(build_kv_stacked_k2b, dict(h_kv=h_kv, blk_size=blk, d=d))
+    stacks.view(k_blocks[:1], v_blocks[:1], torch.device("cpu"))
+    layer._repoint_k2b_blocks(stacks)
+    out_after_repoint = _chunked_decode(q, k_blocks, v_blocks, h_kv, group, 2, d)
+    assert torch.equal(out_before, out_after_repoint), (
+        "chunked output changed after re-pointing block 0's res_Q_int/indices"
+    )
+
+    # Force a _grow: append the remaining blocks with a tiny starting capacity so
+    # `view` must grow past the block-0-only allocation.
+    version_before_grow = stacks.version
+    stacks.view(k_blocks, v_blocks, torch.device("cpu"))
+    assert stacks.version > version_before_grow, (
+        "test setup did not actually exercise a _grow — cap/n_stacked did not "
+        "cross the capacity boundary"
+    )
+    layer._repoint_k2b_blocks(stacks)  # must refresh stale views after the grow
+    out_after_grow = _chunked_decode(q, k_blocks, v_blocks, h_kv, group, 2, d)
+    assert torch.equal(out_before, out_after_grow), (
+        "chunked output changed after a _grow + re-point refresh — stale view "
+        "(pointing at a freed pre-grow buffer) or refresh bug"
+    )
+
+    # And the post-grow views must actually point at the NEW buffer, not the old one.
+    res_int_buf = stacks._buf["res_int"]
+    for kp, _, _ in k_blocks:
+        assert kp["res_Q_int"].untyped_storage().data_ptr() == (
+            res_int_buf.untyped_storage().data_ptr()
+        ), "block still points at a pre-grow (stale) buffer"
+
+
+def test_k2b_repoint_restack_on_shrink_is_forbidden():
+    """The `n < self._n_stacked` restack branch would rebuild pages FROM the block
+    list while freeing the buffer those very blocks may be re-pointed into — an
+    unsound rebuild-from-views-of-the-buffer-being-replaced hazard. It is
+    unreachable through PackedStreamingLayer (pages are append-only — see the F3
+    invariant note), so _PagedStacks.view() now asserts instead of silently
+    producing a wrong restack. This test pins that it fails loudly rather than
+    reachably corrupting state, should some future caller violate the invariant.
+    """
+    from bmx.cache.packed_streaming import _PagedStacks
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_k2b
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 3
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=3)
+
+    stacks = _PagedStacks(build_kv_stacked_k2b, dict(h_kv=h_kv, blk_size=blk, d=d))
+    stacks.view(k_blocks, v_blocks, torch.device("cpu"))
+    with pytest.raises(AssertionError, match="restack-on-shrink"):
+        stacks.view(k_blocks[:1], v_blocks[:1], torch.device("cpu"))
+
+
+def test_rtn_token_blocks_never_repointed():
+    """rtn_token/rtn_token has no re-pointable field: build_kv_stacked_packed's
+    from_matrix head-split (S, h_kv*d) <-> (h_kv, S, d) permute+reshape is not a
+    free view for h_kv > 1 (reshape after that permute silently falls back to a
+    copy — verified: the resulting tensor's storage differs from the stack
+    buffer's). PackedStreamingLayer therefore never re-points that config; this
+    test pins Q_int/scale as untouched, original, non-buffer-aliased tensors after
+    building the packed stack, documenting the config is (and must remain) fully
+    duplicated rather than shipping a copy disguised as a view.
+    """
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_packed
+
+    h_kv, blk, d, group, n = 2, 16, 8, 8, 2
+    torch.manual_seed(4)
+    k_blocks, v_blocks = [], []
+    for i in range(n):
+        s, e = i * blk, (i + 1) * blk
+        kM = to_matrix(torch.randn(h_kv, blk, d))
+        kp, _ = quantize_packed("rtn_token", kM, bits=4, group=group, seed=4)
+        k_blocks.append((kp, s, e))
+        v_blocks.append((kp, s, e))
+    orig_Q_int = [kp["Q_int"] for kp, _, _ in k_blocks]
+
+    k_codes, v_codes, k_scales, v_scales = build_kv_stacked_packed(
+        k_blocks,
+        v_blocks,
+        max_blocks=n,
+        h_kv=h_kv,
+        blk_size=blk,
+        d=d,
+        group=group,
+        v_group=group,
+        device="cpu",
+    )
+
+    for i in range(n):
+        kp, _, _ = k_blocks[i]
+        assert kp["Q_int"] is orig_Q_int[i], (
+            "rtn_token block Q_int must stay the original tensor (no re-point "
+            "exists for this config — see _repoint_k2b_blocks docstring)"
+        )
+        # Confirm (rather than assume) the layout genuinely can't view-alias: the
+        # would-be inverse (permute back to (S, h_kv*d)) does not share storage
+        # with the stack buffer.
+        back = k_codes[i].permute(1, 0, 2).reshape(blk, h_kv * d)
+        assert back.untyped_storage().data_ptr() != (
+            k_codes.untyped_storage().data_ptr()
+        ), (
+            "unexpected: from_matrix's permuted layout turned out to be reshape-"
+            "contiguous here — re-examine whether rtn_token IS re-pointable "
+            "(this would contradict the documented h_kv>1 analysis)"
+        )

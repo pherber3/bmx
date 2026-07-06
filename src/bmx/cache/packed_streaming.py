@@ -66,6 +66,13 @@ class _PagedStacks:
     tensors (packed: k_codes/v_codes/k_scales/v_scales) or a dict (k2b). The buffer is
     agnostic: it stacks each tensor field along dim 0 and carries any non-tensor dict
     entries (rank, k_group) verbatim from the latest build.
+
+    ``version`` increments on every reallocation (``_alloc``/``_grow``/``reset``) so a
+    caller holding views into the OLD buffers (e.g. PackedStreamingLayer's re-pointed
+    block dicts, W5-1) can detect staleness by comparing a remembered version and
+    refresh. It intentionally does NOT increment on an in-place ``_copy_in`` (existing
+    slot storage is untouched, only newly-appended slots are written — any view into an
+    already-stacked slot from a prior version remains valid until the next grow).
     """
 
     def __init__(self, build_fn, build_kwargs: dict):
@@ -78,6 +85,7 @@ class _PagedStacks:
         self._is_dict = False
         self._buf: list[torch.Tensor] | dict | None = None  # resident tensors
         self._meta: dict = {}  # non-tensor dict entries (rank, k_group) for the k2b dict
+        self.version = 0  # bumped on _alloc/_grow/reset — buffer-identity generation
 
     @staticmethod
     def _tensors(built):
@@ -101,6 +109,7 @@ class _PagedStacks:
                 for t in sample
             ]
         self._cap = cap
+        self.version += 1
 
     def _grow(self, cap: int):
         """Grow capacity to ``cap``, preserving the already-stacked slots."""
@@ -119,6 +128,7 @@ class _PagedStacks:
                 new.append(nt)
             self._buf = new
         self._cap = cap
+        self.version += 1
 
     def _copy_in(self, built, start: int, count: int):
         """Copy the first ``count`` slots of a fresh build into slots [start:start+count]."""
@@ -140,9 +150,28 @@ class _PagedStacks:
 
         if n < self._n_stacked:
             # Pages were dropped (cache reset / detach without clearing) — restack.
-            self._n_stacked = 0
-            self._cap = 0
-            self._buf = None
+            # HAZARD (W5-1): if the caller re-points block-dict fields into views of
+            # self._buf (single-storage pages), rebuilding here would read FROM views
+            # into the buffer this branch is about to discard — a use-after-free in
+            # spirit (the source arrays for build_fn would alias the destination being
+            # overwritten via a fresh torch.zeros, so not literally UB, but the
+            # semantics — "restack pages using pages we're about to invalidate" — are
+            # unsound and unsupported). Un-reachable in the current cache: _k_blocks/
+            # _v_blocks are append-only for the lifetime of a PackedStreamingLayer (see
+            # the F3 invariant note in packed_streaming.PackedStreamingLayer.__init__ —
+            # pages are committed once, never dropped/reordered/cropped), and no crop/
+            # reorder_cache override exists on PackedStreamingLayer/-Cache. Fail loudly
+            # instead of silently producing wrong results if that ever changes.
+            raise AssertionError(
+                "_PagedStacks.view() called with fewer committed pages "
+                f"({n}) than already stacked ({self._n_stacked}) — the restack-on-"
+                "shrink path is unsupported when block dicts may hold views into "
+                "this buffer (W5-1 single-storage pages). PackedStreamingLayer never "
+                "drops/reorders committed pages, so this should be unreachable; if a "
+                "new caller needs to shrink the committed-page list, it must "
+                "materialize (clone) any re-pointed block tensors before calling "
+                "view() with a shorter list."
+            )
 
         if self._n_stacked < n:
             new_k = k_blocks[self._n_stacked : n]
@@ -170,6 +199,7 @@ class _PagedStacks:
         self._cap = 0
         self._buf = None
         self._meta = {}
+        self.version += 1
 
 
 def chunked_attention_forward(
@@ -264,6 +294,18 @@ class PackedStreamingLayer(DynamicLayer):
         # page at a time thereafter (O(page)/step instead of O(context)/step rebuild).
         self._packed_stacks: _PagedStacks | None = None
         self._k2b_stacks: _PagedStacks | None = None
+
+        # W5-1 single-storage pages: once a page is absorbed into _k2b_stacks, its
+        # block-dict "res_Q_int"/"indices" tensors are re-pointed to VIEWS into the
+        # stack buffer (killing the double-buffer for those two fields — see
+        # _repoint_k2b_blocks). _k2b_repointed is how many leading _k_blocks/_v_blocks
+        # entries have been re-pointed so far; _k2b_repoint_version is the
+        # _k2b_stacks.version seen at the last re-point (a _grow reallocates the
+        # buffer, invalidating old views, so a version bump forces a full refresh).
+        # rtn_token/rtn_token has NO re-pointable field (see _repoint_k2b_blocks'
+        # module-level docstring companion in the report) so it has no analogous state.
+        self._k2b_repointed: int = 0
+        self._k2b_repoint_version: int = -1
 
         # Frozen subspace for lowrank_rtn_channel K (same approach as streaming.py).
         self._frozen_svd: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -500,6 +542,65 @@ class PackedStreamingLayer(DynamicLayer):
             return 0
         return self._committed_S_q + self.keys.shape[-2]
 
+    def _repoint_k2b_blocks(self, stacks: "_PagedStacks") -> None:
+        """W5-1 single-storage pages: after ``stacks`` absorbs committed k2b pages,
+        re-point the block dicts' ``res_Q_int``/``indices`` tensors to VIEWS into the
+        stack buffer, freeing the block-list copy of those two fields (they were the
+        two biggest fields — see the report's per-field byte table).
+
+        Callable directly (device-agnostic — ``_PagedStacks`` has no CUDA
+        dependency), so a CPU test can drive it without going through attend()'s
+        CUDA-gated fused dispatch.
+
+        FIELD SCOPE (k2b only — see the report for the full derivation):
+          - ``res_int[i]``  -> K block dict ``res_Q_int``: same (C, blk) int8 shape,
+            a plain row of the stack buffer (build_kv_stacked_k2b does
+            ``res_int[i] = kp["res_Q_int"].to(device)`` with NO dtype cast and NO
+            permute) -> re-pointable.
+          - ``v_idx[i]``    -> V block dict ``indices``: same (blk, C) int16 shape,
+            same reasoning -> re-pointable.
+          - ``us``/``vfac``/``res_scale``/``v_norm`` all CAST fp32->fp16 in the
+            builder (``Us``/``V``/``res_scale``/``norms`` are fp32 in the block
+            dict) -> kept as the ORIGINAL block tensors, never re-pointed (a view
+            cannot span two dtypes/storages).
+
+        rtn_token/rtn_token has NO analogous method: build_kv_stacked_packed calls
+        from_matrix (a (S, h_kv*d) <-> (h_kv, S, d) HEAD-SPLIT permute+reshape) on
+        Q_int/scale for BOTH K and V. For h_kv > 1 that permuted axis order is not
+        reshape-contiguous back to the block dict's native (S, h_kv*d) layout — a
+        real data-movement transform, not a free view (verified: `.reshape` after
+        the permute silently falls back to `.contiguous()`, changing storage). So
+        for rtn_token/rtn_token EVERY field would require a copy to re-point, i.e.
+        zero bytes are losslessly re-pointable there; that config is intentionally
+        left fully duplicated (today's behavior), documented in the report rather
+        than forcing a copy-disguised-as-a-view.
+
+        Idempotent: re-running with the same ``stacks.version`` and the same (or a
+        larger) committed-page count only re-points newly-stacked pages; blocks
+        already re-pointed under the current version are left untouched (their
+        views remain valid — grow-in-place / _copy_in never touches slots as they
+        are appended, only version bumps via _alloc/_grow invalidate old views).
+        """
+        n = stacks._n_stacked
+        if stacks.version != self._k2b_repoint_version:
+            # A _grow (or _alloc) happened since the last re-point: EVERY previously
+            # re-pointed view is stale (the old buffer may have been freed). Refresh
+            # from scratch so no view can survive pointing at a dead buffer.
+            self._k2b_repointed = 0
+            self._k2b_repoint_version = stacks.version
+        start = self._k2b_repointed
+        if start >= n:
+            return
+        buf = stacks._buf  # dict of full-capacity resident tensors (not sliced)
+        res_int_buf = buf["res_int"]
+        v_idx_buf = buf["v_idx"]
+        for i in range(start, n):
+            kp, ks, ke = self._k_blocks[i]
+            vp, vs, ve = self._v_blocks[i]
+            kp["res_Q_int"] = res_int_buf[i]
+            vp["indices"] = v_idx_buf[i]
+        self._k2b_repointed = n
+
     def attend(
         self,
         q: torch.Tensor,
@@ -653,6 +754,11 @@ class PackedStreamingLayer(DynamicLayer):
                     dict(h_kv=self._h_kv, blk_size=blk, d=q.shape[2]),
                 )
             stacks = self._k2b_stacks.view(self._k_blocks, self._v_blocks, q.device)
+            # W5-1 single-storage pages: absorb the block-list copy of res_Q_int/
+            # indices into views of the stack buffer just built/grown above. Must
+            # run AFTER every view() call (the only site that can grow/restack the
+            # buffer) so a version bump is never missed.
+            self._repoint_k2b_blocks(self._k2b_stacks)
             return fused_decode_attention_k2b(
                 q,
                 stacks,
