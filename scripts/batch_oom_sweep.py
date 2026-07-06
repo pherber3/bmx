@@ -65,6 +65,9 @@ class Config:
     # W5-2: bit-packed V indices in the packed cache's stacks (4 codes/byte).
     # Measures the second rung of the memory ladder (~3.6 -> ~1.7 GiB/seq @32k).
     pack_v: bool = False
+    # W5-3a: nibble-packed K residual (2 signed codes/byte) — the third memory rung
+    # (~2.26 -> ~1.73 GiB/seq @32k predicted).
+    pack_k: bool = False
 
 
 def _prompt_ids(tokenizer, ctx_len: int, device) -> torch.Tensor:
@@ -82,7 +85,7 @@ def _make_cache(mode: str, model, cfg: Config):
     if mode == "streaming":
         return StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
     return PackedStreamingCache(
-        model.config, k_spec=k_spec, v_spec=v_spec, pack_v=cfg.pack_v
+        model.config, k_spec=k_spec, v_spec=v_spec, pack_v=cfg.pack_v, pack_k=cfg.pack_k
     )
 
 
