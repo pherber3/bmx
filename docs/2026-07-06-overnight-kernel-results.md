@@ -93,3 +93,27 @@ VM: `~/bench_baseline.log`, `~/bench_fp16.log`, `~/profile_ab_clean.log`,
 `~/probe_logit_delta.log`, `~/probe_chatwrap.log`, `~/lb_anchor.log`,
 `~/lb_anchor_v1e.log`, `results/oom_sweep_*.json`, final block logs. Runs:
 `results/k3_longbench/20260706-{000742,024100}-84bb1f8`. To transport in the morning.
+
+## Addendum (dawn): final block numbers + the memory-ladder state of truth
+
+- **Post-fix end-to-end** (pack_v default on): packed 51.8 / 63.2 / 132.6 / 256.7 ms
+  at 4k/16k/65k/128k (−11–12% at long ctx vs 287.9; the isolated 1.85× shrinks in situ
+  — the kernel loses the L2 locality the back-to-back bench enjoyed). streaming
+  31.7–35.3 flat; dense 44.0–58.9. **Deployment guidance: streaming = latency path,
+  packed = memory path, identical quality (parity gate green).**
+- **Steady-state OOM sweep** (fixed design): dense 16 co-resident 32k seqs; packed 12
+  (was 8) — still an honest NEGATIVE on concurrency, but now contradicted by direct
+  measurement:
+- **Memory-ledger probe** (`~/probe_mem_ledger.log`): one packed cache at 32k after
+  stack+re-point = **2.789 GiB allocator-verified** (2.753 accounted field-by-field;
+  res_Q_int/indices block copies confirmed freed). Two findings:
+  (a) `_rope_cos/_rope_sin` are duplicated PER LAYER — ~0.5 GiB/cache of identical
+  tables at 32k (≈2.1 at 128k). Share per cache (or lru-cache per device) — first
+  morning fix, drops steady to ~2.3;
+  (b) the sweep's 4.506 GiB/seq marginal vs the probe's 2.789 true footprint — ~1.7
+  GiB of per-iteration transient the sweep counts that a settled cache doesn't hold
+  (unreconciled; instrument alloc_marks inside a 2-seq mini-run to localize). Until
+  (a)+(b) resolve, the concurrency table is NOT the cache's fault: predicted max
+  packed seqs at true 2.3–2.8/seq ≈ 28–34 vs dense 16.
+- **Closing gate: full GH200 suite 354 passed / 2 skipped / 1 xfailed** on the final
+  tree (kernel fp16 + pack_v default + all of Waves 3–5).
