@@ -154,7 +154,8 @@ def test_triton_k2b_module_imports():
 
 
 @cuda
-def test_triton_k2b_decode_matches_oracle():
+@pytest.mark.parametrize("pack_v", [False, True], ids=["v_idx", "v_idx_packed"])
+def test_triton_k2b_decode_matches_oracle(pack_v):
     """fused_decode_attention_k2b must match naive_dense_attention oracle.
 
     K = lowrank_rtn_channel (3-bit, rank=16), V = turboquant_mse_perhead (2-bit).
@@ -165,6 +166,10 @@ def test_triton_k2b_decode_matches_oracle():
 
     Tolerance: max_abs < 2e-2 (tf32 kernel + fp16 codec; expect tighter).
     If near 2e-2, investigate — do NOT loosen.
+
+    pack_v parametrization (W5-2, GH200 acceptance prep): pack_v=True exercises
+    the V_PACKED in-kernel unpack branch (4 codes/byte); pack_v=False is the
+    default/pre-existing path. Both must clear the same oracle bar.
     """
     from bmx.cache.chunked_attention import attention_diff, naive_dense_attention
     from bmx.cache.triton_dequant_attention import (
@@ -213,6 +218,7 @@ def test_triton_k2b_decode_matches_oracle():
         blk_size=blk,
         d=d,
         device="cuda",
+        pack_v=pack_v,
     )
     out_cuda = fused_decode_attention_k2b(
         q.cuda(),
@@ -229,7 +235,7 @@ def test_triton_k2b_decode_matches_oracle():
 
     diff = attention_diff(out_cpu, ref_cpu)
     assert diff["max_abs"] < 2e-2, (
-        f"fused_decode_attention_k2b drifted from oracle: {diff}.\n"
+        f"fused_decode_attention_k2b drifted from oracle (pack_v={pack_v}): {diff}.\n"
         f"  K arm: lowrank_rtn_channel (rank={k_rank}, bits={k_bits}, group={k_group}, seed={k_seed})\n"
         f"  V arm: turboquant_mse_perhead (bits={v_bits}, seed={v_seed})\n"
         "If max_abs >= 2e-2 investigate — do NOT loosen this tolerance."
@@ -237,12 +243,16 @@ def test_triton_k2b_decode_matches_oracle():
 
 
 @cuda
-def test_triton_k2b_pre_rope_matches_chunked():
+@pytest.mark.parametrize("pack_v", [False, True], ids=["v_idx", "v_idx_packed"])
+def test_triton_k2b_pre_rope_matches_chunked(pack_v):
     """k2b with k_pre_rope=True applies RoPE in-kernel.
 
     Reference is chunked_dequant_attention (PyTorch apply_rope on reconstructed K
     — the verified pre-RoPE path), so this confirms the in-kernel rotate_half matches.
     GQA (n_q_groups=4) + multi-KV-head.
+
+    pack_v parametrization (W5-2, GH200 acceptance prep): see
+    test_triton_k2b_decode_matches_oracle's docstring.
     """
     from bmx.cache.chunked_attention import attention_diff, chunked_dequant_attention
     from bmx.cache.triton_dequant_attention import (
@@ -286,6 +296,7 @@ def test_triton_k2b_pre_rope_matches_chunked():
         blk_size=blk,
         d=d,
         device="cuda",
+        pack_v=pack_v,
     )
     out = fused_decode_attention_k2b(
         q.cuda(),
@@ -301,8 +312,9 @@ def test_triton_k2b_pre_rope_matches_chunked():
 
     diff = attention_diff(out, ref)
     assert diff["max_abs"] < 2e-2, (
-        f"k2b in-kernel RoPE diverged from chunked reference: {diff}. "
-        "If max_abs >= 2e-2 investigate the in-kernel rotate_half — do NOT loosen."
+        f"k2b in-kernel RoPE diverged from chunked reference (pack_v={pack_v}): "
+        f"{diff}. If max_abs >= 2e-2 investigate the in-kernel rotate_half/unpack "
+        "— do NOT loosen."
     )
 
 

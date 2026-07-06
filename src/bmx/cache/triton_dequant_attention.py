@@ -34,6 +34,92 @@ def _next_pow2(n: int) -> int:
     return p
 
 
+# ---------------------------------------------------------------------------
+# Bit-packing (W5-2): pack low-bit-width codes 8/bits-per-byte along the LAST
+# axis. Containers today are int16 regardless of bit-width (codecs.py stores
+# codebook indices as int16 unconditionally) -- for a 2-bit V code that is 8x
+# the bytes actually needed. This packs/unpacks a reference (pure-torch, no
+# Triton) representation for the STACKED resident buffers only; the block
+# dicts and codecs.py quantize_packed/dequant_packed keep int16 (reference-
+# path parity -- see build_kv_stacked_k2b's pack_v flag and the plan doc,
+# docs/superpowers/plans/2026-07-05-resident-memory-realization.md, Task 2).
+# ---------------------------------------------------------------------------
+
+
+def pack_codes(idx: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack int codes into uint8 containers, 8/bits codes per byte (last axis).
+
+    Little-endian within the byte: code at channel c lives in byte c//per_byte
+    at bit-offset bits*(c % per_byte), per_byte = 8 // bits. Only bit-widths
+    that divide 8 and are < 8 are supported (2 and 4 in practice -- vbits for
+    the turboquant V codec); the last axis (channel/C) must be divisible by
+    per_byte so every output byte is fully populated by real codes.
+
+    idx: (..., C) any integer dtype, values in [0, 2**bits).
+    Returns: (..., C // per_byte) uint8.
+    """
+    assert 8 % bits == 0 and bits < 8, (
+        f"pack_codes only supports bit-widths dividing 8 and < 8 (got bits={bits}); "
+        "2 and 4 are the supported turboquant/RTN low-bit-width codes."
+    )
+    per_byte = 8 // bits
+    C = idx.shape[-1]
+    assert C % per_byte == 0, (
+        f"pack_codes: last axis C={C} must be divisible by per_byte={per_byte} "
+        f"(8 // bits={bits}) so every packed byte is fully populated."
+    )
+    idx_u8 = idx.to(torch.uint8)
+    grouped = idx_u8.reshape(*idx.shape[:-1], C // per_byte, per_byte)  # (...,C/pb,pb)
+    shifts = (torch.arange(per_byte, device=idx.device, dtype=torch.uint8) * bits).to(
+        torch.uint8
+    )
+    # int32 accumulation avoids uint8 overflow when shifting/OR-ing the top code.
+    packed = (
+        (grouped.to(torch.int32) << shifts.to(torch.int32)).sum(dim=-1).to(torch.uint8)
+    )
+    return packed
+
+
+def unpack_codes(packed: torch.Tensor, bits: int, C: int) -> torch.Tensor:
+    """Exact inverse of pack_codes. packed: (..., C // per_byte) uint8 -> (..., C) int16."""
+    assert 8 % bits == 0 and bits < 8, (
+        f"unpack_codes only supports bit-widths dividing 8 and < 8 (got bits={bits})."
+    )
+    per_byte = 8 // bits
+    assert C % per_byte == 0, (
+        f"unpack_codes: C={C} must be divisible by per_byte={per_byte} (8 // bits={bits})."
+    )
+    assert packed.shape[-1] == C // per_byte, (
+        f"unpack_codes: packed last axis {packed.shape[-1]} != C // per_byte "
+        f"({C} // {per_byte} = {C // per_byte})"
+    )
+    mask = (1 << bits) - 1
+    shifts = torch.arange(per_byte, device=packed.device, dtype=torch.uint8) * bits
+    packed_i32 = packed.to(torch.int32).unsqueeze(-1)  # (..., C/pb, 1)
+    codes = (packed_i32 >> shifts.to(torch.int32)) & mask  # (..., C/pb, pb)
+    return codes.reshape(*packed.shape[:-1], C).to(torch.int16)
+
+
+def block_v_indices(vp: dict, vbits: int, C: int) -> torch.Tensor:
+    """Return a V block dict's int16 codebook indices, transparent to pack_v.
+
+    ``vp`` is a V block dict as stored in PackedStreamingLayer._v_blocks. Under
+    the default (unpacked) path it holds ``vp["indices"]`` (int16, (blk, C))
+    directly. Under W5-1+W5-2 single-storage pack_v=True re-pointing
+    (_repoint_k2b_blocks), "indices" is DELETED and replaced by
+    "indices_packed" (a view into the packed uint8 stack buffer) to free the
+    int16 block-list copy -- the whole point of packing. This helper is the
+    ONE place that knows both representations, so any consumer that needs
+    int16 indices from a (possibly re-pointed) stacked block goes through it
+    instead of reading "indices" by key directly. The unpack here is
+    transient (never stored back onto vp) -- it materializes a fresh int16
+    tensor each call, same as the pre-pack_v behavior.
+    """
+    if "indices" in vp:
+        return vp["indices"]
+    return unpack_codes(vp["indices_packed"], vbits, C)
+
+
 def _pick_block_n(blk_size: int, cap: int = 64) -> int:
     """KV tile size for the fused kernels' internal block loop: the largest power of 2 that is
     <= cap AND divides blk_size, so each tile lies within one stored block
@@ -733,6 +819,7 @@ if TRITON_AVAILABLE:
         vbits: tl.constexpr,  # turboquant V bits (codebook size 2**vbits)
         BLOCK_N: tl.constexpr,  # KV tile rows per loop iter (small pow2; divides blk_size)
         HAS_ROPE: tl.constexpr,
+        V_PACKED: tl.constexpr,  # W5-2: v_idx_ptr holds packed uint8 (per_byte codes/byte)
     ):
         """k2b fused decode: in-kernel lowrank-K + RoPE + per-head turboquant-V.
 
@@ -863,14 +950,32 @@ if TRITON_AVAILABLE:
                 mask=tile_mask,
                 other=0.0,
             ).to(tl.float32)  # (BLOCK_N,) per-row norm for THIS head
-            v_idx = tl.load(
-                v_idx_ptr
-                + blk * blk_size * C
-                + r[:, None] * C
-                + (kv * d + d_idx)[None, :],
-                mask=tile_mask[:, None],
-                other=0,
-            ).to(tl.int32)  # (BLOCK_N, d) codebook indices for this head
+            c_global = kv * d + d_idx  # (d,) this head's channel range in [0, C)
+            if V_PACKED:
+                # 8/vbits codes per uint8 byte, little-endian within the byte (see
+                # pack_codes): code at channel c lives in byte c//per_byte at bit
+                # offset vbits*(c % per_byte). Redundant per-element byte loads
+                # across the vbits codes sharing one byte are fine — L2 catches
+                # them (per task brief); this does NOT restructure the tile loop.
+                per_byte: tl.constexpr = 8 // vbits
+                C_packed: tl.constexpr = C // per_byte
+                byte_off = c_global // per_byte  # (d,) byte index within the row
+                bit_shift = (c_global % per_byte) * vbits  # (d,) shift within the byte
+                v_byte = tl.load(
+                    v_idx_ptr
+                    + blk * blk_size * C_packed
+                    + r[:, None] * C_packed
+                    + byte_off[None, :],
+                    mask=tile_mask[:, None],
+                    other=0,
+                ).to(tl.int32)  # (BLOCK_N, d)
+                v_idx = (v_byte >> bit_shift[None, :]) & ((1 << vbits) - 1)
+            else:
+                v_idx = tl.load(
+                    v_idx_ptr + blk * blk_size * C + r[:, None] * C + c_global[None, :],
+                    mask=tile_mask[:, None],
+                    other=0,
+                ).to(tl.int32)  # (BLOCK_N, d) codebook indices for this head
             m_quant = tl.load(cb_ptr + v_idx).to(tl.float32) * sqrt_d  # (BLOCK_N, d)
             # H_d · M_quant rows (orthonormal d-Hadamard via (d,d) matmul; d>=16 ok),
             # then per-channel signs and the per-row norm -> dequantized V (BLOCK_N,d).
@@ -897,21 +1002,29 @@ def build_kv_stacked_k2b(
     blk_size: int,
     d: int,
     device: torch.device | str = "cuda",
+    pack_v: bool = False,
 ):
     """Pre-stack k2b packed factors (lowrank_rtn_channel K + PER-HEAD turboquant V).
 
     K blocks: standard lowrank_rtn_channel packed dicts (Us, V, res_Q_int, res_scale).
     V blocks: PER-HEAD turboquant dicts — {"indices": (blk, h_kv*d) int16,
-              "norms": (blk, h_kv) fp16} from _turboquant_mse_perhead_packed.
+              "norms": (blk, h_kv) fp16, "bits": int} from _turboquant_mse_perhead_packed.
 
     Returns a dict of device tensors the k2b fused kernel consumes:
       us:        (max_blocks, blk, rank)            fp16
       vfac:      (max_blocks, h_kv*d, rank)         fp16
       res_int:   (max_blocks, h_kv*d, blk)          int8
       res_scale: (max_blocks, h_kv*d, blk//k_group) fp16
-      v_idx:     (max_blocks, blk, h_kv*d)          int16
+      v_idx:     (max_blocks, blk, h_kv*d)          int16   -- when pack_v=False
+      v_idx_packed: (max_blocks, blk, h_kv*d // per_byte) uint8 -- when pack_v=True
+                 (4 codes/byte at vbits=2; per_byte = 8 // vbits)
       v_norm:    (max_blocks, blk, h_kv)            fp16  (per-(row,head) norms)
-    plus rank, k_group (read off block 0).
+    plus rank, k_group (read off block 0); when pack_v=True also pack_v=True and
+    vbits (read off block 0's "bits" entry) so downstream consumers (the fused
+    kernel launcher, _repoint_k2b_blocks) can tell which field/layout is present
+    WITHOUT re-deriving vbits from elsewhere. When pack_v=False the output is
+    byte-identical to before this flag existed (regression-pinned by
+    test_build_kv_stacked_k2b_pack_v_false_matches_today).
     """
     C = h_kv * d
     rank = k_blocks[0][0]["Us"].shape[1]
@@ -923,8 +1036,16 @@ def build_kv_stacked_k2b(
     vfac = torch.zeros(max_blocks, C, rank, dtype=torch.float16, device=device)
     res_int = torch.zeros(max_blocks, C, blk_size, dtype=torch.int8, device=device)
     res_scale = torch.zeros(max_blocks, C, n_kg, dtype=torch.float16, device=device)
-    v_idx = torch.zeros(max_blocks, blk_size, C, dtype=torch.int16, device=device)
     v_norm = torch.zeros(max_blocks, blk_size, h_kv, dtype=torch.float16, device=device)
+
+    vbits = int(v_blocks[0][0]["bits"])
+    if pack_v:
+        per_byte = 8 // vbits
+        v_idx_packed = torch.zeros(
+            max_blocks, blk_size, C // per_byte, dtype=torch.uint8, device=device
+        )
+    else:
+        v_idx = torch.zeros(max_blocks, blk_size, C, dtype=torch.int16, device=device)
 
     for i, ((kp, _ks, _ke), (vp, _vs, _ve)) in enumerate(zip(k_blocks, v_blocks)):
         assert i < max_blocks
@@ -932,19 +1053,29 @@ def build_kv_stacked_k2b(
         vfac[i] = kp["V"].to(device).to(torch.float16)
         res_int[i] = kp["res_Q_int"].to(device)
         res_scale[i] = kp["res_scale"].squeeze(-1).to(device).to(torch.float16)
-        v_idx[i] = vp["indices"].to(device).to(torch.int16)
         v_norm[i] = vp["norms"].to(device).to(torch.float16)  # (blk, h_kv)
+        idx = vp["indices"].to(device).to(torch.int16)
+        if pack_v:
+            v_idx_packed[i] = pack_codes(idx, vbits)
+        else:
+            v_idx[i] = idx
 
-    return {
+    out = {
         "us": us,
         "vfac": vfac,
         "res_int": res_int,
         "res_scale": res_scale,
-        "v_idx": v_idx,
         "v_norm": v_norm,
         "rank": rank,
         "k_group": k_group,
     }
+    if pack_v:
+        out["v_idx_packed"] = v_idx_packed
+        out["pack_v"] = True
+        out["vbits"] = vbits
+    else:
+        out["v_idx"] = v_idx
+    return out
 
 
 def fused_decode_attention_k2b(
@@ -1023,13 +1154,21 @@ def fused_decode_attention_k2b(
         rope_sin.to(q.device, torch.float16).contiguous() if has_rope else stacks["us"]
     )
 
+    # W5-2: the stacks dict carries EITHER "v_idx" (int16, default) OR
+    # "v_idx_packed" (uint8, pack_v=True build_kv_stacked_k2b) — never both.
+    # Detect which field is present so the launcher works unmodified for old
+    # callers (a plain dict with "v_idx" -> v_packed=False, byte-identical
+    # kernel launch to before this flag existed).
+    v_packed = "v_idx_packed" in stacks
+    v_idx_arg = stacks["v_idx_packed"] if v_packed else stacks["v_idx"]
+
     _fused_decode_k2b_kernel[(h_kv, num_splits)](
         q_kv,
         stacks["us"],
         stacks["vfac"],
         stacks["res_int"],
         stacks["res_scale"],
-        stacks["v_idx"],
+        v_idx_arg,
         stacks["v_norm"],
         cb,
         hmat,
@@ -1052,6 +1191,7 @@ def fused_decode_attention_k2b(
         vbits=vbits,
         BLOCK_N=block_n,
         HAS_ROPE=has_rope,
+        V_PACKED=v_packed,
     )
 
     # V is fully dequanted in-kernel (per-head) — acc_part/m_part/lse_part are the

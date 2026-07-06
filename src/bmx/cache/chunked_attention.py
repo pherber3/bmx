@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from bmx.cache.codecs import dequant_packed
 from bmx.cache.collect import from_matrix
 from bmx.cache.rope import apply_rope
+from bmx.cache.triton_dequant_attention import block_v_indices
 
 
 def online_softmax_update(acc, m, lse, scores_new, v_new):
@@ -48,7 +49,26 @@ def attention_diff(a: torch.Tensor, b: torch.Tensor) -> dict:
 
 
 def _dequant_block(packed, arm, group, seed, h_kv):
-    """packed dict -> (h_kv, blk, d) dense, matching to_matrix layout."""
+    """packed dict -> (h_kv, blk, d) dense, matching to_matrix layout.
+
+    W5-2 pack_v interaction: a k2b V block dict that has been re-pointed under
+    pack_v=True (_repoint_k2b_blocks) no longer holds "indices" (int16) --
+    "indices" was DELETED and replaced by "indices_packed" (a view into the
+    packed uint8 stack buffer), freeing the int16 block-list copy. dequant_packed
+    (codecs.py) is arm-generic and always reads "indices" by key, so route
+    through block_v_indices here (the one place that knows both
+    representations) to transiently materialize int16 indices before handing
+    the dict to dequant_packed -- codecs.py itself is untouched.
+    """
+    if (
+        arm == "turboquant_mse_perhead"
+        and "indices" not in packed
+        and "indices_packed" in packed
+    ):
+        vbits = packed["bits"]
+        per_byte = 8 // vbits
+        C = packed["indices_packed"].shape[-1] * per_byte
+        packed = {**packed, "indices": block_v_indices(packed, vbits, C)}
     M = (
         packed["fp16"]
         if arm == "fp16"

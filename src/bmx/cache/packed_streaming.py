@@ -259,12 +259,18 @@ class PackedStreamingLayer(DynamicLayer):
         v_spec: CacheCodecSpec,
         model_config,
         recent_window: int = 32,
+        pack_v: bool = False,
     ):
         super().__init__()
         self.k_spec = k_spec
         self.v_spec = v_spec
         self.model_config = model_config
         self.recent_window = recent_window
+        # W5-2: pack the k2b stacked V indices 4-codes/byte (uint8) instead of
+        # int16. Flag-gated, default OFF everywhere -- flips only on GH200
+        # oracle evidence (see triton_dequant_attention.build_kv_stacked_k2b /
+        # the fused kernel's V_PACKED constexpr branch).
+        self.pack_v = pack_v
 
         # Pre-RoPE key buffer (mirrors StreamingQuantizedLayer._k_pre).
         self._k_pre: torch.Tensor | None = None
@@ -558,11 +564,23 @@ class PackedStreamingLayer(DynamicLayer):
             ``res_int[i] = kp["res_Q_int"].to(device)`` with NO dtype cast and NO
             permute) -> re-pointable.
           - ``v_idx[i]``    -> V block dict ``indices``: same (blk, C) int16 shape,
-            same reasoning -> re-pointable.
+            same reasoning -> re-pointable (pack_v=False; the default).
           - ``us``/``vfac``/``res_scale``/``v_norm`` all CAST fp32->fp16 in the
             builder (``Us``/``V``/``res_scale``/``norms`` are fp32 in the block
             dict) -> kept as the ORIGINAL block tensors, never re-pointed (a view
             cannot span two dtypes/storages).
+
+        W5-2 (pack_v=True): the stack field is ``v_idx_packed`` (uint8,
+        (blk, C // per_byte)) -- NOT the same shape/dtype as the block dict's
+        int16 ``indices``, so re-pointing ``indices`` directly to it would hand
+        a wrong-shape/dtype tensor to any int16-expecting consumer. Instead the
+        block dict's ``indices`` entry is DELETED and replaced with
+        ``indices_packed`` (the packed uint8 view) -- freeing the int16
+        block-list copy, which is the whole point of packing. Any consumer that
+        needs int16 indices from a re-pointed block (e.g. the chunked-attention
+        fallback, multi-turn parity tests) must go through
+        ``triton_dequant_attention.block_v_indices`` (transient unpack, never
+        stored back).
 
         rtn_token/rtn_token has NO analogous method: build_kv_stacked_packed calls
         from_matrix (a (S, h_kv*d) <-> (h_kv, S, d) HEAD-SPLIT permute+reshape) on
@@ -593,12 +611,17 @@ class PackedStreamingLayer(DynamicLayer):
             return
         buf = stacks._buf  # dict of full-capacity resident tensors (not sliced)
         res_int_buf = buf["res_int"]
-        v_idx_buf = buf["v_idx"]
+        pack_v = stacks._meta.get("pack_v", False)
+        v_idx_buf = buf["v_idx_packed"] if pack_v else buf["v_idx"]
         for i in range(start, n):
             kp, ks, ke = self._k_blocks[i]
             vp, vs, ve = self._v_blocks[i]
             kp["res_Q_int"] = res_int_buf[i]
-            vp["indices"] = v_idx_buf[i]
+            if pack_v:
+                vp.pop("indices", None)
+                vp["indices_packed"] = v_idx_buf[i]
+            else:
+                vp["indices"] = v_idx_buf[i]
         self._k2b_repointed = n
 
     def attend(
@@ -751,7 +774,12 @@ class PackedStreamingLayer(DynamicLayer):
             if self._k2b_stacks is None:
                 self._k2b_stacks = _PagedStacks(
                     build_kv_stacked_k2b,
-                    dict(h_kv=self._h_kv, blk_size=blk, d=q.shape[2]),
+                    dict(
+                        h_kv=self._h_kv,
+                        blk_size=blk,
+                        d=q.shape[2],
+                        pack_v=self.pack_v,
+                    ),
                 )
             stacks = self._k2b_stacks.view(self._k_blocks, self._v_blocks, q.device)
             # W5-1 single-storage pages: absorb the block-list copy of res_Q_int/
@@ -837,16 +865,19 @@ class PackedStreamingCache(Cache):
         k_spec: CacheCodecSpec,
         v_spec: CacheCodecSpec,
         recent_window: int = 32,
+        pack_v: bool = False,
     ):
         super().__init__(
             layer_class_to_replicate=lambda: PackedStreamingLayer(
-                k_spec, v_spec, model_config, recent_window
+                k_spec, v_spec, model_config, recent_window, pack_v=pack_v
             )
         )
         self.model_config = model_config
         self.k_spec = k_spec
         self.v_spec = v_spec
         self.recent_window = recent_window
+        # W5-2: threaded down to every PackedStreamingLayer (default OFF).
+        self.pack_v = pack_v
         self._handles: list = []
         self._saved_impl: str | None = None
         self._model = None
@@ -869,7 +900,11 @@ class PackedStreamingCache(Cache):
         while len(self.layers) < n_layers:
             self.layers.append(
                 PackedStreamingLayer(
-                    self.k_spec, self.v_spec, self.model_config, self.recent_window
+                    self.k_spec,
+                    self.v_spec,
+                    self.model_config,
+                    self.recent_window,
+                    pack_v=self.pack_v,
                 )
             )
 
