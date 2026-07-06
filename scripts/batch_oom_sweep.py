@@ -131,6 +131,12 @@ def _trial(model, tokenizer, cfg: Config, mode: str, ctx: int, n_seqs: int) -> d
             next_tok.append(out.logits[:, -1:].argmax(-1))
         del out, tok
         caches.append(cache)
+        # Settle before marking: the W5-1 re-point drops the last references to the
+        # block-list duplicates, but if any sit in reference cycles they linger until
+        # a GC pass — without this, marks measure garbage-not-yet-collected, not
+        # residency (probe read 2.79 GiB/seq while un-gc'd marks read 4.5).
+        gc.collect()
+        torch.cuda.empty_cache()
         alloc_marks.append(torch.cuda.memory_allocated())
 
     # Phase 2: decode through each cache while ALL N stay resident.
