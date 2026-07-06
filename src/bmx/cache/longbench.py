@@ -170,11 +170,20 @@ def build_longbench_prompt(
     else:
         prompt_text = tokenizer.decode(ids[0], skip_special_tokens=True)
 
-    wrapped_ids = tokenizer.apply_chat_template(
+    # return_dict=True + ["input_ids"] is the stable interface: without return_dict,
+    # transformers 5.x tokenizers can hand back a list of tokenizers.Encoding objects
+    # (ignoring return_tensors) — hit on the REAL Llama-3.1 tokenizer 2026-07-06; the
+    # CPU fake returned a tensor, which is why tests missed it.
+    wrapped = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt_text}],
         add_generation_prompt=True,
         tokenize=True,
+        return_dict=True,
         return_tensors="pt",
+    )
+    wrapped_ids = wrapped["input_ids"]
+    assert torch.is_tensor(wrapped_ids) and wrapped_ids.dim() == 2, (
+        f"apply_chat_template returned {type(wrapped_ids)!r}; expected (1, L) ids tensor"
     )
     bos_id = getattr(tokenizer, "bos_token_id", None)
     if bos_id is not None:

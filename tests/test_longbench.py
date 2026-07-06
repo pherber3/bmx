@@ -262,7 +262,12 @@ class _ChatCapableTok:
         return " ".join(words)
 
     def apply_chat_template(
-        self, messages, add_generation_prompt=True, tokenize=True, return_tensors=None
+        self,
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors=None,
+        return_dict=False,
     ):
         import torch
 
@@ -276,7 +281,23 @@ class _ChatCapableTok:
         self._last_words = words
         body = [100 + i for i in range(len(words))]
         ids = torch.tensor([[self.bos_token_id] + body])
-        return ids if tokenize else wrapped
+        if not tokenize:
+            return wrapped
+        if return_dict:
+            return {"input_ids": ids}
+        # Mirror the REAL transformers-5.x trap that bit the first on-VM chat-wrap run
+        # (2026-07-06): without return_dict=True, the fast tokenizer hands back a list
+        # of tokenizers.Encoding objects, IGNORING return_tensors. Returning a
+        # non-tensor here keeps the regression honest — build_longbench_prompt must go
+        # through the return_dict interface or these tests fail the way the VM did.
+        return [_FakeEncoding(ids[0])]
+
+
+class _FakeEncoding:
+    """Stand-in for tokenizers.Encoding: has .ids, is NOT a tensor, has no .tolist()."""
+
+    def __init__(self, ids_row):
+        self.ids = ids_row.tolist()
 
 
 def _chat_item():
