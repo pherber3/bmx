@@ -62,6 +62,9 @@ class Config:
     seed: int = 0
     out: str = "results/batch_oom_sweep.json"
     confirm_run: bool = False  # hard gate: this script OOMs the GPU by design
+    # W5-2: bit-packed V indices in the packed cache's stacks (4 codes/byte).
+    # Measures the second rung of the memory ladder (~3.6 -> ~1.7 GiB/seq @32k).
+    pack_v: bool = False
 
 
 def _prompt_ids(tokenizer, ctx_len: int, device) -> torch.Tensor:
@@ -76,8 +79,11 @@ def _make_cache(mode: str, model, cfg: Config):
 
         return DynamicCache()
     k_spec, v_spec = spec_pair(cfg.arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
-    cls = StreamingQuantizedCache if mode == "streaming" else PackedStreamingCache
-    return cls(model.config, k_spec=k_spec, v_spec=v_spec)
+    if mode == "streaming":
+        return StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    return PackedStreamingCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, pack_v=cfg.pack_v
+    )
 
 
 class _Wired:
