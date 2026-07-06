@@ -117,3 +117,16 @@ VM: `~/bench_baseline.log`, `~/bench_fp16.log`, `~/profile_ab_clean.log`,
   packed seqs at true 2.3–2.8/seq ≈ 28–34 vs dense 16.
 - **Closing gate: full GH200 suite 354 passed / 2 skipped / 1 xfailed** on the final
   tree (kernel fp16 + pack_v default + all of Waves 3–5).
+
+## Final addendum: C3 DEMONSTRATED — 2.258 GiB/seq measured, mystery fully decomposed
+
+With pack_v + shared RoPE + GC-settled marks (`results/oom_sweep_packv_rope.json`):
+**packed marginal 2.258 GiB/seq @32k vs dense fp16's 4.008** — matching the
+memory-ledger probe's prediction (2.79 − 0.5 rope = 2.29) to within 1.5%. The night's
+"4.5 GiB mystery" decomposed EXACTLY into three fixed causes: the all-prefill sweep
+design (65c7d59), per-layer RoPE duplication (e4720b2), and the sweep script's
+pack_v=False config default shadowing the cache's new True default (measurement-side;
+the earlier 4.008 rows were the unpacked layout). No residual gap; the W5-1/W5-2
+frees are confirmed working in the multi-cache serving pattern.
+Remaining ladder to the honest-bpe ~1.1 GiB: W5-3 K-residual 3-bit packing (−0.67)
+and fp16-ing the fp32 block-dict metadata fields (−0.3) — both optional post-paper.
