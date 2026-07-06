@@ -115,13 +115,21 @@ def _trial(model, tokenizer, cfg: Config, mode: str, ctx: int, n_seqs: int) -> d
     alloc_marks: list[int] = []
     t0 = time.perf_counter()
 
-    # Phase 1: prefill all N caches, keeping every one resident.
+    # Phase 1: prefill all N caches, keeping every one resident. Each cache also
+    # decodes ONE token immediately after its prefill: on the packed path that
+    # first decode builds the stacks and (W5-1) re-points/frees the block-list
+    # duplicates, so alloc_marks record STEADY-STATE per-sequence residency — the
+    # number a serving system actually pays — not the transient prefill layout.
+    # (The first sweep, 2026-07-05, prefilled all N before any decode; its OOM
+    # boundary was set by the pre-stacking transient and W5-1 could never help.)
     for _ in range(n_seqs):
         cache = _make_cache(mode, model, cfg)
         with _Wired(cache, model), torch.no_grad():
             out = model(ids_, past_key_values=cache, use_cache=True)
+            tok = out.logits[:, -1:].argmax(-1)
+            out = model(tok, past_key_values=cache, use_cache=True)
             next_tok.append(out.logits[:, -1:].argmax(-1))
-        del out
+        del out, tok
         caches.append(cache)
         alloc_marks.append(torch.cuda.memory_allocated())
 
