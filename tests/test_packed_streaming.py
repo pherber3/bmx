@@ -828,3 +828,50 @@ def test_chunked_attention_after_pack_v_repoint_matches_pristine():
         "— block_v_indices access-path wiring in chunked_attention._dequant_block "
         "is not transparent to pack_v"
     )
+
+
+def test_rope_tables_shared_across_layers_and_caches():
+    """2026-07-06 memory fix: RoPE cos/sin are process-shared, not per-layer copies.
+
+    The memory-ledger probe found ~0.5 GiB/cache of identical per-layer tables at
+    32k. After _shared_rope, every layer of every cache on the same config must hold
+    THE SAME storage, and values must equal a direct rope_cos_sin computation.
+    """
+    import torch
+
+    from bmx.cache.rope import rope_cos_sin
+
+    model = tiny_llama()
+    k_spec, v_spec = _k2b()
+    input_ids = ids(vocab=97, seq=200, seed=3)  # >PAGE+window so pages flush
+
+    caches = []
+    for _ in range(2):
+        cache = PackedStreamingCache(model.config, k_spec=k_spec, v_spec=v_spec)
+        cache.attach(model)
+        with torch.no_grad():
+            model.generate(
+                input_ids,
+                max_new_tokens=4,
+                do_sample=False,
+                use_cache=True,
+                past_key_values=cache,
+            )
+        cache.detach()
+        caches.append(cache)
+
+    ptrs = set()
+    for cache in caches:
+        for layer in cache.layers:
+            if layer._rope_cos is None:
+                continue
+            ptrs.add(layer._rope_cos.untyped_storage().data_ptr())
+    assert len(ptrs) == 1, f"expected ONE shared rope storage, got {len(ptrs)}"
+
+    any_layer = next(
+        layer for c in caches for layer in c.layers if layer._rope_cos is not None
+    )
+    n = any_layer._rope_cos.shape[0]
+    ref_cos, ref_sin = rope_cos_sin(model.config, n, start=0, device="cpu")
+    assert torch.equal(any_layer._rope_cos, ref_cos.to(torch.float16))
+    assert torch.equal(any_layer._rope_sin, ref_sin.to(torch.float16))

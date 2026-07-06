@@ -48,6 +48,44 @@ def _next_capacity(need: int, have: int) -> int:
     return cap
 
 
+# Process-shared growing RoPE tables, keyed by (device, rope-relevant config params).
+# Every PackedStreamingLayer of every cache on the same model config reads the SAME
+# fp16 (max_S, d) cos/sin pair — previously each of the 32 layers grew its own copy
+# (memory-ledger probe 2026-07-06: ~0.5 GiB duplicated per cache at 32k). Two configs
+# with identical rope params colliding is harmless: the tables are identical by
+# construction (rope_cos_sin derives them from exactly these params).
+_ROPE_SHARED: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _rope_key(config, device: torch.device) -> tuple:
+    return (
+        str(device),
+        float(getattr(config, "rope_theta", 10000.0)),
+        int(getattr(config, "head_dim", 0) or 0),
+        int(getattr(config, "hidden_size", 0)),
+        int(getattr(config, "num_attention_heads", 0)),
+        str(getattr(config, "rope_scaling", None)),
+    )
+
+
+def _shared_rope(
+    config, upto: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return shared fp16 cos/sin tables covering positions [0, upto), growing once."""
+    key = _rope_key(config, device)
+    cos, sin = _ROPE_SHARED.get(key, (None, None))
+    covered = 0 if cos is None else cos.shape[0]
+    if upto > covered:
+        nc, ns = rope_cos_sin(config, upto - covered, start=covered, device=device)
+        # Cast once at grow-time to the cache compute dtype (fp16), so the decode
+        # loop doesn't re-cast the slice every block (unchanged policy).
+        nc, ns = nc.to(torch.float16), ns.to(torch.float16)
+        cos = nc if cos is None else torch.cat([cos, nc], dim=0)
+        sin = ns if sin is None else torch.cat([sin, ns], dim=0)
+        _ROPE_SHARED[key] = (cos, sin)
+    return _ROPE_SHARED[key]
+
+
 class _PagedStacks:
     """Persistent device-resident stacked-KV buffer with O(page) incremental append.
 
@@ -348,20 +386,18 @@ class PackedStreamingLayer(DynamicLayer):
         )
 
     def _extend_rope(self, new_committed: int, device: torch.device) -> None:
-        """Extend the growing RoPE table to cover [0, new_committed)."""
-        covered = 0 if self._rope_cos is None else self._rope_cos.shape[0]
-        if new_committed > covered:
-            nc, ns = rope_cos_sin(
-                self.model_config, new_committed - covered, start=covered, device=device
-            )
-            # Cast once at grow-time to the cache compute dtype (fp16), so the
-            # decode loop doesn't re-cast the slice every block.
-            nc, ns = nc.to(torch.float16), ns.to(torch.float16)
-            if self._rope_cos is None:
-                self._rope_cos, self._rope_sin = nc, ns
-            else:
-                self._rope_cos = torch.cat([self._rope_cos, nc], dim=0)
-                self._rope_sin = torch.cat([self._rope_sin, ns], dim=0)
+        """Point this layer at the process-shared RoPE table covering [0, new_committed).
+
+        The tables are identical for every layer (same config, same positions), and
+        were previously grown PER LAYER — ~0.5 GiB of duplicated fp16 tables per
+        32-layer cache at 32k ctx, ~2.1 GiB at 128k (memory-ledger probe,
+        2026-07-06). One shared grower per (device, rope-params) now serves all
+        layers of all caches on the same model config; layers rebind on every call
+        because a grow reallocates (torch.cat) the shared tensors.
+        """
+        self._rope_cos, self._rope_sin = _shared_rope(
+            self.model_config, new_committed, device
+        )
 
     def _pack_k_block(
         self,
