@@ -100,6 +100,71 @@ def unpack_codes(packed: torch.Tensor, bits: int, C: int) -> torch.Tensor:
     return codes.reshape(*packed.shape[:-1], C).to(torch.int16)
 
 
+def pack_signed_codes(code: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack SIGNED int codes into uint8 nibble containers, 2 codes per byte (last axis).
+
+    W5-3: the K residual (rtn_quantize_packed, codecs.py) stores SIGNED int8 codes
+    in [-2**(bits-1)-1, 2**(bits-1)-1] -- e.g. 3-bit RTN codes are in [-4, 3] --
+    unlike V's UNSIGNED codebook indices (pack_codes above). This is deliberately
+    NOT true bit-width packing: 3-bit codes are packed into 4-bit two's-complement
+    NIBBLES (2/byte), not 8 codes per 3 bytes -- nibble alignment keeps the in-kernel
+    unpack a single shift+mask+sign-extend (no cross-byte straddle); true sub-nibble
+    packing is post-paper. Only bits<=4 is supported (the nibble must represent the
+    full signed range); per_byte is always 2 (nibbles), independent of bits.
+
+    code: (..., N) any integer dtype, values in [-2**(bits-1)-1, 2**(bits-1)-1].
+    Returns: (..., N // 2) uint8, two's-complement nibbles ((code & 0xF) packed
+    low-then-high within each byte, matching pack_codes' little-endian convention).
+    """
+    assert 1 <= bits <= 4, (
+        f"pack_signed_codes only supports bits in [1,4] (nibble two's-complement "
+        f"range), got bits={bits}."
+    )
+    qmax = 2 ** (bits - 1) - 1
+    lo, hi = -qmax - 1, qmax
+    assert int(code.min()) >= lo and int(code.max()) <= hi, (
+        f"pack_signed_codes: codes out of the signed {bits}-bit range [{lo},{hi}] "
+        f"(got min={int(code.min())}, max={int(code.max())})"
+    )
+    N = code.shape[-1]
+    assert N % 2 == 0, (
+        f"pack_signed_codes: last axis N={N} must be even (nibble pairs)."
+    )
+    nibbles = (code.to(torch.int32) & 0xF).to(
+        torch.uint8
+    )  # two's-complement truncation
+    grouped = nibbles.reshape(*code.shape[:-1], N // 2, 2)  # (..., N/2, 2)
+    packed = (
+        grouped[..., 0].to(torch.int32) | (grouped[..., 1].to(torch.int32) << 4)
+    ).to(torch.uint8)
+    return packed
+
+
+def unpack_signed_codes(packed: torch.Tensor, bits: int, N: int) -> torch.Tensor:
+    """Exact inverse of pack_signed_codes. packed: (..., N//2) uint8 -> (..., N) int8.
+
+    Sign-extends each nibble: v = (nibble ^ 0x8) - 0x8 (nibble's bit 3 is the sign
+    bit regardless of `bits` -- packing always uses full 4-bit two's-complement
+    nibbles, so unpack does too; `bits` is accepted only for the range assertion/
+    API symmetry with pack_signed_codes).
+    """
+    assert 1 <= bits <= 4, (
+        f"unpack_signed_codes only supports bits in [1,4], got bits={bits}."
+    )
+    assert N % 2 == 0, f"unpack_signed_codes: N={N} must be even (nibble pairs)."
+    assert packed.shape[-1] == N // 2, (
+        f"unpack_signed_codes: packed last axis {packed.shape[-1]} != N // 2 ({N // 2})"
+    )
+    packed_i32 = packed.to(torch.int32)
+    lo_nibble = packed_i32 & 0xF
+    hi_nibble = (packed_i32 >> 4) & 0xF
+    interleaved = torch.stack([lo_nibble, hi_nibble], dim=-1).reshape(
+        *packed.shape[:-1], N
+    )
+    signed = (interleaved ^ 0x8) - 0x8  # sign-extend nibble -> int
+    return signed.to(torch.int8)
+
+
 def block_v_indices(vp: dict, vbits: int, C: int) -> torch.Tensor:
     """Return a V block dict's int16 codebook indices, transparent to pack_v.
 
@@ -118,6 +183,27 @@ def block_v_indices(vp: dict, vbits: int, C: int) -> torch.Tensor:
     if "indices" in vp:
         return vp["indices"]
     return unpack_codes(vp["indices_packed"], vbits, C)
+
+
+def block_k_res(kp: dict, bits: int, blk: int) -> torch.Tensor:
+    """Return a K block dict's int8 RTN residual codes, transparent to pack_k.
+
+    ``kp`` is a K block dict as stored in PackedStreamingLayer._k_blocks. Under
+    the default (unpacked) path it holds ``kp["res_Q_int"]`` (int8, (C, blk))
+    directly. Under W5-1+W5-3 single-storage pack_k=True re-pointing
+    (_repoint_k2b_blocks), "res_Q_int" is DELETED and replaced by
+    "res_Q_int_packed" (a view into the packed uint8 nibble stack buffer, packed
+    along the TOKEN/blk axis -- see build_kv_stacked_k2b's pack_k docstring) to
+    free the int8 block-list copy -- the whole point of packing. This is the K-side
+    sibling of block_v_indices: the ONE place that knows both representations, so
+    any consumer that needs int8 residual codes from a (possibly re-pointed)
+    stacked block goes through it instead of reading "res_Q_int" by key directly.
+    The unpack here is transient (never stored back onto kp) -- it materializes a
+    fresh int8 tensor each call, same as the pre-pack_k behavior.
+    """
+    if "res_Q_int" in kp:
+        return kp["res_Q_int"]
+    return unpack_signed_codes(kp["res_Q_int_packed"], bits, blk)
 
 
 def _pick_block_n(blk_size: int, cap: int = 64) -> int:
@@ -782,6 +868,10 @@ if TRITON_AVAILABLE:
         #   Us:        (max_blocks, blk, rank)            fp16  (shared across heads)
         #   Vfac:      (max_blocks, h_kv*d, rank)         fp16
         #   res_int:   (max_blocks, h_kv*d, blk)          int8  (RTN residual codes)
+        #     -- OR, under K_PACKED (W5-3): (max_blocks, h_kv*d, blk//2) uint8,
+        #     2 SIGNED codes/byte as 4-bit two's-complement nibbles, packed along
+        #     the TOKEN (blk) axis so a channel row's bytes stay contiguous (this
+        #     row IS what a (d, BLOCK_N) tile loads — see the res load site below).
         #   res_scale: (max_blocks, h_kv*d, blk//k_group) fp16
         us_ptr,
         vfac_ptr,
@@ -820,6 +910,7 @@ if TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,  # KV tile rows per loop iter (small pow2; divides blk_size)
         HAS_ROPE: tl.constexpr,
         V_PACKED: tl.constexpr,  # W5-2: v_idx_ptr holds packed uint8 (per_byte codes/byte)
+        K_PACKED: tl.constexpr,  # W5-3: res_int_ptr holds packed uint8 signed nibbles (2/byte)
     ):
         """k2b fused decode: in-kernel lowrank-K + RoPE + per-head turboquant-V.
 
@@ -902,14 +993,34 @@ if TRITON_AVAILABLE:
             k_low = tl.dot(us, tl.trans(vfac))  # (BLOCK_N, d) fp32 acc
 
             # --- K RTN residual: res_int (d, blk) int8 * per-group scale -> (BLOCK_N,d) ---
-            res = tl.load(
-                res_int_ptr
-                + blk * C * blk_size
-                + (kv * d + d_idx)[:, None] * blk_size
-                + r[None, :],
-                mask=tile_mask[None, :],
-                other=0,
-            ).to(tl.float32)  # (d, BLOCK_N)
+            if K_PACKED:
+                # 2 SIGNED codes/byte, packed along blk (see pack_signed_codes):
+                # code at token r lives in byte r//2, nibble (r%2) — low nibble
+                # first (bits 0-3), high nibble second (bits 4-7). Row stride is
+                # halved (blk_size//2 bytes/channel-row instead of blk_size).
+                byte_off = r // 2  # (BLOCK_N,) byte index within the channel row
+                shift = (r % 2) * 4  # (BLOCK_N,) nibble bit-offset within the byte
+                res_byte = tl.load(
+                    res_int_ptr
+                    + blk * C * (blk_size // 2)
+                    + (kv * d + d_idx)[:, None] * (blk_size // 2)
+                    + byte_off[None, :],
+                    mask=tile_mask[None, :],
+                    other=0,
+                ).to(tl.int32)  # (d, BLOCK_N)
+                nibble = (res_byte >> shift[None, :]) & 0xF
+                res = ((nibble ^ 0x8) - 0x8).to(
+                    tl.float32
+                )  # sign-extend -> (d, BLOCK_N)
+            else:
+                res = tl.load(
+                    res_int_ptr
+                    + blk * C * blk_size
+                    + (kv * d + d_idx)[:, None] * blk_size
+                    + r[None, :],
+                    mask=tile_mask[None, :],
+                    other=0,
+                ).to(tl.float32)  # (d, BLOCK_N)
             res_sc = tl.load(
                 res_scale_ptr
                 + blk * C * n_kg
@@ -1014,6 +1125,8 @@ def build_kv_stacked_k2b(
     d: int,
     device: torch.device | str = "cuda",
     pack_v: bool = False,
+    pack_k: bool = False,
+    k_bits: int = 3,
 ):
     """Pre-stack k2b packed factors (lowrank_rtn_channel K + PER-HEAD turboquant V).
 
@@ -1024,30 +1137,48 @@ def build_kv_stacked_k2b(
     Returns a dict of device tensors the k2b fused kernel consumes:
       us:        (max_blocks, blk, rank)            fp16
       vfac:      (max_blocks, h_kv*d, rank)         fp16
-      res_int:   (max_blocks, h_kv*d, blk)          int8
+      res_int:   (max_blocks, h_kv*d, blk)          int8    -- when pack_k=False
+      res_int_packed: (max_blocks, h_kv*d, blk // 2) uint8  -- when pack_k=True
+                 (2 SIGNED codes/byte as 4-bit two's-complement nibbles, packed
+                 along the TOKEN/blk axis — see pack_signed_codes and the module
+                 docstring; blk must be even)
       res_scale: (max_blocks, h_kv*d, blk//k_group) fp16
       v_idx:     (max_blocks, blk, h_kv*d)          int16   -- when pack_v=False
       v_idx_packed: (max_blocks, blk, h_kv*d // per_byte) uint8 -- when pack_v=True
                  (4 codes/byte at vbits=2; per_byte = 8 // vbits)
       v_norm:    (max_blocks, blk, h_kv)            fp16  (per-(row,head) norms)
     plus rank, k_group (read off block 0); when pack_v=True also pack_v=True and
-    vbits (read off block 0's "bits" entry) so downstream consumers (the fused
-    kernel launcher, _repoint_k2b_blocks) can tell which field/layout is present
-    WITHOUT re-deriving vbits from elsewhere. When pack_v=False the output is
-    byte-identical to before this flag existed (regression-pinned by
-    test_build_kv_stacked_k2b_pack_v_false_matches_today).
+    vbits (read off block 0's "bits" entry); when pack_k=True also pack_k=True and
+    k_bits (the caller's k_spec.bits — NOT stored in the lowrank_rtn_channel packed
+    dict the way V's turboquant dict stores "bits", so it must be passed in) so
+    downstream consumers (the fused kernel launcher, _repoint_k2b_blocks) can tell
+    which field/layout is present WITHOUT re-deriving bits from elsewhere. When
+    pack_v=False AND pack_k=False the output is byte-identical to before either
+    flag existed (regression-pinned by test_build_kv_stacked_k2b_pack_v_false_matches_today
+    and its pack_k sibling).
     """
     C = h_kv * d
     rank = k_blocks[0][0]["Us"].shape[1]
     res_scale0 = k_blocks[0][0]["res_scale"]  # (C, n_groups, 1)
     n_kg = res_scale0.shape[1]
     k_group = blk_size // n_kg
+    if pack_k:
+        assert blk_size % 2 == 0, (
+            f"build_kv_stacked_k2b: pack_k=True requires an even blk_size "
+            f"(nibble pairs along the token axis), got blk_size={blk_size}."
+        )
 
     us = torch.zeros(max_blocks, blk_size, rank, dtype=torch.float16, device=device)
     vfac = torch.zeros(max_blocks, C, rank, dtype=torch.float16, device=device)
-    res_int = torch.zeros(max_blocks, C, blk_size, dtype=torch.int8, device=device)
     res_scale = torch.zeros(max_blocks, C, n_kg, dtype=torch.float16, device=device)
     v_norm = torch.zeros(max_blocks, blk_size, h_kv, dtype=torch.float16, device=device)
+
+    if pack_k:
+        res_int_packed = torch.zeros(
+            max_blocks, C, blk_size // 2, dtype=torch.uint8, device=device
+        )
+    else:
+        res_int = torch.zeros(max_blocks, C, blk_size, dtype=torch.int8, device=device)
 
     vbits = int(v_blocks[0][0]["bits"])
     if pack_v:
@@ -1062,8 +1193,12 @@ def build_kv_stacked_k2b(
         assert i < max_blocks
         us[i] = kp["Us"].to(device).to(torch.float16)
         vfac[i] = kp["V"].to(device).to(torch.float16)
-        res_int[i] = kp["res_Q_int"].to(device)
         res_scale[i] = kp["res_scale"].squeeze(-1).to(device).to(torch.float16)
+        res = kp["res_Q_int"].to(device)
+        if pack_k:
+            res_int_packed[i] = pack_signed_codes(res, k_bits)
+        else:
+            res_int[i] = res
         v_norm[i] = vp["norms"].to(device).to(torch.float16)  # (blk, h_kv)
         idx = vp["indices"].to(device).to(torch.int16)
         if pack_v:
@@ -1074,12 +1209,17 @@ def build_kv_stacked_k2b(
     out = {
         "us": us,
         "vfac": vfac,
-        "res_int": res_int,
         "res_scale": res_scale,
         "v_norm": v_norm,
         "rank": rank,
         "k_group": k_group,
     }
+    if pack_k:
+        out["res_int_packed"] = res_int_packed
+        out["pack_k"] = True
+        out["k_bits"] = k_bits
+    else:
+        out["res_int"] = res_int
     if pack_v:
         out["v_idx_packed"] = v_idx_packed
         out["pack_v"] = True
@@ -1113,6 +1253,10 @@ def fused_decode_attention_k2b(
     (_tail_partial) but merged by the same GPU split-KV merge kernel as every other
     split (desk review F1b) — see fused_decode_attention_packed's docstring for the
     full tail-slot design.
+
+    pack_v/pack_k are NOT explicit params here — both are auto-detected from which
+    fields `stacks` carries ("v_idx" vs "v_idx_packed"; "res_int" vs
+    "res_int_packed"), the same pattern build_kv_stacked_k2b uses to report them.
     """
     _require_triton()
 
@@ -1139,9 +1283,13 @@ def fused_decode_attention_k2b(
     # V_PACKED codegen carries extra (BLOCK_N, d) int32 index/byte temporaries; at
     # production dims (d=128, BLOCK_N=64) that overflowed the GH200's 232KB SMEM
     # (needed 241664 — first real-dims firing, 2026-07-06; the CUDA pack_v oracle
-    # tests passed only at tiny dims). Cap the KV tile at 32 rows when packed.
+    # tests passed only at tiny dims). Cap the KV tile at 32 rows when EITHER V or K
+    # is packed (K_PACKED, W5-3, adds similar int32 byte/nibble temporaries — same
+    # SMEM hazard; a K_PACKED-only BLOCK_N=64 firing has not been GH200-verified, so
+    # we don't want to find out it blows SMEM in production).
     v_packed = "v_idx_packed" in stacks
-    block_n = _pick_block_n(blk_size, cap=32 if v_packed else 64)
+    k_packed = "res_int_packed" in stacks
+    block_n = _pick_block_n(blk_size, cap=32 if (v_packed or k_packed) else 64)
 
     cb = _codebook_dev(vbits, str(q.device))
     sqrt_d = 1.0 / math.sqrt(d)  # M_quant = cb[idx] / √d (per-head rotation)
@@ -1176,12 +1324,15 @@ def fused_decode_attention_k2b(
     # dict with "v_idx" -> v_packed=False, byte-identical kernel launch to before
     # the flag existed.
     v_idx_arg = stacks["v_idx_packed"] if v_packed else stacks["v_idx"]
+    # W5-3: same pattern for K's residual — EITHER "res_int" (int8, default) OR
+    # "res_int_packed" (uint8 signed nibbles, pack_k=True) — never both.
+    res_int_arg = stacks["res_int_packed"] if k_packed else stacks["res_int"]
 
     _fused_decode_k2b_kernel[(h_kv, num_splits)](
         q_kv,
         stacks["us"],
         stacks["vfac"],
-        stacks["res_int"],
+        res_int_arg,
         stacks["res_scale"],
         v_idx_arg,
         stacks["v_norm"],
@@ -1207,6 +1358,7 @@ def fused_decode_attention_k2b(
         BLOCK_N=block_n,
         HAS_ROPE=has_rope,
         V_PACKED=v_packed,
+        K_PACKED=k_packed,
     )
 
     # V is fully dequanted in-kernel (per-head) — acc_part/m_part/lse_part are the

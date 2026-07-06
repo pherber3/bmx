@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from bmx.cache.codecs import dequant_packed
 from bmx.cache.collect import from_matrix
 from bmx.cache.rope import apply_rope
-from bmx.cache.triton_dequant_attention import block_v_indices
+from bmx.cache.triton_dequant_attention import block_k_res, block_v_indices
 
 
 def online_softmax_update(acc, m, lse, scores_new, v_new):
@@ -59,6 +59,14 @@ def _dequant_block(packed, arm, group, seed, h_kv):
     through block_v_indices here (the one place that knows both
     representations) to transiently materialize int16 indices before handing
     the dict to dequant_packed -- codecs.py itself is untouched.
+
+    W5-3 pack_k interaction: same pattern, K side. A lowrank_rtn_channel K block
+    dict re-pointed under pack_k=True (_repoint_k2b_blocks) no longer holds
+    "res_Q_int" (int8) -- it was DELETED and replaced by "res_Q_int_packed" (a
+    view into the packed uint8 nibble stack buffer) plus "res_bits" (the K
+    residual bit-width, stashed at repoint time since -- unlike V's turboquant
+    dict -- the lowrank_rtn_channel dict has no native "bits" key to read).
+    Route through block_k_res to transiently materialize int8 codes.
     """
     if (
         arm == "turboquant_mse_perhead"
@@ -69,6 +77,17 @@ def _dequant_block(packed, arm, group, seed, h_kv):
         per_byte = 8 // vbits
         C = packed["indices_packed"].shape[-1] * per_byte
         packed = {**packed, "indices": block_v_indices(packed, vbits, C)}
+    if (
+        arm == "lowrank_rtn_channel"
+        and "res_Q_int" not in packed
+        and "res_Q_int_packed" in packed
+    ):
+        k_bits = packed["res_bits"]
+        blk = packed["res_Q_int_packed"].shape[-1] * 2
+        packed = {
+            **packed,
+            "res_Q_int": block_k_res(packed, k_bits, blk),
+        }
     M = (
         packed["fp16"]
         if arm == "fp16"

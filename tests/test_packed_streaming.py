@@ -259,8 +259,12 @@ def _k2b_perhead():
     not torch.cuda.is_available(),
     reason="fused-k2b decode path is taken only when q.is_cuda + Triton present",
 )
-@pytest.mark.parametrize("pack_v", [False, True], ids=["v_idx", "v_idx_packed"])
-def test_fused_k2b_generate_matches_streaming_cuda(pack_v):
+@pytest.mark.parametrize(
+    "pack_k,pack_v",
+    [(False, False), (False, True), (True, False), (True, True)],
+    ids=["none", "v_idx_packed", "res_int_packed", "both_packed"],
+)
+def test_fused_k2b_generate_matches_streaming_cuda(pack_k, pack_v):
     """The REAL-recipe deployment path: PackedStreamingCache decode routes through
     the fused k2b kernel (in-kernel lowrank-K + RoPE + per-head turboquant-V with an
     in-kernel d-point Hadamard unrotate). On CUDA with lowrank_rtn_channel K +
@@ -273,6 +277,9 @@ def test_fused_k2b_generate_matches_streaming_cuda(pack_v):
     pack_v parametrization (W5-2, GH200 acceptance prep): pack_v=True exercises
     the full flag-gated path end-to-end (build_kv_stacked_k2b pack_v=True ->
     _repoint_k2b_blocks indices_packed re-point -> V_PACKED in-kernel unpack).
+    pack_k parametrization (W5-3): same, K side (res_int_packed re-point ->
+    K_PACKED in-kernel signed-nibble unpack). All 4 combinations must clear the
+    same tf32 drift bar.
     """
     model = tiny_llama_d32().cuda()  # head_dim=32 so the fused-k2b dims gate passes
     input_ids = ids(vocab=97, seq=60, seed=13).cuda()
@@ -289,14 +296,15 @@ def test_fused_k2b_generate_matches_streaming_cuda(pack_v):
         return out.logits[0, -1].float()
 
     ref = _decode_logits(StreamingQuantizedCache)
-    fused = _decode_logits(PackedStreamingCache, pack_v=pack_v)
+    fused = _decode_logits(PackedStreamingCache, pack_v=pack_v, pack_k=pack_k)
     max_abs = (ref - fused).abs().max().item()
     # Codec is now identical on both sides (both use per-head Hadamard after CHANGE 1).
     # Residual diff is fused-kernel tf32 tensor-core math vs chunked fp32 reference,
     # so atol=0 exact parity is not expected here; 5e-2 covers the tf32 drift.
     assert max_abs < 5e-2, (
-        f"fused-k2b decode logits diverged from streaming (pack_v={pack_v}): "
-        f"max_abs={max_abs} (fused_decode_attention_k2b in packed_streaming.attend)"
+        f"fused-k2b decode logits diverged from streaming (pack_k={pack_k}, "
+        f"pack_v={pack_v}): max_abs={max_abs} "
+        "(fused_decode_attention_k2b in packed_streaming.attend)"
     )
 
 
@@ -875,3 +883,358 @@ def test_rope_tables_shared_across_layers_and_caches():
     ref_cos, ref_sin = rope_cos_sin(model.config, n, start=0, device="cpu")
     assert torch.equal(any_layer._rope_cos, ref_cos.to(torch.float16))
     assert torch.equal(any_layer._rope_sin, ref_sin.to(torch.float16))
+
+
+# ---------------------------------------------------------------------------
+# W5-3: flag-gated nibble packing for the K residual (2 SIGNED codes/byte).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_pack_unpack_signed_codes_roundtrip(bits):
+    """pack_signed_codes/unpack_signed_codes must be an exact inverse pair over
+    the FULL signed range for the given bit-width, packed as 4-bit nibbles."""
+    from bmx.cache.triton_dequant_attention import (
+        pack_signed_codes,
+        unpack_signed_codes,
+    )
+
+    qmax = 2 ** (bits - 1) - 1
+    lo, hi = -qmax - 1, qmax
+    N = 16  # even
+    full_range = torch.arange(lo, hi + 1, dtype=torch.int8)
+    reps = -(-N // full_range.numel())  # ceil division, no numpy import needed
+    codes = full_range.repeat(reps)[:N].reshape(1, N).to(torch.int8)
+
+    packed = pack_signed_codes(codes, bits)
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (1, N // 2)
+
+    unpacked = unpack_signed_codes(packed, bits, N)
+    assert unpacked.dtype == torch.int8
+    assert torch.equal(unpacked, codes)
+
+
+def test_pack_signed_codes_random_roundtrip():
+    """Roundtrip over random codes at bits=3 (the real K-residual bit-width) and
+    a multi-dim leading shape, mirroring test_pack_unpack_codes_roundtrip (V)."""
+    from bmx.cache.triton_dequant_attention import (
+        pack_signed_codes,
+        unpack_signed_codes,
+    )
+
+    torch.manual_seed(0)
+    bits = 3
+    qmax = 2 ** (bits - 1) - 1
+    shape = (3, 5, 16)  # last axis even
+    codes = torch.randint(-qmax - 1, qmax + 1, shape, dtype=torch.int8)
+
+    packed = pack_signed_codes(codes, bits)
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (*shape[:-1], shape[-1] // 2)
+
+    unpacked = unpack_signed_codes(packed, bits, shape[-1])
+    assert unpacked.dtype == torch.int8
+    assert torch.equal(unpacked, codes)
+
+
+def test_pack_signed_codes_rejects_odd_shapes_bits_and_out_of_range():
+    """Loud assertion on unsupported bit-widths, odd N, and out-of-range codes."""
+    from bmx.cache.triton_dequant_attention import (
+        pack_signed_codes,
+        unpack_signed_codes,
+    )
+
+    codes = torch.randint(-4, 4, (2, 8), dtype=torch.int8)
+    with pytest.raises(AssertionError):
+        pack_signed_codes(codes, bits=0)  # < 1
+    with pytest.raises(AssertionError):
+        pack_signed_codes(codes, bits=5)  # > 4 (nibble can't hold the full range)
+    codes_odd = torch.randint(-4, 4, (2, 7), dtype=torch.int8)
+    with pytest.raises(AssertionError):
+        pack_signed_codes(codes_odd, bits=3)  # N=7 odd
+    out_of_range = torch.full((2, 8), 100, dtype=torch.int8)
+    with pytest.raises(AssertionError):
+        pack_signed_codes(out_of_range, bits=3)  # 100 > qmax=3
+
+    packed = pack_signed_codes(codes, bits=3)
+    with pytest.raises(AssertionError):
+        unpack_signed_codes(packed, bits=3, N=7)  # N not even
+    with pytest.raises(AssertionError):
+        unpack_signed_codes(packed, bits=3, N=6)  # N // 2 != packed.shape[-1]
+
+
+def test_build_kv_stacked_k2b_pack_k_false_matches_today():
+    """Regression pin: pack_k=False (the default) must be byte-identical to the
+    pre-W5-3 builder output — same field names/dtypes/values."""
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_k2b
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 2
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=20)
+
+    built = build_kv_stacked_k2b(
+        k_blocks, v_blocks, max_blocks=n, h_kv=h_kv, blk_size=blk, d=d, device="cpu"
+    )
+    assert set(built.keys()) == {
+        "us",
+        "vfac",
+        "res_int",
+        "res_scale",
+        "v_idx",
+        "v_norm",
+        "rank",
+        "k_group",
+    }
+    assert built["res_int"].dtype == torch.int8
+    assert built["res_int"].shape == (n, h_kv * d, blk)
+    assert "res_int_packed" not in built
+    assert "pack_k" not in built
+
+
+def test_build_kv_stacked_k2b_pack_k_true_unpacks_to_same_res_int():
+    """pack_k=True's res_int_packed, unpacked, must equal the pack_k=False res_int."""
+    from bmx.cache.triton_dequant_attention import (
+        build_kv_stacked_k2b,
+        unpack_signed_codes,
+    )
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 2
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=21)
+    k_bits = 3
+
+    built_unpacked = build_kv_stacked_k2b(
+        k_blocks, v_blocks, max_blocks=n, h_kv=h_kv, blk_size=blk, d=d, device="cpu"
+    )
+    built_packed = build_kv_stacked_k2b(
+        k_blocks,
+        v_blocks,
+        max_blocks=n,
+        h_kv=h_kv,
+        blk_size=blk,
+        d=d,
+        device="cpu",
+        pack_k=True,
+        k_bits=k_bits,
+    )
+
+    assert built_packed["pack_k"] is True
+    assert built_packed["k_bits"] == k_bits
+    assert built_packed["res_int_packed"].dtype == torch.uint8
+    assert built_packed["res_int_packed"].shape == (n, h_kv * d, blk // 2)
+    assert "res_int" not in built_packed
+
+    recovered = unpack_signed_codes(built_packed["res_int_packed"], k_bits, blk)
+    assert torch.equal(recovered, built_unpacked["res_int"])
+
+    # Every other field is untouched by pack_k.
+    for key in ("us", "vfac", "res_scale", "v_idx", "v_norm", "rank", "k_group"):
+        a, b = built_unpacked[key], built_packed[key]
+        if torch.is_tensor(a):
+            assert torch.equal(a, b), f"field {key} differs under pack_k"
+        else:
+            assert a == b, f"field {key} differs under pack_k"
+
+
+def test_build_kv_stacked_k2b_pack_k_and_pack_v_independent():
+    """pack_k and pack_v are independent flags — both True packs both sides,
+    each with its own field/meta pair, and both unpack correctly."""
+    from bmx.cache.triton_dequant_attention import (
+        build_kv_stacked_k2b,
+        unpack_codes,
+        unpack_signed_codes,
+    )
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 2
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=22)
+    C = h_kv * d
+    k_bits = 3
+    vbits = v_blocks[0][0]["bits"]
+
+    built = build_kv_stacked_k2b(
+        k_blocks,
+        v_blocks,
+        max_blocks=n,
+        h_kv=h_kv,
+        blk_size=blk,
+        d=d,
+        device="cpu",
+        pack_k=True,
+        pack_v=True,
+        k_bits=k_bits,
+    )
+    assert built["pack_k"] is True
+    assert built["pack_v"] is True
+    assert "res_int" not in built and "v_idx" not in built
+
+    built_plain = build_kv_stacked_k2b(
+        k_blocks, v_blocks, max_blocks=n, h_kv=h_kv, blk_size=blk, d=d, device="cpu"
+    )
+    assert torch.equal(
+        unpack_signed_codes(built["res_int_packed"], k_bits, blk),
+        built_plain["res_int"],
+    )
+    assert torch.equal(
+        unpack_codes(built["v_idx_packed"], vbits, C), built_plain["v_idx"]
+    )
+
+
+def test_k2b_repoint_pack_k_true_replaces_res_q_int_with_packed_view():
+    """Under pack_k=True, _repoint_k2b_blocks must DELETE the block dict's
+    "res_Q_int" key and replace it with "res_Q_int_packed" (a view into the
+    packed uint8 nibble stack buffer) + "res_bits" — NOT re-point "res_Q_int"
+    itself to a wrong-shape/dtype tensor. indices re-pointing is unaffected.
+    """
+    from bmx.cache.packed_streaming import PackedStreamingLayer, _PagedStacks
+    from bmx.cache.triton_dequant_attention import (
+        build_kv_stacked_k2b,
+        unpack_signed_codes,
+    )
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 2
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=23)
+    orig_res_Q_int = [kp["res_Q_int"] for kp, _, _ in k_blocks]
+    k_bits = 3
+
+    layer = PackedStreamingLayer.__new__(PackedStreamingLayer)
+    layer._k_blocks = k_blocks
+    layer._v_blocks = v_blocks
+    layer._k2b_repointed = 0
+    layer._k2b_repoint_version = -1
+
+    stacks = _PagedStacks(
+        build_kv_stacked_k2b,
+        dict(h_kv=h_kv, blk_size=blk, d=d, pack_k=True, k_bits=k_bits),
+    )
+    stacks.view(k_blocks, v_blocks, torch.device("cpu"))
+    layer._repoint_k2b_blocks(stacks)
+
+    res_int_packed_buf = stacks._buf["res_int_packed"]
+    for i in range(n):
+        kp, _, _ = k_blocks[i]
+        assert "res_Q_int" not in kp, "res_Q_int must be deleted under pack_k=True"
+        assert "res_Q_int_packed" in kp
+        assert kp["res_bits"] == k_bits
+        assert kp["res_Q_int_packed"].untyped_storage().data_ptr() == (
+            res_int_packed_buf.untyped_storage().data_ptr()
+        )
+        recovered = unpack_signed_codes(kp["res_Q_int_packed"], k_bits, blk)
+        assert torch.equal(recovered, orig_res_Q_int[i])
+
+    # indices re-pointing is unaffected by pack_k.
+    v_idx_buf = stacks._buf["v_idx"]
+    for vp, _, _ in v_blocks:
+        assert vp["indices"].untyped_storage().data_ptr() == (
+            v_idx_buf.untyped_storage().data_ptr()
+        )
+
+
+def test_block_k_res_helper_transparent_to_pack_k():
+    """block_k_res returns the same int8 residual codes whether the block dict
+    holds "res_Q_int" (pack_k=False) or "res_Q_int_packed" (pack_k=True, re-pointed)."""
+    from bmx.cache.triton_dequant_attention import block_k_res
+
+    torch.manual_seed(24)
+    h_kv, blk, d, rank, group = 2, 16, 8, 8, 8
+    from bmx.cache.codecs import quantize_packed
+    from bmx.cache.collect import to_matrix
+
+    kM = to_matrix(torch.randn(h_kv, blk, d))
+    kp, _ = quantize_packed(
+        "lowrank_rtn_channel", kM, bits=3, group=group, rank=rank, seed=0
+    )
+    direct = block_k_res(kp, 3, blk)
+    assert torch.equal(direct, kp["res_Q_int"])
+
+    from bmx.cache.triton_dequant_attention import pack_signed_codes
+
+    kp_packed = {k: v for k, v in kp.items() if k != "res_Q_int"}
+    kp_packed["res_Q_int_packed"] = pack_signed_codes(kp["res_Q_int"], 3)
+    via_unpack = block_k_res(kp_packed, 3, blk)
+    assert torch.equal(via_unpack, kp["res_Q_int"])
+
+
+def test_chunked_attention_after_pack_k_repoint_matches_pristine():
+    """The chunked-attention fallback path (CPU-reachable; used for prefill and
+    any non-fused decode) must produce IDENTICAL output whether it reads K blocks
+    that (a) still hold pristine int8 "res_Q_int", or (b) have been re-pointed
+    under pack_k=True and now hold "res_Q_int_packed"/"res_bits" only. This is
+    the referee for the W5-1/W5-3 interaction: a post-stacking chunked read must
+    still work.
+    """
+    from bmx.cache.packed_streaming import PackedStreamingLayer, _PagedStacks
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_k2b
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 2
+    n_q_heads = h_kv * 2  # n_q_groups = 2
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=25)
+    q = torch.randn(n_q_heads, 1, d)
+    k_bits = 3
+
+    out_pristine = _chunked_decode(q, k_blocks, v_blocks, h_kv, group, 25, d)
+
+    layer = PackedStreamingLayer.__new__(PackedStreamingLayer)
+    layer._k_blocks = k_blocks
+    layer._v_blocks = v_blocks
+    layer._k2b_repointed = 0
+    layer._k2b_repoint_version = -1
+
+    stacks = _PagedStacks(
+        build_kv_stacked_k2b,
+        dict(h_kv=h_kv, blk_size=blk, d=d, pack_k=True, k_bits=k_bits),
+    )
+    stacks.view(k_blocks, v_blocks, torch.device("cpu"))
+    layer._repoint_k2b_blocks(stacks)
+
+    # Sanity: the re-point actually happened (res_Q_int deleted, packed present).
+    for kp, _, _ in k_blocks:
+        assert "res_Q_int" not in kp
+        assert "res_Q_int_packed" in kp
+
+    out_after_pack_k_repoint = _chunked_decode(
+        q, k_blocks, v_blocks, h_kv, group, 25, d
+    )
+    assert torch.equal(out_pristine, out_after_pack_k_repoint), (
+        "chunked_dequant_attention output changed after pack_k=True re-pointing "
+        "— block_k_res access-path wiring in chunked_attention._dequant_block "
+        "is not transparent to pack_k"
+    )
+
+
+def test_chunked_attention_after_pack_k_and_pack_v_repoint_matches_pristine():
+    """Both flags together: chunked-attention output must be identical whether
+    both K and V blocks are pristine, or both have been re-pointed under
+    pack_k=True + pack_v=True simultaneously."""
+    from bmx.cache.packed_streaming import PackedStreamingLayer, _PagedStacks
+    from bmx.cache.triton_dequant_attention import build_kv_stacked_k2b
+
+    h_kv, blk, d, rank, group, n = 2, 32, 16, 16, 16, 2
+    n_q_heads = h_kv * 2
+    k_blocks, v_blocks = _k2b_cpu_blocks(n, h_kv, blk, d, rank, group, seed=26)
+    q = torch.randn(n_q_heads, 1, d)
+    k_bits = 3
+
+    out_pristine = _chunked_decode(q, k_blocks, v_blocks, h_kv, group, 26, d)
+
+    layer = PackedStreamingLayer.__new__(PackedStreamingLayer)
+    layer._k_blocks = k_blocks
+    layer._v_blocks = v_blocks
+    layer._k2b_repointed = 0
+    layer._k2b_repoint_version = -1
+
+    stacks = _PagedStacks(
+        build_kv_stacked_k2b,
+        dict(h_kv=h_kv, blk_size=blk, d=d, pack_k=True, pack_v=True, k_bits=k_bits),
+    )
+    stacks.view(k_blocks, v_blocks, torch.device("cpu"))
+    layer._repoint_k2b_blocks(stacks)
+
+    for kp, _, _ in k_blocks:
+        assert "res_Q_int" not in kp and "res_Q_int_packed" in kp
+    for vp, _, _ in v_blocks:
+        assert "indices" not in vp and "indices_packed" in vp
+
+    out_after_repoint = _chunked_decode(q, k_blocks, v_blocks, h_kv, group, 26, d)
+    assert torch.equal(out_pristine, out_after_repoint), (
+        "chunked_dequant_attention output changed after combined pack_k+pack_v "
+        "re-pointing"
+    )

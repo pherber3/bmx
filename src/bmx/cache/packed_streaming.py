@@ -298,6 +298,7 @@ class PackedStreamingLayer(DynamicLayer):
         model_config,
         recent_window: int = 32,
         pack_v: bool = True,
+        pack_k: bool = False,
     ):
         super().__init__()
         self.k_spec = k_spec
@@ -309,6 +310,12 @@ class PackedStreamingLayer(DynamicLayer):
         # oracle evidence (see triton_dequant_attention.build_kv_stacked_k2b /
         # the fused kernel's V_PACKED constexpr branch).
         self.pack_v = pack_v
+        # W5-3: pack the k2b stacked K residual 2-SIGNED-codes/byte (4-bit
+        # two's-complement nibbles, uint8) instead of int8. Flag-gated, default
+        # OFF everywhere until GH200 oracle evidence (see
+        # triton_dequant_attention.build_kv_stacked_k2b's pack_k kwarg / the
+        # fused kernel's K_PACKED constexpr branch). Independent of pack_v.
+        self.pack_k = pack_k
 
         # Pre-RoPE key buffer (mirrors StreamingQuantizedLayer._k_pre).
         self._k_pre: torch.Tensor | None = None
@@ -618,6 +625,17 @@ class PackedStreamingLayer(DynamicLayer):
         ``triton_dequant_attention.block_v_indices`` (transient unpack, never
         stored back).
 
+        W5-3 (pack_k=True): same pattern, K side. The stack field is
+        ``res_int_packed`` (uint8, (C, blk // 2), signed 4-bit nibbles) -- NOT
+        the same shape/dtype as the block dict's int8 ``res_Q_int``, so the
+        block dict's ``res_Q_int`` entry is DELETED and replaced with
+        ``res_Q_int_packed`` (the packed uint8 view) plus ``res_bits`` (the K
+        residual bit-width, stashed here since the lowrank_rtn_channel dict --
+        unlike V's turboquant dict -- has no native "bits" key). Consumers go
+        through ``triton_dequant_attention.block_k_res`` (transient unpack,
+        never stored back). pack_k and pack_v are independent flags -- either,
+        both, or neither may be set on a given stacks buffer.
+
         rtn_token/rtn_token has NO analogous method: build_kv_stacked_packed calls
         from_matrix (a (S, h_kv*d) <-> (h_kv, S, d) HEAD-SPLIT permute+reshape) on
         Q_int/scale for BOTH K and V. For h_kv > 1 that permuted axis order is not
@@ -646,13 +664,20 @@ class PackedStreamingLayer(DynamicLayer):
         if start >= n:
             return
         buf = stacks._buf  # dict of full-capacity resident tensors (not sliced)
-        res_int_buf = buf["res_int"]
         pack_v = stacks._meta.get("pack_v", False)
+        pack_k = stacks._meta.get("pack_k", False)
         v_idx_buf = buf["v_idx_packed"] if pack_v else buf["v_idx"]
+        res_int_buf = buf["res_int_packed"] if pack_k else buf["res_int"]
+        k_bits = stacks._meta.get("k_bits")
         for i in range(start, n):
             kp, ks, ke = self._k_blocks[i]
             vp, vs, ve = self._v_blocks[i]
-            kp["res_Q_int"] = res_int_buf[i]
+            if pack_k:
+                kp.pop("res_Q_int", None)
+                kp["res_Q_int_packed"] = res_int_buf[i]
+                kp["res_bits"] = k_bits
+            else:
+                kp["res_Q_int"] = res_int_buf[i]
             if pack_v:
                 vp.pop("indices", None)
                 vp["indices_packed"] = v_idx_buf[i]
@@ -815,6 +840,8 @@ class PackedStreamingLayer(DynamicLayer):
                         blk_size=blk,
                         d=q.shape[2],
                         pack_v=self.pack_v,
+                        pack_k=self.pack_k,
+                        k_bits=self.k_spec.bits,
                     ),
                 )
             stacks = self._k2b_stacks.view(self._k_blocks, self._v_blocks, q.device)
@@ -902,10 +929,16 @@ class PackedStreamingCache(Cache):
         v_spec: CacheCodecSpec,
         recent_window: int = 32,
         pack_v: bool = True,
+        pack_k: bool = False,
     ):
         super().__init__(
             layer_class_to_replicate=lambda: PackedStreamingLayer(
-                k_spec, v_spec, model_config, recent_window, pack_v=pack_v
+                k_spec,
+                v_spec,
+                model_config,
+                recent_window,
+                pack_v=pack_v,
+                pack_k=pack_k,
             )
         )
         self.model_config = model_config
@@ -914,6 +947,8 @@ class PackedStreamingCache(Cache):
         self.recent_window = recent_window
         # W5-2: threaded down to every PackedStreamingLayer (default OFF).
         self.pack_v = pack_v
+        # W5-3: threaded down to every PackedStreamingLayer (default OFF).
+        self.pack_k = pack_k
         self._handles: list = []
         self._saved_impl: str | None = None
         self._model = None
@@ -941,6 +976,7 @@ class PackedStreamingCache(Cache):
                     self.model_config,
                     self.recent_window,
                     pack_v=self.pack_v,
+                    pack_k=self.pack_k,
                 )
             )
 
