@@ -54,3 +54,19 @@ def test_census_specs_equivalence():
         arm="lowrank_rtn_channel", bits=3, rank=16, group=64, pre_rope=True
     )
     assert v == CacheCodecSpec(arm="turboquant_mse", bits=2)
+
+
+def test_turboquant_parametric_bits():
+    """turboquant_mse_b{bits}/_prod_b{bits}: bit-width is a codec parameter, not a design
+    constraint — the parametric names enable the matched-bits comparison vs k2b."""
+    for name, base, bits in [
+        ("turboquant_mse_b3", "turboquant_mse", 3),
+        ("turboquant_mse_b4", "turboquant_mse", 4),
+        ("turboquant_prod_b3", "turboquant_prod", 3),
+    ]:
+        k, v = spec_pair(name)
+        assert k.arm == base and v.arm == base
+        assert k.bits == bits and v.bits == bits
+    # the plain names stay pinned at 2 bits (recorded-results compatibility)
+    k, v = spec_pair("turboquant_mse")
+    assert k.bits == 2

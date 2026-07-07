@@ -63,6 +63,15 @@ def spec_pair(
     if arm in ("turboquant_mse", "turboquant_prod"):
         s = CacheCodecSpec(arm=arm, bits=2, seed=seed)
         return s, s
+    # Parametric bit-width variants "turboquant_mse_b{bits}" (e.g. _b3, _b4): the codec's
+    # bit-width was never a design constraint — only this registry pinned it at 2. Enables
+    # the matched-bits comparison against k2b (~3.94b), the test of the structure claim
+    # (TurboQuant's own non-integer 2.5/3.5 rows come from outlier-splitting, a different
+    # mechanism we deliberately do NOT replicate; integer bits is the clean comparison).
+    if arm.startswith("turboquant_mse_b") or arm.startswith("turboquant_prod_b"):
+        base, _, bits_str = arm.rpartition("_b")
+        s = CacheCodecSpec(arm=base, bits=int(bits_str), seed=seed)
+        return s, s
     if arm == "kivi":
         return (
             CacheCodecSpec(arm="rtn_channel", bits=2, group=group, seed=seed),
