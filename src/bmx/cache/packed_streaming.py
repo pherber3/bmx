@@ -298,7 +298,7 @@ class PackedStreamingLayer(DynamicLayer):
         model_config,
         recent_window: int = 32,
         pack_v: bool = True,
-        pack_k: bool = False,
+        pack_k: bool = True,
     ):
         super().__init__()
         self.k_spec = k_spec
@@ -929,7 +929,7 @@ class PackedStreamingCache(Cache):
         v_spec: CacheCodecSpec,
         recent_window: int = 32,
         pack_v: bool = True,
-        pack_k: bool = False,
+        pack_k: bool = True,
     ):
         super().__init__(
             layer_class_to_replicate=lambda: PackedStreamingLayer(
