@@ -11,7 +11,13 @@ import pandas as pd
 import pytest
 
 from experiments.plot_longbench_table import PUBLISHED
-from experiments.plot_pareto import ParetoPoint, build_pareto, make_figure
+from experiments.plot_pareto import (
+    PANEL_A_YLIM,
+    ParetoPoint,
+    build_pareto,
+    load_run_dirs,
+    make_figure,
+)
 
 
 def _row(arm, task, score, *, kv_size_bits=3.0):
@@ -170,3 +176,172 @@ def test_caption_cites_bitwidth_caveat_and_kivi_diagnosis(tmp_path):
     text = caption_path.read_text()
     assert "2.5" in text
     assert "kivi-arm-diagnosis" in text
+
+
+def _write_run(tmp_path, name, rows, extra_cols=None):
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    df = pd.DataFrame(rows)
+    if extra_cols:
+        for col, val in extra_cols.items():
+            df[col] = val
+    df.to_parquet(run_dir / "metrics.parquet")
+    return run_dir
+
+
+# --- multi-run loading (load_run_dirs) ---
+
+
+def test_load_run_dirs_concats_with_schema_mismatch(tmp_path):
+    # Old-vintage run: no longbench_version/max_prompt_tokens columns at all.
+    old_rows = [_row("fp16", "narrativeqa", 0.40, kv_size_bits=16.0)]
+    old_dir = _write_run(tmp_path, "old-run", old_rows)
+    # New-vintage run: has the extra columns.
+    new_rows = [_row("k2b", "narrativeqa", 0.39, kv_size_bits=4.0)]
+    new_dir = _write_run(
+        tmp_path,
+        "new-run",
+        new_rows,
+        extra_cols={"longbench_version": "v1_e", "max_prompt_tokens": 31500},
+    )
+    combined, fp16_dir = load_run_dirs((str(old_dir), str(new_dir)))
+    assert fp16_dir == str(old_dir)
+    assert set(combined["arm"].unique()) == {"fp16", "k2b"}
+    # old-run rows have NaN for the columns only new-run has.
+    old_mask = combined["_run_dir"] == str(old_dir)
+    assert combined.loc[old_mask, "longbench_version"].isna().all()
+
+
+def test_load_run_dirs_duplicate_arm_hard_errors(tmp_path):
+    dir_a = _write_run(
+        tmp_path, "a", [_row("fp16", "narrativeqa", 0.4, kv_size_bits=16.0)]
+    )
+    dir_b = _write_run(tmp_path, "b", [_row("fp16", "qasper", 0.41, kv_size_bits=16.0)])
+    with pytest.raises(ValueError, match="ambiguous row provenance"):
+        load_run_dirs((str(dir_a), str(dir_b)))
+
+
+def test_load_run_dirs_duplicate_arm_override_last_wins(tmp_path):
+    # fp16 must stay unique to dir_a (first-dir-wins is a separate, stricter rule than
+    # override); use a non-fp16 arm to exercise the override-last-wins path.
+    dir_a = _write_run(
+        tmp_path,
+        "a",
+        [
+            _row("fp16", "narrativeqa", 0.4, kv_size_bits=16.0),
+            _row("k2b", "narrativeqa", 0.1, kv_size_bits=4.0),
+        ],
+    )
+    dir_b = _write_run(
+        tmp_path, "b", [_row("k2b", "narrativeqa", 0.9, kv_size_bits=4.0)]
+    )
+    with pytest.warns(UserWarning, match="overridden"):
+        combined, fp16_dir = load_run_dirs(
+            (str(dir_a), str(dir_b)), allow_arm_override=True
+        )
+    k2b_rows = combined[combined["arm"] == "k2b"]
+    assert len(k2b_rows) == 1
+    assert k2b_rows["code_sim"].iloc[0] == pytest.approx(0.9)  # dir_b (last) wins
+
+
+def test_load_run_dirs_input_policy_mismatch_hard_errors(tmp_path):
+    truncated = _write_run(
+        tmp_path,
+        "truncated",
+        [_row("fp16", "narrativeqa", 0.4, kv_size_bits=16.0)],
+        extra_cols={"longbench_version": "v1", "max_prompt_tokens": -1},
+    )
+    untruncated = _write_run(
+        tmp_path,
+        "untruncated",
+        [_row("k2b", "narrativeqa", 0.39, kv_size_bits=4.0)],
+        extra_cols={"longbench_version": "v1_e", "max_prompt_tokens": 31500},
+    )
+    with pytest.raises(ValueError, match="input-policy mismatch"):
+        load_run_dirs((str(truncated), str(untruncated)))
+
+
+def test_load_run_dirs_nan_policy_column_compatible_with_present_value(tmp_path):
+    # A pre-W3 dir (no policy columns at all) must NOT be flagged as a mismatch against a
+    # dir that does have the columns — NaN is compatible-by-definition, per module docstring.
+    old_dir = _write_run(
+        tmp_path, "old", [_row("fp16", "narrativeqa", 0.4, kv_size_bits=16.0)]
+    )
+    new_dir = _write_run(
+        tmp_path,
+        "new",
+        [_row("k2b", "narrativeqa", 0.39, kv_size_bits=4.0)],
+        extra_cols={"longbench_version": "v1_e", "max_prompt_tokens": 31500},
+    )
+    combined, fp16_dir = load_run_dirs((str(old_dir), str(new_dir)))  # must not raise
+    assert fp16_dir == str(old_dir)
+
+
+def test_load_run_dirs_missing_fp16_in_first_dir_errors(tmp_path):
+    dir_a = _write_run(
+        tmp_path, "a", [_row("k2b", "narrativeqa", 0.39, kv_size_bits=4.0)]
+    )
+    dir_b = _write_run(
+        tmp_path, "b", [_row("fp16", "narrativeqa", 0.4, kv_size_bits=16.0)]
+    )
+    with pytest.raises(ValueError, match="fp16"):
+        load_run_dirs((str(dir_a), str(dir_b)))
+
+
+# --- Panel A clip / arrow bookkeeping ---
+
+
+def test_points_below_clip_lists_out_of_range_points():
+    rows = _synthetic_rows()
+    # turboquant_prod at a huge negative delta, well outside PANEL_A_YLIM.
+    rows += [
+        _row("turboquant_prod", t, 0.001, kv_size_bits=2.0) for t in ["narrativeqa"]
+    ]
+    df = pd.DataFrame(rows)
+    result = build_pareto(df)
+    below_labels = {p.label for p in result["points_below_clip"]}
+    assert "turboquant_prod" in below_labels
+    assert result["y_clip"] == PANEL_A_YLIM
+
+
+def test_points_below_clip_empty_when_all_in_range():
+    df = pd.DataFrame(_synthetic_rows())
+    result = build_pareto(df)
+    # synthetic rows are all small deltas, well within the default clip.
+    assert result["points_below_clip"] == []
+
+
+def test_y_clip_disabled_when_none():
+    df = pd.DataFrame(_synthetic_rows())
+    result = build_pareto(df, y_clip=None)
+    assert result["y_clip"] is None
+    assert result["points_below_clip"] == []
+
+
+def test_make_figure_renders_clip_note_in_caption_when_points_clipped(tmp_path):
+    rows = _synthetic_rows()
+    rows += [_row("turboquant_prod", "narrativeqa", 0.001, kv_size_bits=2.0)]
+    df = pd.DataFrame(rows)
+    result = build_pareto(df)
+    _, _, caption_path = make_figure(result, run_id="run1", out_dir=tmp_path)
+    text = caption_path.read_text()
+    assert "clipped" in text.lower()
+    assert "turboquant_prod" in text
+
+
+def test_multi_run_end_to_end_with_provenance_caption(tmp_path):
+    dir_a = _write_run(tmp_path, "run-a", _synthetic_rows())
+    dir_b = _write_run(
+        tmp_path,
+        "run-b",
+        [_row("k2b_k2r8", "narrativeqa", 0.41, kv_size_bits=3.0)],
+    )
+    combined, fp16_dir = load_run_dirs((str(dir_a), str(dir_b)))
+    result = build_pareto(combined, fp16_run_dir=fp16_dir)
+    labels = {p.label for p in result["ours"]}
+    assert "k2b_k2r8" in labels  # arm from the second run dir is present
+    _, _, caption_path = make_figure(
+        result, run_id="run-a", out_dir=tmp_path / "out", run_ids=["run-a", "run-b"]
+    )
+    text = caption_path.read_text()
+    assert "run-a" in text and "run-b" in text

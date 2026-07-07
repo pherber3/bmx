@@ -341,12 +341,33 @@ def build_table(
     overall_verdict = "FAIL" if any_fail else ("PASS" if any_compared else "N/A")
 
     # --- Provenance / caption ---
-    versions = sorted(df["longbench_version"].unique()) if len(df) else []
-    max_prompt_tokens_vals = sorted(df["max_prompt_tokens"].unique()) if len(df) else []
-    n_samples_vals = sorted(df["n_samples"].unique()) if len(df) else []
+    # Defensive: longbench_version/max_prompt_tokens are absent in pre-W3 parquets (older code
+    # vintage predates these columns entirely). Report "unknown (pre-W3 parquet)" instead of
+    # crashing with KeyError — this is a read-only provenance/caption concern, not a scoring
+    # change. n_samples predates W3 too but was already present in every observed parquet;
+    # guarded the same way for symmetry/future-proofing.
+    UNKNOWN_PRE_W3 = "unknown (pre-W3 parquet)"
+    if "longbench_version" in df.columns and len(df):
+        versions = sorted(df["longbench_version"].dropna().unique())
+    else:
+        versions = []
+    if "max_prompt_tokens" in df.columns and len(df):
+        max_prompt_tokens_vals = sorted(df["max_prompt_tokens"].dropna().unique())
+    else:
+        max_prompt_tokens_vals = []
+    if "n_samples" in df.columns and len(df):
+        n_samples_vals = sorted(df["n_samples"].dropna().unique())
+    else:
+        n_samples_vals = []
+
+    versions_display = versions if versions else UNKNOWN_PRE_W3
+    max_prompt_tokens_display = (
+        max_prompt_tokens_vals if max_prompt_tokens_vals else UNKNOWN_PRE_W3
+    )
+    n_samples_display = n_samples_vals if n_samples_vals else UNKNOWN_PRE_W3
     caption = (
-        f"run_id={run_id}; longbench_version={versions}; "
-        f"max_prompt_tokens={max_prompt_tokens_vals}; n_samples={n_samples_vals}"
+        f"run_id={run_id}; longbench_version={versions_display}; "
+        f"max_prompt_tokens={max_prompt_tokens_display}; n_samples={n_samples_display}"
     )
 
     parity_warning = None

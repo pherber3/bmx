@@ -252,3 +252,16 @@ def test_kv_size_column_is_16_for_fp16_and_matches_mean_bpe_for_measured_arm():
 def test_result_is_dataclass_like_container():
     assert hasattr(TableResult, "to_markdown")
     assert hasattr(TableResult, "to_latex")
+
+
+def test_pre_w3_parquet_missing_provenance_columns_does_not_crash():
+    """Old (pre-W3) parquets lack longbench_version/max_prompt_tokens/n_samples entirely —
+    build_table must not KeyError on caption/provenance construction (this is exactly the
+    crash the w6-1 report observed against results/k3_longbench/20260702-164100-46b9579)."""
+    rows = _synthetic_rows()
+    df = pd.DataFrame(rows).drop(
+        columns=["longbench_version", "max_prompt_tokens", "n_samples"]
+    )
+    result = build_table(df, run_id="old-run", anchor_tolerance=2.0)
+    assert "unknown (pre-W3 parquet)" in result.caption
+    assert result.parity_warning is None  # can't assert non-parity without the columns
