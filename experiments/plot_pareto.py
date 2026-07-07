@@ -124,16 +124,23 @@ def load_run_dirs(
                 )
             arm_to_dir[arm] = str(p)
 
-    # Input-policy consistency: compare only the present (non-NaN) values of each policy
-    # column across dirs. Absence (NaN, pre-W3 parquet) is compatible-by-definition with the
-    # 60h run's untruncated v1 policy, per the docstring above.
+    # Input-policy consistency. Absence (NaN, pre-W3 parquet) MEANS the untruncated-v1
+    # policy (per the docstring above) — so NaN is normalized to that policy's canonical
+    # value and then compared like any other: a pre-W3 dir + a truncated dir MUST clash.
+    # (The first implementation only compared present values, which silently merged the
+    # 60h table with a truncated run — the exact violation this guard exists to catch.)
+    _NAN_MEANS = {"max_prompt_tokens": -1.0, "longbench_version": "v1"}
     for col in POLICY_COLUMNS:
         seen: dict[object, str] = {}
         for df in frames:
             run_dir = df["_run_dir"].iloc[0]
             if col not in df.columns:
-                continue
-            vals = df[col].dropna().unique()
+                vals = [_NAN_MEANS[col]] if col in _NAN_MEANS else []
+            else:
+                vals = [
+                    _NAN_MEANS.get(col, v) if pd.isna(v) else v
+                    for v in df[col].unique()
+                ]
             for v in vals:
                 if seen and v not in seen and any(v != sv for sv in seen):
                     conflicting_dir = next(iter(seen.values()))

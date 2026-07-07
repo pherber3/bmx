@@ -196,13 +196,15 @@ def test_load_run_dirs_concats_with_schema_mismatch(tmp_path):
     # Old-vintage run: no longbench_version/max_prompt_tokens columns at all.
     old_rows = [_row("fp16", "narrativeqa", 0.40, kv_size_bits=16.0)]
     old_dir = _write_run(tmp_path, "old-run", old_rows)
-    # New-vintage run: has the extra columns.
+    # New-vintage run: has the extra columns, with values POLICY-COMPATIBLE with the
+    # old dir (NaN means untruncated v1 -> canonical v1 + the -1 untruncated
+    # sentinel). Schema concat is what's under test here, not the policy guard.
     new_rows = [_row("k2b", "narrativeqa", 0.39, kv_size_bits=4.0)]
     new_dir = _write_run(
         tmp_path,
         "new-run",
         new_rows,
-        extra_cols={"longbench_version": "v1_e", "max_prompt_tokens": 31500},
+        extra_cols={"longbench_version": "v1", "max_prompt_tokens": -1},
     )
     combined, fp16_dir = load_run_dirs((str(old_dir), str(new_dir)))
     assert fp16_dir == str(old_dir)
@@ -261,20 +263,33 @@ def test_load_run_dirs_input_policy_mismatch_hard_errors(tmp_path):
         load_run_dirs((str(truncated), str(untruncated)))
 
 
-def test_load_run_dirs_nan_policy_column_compatible_with_present_value(tmp_path):
-    # A pre-W3 dir (no policy columns at all) must NOT be flagged as a mismatch against a
-    # dir that does have the columns — NaN is compatible-by-definition, per module docstring.
+def test_load_run_dirs_nan_policy_means_untruncated_v1(tmp_path):
+    # NaN (pre-W3 dir) MEANS untruncated v1 — so it merges with a new-vintage dir at the
+    # canonical values (v1, -1 sentinel) but HARD-ERRORS against a truncated or v1_e dir.
+    # (The first implementation only compared present values, silently merging the 60h
+    # table with a truncated run — the exact violation the guard exists to catch.)
     old_dir = _write_run(
         tmp_path, "old", [_row("fp16", "narrativeqa", 0.4, kv_size_bits=16.0)]
     )
-    new_dir = _write_run(
+    compat_dir = _write_run(
         tmp_path,
-        "new",
+        "compat",
         [_row("k2b", "narrativeqa", 0.39, kv_size_bits=4.0)],
-        extra_cols={"longbench_version": "v1_e", "max_prompt_tokens": 31500},
+        extra_cols={"longbench_version": "v1", "max_prompt_tokens": -1},
     )
-    combined, fp16_dir = load_run_dirs((str(old_dir), str(new_dir)))  # must not raise
+    combined, fp16_dir = load_run_dirs(
+        (str(old_dir), str(compat_dir))
+    )  # must not raise
     assert fp16_dir == str(old_dir)
+
+    truncated_dir = _write_run(
+        tmp_path,
+        "truncated",
+        [_row("k2b_k2r8", "narrativeqa", 0.17, kv_size_bits=2.9)],
+        extra_cols={"longbench_version": "v1", "max_prompt_tokens": 31500},
+    )
+    with pytest.raises(ValueError, match="input-policy mismatch"):
+        load_run_dirs((str(old_dir), str(truncated_dir)))
 
 
 def test_load_run_dirs_missing_fp16_in_first_dir_errors(tmp_path):
