@@ -72,6 +72,16 @@ def spec_pair(
         base, _, bits_str = arm.rpartition("_b")
         s = CacheCodecSpec(arm=base, bits=int(bits_str), seed=seed)
         return s, s
+    # Asymmetric bit-width variants "turboquant_mse_k{kb}v{vb}" (e.g. _k3v2): K and V
+    # sensitivity differ (bits belong to K), so turboquant's OWN best frontier point is
+    # asymmetric — the honest baseline any new codec must beat, not the symmetric strawman.
+    if arm.startswith("turboquant_mse_k") or arm.startswith("turboquant_prod_k"):
+        base, _, body = arm.rpartition("_k")
+        bits_k_str, _, bits_v_str = body.partition("v")
+        return (
+            CacheCodecSpec(arm=base, bits=int(bits_k_str), seed=seed),
+            CacheCodecSpec(arm=base, bits=int(bits_v_str), seed=seed),
+        )
     if arm == "kivi":
         return (
             CacheCodecSpec(arm="rtn_channel", bits=2, group=group, seed=seed),

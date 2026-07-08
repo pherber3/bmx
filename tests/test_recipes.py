@@ -70,3 +70,17 @@ def test_turboquant_parametric_bits():
     # the plain names stay pinned at 2 bits (recorded-results compatibility)
     k, v = spec_pair("turboquant_mse")
     assert k.bits == 2
+
+
+def test_turboquant_asymmetric_bits():
+    """turboquant_mse_k{kb}v{vb}: turboquant's own best frontier point is asymmetric
+    (bits belong to K) — the honest baseline for any new sub-3-bit codec."""
+    for name, base, bk, bv in [
+        ("turboquant_mse_k3v2", "turboquant_mse", 3, 2),
+        ("turboquant_mse_k2v3", "turboquant_mse", 2, 3),
+        ("turboquant_mse_k4v2", "turboquant_mse", 4, 2),
+        ("turboquant_prod_k3v2", "turboquant_prod", 3, 2),
+    ]:
+        k, v = spec_pair(name)
+        assert k.arm == base and v.arm == base
+        assert k.bits == bk and v.bits == bv
