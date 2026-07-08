@@ -431,6 +431,109 @@ def test_frozen_subspace_not_refit():
         cache.detach()
 
 
+def test_k2t_frozen_subspace_engaged_and_not_refit(monkeypatch):
+    """k2t (lowrank_turboquant K) must take the SAME frozen-subspace path as
+    lowrank_rtn_channel: the channel subspace V is fitted ONCE per layer at the
+    first flush and REUSED (projection only) for every later block. A fall-
+    through to the generic path would refit truncated_svd per 128-token page —
+    violating the frozen-subspace design and re-charging factor bpe per block.
+
+    Counts truncated_svd calls on BOTH modules that bind it (streaming's frozen
+    fit and codecs' internal refit), so a per-block refit on either path fails.
+    """
+    import bmx.cache.codecs as codecs_mod
+    import bmx.cache.streaming as streaming_mod
+    from bmx.cache.recipes import spec_pair
+
+    model = tiny_llama()
+    k_spec, v_spec = spec_pair("k2t", rank=4, group=16)
+    assert k_spec.arm == "lowrank_turboquant"  # pin the recipe wiring
+
+    svd_calls: list = []
+    real_svd = streaming_mod.truncated_svd
+
+    def counting_svd(M, rank):
+        svd_calls.append(tuple(M.shape))
+        return real_svd(M, rank)
+
+    monkeypatch.setattr(streaming_mod, "truncated_svd", counting_svd)
+    monkeypatch.setattr(codecs_mod, "truncated_svd", counting_svd)
+
+    g = torch.Generator().manual_seed(17)
+    input_ids = torch.randint(0, 97, (1, 270), generator=g)
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    try:
+        with torch.no_grad():
+            # Prefill 140: first 128-token page flushes (S-W=132 >= PAGE).
+            model(input_ids[:, :140], past_key_values=cache, use_cache=True)
+        layer = cache.layers[0]
+        assert layer._committed_S_q == 128, "first flush did not fire (vacuous)"
+        assert layer._frozen_svd is not None, (
+            "k2t did not engage the frozen-subspace path — lowrank_turboquant "
+            "fell through to the generic per-block-refit path"
+        )
+        _, V_first = layer._frozen_svd
+        V_first = V_first.clone()
+        fits_after_first_flush = len(svd_calls)
+
+        with torch.no_grad():
+            # One more batched step to S=270: second page flushes (S_q -> 256).
+            model(input_ids[:, 140:], past_key_values=cache, use_cache=True)
+        assert layer._committed_S_q == 256, "second flush did not fire (vacuous)"
+    finally:
+        cache.detach()
+
+    n_layers = len(cache.layers)
+    assert fits_after_first_flush == n_layers, (
+        f"expected exactly one SVD fit per layer at first flush, "
+        f"got {fits_after_first_flush} for {n_layers} layers"
+    )
+    assert len(svd_calls) == n_layers, (
+        f"truncated_svd refit on a later flush ({len(svd_calls)} total calls for "
+        f"{n_layers} layers) — subspace is not frozen"
+    )
+    _, V_after = cache.layers[0]._frozen_svd
+    assert torch.equal(V_first, V_after), (
+        "_frozen_svd V changed after first flush — subspace is not frozen"
+    )
+
+
+def test_k2t_generate_finite_logits():
+    """k2t end-to-end on a tiny factory model: prefill past the PAGE boundary
+    (so the lowrank_turboquant K codec actually runs) then greedy-decode token
+    by token through the streaming cache — every step's logits must be finite
+    and the blended bpe must show real compression (non-vacuous).
+    """
+    from bmx.cache.recipes import spec_pair
+
+    model = tiny_llama()
+    k_spec, v_spec = spec_pair("k2t", rank=4, group=16)
+    g = torch.Generator().manual_seed(23)
+    prompt = torch.randint(0, 97, (1, 140), generator=g)
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    try:
+        with torch.no_grad():
+            out = model(prompt, past_key_values=cache, use_cache=True)
+            assert torch.isfinite(out.logits).all()
+            tok = out.logits[:, -1:].argmax(-1)
+            for _ in range(12):  # greedy decode, one token at a time
+                out = model(tok, past_key_values=cache, use_cache=True)
+                assert torch.isfinite(out.logits).all()
+                tok = out.logits[:, -1:].argmax(-1)
+    finally:
+        cache.detach()
+    k_post, v = cache.reconstruct_layer(0)
+    assert torch.isfinite(k_post).all() and torch.isfinite(v).all()
+    bpe_k, _ = cache.bits_per_entry()
+    assert bpe_k < 16.0, f"expected blended bpe_k < 16.0 (page flushed), got {bpe_k}"
+
+
 def test_greedy_decode_no_flush_branch_matches_itself():
     """Pins the no-flush branch's numerics as a change guard (Task 2 / Wave 3).
 

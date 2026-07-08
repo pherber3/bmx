@@ -14,9 +14,10 @@ Write-once semantics:
   per-token norm rescale compounds => V norm explodes over decode steps).
 
 Frozen subspace:
-  For lowrank_rtn_channel K, the channel subspace V is fitted at the FIRST flush
-  and reused for all subsequent blocks (_frozen_svd). Per-block Us is computed as
-  M_block @ V_frozen (projection onto the frozen subspace).
+  For the lowrank K arms (_FROZEN_SUBSPACE_ARMS), the channel subspace V is
+  fitted at the FIRST flush and reused for all subsequent blocks (_frozen_svd).
+  Per-block Us is computed as M_block @ V_frozen (projection onto the frozen
+  subspace).
 
 Memory pruning:
   After committing a pre-RoPE block to _q_prefix_k, the corresponding columns of
@@ -39,6 +40,12 @@ from bmx.cache.hf_compat import (
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 from bmx.decomp.lrs import truncated_svd
+
+# Lowrank K arms that share the frozen pre-RoPE subspace path: V fitted once at
+# the first flush, later blocks projected onto it (never refit per block). Both
+# accept svd_factors=(Us, V) in quantize_cache; they differ only in how the
+# post-lowrank residual is coded (per-channel RTN vs turboquant-MSE).
+_FROZEN_SUBSPACE_ARMS = frozenset({"lowrank_rtn_channel", "lowrank_turboquant"})
 
 
 def compute_flush_schedule(S: int, W: int, g: int) -> int:
@@ -84,7 +91,7 @@ class StreamingQuantizedLayer(DynamicLayer):
         self._committed_S_q: int = 0
 
         # Frozen subspace: (Us, V) from truncated_svd at first flush.
-        # Only used for lowrank_rtn_channel K with pre_rope.
+        # Only used for _FROZEN_SUBSPACE_ARMS K with pre_rope.
         # V is the (C, rank) channel subspace — frozen across all blocks.
         self._frozen_svd: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -148,7 +155,7 @@ class StreamingQuantizedLayer(DynamicLayer):
             # fp16 arm: no quantization; just apply RoPE at the correct positions.
             k_hat_pre = k_block_pre
             codec_bpe = 16.0
-        elif spec.arm == "lowrank_rtn_channel":
+        elif spec.arm in _FROZEN_SUBSPACE_ARMS:
             # Frozen subspace across blocks: fit once at first flush, project thereafter.
             M = to_matrix(k_block_pre)  # (block_len, h*d) fp32
             if self._frozen_svd is None:
@@ -158,12 +165,13 @@ class StreamingQuantizedLayer(DynamicLayer):
                 self._frozen_svd = (Us, V)
             else:
                 # Later flushes: project onto the frozen subspace.
-                # S-divisibility (lowrank_rtn_channel requires S % group == 0, group >= rank)
-                # guarantees block_len >= rank; assert here to document the invariant.
+                # block_len is a full PAGE (>= 128 >= rank); for
+                # lowrank_rtn_channel S-divisibility (S % group == 0, group >=
+                # rank) also guarantees it. Assert to document the invariant.
                 _, V_frozen = self._frozen_svd
                 assert M.shape[0] >= V_frozen.shape[1], (
                     f"block_len={M.shape[0]} < rank={V_frozen.shape[1]}; "
-                    "S-divisibility by group (>= rank) must hold"
+                    "flush blocks must be at least rank tokens long"
                 )
                 # Us_block = M @ V_frozen  (project block rows onto frozen channel subspace)
                 Us = M @ V_frozen  # (block_len, rank)
@@ -171,6 +179,7 @@ class StreamingQuantizedLayer(DynamicLayer):
                 spec.arm,
                 M,
                 bits=spec.bits,
+                seed=spec.seed,  # lowrank_turboquant's residual rotation is seeded
                 group=spec.group,
                 rank=spec.rank,
                 svd_factors=(Us, self._frozen_svd[1]),
