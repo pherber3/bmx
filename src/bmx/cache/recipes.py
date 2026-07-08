@@ -60,6 +60,31 @@ def spec_pair(
             ),
             CacheCodecSpec(arm="turboquant_mse", bits=2, seed=seed),
         )
+    if arm == "k2t" or arm.startswith("k2t_k"):
+        # k2t = the improved-k2b candidate: same structure as k2b (lowrank K
+        # pre-RoPE + turboquant V) but the K residual is coded with the
+        # turboquant-MSE mechanism instead of per-channel RTN, and the K budget
+        # drops to 2b (target ~2.5-2.8 avg measured bits). Motivation: k2b ties
+        # turboquant_mse_b3 on LongBench Avg at 3.94 vs 3.21 measured bits —
+        # the RTN residual is the suspected bit-waster. Parameterized variants
+        # "k2t_k{bits}r{rank}" override the K budget, mirroring k2b_k{bits}r{rank}.
+        # (group is inert for lowrank_turboquant; kept for spec symmetry.)
+        bits_k, rank_k = 2, rank
+        if arm != "k2t":
+            body = arm[len("k2t_k") :]
+            bits_str, rank_str = body.split("r")
+            bits_k, rank_k = int(bits_str), int(rank_str)
+        return (
+            CacheCodecSpec(
+                arm="lowrank_turboquant",
+                bits=bits_k,
+                rank=rank_k,
+                group=group,
+                seed=seed,
+                pre_rope=True,
+            ),
+            CacheCodecSpec(arm="turboquant_mse", bits=2, seed=seed),
+        )
     if arm in ("turboquant_mse", "turboquant_prod"):
         s = CacheCodecSpec(arm=arm, bits=2, seed=seed)
         return s, s

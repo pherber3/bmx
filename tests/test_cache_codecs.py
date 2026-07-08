@@ -106,7 +106,12 @@ class TestMonotonicity:
 # ---------------------------------------------------------------------------
 
 
-SEEDED_ARMS = ("rotate_rtn_token", "turboquant_mse", "turboquant_prod")
+SEEDED_ARMS = (
+    "rotate_rtn_token",
+    "turboquant_mse",
+    "turboquant_prod",
+    "lowrank_turboquant",
+)
 
 
 class TestDeterminism:
@@ -994,6 +999,127 @@ def test_frozen_vs_oracle_detects_drift():
     assert lg_orac_d <= lg_froz_d + 1e-9, (
         f"oracle did not beat frozen under drift: {lg_orac_d} vs {lg_froz_d}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. lowrank_turboquant — lowrank K + turboquant-MSE residual (the k2b
+#     bit-waster test: structure + good quantizer vs good quantizer alone)
+# ---------------------------------------------------------------------------
+
+
+def test_lowrank_turboquant_registered():
+    from bmx.cache.codecs import CACHE_ARMS, S_DIVISIBILITY_ARMS
+
+    assert "lowrank_turboquant" in CACHE_ARMS
+    # turboquant residual has no per-channel group over S — no S-divisibility.
+    assert "lowrank_turboquant" not in S_DIVISIBILITY_ARMS
+
+
+def test_lowrank_turboquant_roundtrip_shape_dtype():
+    M = _seeded_matrix()
+    m_hat, bpe = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED
+    )
+    assert m_hat.shape == M.shape
+    assert m_hat.dtype == M.dtype
+    assert math.isfinite(bpe) and bpe > 0
+
+
+def test_lowrank_turboquant_bpe_formula():
+    # bpe = bits (Lloyd payload) + 16/C (fp16 per-row residual norm)
+    #     + 16*r*(S+C)/(S*C) (fp16 factors). Codebook + Hadamard are
+    #     seed-generated: 0 stored bits (same convention as turboquant_mse).
+    M = _seeded_matrix()
+    _, bpe = quantize_cache("lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED)
+    expected = BITS + 16.0 / C + 16.0 * RANK * (S + C) / (S * C)
+    assert math.isclose(bpe, expected, rel_tol=1e-9), f"{bpe} != {expected}"
+
+
+def test_lowrank_turboquant_bpe_monotone_in_rank_and_bits():
+    M = _seeded_matrix()
+    _, bpe_r4 = quantize_cache("lowrank_turboquant", M, bits=BITS, rank=4, seed=SEED)
+    _, bpe_r8 = quantize_cache("lowrank_turboquant", M, bits=BITS, rank=8, seed=SEED)
+    assert bpe_r8 > bpe_r4, "bpe must grow with rank (factor metadata)"
+    _, bpe_b2 = quantize_cache("lowrank_turboquant", M, bits=2, rank=RANK, seed=SEED)
+    _, bpe_b3 = quantize_cache("lowrank_turboquant", M, bits=3, rank=RANK, seed=SEED)
+    assert bpe_b3 > bpe_b2, "bpe must grow with residual bit-width"
+
+
+def test_lowrank_turboquant_packed_split_contract():
+    # quantize_cache must be literally dequant_packed ∘ quantize_packed.
+    from bmx.cache.codecs import dequant_packed, quantize_packed
+
+    M = _seeded_matrix()
+    packed, bpe_p = quantize_packed(
+        "lowrank_turboquant", M, bits=BITS, seed=SEED, rank=RANK
+    )
+    m_split = dequant_packed("lowrank_turboquant", packed, seed=SEED)
+    m_cache, bpe_c = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, seed=SEED, rank=RANK
+    )
+    assert torch.equal(m_split, m_cache)
+    assert math.isclose(bpe_p, bpe_c, rel_tol=1e-12)
+    assert packed["res_indices"].dtype == torch.int16
+    assert packed["res_norms"].shape == (M.shape[0], 1)
+
+
+def test_lowrank_turboquant_requires_rank():
+    M = _seeded_matrix()
+    with pytest.raises(AssertionError):
+        quantize_cache("lowrank_turboquant", M, bits=BITS, rank=0, seed=SEED)
+
+
+def test_lowrank_turboquant_svd_factors_equivalence():
+    M = _seeded_matrix()
+    factors = truncated_svd(M, RANK)
+    m_default, bpe_default = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED
+    )
+    m_passed, bpe_passed = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED, svd_factors=factors
+    )
+    assert torch.equal(m_default, m_passed)
+    assert math.isclose(bpe_default, bpe_passed, rel_tol=1e-12)
+
+
+def test_lowrank_turboquant_beats_turboquant_mse_at_matched_bits():
+    """The clean 'structure + good quantizer vs good quantizer alone' gate.
+
+    Planted rank-6 K + noise: lowrank_turboquant @(rank 6, 2b residual) must
+    achieve LOWER logit AND reconstruction distortion than plain turboquant_mse
+    @3b while spending FEWER total bits (repo bpe accounting, ALL metadata
+    counted — matched bits, never matched rank)."""
+    S_, C_, r_ = 1024, 128, 6
+    h_kv = 2
+    g = torch.Generator().manual_seed(21)
+    U = torch.randn(S_, r_, generator=g)
+    W = torch.randn(r_, C_, generator=g)
+    noise = torch.randn(S_, C_, generator=g)
+    M = U @ W / math.sqrt(r_) + 0.1 * noise
+
+    m_lt, bpe_lt = quantize_cache("lowrank_turboquant", M, bits=2, rank=r_, seed=SEED)
+    m_t3, bpe_t3 = quantize_cache("turboquant_mse", M, bits=3, seed=SEED)
+
+    # Matched-bits gate via the repo's honest accounting.
+    assert bpe_lt <= bpe_t3 + 1e-9, (
+        f"not a matched-bits comparison: lowrank_turboquant {bpe_lt:.4f} bpe > "
+        f"turboquant_mse@3b {bpe_t3:.4f} bpe"
+    )
+
+    # Logit distortion vs probe queries (the ranking metric; not Frobenius-only).
+    q = _qkv_for(M, h_kv=h_kv)
+    lg_lt = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(m_lt, h_kv).double(), q.double()
+    )
+    lg_t3 = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(m_t3, h_kv).double(), q.double()
+    )
+    assert lg_lt < lg_t3, (
+        f"lowrank_turboquant logit distortion {lg_lt:.4f} not < "
+        f"turboquant_mse@3b {lg_t3:.4f} at fewer bits ({bpe_lt:.3f} vs {bpe_t3:.3f})"
+    )
+    # Reconstruction (secondary; same direction expected on this synthetic).
+    assert _rel_err(m_lt, M) < _rel_err(m_t3, M)
 
 
 def test_bpe_term_helpers_are_the_audit_surface():

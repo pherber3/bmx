@@ -29,6 +29,23 @@ def test_k2b_ph_uses_perhead_v():
     assert v == CacheCodecSpec(arm="turboquant_mse_perhead", bits=2, seed=0)
 
 
+def test_k2t_canonical():
+    # k2t = improved-k2b candidate: same structure, turboquant residual on K.
+    k, v = spec_pair("k2t", rank=16, group=64, seed=0)
+    assert k == CacheCodecSpec(
+        arm="lowrank_turboquant", bits=2, rank=16, group=64, seed=0, pre_rope=True
+    )
+    assert v == CacheCodecSpec(arm="turboquant_mse", bits=2, seed=0)
+
+
+def test_k2t_parameterized_parsing():
+    k, v = spec_pair("k2t_k3r8", rank=16, group=64, seed=0)
+    assert k.arm == "lowrank_turboquant"
+    assert k.bits == 3 and k.rank == 8  # "k2t_k{bits}r{rank}" override
+    assert k.pre_rope is True
+    assert v == CacheCodecSpec(arm="turboquant_mse", bits=2, seed=0)
+
+
 def test_kivi_pair():
     k, v = spec_pair("kivi", group=64, seed=0)
     assert k.arm == "rtn_channel" and v.arm == "rtn_token"

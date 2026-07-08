@@ -47,6 +47,8 @@ _ARM_TABLE: dict[str, _ArmTraits] = {
     "turboquant_mse_perhead": _ArmTraits(packed=True),
     "turboquant_prod": _ArmTraits(packed=True),
     "lowrank_rtn_channel": _ArmTraits(s_divisible=True, packed=True),
+    # No s_divisible: the turboquant residual is per-row (no channel groups over S).
+    "lowrank_turboquant": _ArmTraits(packed=True),
     "lowrank_waterfill_channel": _ArmTraits(s_divisible=True),
     "lowrank_eigwaterfill_channel": _ArmTraits(s_divisible=True),
     "lowrank_randwaterfill_channel": _ArmTraits(s_divisible=True),
@@ -530,6 +532,27 @@ def _turboquant_mse_dequant(
     return _turboquant_mse_perhead_dequant(indices, norms, bits, seed, 1)
 
 
+def _lowrank_split(
+    arm: str, M: torch.Tensor, rank: int, svd_factors: tuple | None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared low-rank split for the lowrank_* packed arms.
+
+    Returns (Us_stored, V_stored, L, R): fp16-roundtripped factors (the stored
+    form the bpe accounting charges), L = Us_stored @ V_stored^T, R = M - L.
+    """
+    S, C = M.shape
+    assert rank > 0, f"{arm} requires rank > 0, got {rank}"
+    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
+    if svd_factors is not None:
+        Us, V = svd_factors
+    else:
+        Us, V = truncated_svd(M, rank)
+    Us_stored = Us.half().float()
+    V_stored = V.half().float()
+    L = Us_stored @ V_stored.mT
+    return Us_stored, V_stored, L, M - L
+
+
 def quantize_packed(
     arm: str,
     M: torch.Tensor,
@@ -596,18 +619,31 @@ def quantize_packed(
         }
         # payload + 1 sign bit + two fp16 norm vectors (mse + qjl) = 2 * norm_bits(1, C)
         return packed, (bits - 1) + 1 + 32.0 / C
+    if arm == "lowrank_turboquant":
+        # The k2b bit-waster test (U1): k2b (lowrank + per-channel RTN residual)
+        # ties turboquant_mse_b3 on LongBench Avg but at 3.94 vs 3.21 measured
+        # bits — the RTN residual is the suspected bit-waster (RTN-family arms
+        # are the worst rows in our tables). This arm is identical to
+        # lowrank_rtn_channel EXCEPT the post-lowrank residual is coded with the
+        # turboquant-MSE mechanism (per-row norm + seeded Hadamard rotation +
+        # Gaussian Lloyd-Max codebook — the exact machinery turboquant_mse
+        # uses), making it the clean "structure + good quantizer vs good
+        # quantizer alone" comparison. bpe: Lloyd payload + fp16 per-row
+        # residual norm (16/C) + fp16 factors; rotation + codebook are
+        # seed-generated (0 stored bits), same convention as turboquant_mse.
+        Us_stored, V_stored, L, R = _lowrank_split(arm, M, rank, svd_factors)
+        res_indices, res_norms = _turboquant_mse_packed(R, bits, seed)
+        bpe = bits + norm_bits(1, C) + factor_bits(rank, S, C)
+        return {
+            "Us": Us_stored,
+            "V": V_stored,
+            "res_indices": res_indices,
+            "res_norms": res_norms,
+            "bits": bits,
+        }, bpe
     # lowrank_rtn_channel
-    assert rank > 0, f"lowrank_rtn_channel requires rank > 0, got {rank}"
-    assert rank <= min(S, C), f"rank {rank} > min(S,C)={min(S, C)}"
     assert S % group == 0, f"S={S} not divisible by group={group}"
-    if svd_factors is not None:
-        Us, V = svd_factors
-    else:
-        Us, V = truncated_svd(M, rank)
-    Us_stored = Us.half().float()
-    V_stored = V.half().float()
-    L = Us_stored @ V_stored.mT
-    R = M - L
+    Us_stored, V_stored, _, R = _lowrank_split(arm, M, rank, svd_factors)
     res_Q_int, res_scale = rtn_quantize_packed(R.mT, bits, group)
     bpe = bits + scale_bits(group) + factor_bits(rank, S, C)
     return {
@@ -652,6 +688,12 @@ def dequant_packed(
         scale = math.sqrt(math.pi / 2) / C
         R_hat = packed["qjl_norms"] * scale * (signs @ G)
         return M1 + R_hat
+    if arm == "lowrank_turboquant":
+        L = packed["Us"] @ packed["V"].mT
+        R_hat = _turboquant_mse_dequant(
+            packed["res_indices"], packed["res_norms"], packed["bits"], seed
+        )
+        return L + R_hat
     # lowrank_rtn_channel
     L = packed["Us"] @ packed["V"].mT
     R_hat = rtn_dequantize_packed(packed["res_Q_int"], packed["res_scale"], group).mT
@@ -694,13 +736,15 @@ def quantize_cache(
     group : int
         Group size for rtn_token / rtn_channel / rotate_rtn_token / lowrank arms.
     rank : int
-        Low-rank components for lowrank_rtn_channel (must be > 0 for that arm).
+        Low-rank components for lowrank_rtn_channel / lowrank_turboquant (must
+        be > 0 for those arms).
     svd_factors : tuple | None
         Optional pre-computed (Us, V) from truncated_svd(M, rank), mirroring
         bmx.quant.arms's ``ls`` param precedent.  When provided, the internal
         truncated_svd call is skipped (useful when sweeping bits for a fixed
         (M, rank) — the SVD result depends only on those two, not on bits).
-        Used by lowrank_rtn_channel (svd_factors only) and all lowrank_*waterfill_channel arms;
+        Used by lowrank_rtn_channel / lowrank_turboquant (svd_factors only) and all
+        lowrank_*waterfill_channel arms;
         ignored by the RTN/turboquant arms.
     tiers : tuple[int, ...]
         Allowed bit-widths for per-channel allocation in lowrank_rtn_channel (svd_factors only)
