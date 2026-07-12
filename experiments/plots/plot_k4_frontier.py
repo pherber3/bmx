@@ -15,6 +15,26 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 
+def _arm_selection(df: pd.DataFrame, arm: str) -> tuple[pd.Series, str]:
+    """Row mask + legend label for one frontier arm.
+
+    Spectral variants get per-arm filters (all at fit_mode == "oracle"):
+    "spectral" is the weighted headline, "spectral_unweighted" is the P4
+    ablation (weighted == False on real frames), "spectral_randbasis" is the
+    random-basis control (no weighted filter).
+    """
+    if arm == "spectral":
+        mask = (df.arm == arm) & df.weighted & (df.fit_mode == "oracle")
+        return mask, "spectral (weighted, oracle)"
+    if arm == "spectral_unweighted":
+        mask = (df.arm == arm) & ~df.weighted & (df.fit_mode == "oracle")
+        return mask, "spectral (unweighted, oracle)"
+    if arm == "spectral_randbasis":
+        mask = (df.arm == arm) & (df.fit_mode == "oracle")
+        return mask, "random-basis control"
+    return df.arm == arm, arm
+
+
 def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
     """Generate K4 frontier figures: model/skeptic accounting + structure tax.
 
@@ -52,12 +72,7 @@ def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
     fig, ax = plt.subplots(figsize=(8, 5))
 
     for arm in sorted(available_arms):
-        # Filter: spectral variants prefer fit_mode="oracle" and weighted=True
-        if arm.startswith("spectral"):
-            mask = (df.arm == arm) & df.weighted & (df.fit_mode == "oracle")
-        else:
-            mask = df.arm == arm
-
+        mask, label = _arm_selection(df, arm)
         sub = df[mask]
         if sub.empty:
             continue
@@ -79,7 +94,7 @@ def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
             grouped["distortion_mean"],
             yerr=grouped["distortion_sem"],
             marker="o",
-            label=arm if not arm.startswith("spectral") else "spectral (oracle)",
+            label=label,
             capsize=4,
         )
 
@@ -99,12 +114,7 @@ def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
     fig, ax = plt.subplots(figsize=(8, 5))
 
     for arm in sorted(available_arms):
-        # Filter: spectral variants prefer fit_mode="oracle" and weighted=True
-        if arm.startswith("spectral"):
-            mask = (df.arm == arm) & df.weighted & (df.fit_mode == "oracle")
-        else:
-            mask = df.arm == arm
-
+        mask, label = _arm_selection(df, arm)
         sub = df[mask]
         if sub.empty:
             continue
@@ -126,7 +136,7 @@ def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
             grouped["distortion_mean"],
             yerr=grouped["distortion_sem"],
             marker="o",
-            label=arm if not arm.startswith("spectral") else "spectral (oracle)",
+            label=label,
             capsize=4,
         )
 
