@@ -146,25 +146,22 @@ def _round_to_tiers(b: torch.Tensor, tiers_t: torch.Tensor) -> torch.Tensor:
     return tiers_t[idx]
 
 
-def allocate_channel_bits(
-    R: torch.Tensor,
+def allocate_bits_from_variance(
+    var: torch.Tensor,
     budget_bits: float,
     tiers: tuple[int, ...] = (0, 2, 3, 4),
     *,
-    axis: int = 0,
     n_search: int = 40,
 ) -> torch.Tensor:
-    """Reverse-water-filling per-channel bit allocation (Cover-Thomas Thm 13.3.3).
+    """Reverse-water-filling bit allocation from a per-direction variance vector.
 
-    Per-channel variance var_c (over `axis`); continuous rate
-    b_c = max(0, 0.5*log2(var_c / kappa)); kappa bisected so the tier-rounded
-    mean lands at-or-just-below budget_bits. Deterministic.
-
+    Same bisection as allocate_channel_bits; factored out so corpus spectra
+    (K4 spectral packs) and per-matrix variances share one implementation.
     Returns (C,) int64 bit-widths, each a member of `tiers`.
     """
-    assert R.dim() == 2, f"R must be 2-D (S, C); got {tuple(R.shape)}"
-    var = R.var(dim=axis, unbiased=False).double().clamp_min(1e-30)  # (C,)
-    tiers_t = torch.tensor(sorted(tiers), dtype=torch.float64, device=R.device)
+    assert var.dim() == 1, f"var must be 1-D (C,); got {tuple(var.shape)}"
+    var = var.double().clamp_min(1e-30)
+    tiers_t = torch.tensor(sorted(tiers), dtype=torch.float64, device=var.device)
 
     def rounded_mean(kappa: float) -> tuple[torch.Tensor, float]:
         b_cont = (0.5 * torch.log2(var / kappa)).clamp_min(0.0)
@@ -189,6 +186,22 @@ def allocate_channel_bits(
         else:
             lo = mid  # over budget; raise kappa
     return best.to(torch.int64)
+
+
+def allocate_channel_bits(
+    R: torch.Tensor,
+    budget_bits: float,
+    tiers: tuple[int, ...] = (0, 2, 3, 4),
+    *,
+    axis: int = 0,
+    n_search: int = 40,
+) -> torch.Tensor:
+    """Reverse-water-filling per-channel bit allocation (Cover-Thomas Thm 13.3.3).
+    Thin wrapper over allocate_bits_from_variance on R.var(dim=axis)."""
+    assert R.dim() == 2, f"R must be 2-D (S, C); got {tuple(R.shape)}"
+    return allocate_bits_from_variance(
+        R.var(dim=axis, unbiased=False), budget_bits, tiers, n_search=n_search
+    )
 
 
 # ---------------------------------------------------------------------------

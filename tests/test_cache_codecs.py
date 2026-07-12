@@ -372,6 +372,30 @@ def test_allocate_returns_only_tier_values():
     assert set(bits.tolist()).issubset(set(tiers))
 
 
+def test_allocate_from_variance_matches_channel_allocator():
+    from bmx.cache.codecs import allocate_bits_from_variance, allocate_channel_bits
+
+    g = torch.Generator().manual_seed(0)
+    R = torch.randn(256, 64, generator=g) * torch.linspace(0.1, 4.0, 64)
+    a = allocate_channel_bits(R, 3.0, tiers=(0, 2, 3, 4))
+    b = allocate_bits_from_variance(
+        R.var(dim=0, unbiased=False), 3.0, tiers=(0, 2, 3, 4)
+    )
+    assert torch.equal(a, b)
+
+
+def test_allocate_from_variance_rich_tiers():
+    from bmx.cache.codecs import allocate_bits_from_variance
+
+    # Spiked spectrum: 4 large eigenvalues over a flat bulk — the K4 tier set
+    # must fund the spikes at 5-8 bits and the bulk at 0-2.
+    var = torch.cat([torch.tensor([1e4, 1e4, 1e3, 1e3]), torch.ones(60)])
+    bits = allocate_bits_from_variance(var, 2.5, tiers=(0, 2, 3, 4, 5, 6, 8))
+    assert bits[:4].min() >= 5, f"spikes underfunded: {bits[:4]}"
+    assert bits[4:].max() <= 3
+    assert bits.float().mean().item() <= 2.5 + 1e-9
+
+
 # ---------------------------------------------------------------------------
 # 11. lowrank_waterfill_channel codec arm
 # ---------------------------------------------------------------------------
