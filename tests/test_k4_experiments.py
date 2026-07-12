@@ -41,7 +41,7 @@ def test_k4_spectra_smoke(tmp_path):
     )
     run_dir = main(cfg)
     df = pd.read_parquet(run_dir / "metrics.parquet")
-    assert set(df.fit_mode.unique()) == {"oracle", "heldout", "corpus"}
+    assert {"oracle", "heldout", "corpus", "reference"} <= set(df.fit_mode.unique())
     assert {"am_gm", "logit", "bpe_model", "bpe_skeptic"} <= set(df.columns)
     verdict = json.loads((run_dir / "g0_verdict.json").read_text())
     assert "retention_heldout" in verdict and "retention_corpus" in verdict

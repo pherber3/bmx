@@ -14,10 +14,10 @@ probe-side information, known at read time regardless of which corpus the
 key basis was fit on.
 
 The `lowrank_rtn_channel` reference arm is fit and scored per layer as a
-uniform-codec baseline for the G0 retention ratio, but is written to a
-SEPARATE `reference.parquet` (fit_mode="reference") rather than appended to
-`metrics.parquet` — the interface contract scopes metrics.parquet's fit_mode
-column to exactly {oracle, heldout, corpus}.
+uniform-codec baseline for the G0 retention ratio; its rows live in the SAME
+metrics.parquet with fit_mode="reference" (weighted=False, budget/spectra
+stats NaN — no spectral pack exists for it; its bpe already counts all
+metadata per-sequence, so bpe_model == bpe_skeptic == bpe_skeptic_deploy).
 """
 
 from __future__ import annotations
@@ -131,7 +131,6 @@ def main(cfg: Config):
         assert rel < 2e-2, f"RoPE self-validation FAILED: {rel:.4f} >= 2e-2"
 
     rows: list[dict] = []
-    ref_rows: list[dict] = []
     model_label = cfg.model_label or "unknown"
     headline_col = "logit_rope" if rope_ready else "logit"
 
@@ -142,15 +141,6 @@ def main(cfg: Config):
             f"fit_mode={row['fit_mode']:8s} budget={row['budget']:.2f}  "
             f"bpe_model={row['bpe_model']:.3f}  rel_fro={row['rel_fro']:.4f}  "
             f"logit={row['logit']:.4f}  logit_rope={row['logit_rope']:.4f}",
-            flush=True,
-        )
-
-    def emit_ref(row: dict) -> None:
-        ref_rows.append(row)
-        print(
-            f"  [reference] layer={row['layer']:2d} bpe={row['bpe']:.3f}  "
-            f"rel_fro={row['rel_fro']:.4f}  logit={row['logit']:.4f}  "
-            f"logit_rope={row['logit_rope']:.4f}",
             flush=True,
         )
 
@@ -276,26 +266,34 @@ def main(cfg: Config):
             k_pre_t,
             M,
         )
-        emit_ref(
+        # Reference rows share the full schema: no spectral pack exists, so
+        # budget/spectra stats are NaN; lowrank_rtn_channel's bpe already
+        # counts all metadata per-sequence, so all three bpe views coincide.
+        emit(
             dict(
                 model=model_label,
                 layer=layer_i,
+                weighted=False,
                 fit_mode="reference",
-                bpe=bpe_ref,
+                budget=float("nan"),
+                bpe_model=bpe_ref,
+                bpe_skeptic=bpe_ref,
+                bpe_skeptic_deploy=bpe_ref,
                 rel_fro=rf_ref,
                 logit=lg_ref,
                 logit_rope=lg_rope_ref,
+                am_gm=float("nan"),
+                top16_energy=float("nan"),
+                n_zero_dirs=float("nan"),
             )
         )
 
     df = pd.DataFrame(rows)
     write_metrics(run, df)
-    ref_df = pd.DataFrame(ref_rows)
-    write_metrics(run, ref_df, "reference")
 
     # ---- G0 verdict: transfer retention at the first (reference) budget ----
     ref_budget = cfg.budgets[0]
-    ref_by_layer = ref_df.set_index("layer")[headline_col]
+    ref_by_layer = df[df.fit_mode == "reference"].set_index("layer")[headline_col]
 
     oracle_sub = df[
         (df.fit_mode == "oracle") & (df.weighted) & (df.budget == ref_budget)
@@ -327,7 +325,8 @@ def main(cfg: Config):
     print("G0 VERDICT — basis-transfer retention at budget", ref_budget)
     print("=" * 88)
     print(json.dumps(verdict, indent=2))
-    print(f"\nTotal rows: {len(df)}  (+{len(ref_df)} reference rows)")
+    n_ref = int((df.fit_mode == "reference").sum())
+    print(f"\nTotal rows: {len(df)}  (including {n_ref} reference rows)")
     print(f"-> {run}")
 
     return run
