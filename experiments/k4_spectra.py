@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import re
 
 import pandas as pd
 import torch
@@ -32,8 +31,7 @@ import tyro
 
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.codecs import quantize_cache
-from bmx.cache.collect import from_matrix, load_cache, to_matrix
-from bmx.cache.metrics import logit_distortion, rel_fro
+from bmx.cache.collect import load_cache, to_matrix
 from bmx.cache.rope import apply_rope
 from bmx.cache.spectral import (
     assemble_whitener,
@@ -43,9 +41,7 @@ from bmx.cache.spectral import (
     skeptic_charge,
     spectral_quantize,
 )
-
-_LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
-DEPLOY_S = 32768
+from experiments._k4_common import DEPLOY_S, _score_tail, load_layer_keys, setup_rope
 
 
 @dataclasses.dataclass
@@ -66,19 +62,6 @@ class Config:
     out_root: str = ""
 
 
-def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_pre_t, M):
-    K_hat = from_matrix(M_hat, h_kv)[:, tail, :].float()
-    rf = rel_fro(M_hat[tail], M[tail])
-    if rope_ready:
-        K_hat_rope = apply_rope(K_hat, cos[tail], sin[tail])
-        lg_rope = logit_distortion(K_post_true[:, tail], K_hat_rope, Q)
-        lg = logit_distortion(k_pre_t.float()[:, tail], K_hat, Q)
-    else:
-        lg = logit_distortion(k_pre_t.float()[:, tail], K_hat, Q)
-        lg_rope = float("nan")
-    return rf, lg, lg_rope
-
-
 def main(cfg: Config):
     run = (
         create_run("k4_spectra", cfg, root=cfg.out_root)
@@ -86,49 +69,16 @@ def main(cfg: Config):
         else create_run("k4_spectra", cfg)
     )
 
-    cache = load_cache(cfg.cache_path)
     corpus_caches = [load_cache(p) for p in cfg.corpus_cache_paths]
 
-    layer_keys: dict[int, dict[str, torch.Tensor]] = {}
-    for key, tensor in cache.items():
-        m = _LAYER_RE.match(key)
-        if m is None:
-            continue
-        layer_keys.setdefault(int(m.group(1)), {})[m.group(2)] = tensor
+    layer_keys = load_layer_keys(cfg.cache_path)
 
     layers = sorted(layer_keys.keys())
     if cfg.max_layers > 0:
         layers = layers[: cfg.max_layers]
 
     # ---- RoPE setup (same pattern as k2d_lrtq_gate.py) ---------------------
-    rope_ready = False
-    cos_sin_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    if cfg.model_name:
-        from transformers import AutoConfig
-
-        from bmx.cache.rope import rope_cos_sin
-
-        hf_config = AutoConfig.from_pretrained(cfg.model_name)
-        rope_ready = True
-        print(f"RoPE config loaded from {cfg.model_name}", flush=True)
-
-    def get_cos_sin(S: int):
-        if S not in cos_sin_cache:
-            cos_sin_cache[S] = rope_cos_sin(hf_config, S)
-        return cos_sin_cache[S]
-
-    # Once-per-run RoPE self-validation on layer 0 (asserted, as in K2/K2d).
-    if rope_ready and layers:
-        l0 = layer_keys[layers[0]]
-        k_pre0, k0 = l0["k_pre"].float(), l0["k"].float()
-        cos0, sin0 = get_cos_sin(k_pre0.shape[1])
-        rel = (
-            (apply_rope(k_pre0, cos0, sin0) - k0).norm() / k0.norm().clamp_min(1e-12)
-        ).item()
-        print(
-            f"[rope_validation] rel_fro(apply_rope(k_pre), k) = {rel:.4f}", flush=True
-        )
-        assert rel < 2e-2, f"RoPE self-validation FAILED: {rel:.4f} >= 2e-2"
+    rope_ready, get_cos_sin = setup_rope(cfg.model_name, layer_keys, layers)
 
     rows: list[dict] = []
     model_label = cfg.model_label or "unknown"

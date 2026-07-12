@@ -45,3 +45,37 @@ def test_k4_spectra_smoke(tmp_path):
     assert {"am_gm", "logit", "bpe_model", "bpe_skeptic"} <= set(df.columns)
     verdict = json.loads((run_dir / "g0_verdict.json").read_text())
     assert "retention_heldout" in verdict and "retention_corpus" in verdict
+
+
+def test_k4_frontier_smoke(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from experiments.k4_frontier import Config, main
+
+    main_path = tmp_path / "main.safetensors"
+    _tiny_cache(main_path, seed=0)
+    cfg = Config(
+        cache_path=str(main_path),
+        model_label="tiny",
+        budgets=(2.0, 3.0),
+        group=16,
+        ranks=(4,),
+        coeffquant_rank=4,
+        out_root=str(tmp_path / "results"),
+    )
+    run_dir = main(cfg)
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    for arm in (
+        "spectral",
+        "spectral_unweighted",
+        "spectral_randbasis",
+        "turboquant_mse",
+        "lowrank_rtn_channel",
+        "k2t_coeffquant",
+        "rtn_channel",
+    ):
+        assert (df.arm == arm).any(), f"missing arm {arm}"
+    v = json.loads((run_dir / "g1_verdict.json").read_text())
+    assert "g1_pass" in v and "p3_verdict" in v and "p4_verdict" in v
