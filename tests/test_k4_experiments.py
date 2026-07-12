@@ -79,3 +79,44 @@ def test_k4_frontier_smoke(tmp_path):
         assert (df.arm == arm).any(), f"missing arm {arm}"
     v = json.loads((run_dir / "g1_verdict.json").read_text())
     assert "g1_pass" in v and "p3_verdict" in v and "p4_verdict" in v
+
+
+def test_k4_frontier_figures(tmp_path):
+    import pandas as pd
+
+    from experiments.plots.plot_k4_frontier import make_figures
+
+    rows = []
+    for arm, base in (
+        ("spectral", 0.03),
+        ("turboquant_mse", 0.09),
+        ("rtn_channel", 0.12),
+    ):
+        for i, bpe in enumerate((2.0, 3.0, 4.0)):
+            rows.append(
+                dict(
+                    model="tiny",
+                    layer=i % 2,
+                    kind="k_pre",
+                    arm=arm,
+                    fit_mode="oracle",
+                    weighted=True,
+                    budget=bpe,
+                    bits=int(bpe),
+                    rank=0,
+                    mse_scale=False,
+                    bpe_model=bpe,
+                    bpe_skeptic=bpe + 8.0,
+                    bpe_skeptic_deploy=bpe + 0.5,
+                    rel_fro=base,
+                    logit=base,
+                    logit_rope=base * (4.0**-i),
+                )
+            )
+    paths = make_figures(pd.DataFrame(rows), str(tmp_path))
+    names = {p.name for p in paths}
+    assert {
+        "k4_frontier_model.png",
+        "k4_frontier_skeptic.png",
+        "k4_structure_tax.png",
+    } <= names
