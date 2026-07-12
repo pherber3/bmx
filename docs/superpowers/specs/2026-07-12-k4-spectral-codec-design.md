@@ -246,7 +246,52 @@ exhibit, allocation heatmap).
   source).
 - Sensitivity-knapsack precedent: AutoQuantize (vault) — **grounded**.
 
-## 9. Success criteria (program-level)
+## 9. Prior art: the waterfill arc — three kills, one revival, and what K4 changes
+
+Waterfilling has been gated three times (2026-06-21) and partially revived (2026-07-08).
+K4 must not re-run any settled question; each verdict below is carried as a constraint.
+
+| # | attempt (doc/run) | verdict | what it settled | how K4 uses it |
+|---|---|---|---|---|
+| 1 | per-channel waterfill, raw basis (`2026-06-21-k2-waterfill-results.md`) | KILLED 32/32 | high-variance raw channels are not query-read; allocation in the raw basis funds the wrong directions | K4 never allocates in the raw basis; eigenbasis only |
+| 2 | eigenbasis (KLT) waterfill (`2026-06-21-k2-eigwaterfill-results.md`) | mechanism REAL (2.24×, all falsification controls passed, query_eigen_alignment 0.59), KILLED-honest at S=2048 (+8 bpe basis charge) | the win exists and is eigenstructure-specific (random-rotation control lost); the kill was the per-sequence C×C charge at short context | the charge is the target: corpus-level mode = 0, skeptic mode amortizes (16·C/S) |
+| 3 | structured rotations: top-k / per-head / frozen-prefix (`2026-06-21-k2-structured-rotation-results.md`) | ALL KILLED at matched bpe @S=2048; frozen drifts 1.93× | cheap basis approximations lose ~2× to spending the same bits on uniform precision; frozen RESIDUAL bases drift (residual eigengap 1.13 ≈ none → Davis–Kahan) | K4 does not ship a per-sequence structured rotation; drift threat is scoped to the gapless bulk (see prediction P2) |
+| 4 | full-C KLT re-quoted at deploy context (`k2_blockklt`, commit `e53cf00`) | REVIVAL: @32k charge = +0.5 bpe; eig_full@2.5 beats uniform@3b **1.9× at matched honest bits**; per-head keeps only ~20% of the win | kill #2 was regime-specific (short-context accounting); cross-head structure is real — full-C required | this IS K4's skeptic-mode operating point, already measured positive |
+| 5 | frozen full-C KLT at 25% prefix (`k2_blockklt_frozen`, commit `3d89bcf`) | +0.41–0.69 eff bits drift; refresh recovers ≤23%; **fit@512 < C is rank-deficient**; longer-fit trend positive | prefix-frozen fits are sample-starved (512 rows for C=1024 dims — half the basis is null-space), so the measured "drift" conflates non-stationarity with estimation failure | corpus fit has n ≫ C — the confound vanishes; Stage-0's drift decomposition separates the two causes cleanly |
+
+**Named predictions this history pre-registers for Stage 0/1** (write the outcomes either way):
+
+- **P1 (transfer):** the corpus-fit full-C basis retains ≥90% of the oracle win — because
+  the June drift lived in the *residual* (gapless), while the funded spike directions have
+  an eigengap and k2c showed pre-RoPE subspaces are positionally stable, and the
+  rank-deficiency confound (row 5) is gone at corpus n.
+- **P2 (bulk insensitivity):** basis error in the gapless bulk costs ~nothing, because
+  waterfilling assigns the bulk near-flat low bits — any orthogonal basis of the bulk
+  subspace is equivalent to the coder. (This is why kill #3's drift number does not
+  transfer to K4: drift concentrated exactly where allocation is flat.)
+- **P3 (coefficient quantization):** quantizing spike coefficients to ~6b and letting rank
+  float dominates every prior rank-16-fp16 arm (theory §8; no prior arm ever tested it —
+  kills #1–#3 and the revival all hard-coded lowrank-fp16 + residual treatment).
+- **P4 (weighted basis):** the W^½-weighted basis raises the 0.59 query-eigen alignment
+  measured in kill #2 and widens the matched-bits win over unweighted KLT.
+
+**Standing methodology carried forward from the arc** (non-negotiable in K4 experiments):
+the uniform bit-SWEEP as the frontier baseline (never a single uniform point — the
+bits-advantage artifact caught in kill #3); the random-rotation control arm (the
+load-bearing eigenstructure proof); the oracle-refit control (drift ceiling); idealized
+AND honest bpe columns with the deploy-S amortized quote; region-matched tail scoring for
+any frozen/streamed claim; deterministic MSE-optimal rounding (the bias-cheap /
+variance-expensive prior — no dithered/unbiased arms).
+
+**Reusable machinery (do not rebuild):** `allocate_channel_bits` (the waterfill
+allocator), `_klt_basis`, `_unrotate`, tier/scale/factor bit accounting in
+`bmx.cache.codecs`; the `k2_blockklt.py` / `k2_waterfill.py` experiment scaffolds
+(Stage 1 extends these); `k2_blockklt_frozen.py`'s region-matched drift methodology
+(Stage 0 extends it). Genuinely new in K4: the query-weighted second moment (W^½ basis),
+the corpus-level fit + transfer test, full-spectrum waterfill with quantized coefficients
+(no fp16 lowrank special case), the sensitivity census + across-layer allocation.
+
+## 10. Success criteria (program-level)
 
 1. G0–G2 pass offline with the gates as stated (or fail with written honest negatives).
 2. The Stage-3 duel shows, at ≤2.7 measured bits, K4 Avg ≥ +2 points over the **best**
