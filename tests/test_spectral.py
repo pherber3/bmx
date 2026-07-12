@@ -1,10 +1,15 @@
 import torch
 
+from bmx.cache.codecs import scale_bits, tier_bits
 from bmx.cache.spectral import (
+    SpectralPack,  # noqa: F401  (documents the fitted-pack API this module tests)
     assemble_whitener,
+    fit_spectral_pack,
     identity_whitener,
     key_second_moment,
     query_position_moment,
+    skeptic_charge,
+    spectral_quantize,
 )
 
 
@@ -101,3 +106,98 @@ def test_query_moment_matches_explicit_rotation_matrices():
         W_expected += Rp.mT @ pooled @ Rp  # R_pT E[qqT] R_p via MATRIX transpose
     W_expected /= len(positions)
     assert torch.allclose(W[0], W_expected, atol=1e-10)
+
+
+def _spiked_keys(S=512, C=64, seed=0, spike_dirs=None, spike_std=(30.0, 30.0)):
+    """Keys with two planted spike directions over unit noise. Returns (M, dirs)."""
+    g = torch.Generator().manual_seed(seed)
+    if spike_dirs is None:
+        raw = torch.randn(C, 2, generator=g)
+        spike_dirs, _ = torch.linalg.qr(raw)  # (C, 2) orthonormal
+    z = torch.randn(S, 2, generator=g) * torch.tensor(spike_std)
+    noise = torch.randn(S, C, generator=g)
+    return z @ spike_dirs.mT + noise, spike_dirs
+
+
+def test_pack_roundtrip_identity():
+    from bmx.cache.spectral import identity_whitener
+
+    M, _ = _spiked_keys()
+    Wh, Wh_inv = identity_whitener(64)
+    pack = fit_spectral_pack(M, Wh, Wh_inv, budget=8.0, tiers=(8,), group=64)
+    # enc @ dec.T must be the identity (basis is invertible by construction)
+    eye = pack.enc.double() @ pack.dec.double().mT
+    assert torch.allclose(eye, torch.eye(64, dtype=torch.float64), atol=1e-4)
+    # At a uniform 8-bit allocation the codec is near-lossless
+    M_hat, bpe = spectral_quantize(M, pack)
+    assert (M_hat - M).norm() / M.norm() < 0.02
+    assert abs(bpe - (8.0 + scale_bits(64))) < 1e-9
+
+
+def test_waterfill_funds_spikes_drops_bulk():
+    from bmx.cache.spectral import identity_whitener
+
+    M, _ = _spiked_keys()
+    Wh, Wh_inv = identity_whitener(64)
+    pack = fit_spectral_pack(M, Wh, Wh_inv, budget=2.0)
+    assert pack.bits[:2].min() >= 5, f"spike dirs underfunded: {pack.bits[:4]}"
+    assert (pack.bits == 0).sum() > 0, "tight budget must drop bulk directions"
+    assert pack.bits.float().mean().item() <= 2.0 + 1e-9
+
+
+def test_weighted_basis_beats_unweighted_on_query_skewed_source():
+    """P4 mechanism test: two equal-variance key spikes, queries read only one.
+    The W-weighted basis funds the query-read spike and wins on logit distortion
+    at the same budget."""
+    from bmx.cache.collect import from_matrix
+    from bmx.cache.metrics import logit_distortion
+    from bmx.cache.spectral import (
+        assemble_whitener,
+        identity_whitener,
+        query_position_moment,
+    )
+
+    C, S, T = 64, 512, 64
+    M, dirs = _spiked_keys(S=S, C=C, seed=0)
+    g = torch.Generator().manual_seed(7)
+    # Queries aligned with spike 1 only (plus small noise); h = h_kv = 1 head.
+    q = (
+        torch.randn(T, 1, generator=g) * dirs[:, 1].unsqueeze(0)
+        + 0.05 * torch.randn(T, C, generator=g)
+    ).unsqueeze(0)  # (1, T, C)
+    cos, sin = torch.ones(S, C), torch.zeros(S, C)  # no RoPE in this synthetic
+
+    W = query_position_moment(q, cos, sin, h_kv=1, position_stride=64)
+    Wh, Wh_inv = assemble_whitener(W)
+    eWh, eWh_inv = identity_whitener(C)
+
+    budget = 2.0
+    p_w = fit_spectral_pack(M, Wh, Wh_inv, budget)
+    p_u = fit_spectral_pack(M, eWh, eWh_inv, budget)
+    K = from_matrix(M, 1)
+    d_w = logit_distortion(K, from_matrix(spectral_quantize(M, p_w)[0], 1), q)
+    d_u = logit_distortion(K, from_matrix(spectral_quantize(M, p_u)[0], 1), q)
+    assert d_w < d_u, f"weighted {d_w} !< unweighted {d_u}"
+
+
+def test_spectral_deterministic():
+    from bmx.cache.spectral import identity_whitener
+
+    M, _ = _spiked_keys(seed=5)
+    Wh, Wh_inv = identity_whitener(64)
+    p1 = fit_spectral_pack(M, Wh, Wh_inv, 2.5)
+    p2 = fit_spectral_pack(M, Wh, Wh_inv, 2.5)
+    assert torch.equal(p1.bits, p2.bits)
+    a, _ = spectral_quantize(M, p1)
+    b, _ = spectral_quantize(M, p2)
+    assert torch.equal(a, b)
+
+
+def test_skeptic_charge_formula():
+    assert (
+        abs(
+            skeptic_charge(1024, 32768, (0, 2, 3, 4, 5, 6, 8))
+            - (16.0 * 1024 / 32768 + tier_bits((0, 2, 3, 4, 5, 6, 8), 32768))
+        )
+        < 1e-12
+    )

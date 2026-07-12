@@ -13,9 +13,13 @@ All moment/eig math is fp64; codec application is fp32.
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 
+from bmx.cache.codecs import allocate_bits_from_variance, scale_bits, tier_bits
 from bmx.cache.rope import _rotate_half
+from bmx.quant.rtn import rtn_quantize
 
 
 def key_second_moment(M: torch.Tensor) -> torch.Tensor:
@@ -85,3 +89,83 @@ def identity_whitener(C: int) -> tuple[torch.Tensor, torch.Tensor]:
     """W = I: the unweighted-KLT ablation path (plain Σ_k eigenbasis)."""
     eye = torch.eye(C, dtype=torch.float64)
     return eye, eye.clone()
+
+
+@dataclasses.dataclass
+class SpectralPack:
+    """Corpus-fit spectral codec for one (layer, side): basis + bit allocation.
+
+    Y = M @ enc (encode); M_hat = Y_hat @ dec.mT (decode); enc @ dec.mT = I.
+    enc = W^{1/2} E, dec = W^{-1/2} E where E is the eigenbasis of
+    W^{1/2} Σ_k W^{1/2} (descending eigenvalues lam). bits waterfills lam.
+    Model-level accounting: the pack ships with the model (zero per-sequence
+    bits); skeptic-mode per-sequence charge is skeptic_charge(C, S, tiers).
+    """
+
+    enc: torch.Tensor  # (C, C) fp32
+    dec: torch.Tensor  # (C, C) fp32
+    lam: torch.Tensor  # (C,) fp32, descending
+    bits: torch.Tensor  # (C,) int64, members of tiers
+    group: int
+    tiers: tuple[int, ...]
+    budget: float
+
+
+def fit_spectral_pack(
+    M_fit: torch.Tensor,
+    Wh: torch.Tensor,
+    Wh_inv: torch.Tensor,
+    budget: float,
+    *,
+    tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8),
+    group: int = 64,
+) -> SpectralPack:
+    """Fit basis + allocation on M_fit (the calibration matrix). fp64 internally."""
+    assert 1 not in tiers, "symmetric RTN is undefined at 1 bit (qmax=0)"
+    Sigma = key_second_moment(M_fit)
+    T = Wh @ Sigma @ Wh
+    lam, E = torch.linalg.eigh(0.5 * (T + T.mT))
+    lam = lam.flip(0).clamp_min(0.0)  # descending
+    E = E.flip(1)
+    bits = allocate_bits_from_variance(lam, budget, tiers)
+    return SpectralPack(
+        enc=(Wh @ E).float(),
+        dec=(Wh_inv @ E).float(),
+        lam=lam.float(),
+        bits=bits,
+        group=group,
+        tiers=tuple(tiers),
+        budget=float(budget),
+    )
+
+
+def spectral_quantize(
+    M: torch.Tensor, pack: SpectralPack, *, mse_scale: bool = True
+) -> tuple[torch.Tensor, float]:
+    """Quantize (S, C) M with a fitted pack. Returns (M_hat, bpe_model).
+
+    bpe_model = mean payload + groupwise-scale term (model-level accounting —
+    the pack itself ships with the model). Add skeptic_charge(C, S, tiers) for
+    the per-sequence-charged view.
+    """
+    S, C = M.shape
+    assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
+    assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"
+    Y = M @ pack.enc.to(M.dtype)
+    Y_hat = torch.zeros_like(Y)
+    for b in sorted(set(int(x) for x in pack.bits.tolist())):
+        if b == 0:
+            continue
+        cols = (pack.bits == b).nonzero(as_tuple=True)[0]
+        Y_hat[:, cols] = rtn_quantize(
+            Y[:, cols].mT, b, pack.group, mse_scale=mse_scale
+        ).mT
+    M_hat = Y_hat @ pack.dec.mT.to(M.dtype)
+    bpe = float(pack.bits.float().mean().item()) + scale_bits(pack.group)
+    return M_hat, bpe
+
+
+def skeptic_charge(C: int, S: int, tiers: tuple[int, ...]) -> float:
+    """Per-sequence charge when the pack is NOT granted model-level status:
+    one fp16 C×C decoder matrix (16·C/S) + the per-direction bit map."""
+    return 16.0 * C / S + tier_bits(tiers, S)
