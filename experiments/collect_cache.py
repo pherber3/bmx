@@ -4,8 +4,14 @@ Usage
 -----
     uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024
     uv run python experiments/collect_cache.py --model-name meta-llama/Llama-3.1-8B --seq-len 2048
+    uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024 --token-offset 1024
 
-Output is written to results/cache/<model_short>_<seq_len>.safetensors (or --out).
+--token-offset shifts the wikitext slice so distinct offsets act as distinct
+documents (calibration corpora for the corpus-vs-heldout transfer test).
+
+Output is written to results/cache/<model_short>_<seq_len>.safetensors, or
+..._<seq_len>_off<token_offset>.safetensors when --token-offset is nonzero
+(or --out).
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ class Config:
     model_name: str = "gpt2"
     seq_len: int = 1024
     n_q_keep: int = 256
+    token_offset: int = 0  # calibration-corpus slice offset (0 => leading tokens)
     out: str = ""  # override output path; empty => auto
 
 
@@ -34,7 +41,10 @@ def main(cfg: Config) -> None:
     if cfg.out:
         out_path = Path(cfg.out)
     else:
-        out_path = Path("results/cache") / f"{model_short}_{cfg.seq_len}.safetensors"
+        suffix = f"_off{cfg.token_offset}" if cfg.token_offset else ""
+        out_path = (
+            Path("results/cache") / f"{model_short}_{cfg.seq_len}{suffix}.safetensors"
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Load model (gpt2 is tiny — keep it fp32; everything else bf16)
@@ -47,7 +57,9 @@ def main(cfg: Config) -> None:
 
     # Load tokens — load_eval_tokens returns a 1-D tensor; collect_cache wants (1, S)
     print(f"Loading {cfg.seq_len} eval tokens for {cfg.model_name}", flush=True)
-    tokens = load_eval_tokens(cfg.model_name, n_tokens=cfg.seq_len)
+    tokens = load_eval_tokens(
+        cfg.model_name, n_tokens=cfg.seq_len, token_offset=cfg.token_offset
+    )
     input_ids = tokens.unsqueeze(0)  # (1, S)
 
     # Collect

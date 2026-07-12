@@ -49,6 +49,7 @@ def load_eval_tokens(
     model_name: str = "gpt2",
     dataset: str = "wikitext-2-raw-v1",
     n_tokens: int = 65536,
+    token_offset: int = 0,
 ) -> torch.Tensor:
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -58,8 +59,10 @@ def load_eval_tokens(
         load_dataset("Salesforce/wikitext", dataset, split="test")["text"]
     )
     # truncation at the tokenizer avoids encoding the full ~289k-token split
-    ids = tok(text, return_tensors="pt", truncation=True, max_length=n_tokens)
-    return ids.input_ids[0]
+    ids = tok(
+        text, return_tensors="pt", truncation=True, max_length=token_offset + n_tokens
+    )
+    return ids.input_ids[0][token_offset:]
 
 
 def swap_and_perplexity(

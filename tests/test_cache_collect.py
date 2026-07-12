@@ -201,3 +201,30 @@ def test_to_matrix_from_matrix_roundtrip():
     kv_back = from_matrix(M, h)
     assert kv_back.shape == (h, S, d)
     assert torch.equal(kv_back, kv.float())
+
+
+# ---------------------------------------------------------------------------
+# Test 6: load_eval_tokens token_offset — multi-document calibration corpora
+# ---------------------------------------------------------------------------
+
+
+def test_load_eval_tokens_offset(monkeypatch):
+    import bmx.eval.layer_swap as ls
+
+    class _FakeTok:
+        def __call__(self, text, return_tensors, truncation, max_length):
+            import torch
+
+            ids = torch.arange(max_length).unsqueeze(0)
+            return type("E", (), {"input_ids": ids})()
+
+    monkeypatch.setattr(
+        "datasets.load_dataset", lambda *a, **k: {"text": ["x"]}, raising=False
+    )
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained", lambda *a, **k: _FakeTok()
+    )
+    base = ls.load_eval_tokens("gpt2", n_tokens=16)
+    off = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=8)
+    assert base.shape == off.shape == (16,)
+    assert off[0].item() == base[0].item() + 8
