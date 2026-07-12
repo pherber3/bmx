@@ -120,3 +120,25 @@ def test_k4_frontier_figures(tmp_path):
         "k4_frontier_skeptic.png",
         "k4_structure_tax.png",
     } <= names
+
+
+def test_greedy_layer_allocation_prefers_sensitive_steep_layers():
+    from experiments.k4_alloc import greedy_layer_allocation
+
+    grid = (2.0, 3.0, 4.0)
+    # Layer 0: sensitive + steep curve; layer 1: insensitive + flat.
+    curves = {0: {2.0: 0.4, 3.0: 0.1, 4.0: 0.02}, 1: {2.0: 0.05, 3.0: 0.04, 4.0: 0.039}}
+    s = {0: 1.0, 1: 0.05}
+    alloc = greedy_layer_allocation(curves, s, grid, target_mean=3.0)
+    assert alloc[0] == 4.0 and alloc[1] == 2.0
+    assert sum(alloc.values()) / 2 == 3.0
+
+
+def test_greedy_layer_allocation_uniform_when_symmetric():
+    from experiments.k4_alloc import greedy_layer_allocation
+
+    grid = (2.0, 3.0, 4.0)
+    curves = {l: {2.0: 0.4, 3.0: 0.1, 4.0: 0.02} for l in range(4)}  # noqa: E741
+    s = {l: 1.0 for l in range(4)}  # noqa: E741
+    alloc = greedy_layer_allocation(curves, s, grid, target_mean=3.0)
+    assert all(v == 3.0 for v in alloc.values())
