@@ -65,41 +65,39 @@ def test_identity_whitener():
 
 def test_query_moment_matches_explicit_rotation_matrices():
     """Value-pin with sin != 0: W must equal mean_p R_pT (pooled qqT) R_p where
-    R_p^T is the inverse rotation (negated sin). A sign flip in the adjoint
-    (_rotate_half(q) * sin instead of * (-sin)) would produce a different result."""
+    R_p is built explicitly from the FORWARD rotation only — columns are
+    apply_rope(e_i) — and transposed as a matrix. No negated sin appears in the
+    ground truth, so it derives the adjoint independently rather than assuming
+    it; a sign flip in the production adjoint would fail this (margin ~0.7 vs
+    atol 1e-10). The cos/sin table uses the duplicated-half structure
+    (cat(freqs, freqs)) of real RoPE tables — the structure under which the
+    negated-sin expression IS the matrix transpose."""
     from bmx.cache.rope import apply_rope
 
     g = torch.Generator().manual_seed(4)
     h, T, d, h_kv, S = 2, 16, 4, 1, 8
     q = torch.randn(h, T, d, generator=g)
-    theta = torch.linspace(0.3, 2.0, S).unsqueeze(1) * torch.linspace(
-        0.5, 1.0, d
+    # Real RoPE tables duplicate halves: cos/sin[:, j] == cos/sin[:, j + d/2].
+    freqs = torch.linspace(0.5, 1.0, d // 2)
+    theta = torch.linspace(0.3, 2.0, S).unsqueeze(1) * torch.cat(
+        [freqs, freqs]
     ).unsqueeze(0)
     cos, sin = theta.cos(), theta.sin()
 
     stride = 2
     W = query_position_moment(q, cos, sin, h_kv, position_stride=stride)
 
-    # Ground truth: build W independently using apply_rope for the inverse rotation.
-    # apply_rope(q, cos, -sin) implements q * cos + rotate_half(q) * (-sin) = R_p^T @ q
-    # (where apply_rope uses cos/sin in the RoPE sense, not matrix form).
-    q64 = q.double()
+    # GQA-pooled query second moment E[qqT] (h_kv=1 pools all heads), once.
+    q_flat = q.double().reshape(-1, d)  # (h*T, d)
+    pooled = q_flat.mT @ q_flat / (h * T)  # (d, d)
 
     W_expected = torch.zeros(d, d, dtype=torch.float64)
     positions = list(range(0, S, stride))
-
     for p in positions:
-        # Compute the inverse rotation by negating sin: R_p^T @ q
-        cos_p = cos[p].double()
-        sin_p = sin[p].double()
-        # q_rot = q64 * cos_p + _rotate_half(q64) * (-sin_p)
-        q_rot_inv = apply_rope(
-            q64, cos_p.unsqueeze(0), -sin_p.unsqueeze(0)
-        )  # (h, T, d)
-
-        # Pool over all h and T: sum (R_p^T @ q)^T @ (R_p^T @ q)
-        q_rot_pooled = q_rot_inv.reshape(-1, d)  # (h*T, d)
-        W_expected += q_rot_pooled.mT @ q_rot_pooled
-
-    W_expected /= len(positions) * h * T
+        # Explicit R_p: columns are apply_rope(e_i) at position p (FORWARD rotation).
+        basis = torch.eye(d).double().unsqueeze(1)  # (d, 1, d): d vectors, 1 position
+        Rp_cols = apply_rope(basis, cos[p : p + 1].double(), sin[p : p + 1].double())
+        Rp = Rp_cols.squeeze(1).mT  # (d, d), column i = R_p e_i
+        W_expected += Rp.mT @ pooled @ Rp  # R_pT E[qqT] R_p via MATRIX transpose
+    W_expected /= len(positions)
     assert torch.allclose(W[0], W_expected, atol=1e-10)
