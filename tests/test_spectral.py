@@ -61,3 +61,45 @@ def test_identity_whitener():
     Wh, Wh_inv = identity_whitener(12)
     assert torch.equal(Wh, torch.eye(12, dtype=torch.float64))
     assert torch.equal(Wh_inv, torch.eye(12, dtype=torch.float64))
+
+
+def test_query_moment_matches_explicit_rotation_matrices():
+    """Value-pin with sin != 0: W must equal mean_p R_pT (pooled qqT) R_p where
+    R_p^T is the inverse rotation (negated sin). A sign flip in the adjoint
+    (_rotate_half(q) * sin instead of * (-sin)) would produce a different result."""
+    from bmx.cache.rope import apply_rope
+
+    g = torch.Generator().manual_seed(4)
+    h, T, d, h_kv, S = 2, 16, 4, 1, 8
+    q = torch.randn(h, T, d, generator=g)
+    theta = torch.linspace(0.3, 2.0, S).unsqueeze(1) * torch.linspace(
+        0.5, 1.0, d
+    ).unsqueeze(0)
+    cos, sin = theta.cos(), theta.sin()
+
+    stride = 2
+    W = query_position_moment(q, cos, sin, h_kv, position_stride=stride)
+
+    # Ground truth: build W independently using apply_rope for the inverse rotation.
+    # apply_rope(q, cos, -sin) implements q * cos + rotate_half(q) * (-sin) = R_p^T @ q
+    # (where apply_rope uses cos/sin in the RoPE sense, not matrix form).
+    q64 = q.double()
+
+    W_expected = torch.zeros(d, d, dtype=torch.float64)
+    positions = list(range(0, S, stride))
+
+    for p in positions:
+        # Compute the inverse rotation by negating sin: R_p^T @ q
+        cos_p = cos[p].double()
+        sin_p = sin[p].double()
+        # q_rot = q64 * cos_p + _rotate_half(q64) * (-sin_p)
+        q_rot_inv = apply_rope(
+            q64, cos_p.unsqueeze(0), -sin_p.unsqueeze(0)
+        )  # (h, T, d)
+
+        # Pool over all h and T: sum (R_p^T @ q)^T @ (R_p^T @ q)
+        q_rot_pooled = q_rot_inv.reshape(-1, d)  # (h*T, d)
+        W_expected += q_rot_pooled.mT @ q_rot_pooled
+
+    W_expected /= len(positions) * h * T
+    assert torch.allclose(W[0], W_expected, atol=1e-10)
