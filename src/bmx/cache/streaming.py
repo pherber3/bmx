@@ -28,6 +28,7 @@ Memory pruning:
 from __future__ import annotations
 
 import dataclasses
+import weakref
 
 import torch
 from transformers.cache_utils import Cache, DynamicLayer
@@ -412,13 +413,21 @@ class StreamingQuantizedCache(Cache):
         # self.k_spec/_pack_for_layer are fully set up below. Stored as
         # self._make_layer so attach() reuses the exact same construction path
         # instead of re-spelling the constructor call.
+        # weakref, not self: this closure is stored on self, so a strong capture
+        # is a self->closure->self cycle — the cache (holding the full dequantized
+        # fp16 K/V) then survives until a gen-2 gc pass instead of dying by
+        # refcount; cycle-trapped caches accumulated to an 88 GiB CUDA OOM across
+        # 31.5k-token LongBench shards. The proxy is only dereferenced while the
+        # cache is alive (update()/attach() call through self).
+        wself = weakref.proxy(self)
+
         def _make_layer():
             return StreamingQuantizedLayer(
                 k_spec,
                 v_spec,
                 model_config,
                 recent_window,
-                pack=self._pack_for_layer(len(self.layers)),
+                pack=wself._pack_for_layer(len(wself.layers)),
             )
 
         self._make_layer = _make_layer

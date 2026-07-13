@@ -7,6 +7,8 @@ prefill.
 
 from __future__ import annotations
 
+import gc
+
 import torch
 
 from bmx.cache.hf_compat import resolve_vocab_size
@@ -109,6 +111,14 @@ def generate_through_cache(
                 if tid in eos_ids:
                     break
     text = tokenizer.decode(new_ids, skip_special_tokens=True)
+    # Free the cache eagerly: a reference cycle anywhere in the cache graph (ours
+    # or transformers') otherwise holds the multi-GiB dequantized K/V until a
+    # gen-2 gc pass — across 31.5k-token LongBench shards that accumulated to an
+    # 88 GiB CUDA OOM. gc cost is ~ms against multi-second generations.
+    del cache
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return text.strip() if strip else text
 
 

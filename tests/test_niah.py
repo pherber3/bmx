@@ -145,3 +145,39 @@ def test_generate_through_cache_strip_true_removes_leading_whitespace():
     assert not result.startswith(" "), (
         f"strip=True must remove leading whitespace; got {result!r}"
     )
+
+
+# --- Regression: cache must be freed by refcount alone (2026-07-13 VM OOM) ---
+
+
+def test_cache_freed_by_refcount_after_generation():
+    """A dropped StreamingQuantizedCache must die without gc.collect().
+
+    Regression: the _make_layer closure stored on self captured self,
+    creating a self->closure->self cycle. Cycle-trapped caches (each holding
+    the full dequantized fp16 K/V) survived until a gen-2 gc pass; on 31.5k-token
+    LongBench shards that accumulated to an 88 GiB CUDA OOM after ~5 shards.
+    Exercises the full lifecycle: construct -> attach -> forward -> detach -> drop.
+    """
+    import gc
+    import weakref
+
+    from bmx.cache.recipes import spec_pair
+    from bmx.cache.streaming import StreamingQuantizedCache
+
+    model = tiny_llama()
+    k_spec, v_spec = spec_pair("k2b", rank=4, group=8)
+    gc.disable()  # deterministic: refcounting only, no collector rescue
+    try:
+        cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+        cache.attach(model)
+        g = torch.Generator().manual_seed(0)
+        prompt = torch.randint(0, 97, (1, 48), generator=g)
+        with cache:
+            with torch.no_grad():
+                model(prompt, past_key_values=cache, use_cache=True)
+        ref = weakref.ref(cache)
+        del cache
+        assert ref() is None, "cache survived del — reference cycle present"
+    finally:
+        gc.enable()
