@@ -17,9 +17,13 @@ import dataclasses
 
 import torch
 
-from bmx.cache.codecs import allocate_bits_from_variance, scale_bits, tier_bits
+from bmx.cache.codecs import (
+    allocate_bits_from_variance,
+    quantize_by_bits,
+    scale_bits,
+    tier_bits,
+)
 from bmx.cache.rope import _rotate_half
-from bmx.quant.rtn import rtn_quantize
 
 
 def key_second_moment(M: torch.Tensor) -> torch.Tensor:
@@ -111,6 +115,61 @@ class SpectralPack:
     budget: float
 
 
+@dataclasses.dataclass
+class SpectralBasis:
+    """Budget-independent part of a spectral fit: basis + spectrum.
+
+    `lam64` retains the fp64 eigenvalues (the exact tensor
+    `allocate_bits_from_variance` is called with at pack time); `lam` is the
+    fp32-rounded copy stored on the resulting SpectralPack.
+    """
+
+    enc: torch.Tensor  # (C, C) fp32
+    dec: torch.Tensor  # (C, C) fp32
+    lam: torch.Tensor  # (C,) fp32, descending
+    lam64: torch.Tensor  # (C,) fp64, descending — private, allocation input
+
+
+def fit_spectral_basis(
+    M_fit: torch.Tensor,
+    Wh: torch.Tensor,
+    Wh_inv: torch.Tensor,
+) -> SpectralBasis:
+    """Fit the budget-independent basis + spectrum on M_fit. fp64 internally."""
+    Sigma = key_second_moment(M_fit)
+    T = Wh @ Sigma @ Wh
+    lam, E = torch.linalg.eigh(0.5 * (T + T.mT))
+    lam = lam.flip(0).clamp_min(0.0)  # descending
+    E = E.flip(1)
+    return SpectralBasis(
+        enc=(Wh @ E).float(),
+        dec=(Wh_inv @ E).float(),
+        lam=lam.float(),
+        lam64=lam,
+    )
+
+
+def pack_from_basis(
+    basis: SpectralBasis,
+    budget: float,
+    *,
+    tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8),
+    group: int = 64,
+) -> SpectralPack:
+    """Allocate bits for one budget against an already-fit SpectralBasis."""
+    assert 1 not in tiers, "symmetric RTN is undefined at 1 bit (qmax=0)"
+    bits = allocate_bits_from_variance(basis.lam64, budget, tiers)
+    return SpectralPack(
+        enc=basis.enc,
+        dec=basis.dec,
+        lam=basis.lam,
+        bits=bits,
+        group=group,
+        tiers=tuple(tiers),
+        budget=float(budget),
+    )
+
+
 def fit_spectral_pack(
     M_fit: torch.Tensor,
     Wh: torch.Tensor,
@@ -121,21 +180,8 @@ def fit_spectral_pack(
     group: int = 64,
 ) -> SpectralPack:
     """Fit basis + allocation on M_fit (the calibration matrix). fp64 internally."""
-    assert 1 not in tiers, "symmetric RTN is undefined at 1 bit (qmax=0)"
-    Sigma = key_second_moment(M_fit)
-    T = Wh @ Sigma @ Wh
-    lam, E = torch.linalg.eigh(0.5 * (T + T.mT))
-    lam = lam.flip(0).clamp_min(0.0)  # descending
-    E = E.flip(1)
-    bits = allocate_bits_from_variance(lam, budget, tiers)
-    return SpectralPack(
-        enc=(Wh @ E).float(),
-        dec=(Wh_inv @ E).float(),
-        lam=lam.float(),
-        bits=bits,
-        group=group,
-        tiers=tuple(tiers),
-        budget=float(budget),
+    return pack_from_basis(
+        fit_spectral_basis(M_fit, Wh, Wh_inv), budget, tiers=tiers, group=group
     )
 
 
@@ -152,14 +198,7 @@ def spectral_quantize(
     assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
     assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"
     Y = M @ pack.enc.to(M.dtype)
-    Y_hat = torch.zeros_like(Y)
-    for b in sorted(set(int(x) for x in pack.bits.tolist())):
-        if b == 0:
-            continue
-        cols = (pack.bits == b).nonzero(as_tuple=True)[0]
-        Y_hat[:, cols] = rtn_quantize(
-            Y[:, cols].mT, b, pack.group, mse_scale=mse_scale
-        ).mT
+    Y_hat = quantize_by_bits(Y, pack.bits, pack.group, mse_scale=mse_scale)
     M_hat = Y_hat @ pack.dec.mT.to(M.dtype)
     bpe = float(pack.bits.float().mean().item()) + scale_bits(pack.group)
     return M_hat, bpe

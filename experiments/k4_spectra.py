@@ -35,8 +35,9 @@ from bmx.cache.collect import load_cache, to_matrix
 from bmx.cache.rope import apply_rope
 from bmx.cache.spectral import (
     assemble_whitener,
-    fit_spectral_pack,
+    fit_spectral_basis,
     identity_whitener,
+    pack_from_basis,
     query_position_moment,
     skeptic_charge,
     spectral_quantize,
@@ -142,14 +143,10 @@ def main(cfg: Config):
             (False, (Ih, Ih_inv)),
         ):
             for fit_mode, M_fit in fit_matrices.items():
+                basis = fit_spectral_basis(M_fit, basis_h, basis_h_inv)
                 for budget in cfg.budgets:
-                    pack = fit_spectral_pack(
-                        M_fit,
-                        basis_h,
-                        basis_h_inv,
-                        budget,
-                        tiers=cfg.tiers,
-                        group=cfg.group,
+                    pack = pack_from_basis(
+                        basis, budget, tiers=cfg.tiers, group=cfg.group
                     )
                     M_hat, bpe_model = spectral_quantize(M, pack)
                     rf, lg, lg_rope = _score_tail(

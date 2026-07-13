@@ -188,6 +188,27 @@ def allocate_bits_from_variance(
     return best.to(torch.int64)
 
 
+def quantize_by_bits(
+    R: torch.Tensor,
+    bits_pc: torch.Tensor,
+    group: int,
+    *,
+    mse_scale: bool = False,
+) -> torch.Tensor:
+    """Groupwise-RTN each column at its assigned bit width (0 = drop).
+
+    Shared by the waterfill arms, the K4 spectral quantizer, and the
+    blockklt experiment — one implementation of the per-tier loop.
+    """
+    R_hat = torch.zeros_like(R)
+    for b in sorted(set(int(x) for x in bits_pc.tolist())):
+        if b == 0:
+            continue
+        cols = (bits_pc == b).nonzero(as_tuple=True)[0]
+        R_hat[:, cols] = rtn_quantize(R[:, cols].mT, b, group, mse_scale=mse_scale).mT
+    return R_hat
+
+
 def allocate_channel_bits(
     R: torch.Tensor,
     budget_bits: float,
@@ -378,13 +399,8 @@ def _lowrank_rotwaterfill_channel(
         with R_hat in the ORIGINAL basis."""
         R_rot = R_in if Q is None else (R_in @ Q)
         bits_pc = allocate_channel_bits(R_rot, budget_bits, tiers=tiers, axis=0)
-        R_rot_hat = torch.zeros_like(R_rot)
         # Each b in the set is present by construction, so cols is never empty.
-        for b in sorted(set(int(x) for x in bits_pc.tolist())):
-            if b == 0:
-                continue
-            cols = (bits_pc == b).nonzero(as_tuple=True)[0]
-            R_rot_hat[:, cols] = rtn_quantize(R_rot[:, cols].mT, b, group).mT
+        R_rot_hat = quantize_by_bits(R_rot, bits_pc, group)
         R_hat_local = R_rot_hat if Q is None else (R_rot_hat @ Q.mT)
         return R_hat_local, float(bits_pc.float().mean().item())
 

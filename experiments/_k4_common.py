@@ -63,14 +63,14 @@ def setup_rope(model_name: str, layer_keys: dict[int, dict[str, torch.Tensor]], 
     return rope_ready, get_cos_sin
 
 
-def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_pre_t, M):
+def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_t, M):
     K_hat = from_matrix(M_hat, h_kv)[:, tail, :].float()
     rf = rel_fro(M_hat[tail], M[tail])
     if rope_ready:
         K_hat_rope = apply_rope(K_hat, cos[tail], sin[tail])
         lg_rope = logit_distortion(K_post_true[:, tail], K_hat_rope, Q)
-        lg = logit_distortion(k_pre_t.float()[:, tail], K_hat, Q)
+        lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
     else:
-        lg = logit_distortion(k_pre_t.float()[:, tail], K_hat, Q)
+        lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
         lg_rope = float("nan")
     return rf, lg, lg_rope

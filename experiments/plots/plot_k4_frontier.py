@@ -5,6 +5,7 @@ Reads parquet, never refits. Select rows explicitly by arm; unknown arms ignored
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import matplotlib
@@ -15,24 +16,95 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 
-def _arm_selection(df: pd.DataFrame, arm: str) -> tuple[pd.Series, str]:
-    """Row mask + legend label for one frontier arm.
+# One row per frontier arm: (arm, extra_mask_fn, label). extra_mask_fn is
+# None for arms selected by `df.arm == arm` alone; otherwise it takes the
+# already-arm-filtered df and returns an additional boolean mask to AND in.
+# Spectral variants are all fit_mode == "oracle": "spectral" is the weighted
+# headline, "spectral_unweighted" is the P4 ablation (weighted == False on
+# real frames), "spectral_randbasis" is the random-basis control (no
+# weighted filter).
+ARM_SPECS: list[tuple[str, Callable[[pd.DataFrame], pd.Series] | None, str]] = [
+    (
+        "spectral",
+        lambda df: df.weighted & (df.fit_mode == "oracle"),
+        "spectral (weighted, oracle)",
+    ),
+    (
+        "spectral_unweighted",
+        lambda df: ~df.weighted & (df.fit_mode == "oracle"),
+        "spectral (unweighted, oracle)",
+    ),
+    (
+        "spectral_randbasis",
+        lambda df: df.fit_mode == "oracle",
+        "random-basis control",
+    ),
+    ("turboquant_mse", None, "turboquant_mse"),
+    ("lowrank_rtn_channel", None, "lowrank_rtn_channel"),
+    ("k2t_coeffquant", None, "k2t_coeffquant"),
+    ("rtn_channel", None, "rtn_channel"),
+]
 
-    Spectral variants get per-arm filters (all at fit_mode == "oracle"):
-    "spectral" is the weighted headline, "spectral_unweighted" is the P4
-    ablation (weighted == False on real frames), "spectral_randbasis" is the
-    random-basis control (no weighted filter).
-    """
-    if arm == "spectral":
-        mask = (df.arm == arm) & df.weighted & (df.fit_mode == "oracle")
-        return mask, "spectral (weighted, oracle)"
-    if arm == "spectral_unweighted":
-        mask = (df.arm == arm) & ~df.weighted & (df.fit_mode == "oracle")
-        return mask, "spectral (unweighted, oracle)"
-    if arm == "spectral_randbasis":
-        mask = (df.arm == arm) & (df.fit_mode == "oracle")
-        return mask, "random-basis control"
+
+def _arm_selection(df: pd.DataFrame, arm: str) -> tuple[pd.Series, str]:
+    """Row mask + legend label for one frontier arm, per ARM_SPECS."""
+    for spec_arm, extra_mask_fn, label in ARM_SPECS:
+        if spec_arm == arm:
+            mask = df.arm == arm
+            if extra_mask_fn is not None:
+                mask = mask & extra_mask_fn(df)
+            return mask, label
     return df.arm == arm, arm
+
+
+def _plot_frontier(
+    df: pd.DataFrame,
+    available_arms: set[str],
+    x_col: str,
+    xlabel: str,
+    title: str,
+    out_path: Path,
+) -> Path:
+    """Frontier figure: one errorbar line per arm, layer-mean distortion vs x_col."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for arm in sorted(available_arms):
+        mask, label = _arm_selection(df, arm)
+        sub = df[mask]
+        if sub.empty:
+            continue
+
+        # Group by x_col, compute layer-mean and sem
+        grouped = (
+            sub.groupby(x_col)
+            .agg(
+                distortion_mean=("distortion", "mean"),
+                distortion_sem=("distortion", lambda x: x.sem() if len(x) > 1 else 0),
+            )
+            .reset_index()
+        )
+        grouped = grouped.sort_values(x_col)
+
+        # Plot with error bars
+        ax.errorbar(
+            grouped[x_col],
+            grouped["distortion_mean"],
+            yerr=grouped["distortion_sem"],
+            marker="o",
+            label=label,
+            capsize=4,
+        )
+
+    ax.set_yscale("log")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("headline distortion")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
@@ -57,105 +129,36 @@ def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
     df["distortion"] = df["logit_rope"].fillna(df["logit"])
 
     # Known arms to plot (select explicitly to avoid unknown arms).
-    known_arms = {
-        "spectral",
-        "spectral_unweighted",
-        "spectral_randbasis",
-        "turboquant_mse",
-        "lowrank_rtn_channel",
-        "k2t_coeffquant",
-        "rtn_channel",
-    }
+    known_arms = {spec_arm for spec_arm, _, _ in ARM_SPECS}
     available_arms = set(df["arm"].unique()) & known_arms
 
-    # --- Figure 1: Frontier vs bpe_model, layer-mean with sem error bars ---
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for arm in sorted(available_arms):
-        mask, label = _arm_selection(df, arm)
-        sub = df[mask]
-        if sub.empty:
-            continue
-
-        # Group by bpe_model, compute layer-mean and sem
-        grouped = (
-            sub.groupby("bpe_model")
-            .agg(
-                distortion_mean=("distortion", "mean"),
-                distortion_sem=("distortion", lambda x: x.sem() if len(x) > 1 else 0),
-            )
-            .reset_index()
-        )
-        grouped = grouped.sort_values("bpe_model")
-
-        # Plot with error bars
-        ax.errorbar(
-            grouped["bpe_model"],
-            grouped["distortion_mean"],
-            yerr=grouped["distortion_sem"],
-            marker="o",
-            label=label,
-            capsize=4,
-        )
-
-    ax.set_yscale("log")
-    ax.set_xlabel("bpe (model accounting)")
-    ax.set_ylabel("headline distortion")
-    ax.set_title("K4: Distortion vs model accounting (log-scale)")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    p1 = out / "k4_frontier_model.png"
-    fig.tight_layout()
-    fig.savefig(p1, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    p1 = _plot_frontier(
+        df,
+        available_arms,
+        "bpe_model",
+        "bpe (model accounting)",
+        "K4: Distortion vs model accounting (log-scale)",
+        out / "k4_frontier_model.png",
+    )
     paths.append(p1)
 
-    # --- Figure 2: Frontier vs bpe_skeptic_deploy, layer-mean with sem error bars ---
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for arm in sorted(available_arms):
-        mask, label = _arm_selection(df, arm)
-        sub = df[mask]
-        if sub.empty:
-            continue
-
-        # Group by bpe_skeptic_deploy, compute layer-mean and sem
-        grouped = (
-            sub.groupby("bpe_skeptic_deploy")
-            .agg(
-                distortion_mean=("distortion", "mean"),
-                distortion_sem=("distortion", lambda x: x.sem() if len(x) > 1 else 0),
-            )
-            .reset_index()
-        )
-        grouped = grouped.sort_values("bpe_skeptic_deploy")
-
-        # Plot with error bars
-        ax.errorbar(
-            grouped["bpe_skeptic_deploy"],
-            grouped["distortion_mean"],
-            yerr=grouped["distortion_sem"],
-            marker="o",
-            label=label,
-            capsize=4,
-        )
-
-    ax.set_yscale("log")
-    ax.set_xlabel("bpe (skeptic deployment accounting)")
-    ax.set_ylabel("headline distortion")
-    ax.set_title("K4: Distortion vs skeptic deployment accounting (log-scale)")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    p2 = out / "k4_frontier_skeptic.png"
-    fig.tight_layout()
-    fig.savefig(p2, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    p2 = _plot_frontier(
+        df,
+        available_arms,
+        "bpe_skeptic_deploy",
+        "bpe (skeptic deployment accounting)",
+        "K4: Distortion vs skeptic deployment accounting (log-scale)",
+        out / "k4_frontier_skeptic.png",
+    )
     paths.append(p2)
 
     # --- Figure 3: Structure tax bar chart at ~3-bit operating point ---
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    # Arms to compare at the 3-bit point
+    # Arms to compare at the 3-bit point. The spectral entry reuses the
+    # frontier table's mask for "spectral" (weighted, oracle) with the
+    # budget==3.0 point selected on top.
+    _spectral_mask, _ = _arm_selection(df, "spectral")
     tax_arms = [
         (
             "turboquant_mse",
@@ -167,10 +170,7 @@ def make_figures(df: pd.DataFrame, out_dir: str) -> list[Path]:
         ),
         (
             "spectral (oracle)",
-            (df.arm == "spectral")
-            & (df.budget == 3.0)
-            & df.weighted
-            & (df.fit_mode == "oracle"),
+            _spectral_mask & (df.budget == 3.0),
         ),
     ]
 

@@ -28,14 +28,16 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.codecs import allocate_bits_from_variance, quantize_cache
+from bmx.cache.codecs import quantize_cache
 from bmx.cache.collect import to_matrix
 from bmx.cache.rope import apply_rope
 from bmx.cache.spectral import (
+    SpectralBasis,
     SpectralPack,
     assemble_whitener,
-    fit_spectral_pack,
+    fit_spectral_basis,
     identity_whitener,
+    pack_from_basis,
     query_position_moment,
     skeptic_charge,
     spectral_quantize,
@@ -104,11 +106,10 @@ class Config:
     out_root: str = ""
 
 
-def _spectral_randbasis_pack(
-    M_fit: torch.Tensor, budget: float, seed: int, tiers, group: int
-) -> SpectralPack:
-    """W=random-orthogonal-basis control: allocation from fit-region variances
-    of Y = M_fit @ Q, Q a seeded random orthogonal (0 stored bits)."""
+def _fit_spectral_randbasis(M_fit: torch.Tensor, seed: int) -> SpectralBasis:
+    """W=random-orthogonal-basis control: budget-independent fit half — Q, its
+    fit-region variances (uncentered second moment per direction), sorted
+    descending. Q is seeded random orthogonal (0 stored bits)."""
     C = M_fit.shape[1]
     Q = random_orthogonal(C, seed, dtype=torch.float64)
     Y = M_fit.double() @ Q
@@ -116,16 +117,17 @@ def _spectral_randbasis_pack(
     order = torch.argsort(var, descending=True)
     var_sorted = var[order]
     Q_sorted = Q[:, order]
-    bits = allocate_bits_from_variance(var_sorted, budget, tiers)
     Qf = Q_sorted.float()
-    return SpectralPack(
-        enc=Qf,
-        dec=Qf,
-        lam=var_sorted.float(),
-        bits=bits,
-        group=group,
-        tiers=tuple(tiers),
-        budget=float(budget),
+    return SpectralBasis(enc=Qf, dec=Qf, lam=var_sorted.float(), lam64=var_sorted)
+
+
+def _spectral_randbasis_pack(
+    M_fit: torch.Tensor, budget: float, seed: int, tiers, group: int
+) -> SpectralPack:
+    """W=random-orthogonal-basis control: allocation from fit-region variances
+    of Y = M_fit @ Q, Q a seeded random orthogonal (0 stored bits)."""
+    return pack_from_basis(
+        _fit_spectral_randbasis(M_fit, seed), budget, tiers=tiers, group=group
     )
 
 
@@ -209,6 +211,9 @@ def main(cfg: Config):
                 cos_l,
                 sin_l,
                 rope_ready if kind == "k_pre" else False,
+                # kind="k": src_t is k_t (already post-RoPE); _score_tail's
+                # k_true_t scores without a second RoPE application
+                # (rope_ready=False here).
                 src_t,
                 M_ref,
             )
@@ -249,14 +254,10 @@ def main(cfg: Config):
             ("spectral_unweighted", False, (Ih, Ih_inv)),
         ):
             for fit_mode, M_fit in fit_matrices.items():
+                basis = fit_spectral_basis(M_fit, basis_h, basis_h_inv)
                 for budget in cfg.budgets:
-                    pack = fit_spectral_pack(
-                        M_fit,
-                        basis_h,
-                        basis_h_inv,
-                        budget,
-                        tiers=cfg.tiers,
-                        group=cfg.group,
+                    pack = pack_from_basis(
+                        basis, budget, tiers=cfg.tiers, group=cfg.group
                     )
                     M_hat, bpe_model = spectral_quantize(M_pre, pack)
                     rf, lg, lg_rope = score(M_hat, "k_pre")
@@ -286,9 +287,10 @@ def main(cfg: Config):
         # spectral_randbasis: only needs a fit region for the allocation; use
         # the same fit-mode set as the weighted arm (oracle/heldout/corpus?).
         for fit_mode, M_fit in fit_matrices.items():
+            randbasis = _fit_spectral_randbasis(M_fit, cfg.seed)
             for budget in cfg.budgets:
-                pack = _spectral_randbasis_pack(
-                    M_fit, budget, cfg.seed, cfg.tiers, cfg.group
+                pack = pack_from_basis(
+                    randbasis, budget, tiers=cfg.tiers, group=cfg.group
                 )
                 M_hat, bpe_model = spectral_quantize(M_pre, pack)
                 rf, lg, lg_rope = score(M_hat, "k_pre")

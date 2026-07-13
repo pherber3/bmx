@@ -45,6 +45,7 @@ from bmx.cache.codecs import (
     _unrotate,
     allocate_channel_bits,
     factor_bits,
+    quantize_by_bits,
     quantize_cache,
     scale_bits,
     tier_bits,
@@ -54,7 +55,6 @@ from bmx.cache.metrics import logit_distortion, rel_fro
 from bmx.cache.rope import apply_rope
 from bmx.decomp.lrs import truncated_svd
 from bmx.quant.hadamard import randomized_hadamard
-from bmx.quant.rtn import rtn_quantize
 
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
 
@@ -100,19 +100,6 @@ def _uniform_bits_vector(C: int, budget: float) -> torch.Tensor:
     return bits
 
 
-def _quantize_by_bits(
-    R: torch.Tensor, bits_pc: torch.Tensor, group: int
-) -> torch.Tensor:
-    """Groupwise-RTN each channel at its assigned bit width (0 = drop)."""
-    R_hat = torch.zeros_like(R)
-    for b in sorted(set(int(x) for x in bits_pc.tolist())):
-        if b == 0:
-            continue
-        cols = (bits_pc == b).nonzero(as_tuple=True)[0]
-        R_hat[:, cols] = rtn_quantize(R[:, cols].mT, b, group).mT
-    return R_hat
-
-
 def _uniform_arm(
     M: torch.Tensor, budget: float, group: int, rank: int, factors: tuple
 ) -> tuple[torch.Tensor, float]:
@@ -128,7 +115,7 @@ def _uniform_arm(
         )
     S, C = M.shape
     L, R = _stored_lowrank(M, factors)
-    R_hat = _quantize_by_bits(R, _uniform_bits_vector(C, budget), group)
+    R_hat = quantize_by_bits(R, _uniform_bits_vector(C, budget), group)
     bpe = budget + scale_bits(group) + factor_bits(rank, S, C)
     return L + R_hat, bpe
 
@@ -141,7 +128,7 @@ def _hadamard_uniform_arm(
     S, C = M.shape
     L, R = _stored_lowrank(M, factors)
     R_rot = randomized_hadamard(R, seed)
-    R_hat_rot = _quantize_by_bits(R_rot, _uniform_bits_vector(C, budget), group)
+    R_hat_rot = quantize_by_bits(R_rot, _uniform_bits_vector(C, budget), group)
     R_hat = _unrotate(R_hat_rot, seed)
     bpe = budget + scale_bits(group) + factor_bits(rank, S, C)
     return L + R_hat, bpe
@@ -177,7 +164,7 @@ def _blockdiag_shared_arm(
     R_hat = torch.zeros_like(R)
     for hh in range(h_kv):
         sl = slice(hh * d, (hh + 1) * d)
-        Rh_hat_rot = _quantize_by_bits(R_rot[:, sl], bits_d, group)
+        Rh_hat_rot = quantize_by_bits(R_rot[:, sl], bits_d, group)
         R_hat[:, sl] = Rh_hat_rot @ Qs[hh].mT
     payload = float(bits_d.float().mean().item())
     bpe = payload + scale_bits(group) + factor_bits(rank, S, C) + tier_bits(tiers, S)
