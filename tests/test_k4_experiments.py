@@ -179,3 +179,25 @@ def test_k4_fit_packs_smoke(tmp_path):
 
     side = json.loads(open(str(out) + ".json").read())
     assert side["w_source"] == "corpus"
+
+
+def test_k4_spectra_w_source_corpus(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_spectra import Config, main
+
+    main_p, other_p = tmp_path / "m.safetensors", tmp_path / "o.safetensors"
+    _tiny_cache(main_p, seed=0)
+    _tiny_cache(other_p, seed=1)
+    cfg = Config(
+        cache_path=str(main_p),
+        corpus_cache_paths=(str(other_p),),
+        model_label="tiny",
+        budgets=(2.5,),
+        group=16,
+        w_source="corpus",
+        out_root=str(tmp_path / "results"),
+    )
+    run_dir = main(cfg)
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert (df.w_source == "corpus").all()

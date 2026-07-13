@@ -8,10 +8,17 @@ verdict. See docs/superpowers/specs/2026-07-12-k4-spectral-codec-design.md §4.
 Fit-mode scope: only the KEY statistics (the second moment Σ_k the basis is
 fit on) vary by fit_mode (oracle: all S rows of the scored cache; heldout:
 rows [:S//2] of the scored cache; corpus: concat of OTHER caches' same-layer
-k_pre matrices). The query moment W — and hence the whitener — is ALWAYS
-estimated from the SCORED cache's own queries in every mode: queries are
+k_pre matrices). The query moment W — and hence the whitener — is controlled
+separately by `w_source`: "scored" (default, byte-identical to prior
+behavior) estimates W from the SCORED cache's own queries — queries are
 probe-side information, known at read time regardless of which corpus the
-key basis was fit on.
+key basis was fit on, so this is the upper-bound/circular variant (W is
+still "known" at read time, but scoring the SAME sequence's W is optimistic).
+"corpus" estimates W by averaging query_position_moment over each corpus
+cache's OWN queries and cos/sin tables (equal-weight per cache, same
+convention as k4_fit_packs.py) — the deployment-grade, query-heldout variant:
+at fit time only corpus-side queries are available, never the queries of the
+sequence that will later be scored.
 
 The `lowrank_rtn_channel` reference arm is fit and scored per layer as a
 uniform-codec baseline for the G0 retention ratio; its rows live in the SAME
@@ -44,6 +51,8 @@ from bmx.cache.spectral import (
 )
 from experiments._k4_common import DEPLOY_S, _score_tail, load_layer_keys, setup_rope
 
+_W_SOURCES = {"scored", "corpus"}
+
 
 @dataclasses.dataclass
 class Config:
@@ -60,10 +69,17 @@ class Config:
     ref_bits: int = 3
     seed: int = 0
     max_layers: int = 0
+    w_source: str = "scored"
     out_root: str = ""
 
 
 def main(cfg: Config):
+    assert cfg.w_source in _W_SOURCES, f"w_source={cfg.w_source!r} not in {_W_SOURCES}"
+    if cfg.w_source == "corpus":
+        assert cfg.corpus_cache_paths, (
+            "w_source='corpus' requires non-empty corpus_cache_paths"
+        )
+
     run = (
         create_run("k4_spectra", cfg, root=cfg.out_root)
         if cfg.out_root
@@ -71,6 +87,15 @@ def main(cfg: Config):
     )
 
     corpus_caches = [load_cache(p) for p in cfg.corpus_cache_paths]
+    # Per-cache layer-keyed view + per-cache RoPE, only needed for w_source
+    # "corpus" (mirrors k4_fit_packs.py's per-cache W loop exactly).
+    corpus_layer_keys = [load_layer_keys(p) for p in cfg.corpus_cache_paths]
+    corpus_get_cos_sins = []
+    corpus_rope_ready = False
+    for lk in corpus_layer_keys:
+        c_ready, c_get_cos_sin = setup_rope(cfg.model_name, lk, sorted(lk.keys()))
+        corpus_rope_ready = corpus_rope_ready or c_ready
+        corpus_get_cos_sins.append(c_get_cos_sin)
 
     layer_keys = load_layer_keys(cfg.cache_path)
 
@@ -115,10 +140,31 @@ def main(cfg: Config):
 
         print(f"\n[layer {layer_i}] (h_kv={h_kv}, S={S}, d={d}, C={C})", flush=True)
 
-        # Query second moment: always from THIS cache's own queries.
-        W_blocks = query_position_moment(
-            q_t.float(), cos_l, sin_l, h_kv, position_stride=cfg.position_stride
-        )
+        # Query second moment: "scored" (default) from THIS cache's own
+        # queries; "corpus" pooled from the corpus caches' own queries
+        # (equal-weight per cache, same convention as k4_fit_packs.py).
+        if cfg.w_source == "corpus":
+            W_sum = torch.zeros(h_kv, d, d, dtype=torch.float64)
+            for lk, c_get_cos_sin in zip(corpus_layer_keys, corpus_get_cos_sins):
+                c_q_t = lk[layer_i]["q"]
+                c_S = lk[layer_i]["k_pre"].shape[1]
+                if corpus_rope_ready:
+                    c_cos, c_sin = c_get_cos_sin(c_S)
+                else:
+                    c_cos = torch.ones(c_S, d)
+                    c_sin = torch.zeros(c_S, d)
+                W_sum += query_position_moment(
+                    c_q_t.float(),
+                    c_cos,
+                    c_sin,
+                    h_kv,
+                    position_stride=cfg.position_stride,
+                )
+            W_blocks = W_sum / len(corpus_layer_keys)
+        else:  # "scored"
+            W_blocks = query_position_moment(
+                q_t.float(), cos_l, sin_l, h_kv, position_stride=cfg.position_stride
+            )
         Wh, Wh_inv = assemble_whitener(W_blocks, ridge=cfg.ridge)
         Ih, Ih_inv = identity_whitener(C)
 
@@ -180,6 +226,7 @@ def main(cfg: Config):
                             weighted=weighted,
                             fit_mode=fit_mode,
                             budget=float(budget),
+                            w_source=cfg.w_source,
                             bpe_model=bpe_model,
                             bpe_skeptic=bpe_skeptic,
                             bpe_skeptic_deploy=bpe_skeptic_deploy,
@@ -223,6 +270,7 @@ def main(cfg: Config):
                 weighted=False,
                 fit_mode="reference",
                 budget=float("nan"),
+                w_source=cfg.w_source,
                 bpe_model=bpe_ref,
                 bpe_skeptic=bpe_ref,
                 bpe_skeptic_deploy=bpe_ref,

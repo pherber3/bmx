@@ -15,6 +15,14 @@ bpe_skeptic_deploy. win = tq_interp / spectral, on layer means; g1_pass
 requires win > 1 at every budget in both accounting modes AND >=90% of
 layers beating the per-layer interpolation. See
 docs/superpowers/specs/2026-07-12-k4-spectral-codec-design.md §4.
+
+W note (query second moment that defines the whitener): `w_source` selects
+"scored" (default, byte-identical to prior behavior) — W from the SCORED
+cache's own queries, the upper-bound/circular variant (optimistic: the same
+sequence being scored supplies its own W) — or "corpus" — W averaged over
+each corpus cache's own queries and cos/sin tables (equal-weight per cache,
+same convention as k4_fit_packs.py), the deployment-grade query-heldout
+variant.
 """
 
 from __future__ import annotations
@@ -46,6 +54,8 @@ from bmx.decomp.lrs import truncated_svd
 from bmx.quant.hadamard import random_orthogonal
 from bmx.quant.rtn import rtn_quantize
 from experiments._k4_common import DEPLOY_S, _score_tail, load_layer_keys, setup_rope
+
+_W_SOURCES = {"scored", "corpus"}
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +113,7 @@ class Config:
     k2t_bits: int = 2
     seed: int = 0
     max_layers: int = 0
+    w_source: str = "scored"
     out_root: str = ""
 
 
@@ -132,6 +143,12 @@ def _spectral_randbasis_pack(
 
 
 def main(cfg: Config):
+    assert cfg.w_source in _W_SOURCES, f"w_source={cfg.w_source!r} not in {_W_SOURCES}"
+    if cfg.w_source == "corpus":
+        assert cfg.corpus_cache_paths, (
+            "w_source='corpus' requires non-empty corpus_cache_paths"
+        )
+
     run = (
         create_run("k4_frontier", cfg, root=cfg.out_root)
         if cfg.out_root
@@ -141,6 +158,15 @@ def main(cfg: Config):
     from bmx.cache.collect import load_cache
 
     corpus_caches = [load_cache(p) for p in cfg.corpus_cache_paths]
+    # Per-cache layer-keyed view + per-cache RoPE, only needed for w_source
+    # "corpus" (mirrors k4_fit_packs.py's per-cache W loop exactly).
+    corpus_layer_keys = [load_layer_keys(p) for p in cfg.corpus_cache_paths]
+    corpus_get_cos_sins = []
+    corpus_rope_ready = False
+    for lk in corpus_layer_keys:
+        c_ready, c_get_cos_sin = setup_rope(cfg.model_name, lk, sorted(lk.keys()))
+        corpus_rope_ready = corpus_rope_ready or c_ready
+        corpus_get_cos_sins.append(c_get_cos_sin)
 
     layer_keys = load_layer_keys(cfg.cache_path)
 
@@ -173,6 +199,7 @@ def main(cfg: Config):
             weighted=False,
             budget=float("nan"),
             mse_scale=False,
+            w_source=cfg.w_source,
         )
         base.update(kw)
         return base
@@ -227,9 +254,31 @@ def main(cfg: Config):
             return svd_cache[rank]
 
         # ---- Spectral fit machinery: query moment, whitener, fit matrices --
-        W_blocks = query_position_moment(
-            q_t.float(), cos_l, sin_l, h_kv, position_stride=cfg.position_stride
-        )
+        # "scored" (default) uses THIS cache's own queries; "corpus" pools
+        # query_position_moment over the corpus caches' own queries (equal-
+        # weight per cache, same convention as k4_fit_packs.py).
+        if cfg.w_source == "corpus":
+            W_sum = torch.zeros(h_kv, d, d, dtype=torch.float64)
+            for lk, c_get_cos_sin in zip(corpus_layer_keys, corpus_get_cos_sins):
+                c_q_t = lk[layer_i]["q"]
+                c_S = lk[layer_i]["k_pre"].shape[1]
+                if corpus_rope_ready:
+                    c_cos, c_sin = c_get_cos_sin(c_S)
+                else:
+                    c_cos = torch.ones(c_S, d)
+                    c_sin = torch.zeros(c_S, d)
+                W_sum += query_position_moment(
+                    c_q_t.float(),
+                    c_cos,
+                    c_sin,
+                    h_kv,
+                    position_stride=cfg.position_stride,
+                )
+            W_blocks = W_sum / len(corpus_layer_keys)
+        else:  # "scored"
+            W_blocks = query_position_moment(
+                q_t.float(), cos_l, sin_l, h_kv, position_stride=cfg.position_stride
+            )
         Wh, Wh_inv = assemble_whitener(W_blocks, ridge=cfg.ridge)
         Ih, Ih_inv = identity_whitener(C)
 
@@ -454,6 +503,7 @@ def main(cfg: Config):
             "fit_mode",
             "weighted",
             "budget",
+            "w_source",
             "bits",
             "rank",
             "mse_scale",
