@@ -14,8 +14,11 @@ All moment/eig math is fp64; codec application is fp32.
 from __future__ import annotations
 
 import dataclasses
+import json
+from pathlib import Path
 
 import torch
+from safetensors.torch import load_file, save_file
 
 from bmx.cache.codecs import (
     allocate_bits_from_variance,
@@ -208,3 +211,66 @@ def skeptic_charge(C: int, S: int, tiers: tuple[int, ...]) -> float:
     """Per-sequence charge when the pack is NOT granted model-level status:
     one fp16 C×C decoder matrix (16·C/S) + the per-direction bit map."""
     return 16.0 * C / S + tier_bits(tiers, S)
+
+
+def save_pack_file(
+    path: str | Path,
+    bases: dict[int, SpectralBasis],
+    budgets: tuple[float, ...],
+    *,
+    tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8),
+    group: int = 64,
+    meta: dict | None = None,
+) -> None:
+    """Save per-layer bases + per-budget bit allocations to one safetensors file.
+
+    Bits are computed via `pack_from_basis` at save time (the fp64 allocation
+    input `basis.lam64` is only needed here) so `load_packs` never re-runs the
+    allocator — reloaded packs are allocation-frozen artifacts, not re-fit.
+    A JSON sidecar at `<path>.json` carries tiers/group/budgets/meta since
+    safetensors only stores tensors.
+    """
+    tensors: dict[str, torch.Tensor] = {}
+    for i, basis in bases.items():
+        tensors[f"layer{i}.enc"] = basis.enc
+        tensors[f"layer{i}.dec"] = basis.dec
+        tensors[f"layer{i}.lam"] = basis.lam
+        for budget in budgets:
+            pack = pack_from_basis(basis, budget, tiers=tiers, group=group)
+            tensors[f"layer{i}.bits_b{budget:g}"] = pack.bits
+    save_file(tensors, str(path))
+
+    sidecar = {"tiers": list(tiers), "group": group, "budgets": list(budgets)}
+    if meta:
+        sidecar.update(meta)
+    Path(str(path) + ".json").write_text(json.dumps(sidecar))
+
+
+def load_packs(path: str | Path, budget: float) -> dict[int, SpectralPack]:
+    """Reconstruct per-layer SpectralPacks for one budget from a saved file.
+
+    Raises KeyError (with the available budgets) if `budget` isn't in the file.
+    """
+    sidecar = json.loads(Path(str(path) + ".json").read_text())
+    budgets = sidecar["budgets"]
+    if budget not in budgets:
+        raise KeyError(f"budget {budget} not in pack file; available: {budgets}")
+    tiers = tuple(sidecar["tiers"])
+    group = sidecar["group"]
+
+    tensors = load_file(str(path))
+    layers = sorted(
+        {int(k.split(".")[0].removeprefix("layer")) for k in tensors if "." in k}
+    )
+    packs: dict[int, SpectralPack] = {}
+    for i in layers:
+        packs[i] = SpectralPack(
+            enc=tensors[f"layer{i}.enc"],
+            dec=tensors[f"layer{i}.dec"],
+            lam=tensors[f"layer{i}.lam"],
+            bits=tensors[f"layer{i}.bits_b{budget:g}"],
+            group=group,
+            tiers=tiers,
+            budget=float(budget),
+        )
+    return packs

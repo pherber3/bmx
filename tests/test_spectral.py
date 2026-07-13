@@ -201,3 +201,39 @@ def test_skeptic_charge_formula():
         )
         < 1e-12
     )
+
+
+def test_pack_file_roundtrip(tmp_path):
+    from bmx.cache.spectral import (
+        fit_spectral_basis,
+        identity_whitener,
+        load_packs,
+        pack_from_basis,
+        save_pack_file,
+    )
+
+    C = 32
+    Wh, Wh_inv = identity_whitener(C)
+    bases = {}
+    for i in range(2):
+        M, _ = _spiked_keys(S=256, C=C, seed=i)
+        bases[i] = fit_spectral_basis(M, Wh, Wh_inv)
+    path = tmp_path / "packs.safetensors"
+    save_pack_file(path, bases, budgets=(2.5, 3.0), group=16, meta={"model": "tiny"})
+
+    packs = load_packs(path, 2.5)
+    assert set(packs) == {0, 1}
+    ref = pack_from_basis(bases[0], 2.5, group=16)
+    assert torch.equal(packs[0].bits, ref.bits)
+    assert torch.allclose(packs[0].enc, ref.enc)
+    assert packs[0].group == 16 and packs[0].budget == 2.5
+
+    import json
+
+    side = json.loads((tmp_path / "packs.safetensors.json").read_text())
+    assert side["model"] == "tiny" and 2.5 in side["budgets"]
+
+    import pytest
+
+    with pytest.raises(KeyError):
+        load_packs(path, 4.0)
