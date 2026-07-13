@@ -53,6 +53,8 @@ class Config:
     chunked dequant-attention at decode) instead of StreamingQuantizedCache.
     Token-identical output (parity-gated); lower resident memory — the path that
     unblocks the batched 128k sweep. Real path only (ignored offline)."""
+    pack_path: str = ""
+    """Path to a fitted spectral pack file; only needed for k4_* arms."""
     # Resume a crashed/killed run: path to its run_dir. Skips (arm, length) pairs whose
     # partial/<arm>__<length>.parquet shard already exists; identity-asserted against the
     # stored config.json + git SHA (mismatch is a hard error, not a warning) so a resumed
@@ -100,7 +102,9 @@ def run(
     n_completed_this_run = 0
     start_time = time.monotonic()
     for arm in cfg.arms:
-        k_spec, v_spec = spec_pair(arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
+        k_spec, v_spec = spec_pair(
+            arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed, pack_path=cfg.pack_path
+        )
         for length in cfg.lengths:
             pair_i += 1
             key = pair_key(arm, length)

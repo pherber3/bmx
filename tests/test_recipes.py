@@ -101,3 +101,14 @@ def test_turboquant_asymmetric_bits():
         k, v = spec_pair(name)
         assert k.arm == base and v.arm == base
         assert k.bits == bk and v.bits == bv
+
+
+def test_k4_recipe_spec_pair():
+    """k4_b{budget}: corpus-fitted spectral K via packs + proven turboquant V@2b.
+    Requires --pack-path (a fitted spectral pack file); empty pack_path raises."""
+    k, v = spec_pair("k4_b2.5", pack_path="/some/packs.safetensors")
+    assert k.arm == "spectral" and k.pre_rope and k.budget == 2.5
+    assert k.pack_path == "/some/packs.safetensors"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+    with pytest.raises(ValueError, match="pack"):
+        spec_pair("k4_b2.5")

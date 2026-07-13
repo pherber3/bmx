@@ -70,6 +70,8 @@ class Config:
     rank: int = 16
     group: int = 64
     seed: int = 0
+    pack_path: str = ""
+    """Path to a fitted spectral pack file; only needed for k4_* arms."""
     # Resume a crashed/killed run: path to its run_dir. Skips (arm, task) pairs whose
     # partial/<arm>__<task>.parquet shard already exists; identity-asserted against the
     # stored config.json + git SHA (mismatch is a hard error, not a warning) so a resumed
@@ -159,7 +161,9 @@ def run(
     n_completed_this_run = 0
     start_time = time.monotonic()
     for arm in cfg.arms:
-        k_spec, v_spec = spec_pair(arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
+        k_spec, v_spec = spec_pair(
+            arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed, pack_path=cfg.pack_path
+        )
         for task in tasks:
             pair_i += 1
             key = pair_key(arm, task)

@@ -11,7 +11,7 @@ from bmx.cache.specs import CacheCodecSpec
 
 
 def spec_pair(
-    arm: str, *, rank: int = 16, group: int = 64, seed: int = 0
+    arm: str, *, rank: int = 16, group: int = 64, seed: int = 0, pack_path: str = ""
 ) -> tuple[CacheCodecSpec, CacheCodecSpec]:
     """(k_spec, v_spec) for a named arm.
 
@@ -82,6 +82,25 @@ def spec_pair(
                 group=group,
                 seed=seed,
                 pre_rope=True,
+            ),
+            CacheCodecSpec(arm="turboquant_mse", bits=2, seed=seed),
+        )
+    if arm.startswith("k4_b"):
+        # k4_b{budget}: corpus-fitted spectral K via packs + proven turboquant V@2b.
+        # Requires --pack-path (a fitted spectral pack file).
+        if not pack_path:
+            raise ValueError(
+                "k4 arms require --pack-path (a fitted spectral pack file)"
+            )
+        budget_str = arm[len("k4_b") :]
+        budget = float(budget_str)
+        return (
+            CacheCodecSpec(
+                arm="spectral",
+                pre_rope=True,
+                group=group,
+                pack_path=pack_path,
+                budget=budget,
             ),
             CacheCodecSpec(arm="turboquant_mse", bits=2, seed=seed),
         )
