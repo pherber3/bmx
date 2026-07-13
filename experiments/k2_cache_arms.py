@@ -44,7 +44,8 @@ from bmx.decomp.lrs import truncated_svd
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
 
 # Arms that accept a bits-only sweep (no rank param needed)
-_BASE_ARMS = [a for a in CACHE_ARMS if a != "lowrank_rtn_channel"]
+# spectral is pack-gated — no packless dispatch
+_BASE_ARMS = [a for a in CACHE_ARMS if a not in ("lowrank_rtn_channel", "spectral")]
 _LOWRANK_ARM = "lowrank_rtn_channel"
 
 
