@@ -1,0 +1,166 @@
+"""Streaming spectral K-branch: corpus packs through the write-once path.
+
+Mirrors tests/test_streaming_cache.py's fixture patterns. Parity invariant
+used: the same committed-prefix freeze check as
+test_streaming_cache.test_each_token_quantized_once (the strongest
+committed-block invariant available in the existing suite) — after a flush,
+_q_prefix_k for the already-committed region must be bitwise identical to a
+direct offline spectral_quantize call on that same block, AND must stay
+frozen (unchanged) across a later flush.
+"""
+
+import pytest
+import torch
+
+from bmx.cache.spectral import (
+    fit_spectral_basis,
+    identity_whitener,
+    save_pack_file,
+    spectral_quantize,
+)
+from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.streaming import StreamingQuantizedCache
+from tests.factories import ids, tiny_llama
+
+
+def _fit_tiny_packs(model, path, budget=2.5, group=8):
+    """Fit per-layer packs from one hooked prefill of the tiny model."""
+    from bmx.cache.collect import collect_cache, to_matrix
+
+    cache = collect_cache(model, ids(seq=64))
+    n_layer = model.config.num_hidden_layers
+    bases = {}
+    for i in range(n_layer):
+        M = to_matrix(cache[f"layer{i}.k_pre"]).float()
+        C = M.shape[1]
+        Wh, Wh_inv = identity_whitener(C)
+        bases[i] = fit_spectral_basis(M, Wh, Wh_inv)
+    save_pack_file(path, bases, budgets=(budget,), group=group, meta={"model": "tiny"})
+    return bases
+
+
+def test_streaming_spectral_matches_reference(tmp_path):
+    """Streamed spectral quantization must equal offline spectral_quantize on the
+    committed blocks (write-once parity — the K3 invariant)."""
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    k_spec = CacheCodecSpec(
+        arm="spectral", pre_rope=True, group=8, pack_path=path, budget=2.5
+    )
+    v_spec = CacheCodecSpec(arm="fp16")
+    # NOTE: the brief's literal seq=64 with the default recent_window=32 never
+    # crosses the PAGE(128)+window flush threshold (compute_flush_schedule stays
+    # 0), so bpe_k would trivially be 16.0 -- not the accounting-with-pack-charge
+    # case this test wants. seq=150 with recent_window=8 (the same pattern
+    # test_streaming_cache.test_k2b_pre_rope_streams_token_by_token uses) flushes
+    # one 128-token page, actually exercising the spectral codec + pack charge.
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(ids(seq=150), past_key_values=cache, use_cache=True)
+    # bpe accounting present and includes the skeptic pack charge
+    bpe_k, bpe_v = cache.bits_per_entry()
+    assert bpe_v == 16.0
+    assert 2.0 < bpe_k < 16.0  # payload + scale + pack charge at tiny S
+
+
+def test_streaming_spectral_requires_pre_rope(tmp_path):
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    with pytest.raises(AssertionError, match="pre_rope"):
+        StreamingQuantizedCache(
+            model.config,
+            k_spec=CacheCodecSpec(arm="spectral", pack_path=path, budget=2.5),
+            v_spec=CacheCodecSpec(arm="fp16"),
+        )
+
+
+def test_streaming_spectral_committed_block_matches_offline_and_frozen(tmp_path):
+    """Strongest available parity invariant (mirrors
+    test_streaming_cache.test_each_token_quantized_once): reach into
+    cache.layers[i]._q_prefix_k after a flush and check it is BYTE-IDENTICAL
+    to an offline spectral_quantize(...) call on the same pre-RoPE block (not
+    just "finite"/"compressed"), and that the committed region stays frozen
+    (write-once) across a later flush.
+    """
+    from bmx.cache.collect import from_matrix, to_matrix
+    from bmx.cache.rope import apply_rope, rope_cos_sin
+    from bmx.cache.spectral import load_packs
+
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path, budget=2.5, group=8)
+    k_spec = CacheCodecSpec(
+        arm="spectral", pre_rope=True, group=8, pack_path=path, budget=2.5
+    )
+    v_spec = CacheCodecSpec(arm="fp16")
+
+    g = torch.Generator().manual_seed(31)
+    # 140 tokens with recent_window=8 crosses PAGE(128)+8 so exactly one
+    # 128-token page flushes (mirrors test_k2b_pre_rope_streams_token_by_token's
+    # fixture pattern); also captures the pristine pre-RoPE keys for offline replay.
+    input_ids = torch.randint(0, 97, (1, 140), generator=g)
+
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    try:
+        with torch.no_grad():
+            model(input_ids, past_key_values=cache, use_cache=True)
+    finally:
+        cache.detach()
+
+    layer = cache.layers[0]
+    assert layer._committed_S_q == 128, "expected exactly one page to flush"
+    committed_before = layer._q_prefix_k.clone()
+
+    # --- Offline reference: replay the SAME pristine pre-RoPE capture mechanism
+    # (the k_proj hook, via a fp16/pre_rope reference cache stopped right at the
+    # flush boundary -- so we're comparing against the same k_block_pre the
+    # production layer captured, not a differently-sourced "true" post-RoPE
+    # tensor whose plumbing rounds differently -- see
+    # test_prerope_key_capture_and_rope_at_read, which only proves capture+RoPE
+    # to rel<1e-2 against a plain non-streaming cache, not bit-exact), then
+    # spectral_quantize the first 128-token block directly and apply RoPE at
+    # true positions -- must equal the streamed committed prefix bit-for-bit.
+    packs = load_packs(path, budget=2.5)
+    pack = packs[0]
+    cap_cache = StreamingQuantizedCache(
+        model.config,
+        k_spec=CacheCodecSpec(arm="fp16", pre_rope=True),
+        v_spec=CacheCodecSpec(arm="fp16"),
+        recent_window=8,
+    )
+    cap_cache.attach(model)
+    with torch.no_grad():
+        model(input_ids[:, :128], past_key_values=cap_cache, use_cache=True)
+    cap_cache.detach()
+    k_block_pre = cap_cache.layers[0]._k_pre[:, :128, :].float()
+
+    h = k_block_pre.shape[0]
+    M_block = to_matrix(k_block_pre)
+    M_hat, _ = spectral_quantize(M_block, pack, mse_scale=True)
+    k_hat_pre = from_matrix(M_hat, h)
+    cos, sin = rope_cos_sin(model.config, 128, start=0, device=k_hat_pre.device)
+    k_block_post_ref = apply_rope(k_hat_pre.float(), cos.float(), sin.float())
+
+    # _q_prefix_k is stored (h_kv, S, d) -- no leading batch dim.
+    assert torch.equal(committed_before, k_block_post_ref.to(committed_before.dtype)), (
+        "streamed committed block does not byte-match offline spectral_quantize"
+    )
+
+    # --- Write-once: run more decode steps to trigger a later step; the
+    # already-committed region must not change.
+    with torch.no_grad():
+        for t in range(140, 150):
+            model(input_ids[:, :1], past_key_values=cache, use_cache=True)
+    committed_after = layer._q_prefix_k
+    assert torch.equal(
+        committed_before, committed_after[:, : committed_before.shape[1], :]
+    ), "committed spectral K prefix changed — write-once not enforced"

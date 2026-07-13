@@ -39,6 +39,12 @@ from bmx.cache.hf_compat import (
 )
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.spectral import (
+    SpectralPack,
+    load_packs,
+    skeptic_charge,
+    spectral_quantize,
+)
 from bmx.decomp.lrs import truncated_svd
 
 # Lowrank K arms that share the frozen pre-RoPE subspace path: V fitted once at
@@ -71,12 +77,22 @@ class StreamingQuantizedLayer(DynamicLayer):
         Most-recent tokens kept fp16 before flushing to quantized state (future).
     """
 
-    def __init__(self, k_spec, v_spec, model_config, recent_window: int = 32):
+    def __init__(
+        self,
+        k_spec,
+        v_spec,
+        model_config,
+        recent_window: int = 32,
+        pack: SpectralPack | None = None,
+    ):
         super().__init__()
         self.k_spec = k_spec
         self.v_spec = v_spec
         self.model_config = model_config
         self.recent_window = recent_window
+        # Corpus-fit spectral pack for this layer (k_spec.arm == "spectral" only);
+        # handed in once at cache-init time (loaded once at the cache level).
+        self._pack = pack
         # Pre-RoPE key capture buffer: accumulated by stash_pre_rope, consumed in update.
         # _k_pre_offset tracks the absolute sequence position of _k_pre[:, 0, :].
         # After commits, _k_pre is pruned to remove already-committed positions.
@@ -184,6 +200,14 @@ class StreamingQuantizedLayer(DynamicLayer):
                 rank=spec.rank,
                 svd_factors=(Us, self._frozen_svd[1]),
             )
+            k_hat_pre = from_matrix(M_hat, h)  # (h_kv, block_len, d)
+        elif spec.arm == "spectral":
+            # Corpus-fit spectral basis (frozen pack, loaded once at cache init):
+            # no per-block fitting at all, unlike the frozen-subspace arms above.
+            # codec_bpe here is the model-level payload+scale bpe; the per-sequence
+            # skeptic pack charge is added once in bits_per_entry(), not per block.
+            M = to_matrix(k_block_pre)  # (block_len, h*d) fp32
+            M_hat, codec_bpe = spectral_quantize(M, self._pack, mse_scale=True)
             k_hat_pre = from_matrix(M_hat, h)  # (h_kv, block_len, d)
         else:
             # General path (rtn_channel, rtn_token, rotate_rtn_token, turboquant_*).
@@ -358,17 +382,44 @@ class StreamingQuantizedCache(Cache):
         v_spec: CacheCodecSpec,
         recent_window: int = 32,
     ):
-        # layer_class_to_replicate lazily appends one layer per new layer_idx.
-        super().__init__(
-            layer_class_to_replicate=lambda: StreamingQuantizedLayer(
-                k_spec, v_spec, model_config, recent_window
+        # Spectral K arm: pre-RoPE only, and the corpus pack file is loaded ONCE
+        # here (never per-layer, never per-call) then handed out by layer_idx.
+        self._packs: dict[int, SpectralPack] = {}
+        if k_spec.arm == "spectral":
+            assert k_spec.pre_rope, (
+                "spectral quantizes pre-RoPE keys; set pre_rope=True"
             )
-        )
+            assert k_spec.pack_path, "spectral requires pack_path"
+            self._packs = load_packs(k_spec.pack_path, k_spec.budget)
+
+        # layer_class_to_replicate lazily appends one layer per new layer_idx, always
+        # in order (transformers' Cache.update appends up to layer_idx while
+        # len(self.layers) <= layer_idx) -- so len(self.layers) at call time IS the
+        # new layer's index. Used to hand each layer its own pack. This closure only
+        # ever EXECUTES from inside a later update() call (never during __init__
+        # itself), by which point self.k_spec/_pack_for_layer are fully set up below.
+        def _make_layer():
+            return StreamingQuantizedLayer(
+                k_spec,
+                v_spec,
+                model_config,
+                recent_window,
+                pack=self._pack_for_layer(len(self.layers)),
+            )
+
+        super().__init__(layer_class_to_replicate=_make_layer)
         self.model_config = model_config
         self.k_spec = k_spec
         self.v_spec = v_spec
         self.recent_window = recent_window
         self._handles: list = []
+
+    def _pack_for_layer(self, i: int) -> "SpectralPack | None":
+        """Look up layer i's spectral pack, asserting it's present when spectral."""
+        if self.k_spec.arm != "spectral":
+            return None
+        assert i in self._packs, f"spectral pack file missing layer {i}"
+        return self._packs[i]
 
     def attach(self, model) -> "StreamingQuantizedCache":
         """Register k_proj hooks so each layer captures its pre-RoPE keys.
@@ -392,7 +443,11 @@ class StreamingQuantizedCache(Cache):
         while len(self.layers) < n_layers:
             self.layers.append(
                 StreamingQuantizedLayer(
-                    self.k_spec, self.v_spec, self.model_config, self.recent_window
+                    self.k_spec,
+                    self.v_spec,
+                    self.model_config,
+                    self.recent_window,
+                    pack=self._pack_for_layer(len(self.layers)),
                 )
             )
 
@@ -427,11 +482,35 @@ class StreamingQuantizedCache(Cache):
         return layer.keys, layer.values
 
     def bits_per_entry(self):
-        """(bpe_k, bpe_v) from the last layer's last quantize (uniform across layers)."""
+        """(bpe_k, bpe_v) from the last layer's last quantize (uniform across layers).
+
+        For the spectral K arm, bpe_k is the layer's blended block-payload bpe
+        (quantized-prefix codec_bpe + fp16-tail 16.0, both already blended in
+        StreamingQuantizedLayer.update — see bpe_k there) PLUS the per-sequence
+        skeptic pack charge:
+
+            bpe_k = (blended block payload bpe) + skeptic_charge(C, S, pack.tiers)
+
+        where S = last.get_seq_length() (the full committed sequence length, fp16
+        tail included — NOT just the quantized-committed count) and
+        C = h_kv * d_head. This charge amortizes the corpus pack's decoder matrix
+        + tier map over the WHOLE sequence once here, rather than re-charging it
+        per flushed block (skeptic_charge's own S-amortization already does the
+        1/S scaling; calling it once per block would double-count blocks that
+        preceded S growing).
+        """
         if not self.layers:
             return float("nan"), float("nan")
         last = self.layers[-1]
-        return last.bpe_k, last.bpe_v
+        bpe_k = last.bpe_k
+        # Only charge once something has actually flushed through the spectral
+        # path (_committed_S_q > 0); an all-fp16 cache (nothing quantized yet)
+        # must report bpe_k == 16.0, not 16.0 + a charge for an unused pack.
+        if self.k_spec.arm == "spectral" and last._committed_S_q > 0:
+            S = last.get_seq_length()
+            C = last._h_kv * last._d_head
+            bpe_k = bpe_k + skeptic_charge(C, S, last._pack.tiers)
+        return bpe_k, last.bpe_v
 
     def memory_report(
         self, seq_len: int, h_kv: int | None = None, d_head: int | None = None
