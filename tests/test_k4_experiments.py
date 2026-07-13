@@ -142,3 +142,16 @@ def test_greedy_layer_allocation_uniform_when_symmetric():
     s = {l: 1.0 for l in range(4)}  # noqa: E741
     alloc = greedy_layer_allocation(curves, s, grid, target_mean=3.0)
     assert all(v == 3.0 for v in alloc.values())
+
+
+def test_uniform_bits_by_layer_non_exact_target():
+    from experiments.k4_alloc import _uniform_bits_by_layer
+
+    # (32, 3.2): (0.2*32)=6.4 -> round to 6 -> realized 3.1875; must not crash.
+    bits = _uniform_bits_by_layer(32, 3.2)
+    assert len(bits) == 32
+    realized = sum(bits.values()) / 32
+    assert abs(realized - 3.2) <= 1.0 / 32 + 1e-9
+    # Exact targets stay exact.
+    bits = _uniform_bits_by_layer(12, 2.5)
+    assert sum(bits.values()) / 12 == 2.5

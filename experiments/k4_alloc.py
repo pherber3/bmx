@@ -113,7 +113,14 @@ def _uniform_bits_by_layer(n_layer: int, target_mean: float) -> dict[int, int]:
         for i in idx.tolist():
             bits[i] = lo + 1
     realized_mean = sum(bits.values()) / n_layer
-    assert abs(realized_mean - target_mean) < 1e-6
+    assert abs(realized_mean - target_mean) <= 1.0 / n_layer + 1e-9, (
+        f"uniform comparator cannot represent target_mean={target_mean} with "
+        f"n_layer={n_layer}; achieved {realized_mean:.4f}"
+    )
+    print(
+        f"  [uniform_bits] target_mean={target_mean:.4f}, realized={realized_mean:.4f}",
+        flush=True,
+    )
     return bits
 
 
