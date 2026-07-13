@@ -155,3 +155,27 @@ def test_uniform_bits_by_layer_non_exact_target():
     # Exact targets stay exact.
     bits = _uniform_bits_by_layer(12, 2.5)
     assert sum(bits.values()) / 12 == 2.5
+
+
+def test_k4_fit_packs_smoke(tmp_path):
+    from bmx.cache.spectral import load_packs
+    from experiments.k4_fit_packs import Config, main
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+    out = tmp_path / "packs.safetensors"
+    cfg = Config(
+        corpus_cache_paths=(str(p1), str(p2)),
+        out_path=str(out),
+        model_label="tiny",
+        budgets=(2.5,),
+        group=16,
+    )
+    main(cfg)
+    packs = load_packs(out, 2.5)
+    assert 0 in packs and packs[0].enc.shape == (16, 16)
+    import json
+
+    side = json.loads(open(str(out) + ".json").read())
+    assert side["w_source"] == "corpus"
