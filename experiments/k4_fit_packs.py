@@ -31,10 +31,9 @@ from bmx.cache.spectral import (
     fit_spectral_basis,
     identity_whitener,
     pack_from_basis,
-    query_position_moment,
     save_pack_file,
 )
-from experiments._k4_common import load_layer_keys, setup_rope
+from experiments._k4_common import corpus_query_moment, load_layer_keys, setup_rope
 
 _W_SOURCES = {"corpus", "none"}
 
@@ -102,23 +101,15 @@ def main(cfg: Config):
 
         # ---- W: pooled query second moment, or identity --------------------
         if cfg.w_source == "corpus":
-            W_sum = torch.zeros(h_kv, d, d, dtype=torch.float64)
-            for lk, get_cos_sin in zip(per_cache_layer_keys, get_cos_sins):
-                q_t = lk[layer_i]["q"]
-                S_c = lk[layer_i]["k_pre"].shape[1]
-                if rope_ready:
-                    cos_c, sin_c = get_cos_sin(S_c)
-                else:
-                    cos_c = torch.ones(S_c, d)
-                    sin_c = torch.zeros(S_c, d)
-                W_sum += query_position_moment(
-                    q_t.float(),
-                    cos_c,
-                    sin_c,
-                    h_kv,
-                    position_stride=cfg.position_stride,
-                )
-            W_blocks = W_sum / len(per_cache_layer_keys)
+            W_blocks = corpus_query_moment(
+                per_cache_layer_keys,
+                get_cos_sins,
+                rope_ready,
+                layer_i,
+                h_kv,
+                d,
+                cfg.position_stride,
+            )
             Wh, Wh_inv = assemble_whitener(W_blocks, ridge=cfg.ridge)
         else:  # "none"
             Wh, Wh_inv = identity_whitener(C)

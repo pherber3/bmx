@@ -7,6 +7,7 @@ import torch
 
 from bmx.cache.codecs import (
     CACHE_ARMS,
+    PACK_GATED_ARMS,
     allocate_channel_bits,
     gaussian_codebook,
     qjl_reconstruct,
@@ -89,7 +90,7 @@ class TestBitAccounting:
 
 
 class TestMonotonicity:
-    @pytest.mark.parametrize("arm", [a for a in CACHE_ARMS if a != "spectral"])
+    @pytest.mark.parametrize("arm", [a for a in CACHE_ARMS if a not in PACK_GATED_ARMS])
     def test_higher_bits_lower_error(self, arm: str):
         # pack-gated arm — no packless dispatch
         M = _seeded_matrix(seed=99)

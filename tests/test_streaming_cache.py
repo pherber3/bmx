@@ -5,7 +5,7 @@ import torch
 
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
-from factories import ids, tiny_llama
+from factories import ids, tiny_gpt2, tiny_llama
 
 
 def _k2b_spec():
@@ -154,6 +154,20 @@ def test_attach_is_idempotent():
     assert k_post.shape[2] == input_ids.shape[1], (
         f"expected S={input_ids.shape[1]}, got {k_post.shape[2]} (double-stash?)"
     )
+
+
+def test_attach_raises_clear_error_on_unsupported_architecture():
+    """attach() with a pre_rope spec on a GPT-2-style model (fused c_attn, no
+    self_attn.k_proj) must raise a clear ValueError, not an AttributeError
+    deep inside the hook-registration loop."""
+    model = tiny_gpt2()
+    cache = StreamingQuantizedCache(
+        model.config,
+        k_spec=CacheCodecSpec(arm="rtn_channel", bits=3, group=16, pre_rope=True),
+        v_spec=CacheCodecSpec(arm="fp16"),
+    )
+    with pytest.raises(ValueError, match="unsupported architecture"):
+        cache.attach(model)
 
 
 def test_streaming_token_by_token_channel_grouped_no_crash():

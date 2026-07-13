@@ -37,6 +37,9 @@ from bmx.quant.rtn import rtn_dequantize_packed, rtn_quantize, rtn_quantize_pack
 class _ArmTraits:
     s_divisible: bool = False  # codec asserts S % group == 0 (streaming alignment)
     packed: bool = False  # has a quantize_packed/dequant_packed split
+    pack_gated: bool = (
+        False  # requires a fitted pack; no packless quantize_cache dispatch
+    )
 
 
 _ARM_TABLE: dict[str, _ArmTraits] = {
@@ -56,12 +59,14 @@ _ARM_TABLE: dict[str, _ArmTraits] = {
     "lowrank_blockdiagwaterfill_channel": _ArmTraits(s_divisible=True),
     "lowrank_frozenwaterfill_channel": _ArmTraits(s_divisible=True),
     "lowrank_oraclewaterfill_channel": _ArmTraits(s_divisible=True),
-    "spectral": _ArmTraits(s_divisible=True),
+    "spectral": _ArmTraits(s_divisible=True, pack_gated=True),
 }
 
 CACHE_ARMS = tuple(_ARM_TABLE)
 # Arms whose codec asserts S % group == 0 (used by streaming.py for alignment).
 S_DIVISIBILITY_ARMS = frozenset(a for a, t in _ARM_TABLE.items() if t.s_divisible)
+# Arms that require a fitted pack; quantize_cache raises NotImplementedError for these.
+PACK_GATED_ARMS = frozenset(a for a, t in _ARM_TABLE.items() if t.pack_gated)
 
 
 # ---------------------------------------------------------------------------
@@ -803,9 +808,9 @@ def quantize_cache(
     """
     assert arm in CACHE_ARMS, f"unknown arm {arm!r}; available: {CACHE_ARMS}"
 
-    if arm == "spectral":
+    if arm in PACK_GATED_ARMS:
         raise NotImplementedError(
-            "spectral requires a fitted pack; it runs through StreamingQuantizedLayer (see bmx.cache.streaming) or spectral_quantize directly"
+            f"{arm} requires a fitted pack; it runs through StreamingQuantizedLayer (see bmx.cache.streaming) or spectral_quantize directly"
         )
 
     if arm in _SPLIT_ARMS:

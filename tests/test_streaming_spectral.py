@@ -9,10 +9,13 @@ direct offline spectral_quantize call on that same block, AND must stay
 frozen (unchanged) across a later flush.
 """
 
+import dataclasses
+
 import pytest
 import torch
 
 from bmx.cache.spectral import (
+    SpectralPack,
     fit_spectral_basis,
     identity_whitener,
     save_pack_file,
@@ -164,3 +167,38 @@ def test_streaming_spectral_committed_block_matches_offline_and_frozen(tmp_path)
     assert torch.equal(
         committed_before, committed_after[:, : committed_before.shape[1], :]
     ), "committed spectral K prefix changed — write-once not enforced"
+
+
+def test_spectral_pack_device_move_is_noop_on_cpu():
+    """CPU-only coverage for the one-time device-placement guard in
+    _quantize_k_block_pre_rope (Fix 1): on CPU the pack is already on
+    k_block_pre's device, so the branch is skipped and .device equality
+    holds. Real CUDA coverage (pack loads on CPU, block runs on the model's
+    CUDA device) lands with the GH200 battery.
+
+    Also pins that dataclasses.replace with .to(same_device) on every tensor
+    field preserves torch.equal — the actual move mechanism used by the
+    guard, exercised directly here since CPU can't trigger a real transfer.
+    """
+    Wh, Wh_inv = identity_whitener(8)
+    M = torch.randn(16, 8, dtype=torch.float32)
+    basis = fit_spectral_basis(M, Wh, Wh_inv)
+    from bmx.cache.spectral import pack_from_basis
+
+    pack = pack_from_basis(basis, budget=3.0, tiers=(0, 2, 3, 4), group=8)
+
+    device = torch.device("cpu")
+    assert pack.enc.device == device
+
+    moved = dataclasses.replace(
+        pack,
+        enc=pack.enc.to(device),
+        dec=pack.dec.to(device),
+        lam=pack.lam.to(device),
+        bits=pack.bits.to(device),
+    )
+    assert isinstance(moved, SpectralPack)
+    assert torch.equal(moved.enc, pack.enc)
+    assert torch.equal(moved.dec, pack.dec)
+    assert torch.equal(moved.lam, pack.lam)
+    assert torch.equal(moved.bits, pack.bits)

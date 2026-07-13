@@ -11,14 +11,14 @@ import torch
 from bmx.cache.collect import from_matrix, load_cache
 from bmx.cache.metrics import logit_distortion, rel_fro
 from bmx.cache.rope import apply_rope
+from bmx.cache.spectral import query_position_moment
 
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
 DEPLOY_S = 32768
 
 
-def load_layer_keys(cache_path: str) -> dict[int, dict[str, torch.Tensor]]:
-    """Load a cache file and bucket its tensors by layer index."""
-    cache = load_cache(cache_path)
+def bucket_layer_keys(cache: dict) -> dict[int, dict[str, torch.Tensor]]:
+    """Bucket an already-loaded cache dict's tensors by layer index."""
     layer_keys: dict[int, dict[str, torch.Tensor]] = {}
     for key, tensor in cache.items():
         m = _LAYER_RE.match(key)
@@ -26,6 +26,11 @@ def load_layer_keys(cache_path: str) -> dict[int, dict[str, torch.Tensor]]:
             continue
         layer_keys.setdefault(int(m.group(1)), {})[m.group(2)] = tensor
     return layer_keys
+
+
+def load_layer_keys(cache_path: str) -> dict[int, dict[str, torch.Tensor]]:
+    """Load a cache file and bucket its tensors by layer index."""
+    return bucket_layer_keys(load_cache(cache_path))
 
 
 def setup_rope(model_name: str, layer_keys: dict[int, dict[str, torch.Tensor]], layers):
@@ -61,6 +66,34 @@ def setup_rope(model_name: str, layer_keys: dict[int, dict[str, torch.Tensor]], 
         assert rel < 2e-2, f"RoPE self-validation FAILED: {rel:.4f} >= 2e-2"
 
     return rope_ready, get_cos_sin
+
+
+def corpus_query_moment(
+    corpus_layer_keys,
+    corpus_get_cos_sins,
+    rope_ready,
+    layer_i,
+    h_kv,
+    d,
+    position_stride,
+):
+    """Equal-weight per-cache average of query_position_moment over corpus caches.
+
+    The deployment-grade W (query-heldout): each cache contributes its own stored
+    queries with its own RoPE tables; no scored-cache query information enters.
+    """
+    W_sum = torch.zeros(h_kv, d, d, dtype=torch.float64)
+    for lk, get_cs in zip(corpus_layer_keys, corpus_get_cos_sins):
+        c_q_t = lk[layer_i]["q"]
+        c_S = lk[layer_i]["k_pre"].shape[1]
+        if rope_ready:
+            c_cos, c_sin = get_cs(c_S)
+        else:
+            c_cos, c_sin = torch.ones(c_S, d), torch.zeros(c_S, d)
+        W_sum += query_position_moment(
+            c_q_t.float(), c_cos, c_sin, h_kv, position_stride=position_stride
+        )
+    return W_sum / len(corpus_layer_keys)
 
 
 def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_t, M):

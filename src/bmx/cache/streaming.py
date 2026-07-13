@@ -27,6 +27,8 @@ Memory pruning:
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 from transformers.cache_utils import Cache, DynamicLayer
 
@@ -207,6 +209,15 @@ class StreamingQuantizedLayer(DynamicLayer):
             # codec_bpe here is the model-level payload+scale bpe; the per-sequence
             # skeptic pack charge is added once in bits_per_entry(), not per block.
             M = to_matrix(k_block_pre)  # (block_len, h*d) fp32
+            if self._pack.enc.device != k_block_pre.device:
+                # One-time device placement (packs load on CPU; move once, not per block).
+                self._pack = dataclasses.replace(
+                    self._pack,
+                    enc=self._pack.enc.to(k_block_pre.device),
+                    dec=self._pack.dec.to(k_block_pre.device),
+                    lam=self._pack.lam.to(k_block_pre.device),
+                    bits=self._pack.bits.to(k_block_pre.device),
+                )
             M_hat, codec_bpe = spectral_quantize(M, self._pack, mse_scale=True)
             k_hat_pre = from_matrix(M_hat, h)  # (h_kv, block_len, d)
         else:
@@ -397,7 +408,10 @@ class StreamingQuantizedCache(Cache):
         # len(self.layers) <= layer_idx) -- so len(self.layers) at call time IS the
         # new layer's index. Used to hand each layer its own pack. This closure only
         # ever EXECUTES from inside a later update() call (never during __init__
-        # itself), by which point self.k_spec/_pack_for_layer are fully set up below.
+        # itself) OR from attach()'s pre-size loop below, by which point
+        # self.k_spec/_pack_for_layer are fully set up below. Stored as
+        # self._make_layer so attach() reuses the exact same construction path
+        # instead of re-spelling the constructor call.
         def _make_layer():
             return StreamingQuantizedLayer(
                 k_spec,
@@ -407,6 +421,7 @@ class StreamingQuantizedCache(Cache):
                 pack=self._pack_for_layer(len(self.layers)),
             )
 
+        self._make_layer = _make_layer
         super().__init__(layer_class_to_replicate=_make_layer)
         self.model_config = model_config
         self.k_spec = k_spec
@@ -439,19 +454,23 @@ class StreamingQuantizedCache(Cache):
 
         # Pre-size: ensure self.layers[i] exists for every model layer so the
         # hook can always find self.layers[i] when it fires (before update).
+        # Reuses the same _make_layer closure __init__ hands to
+        # layer_class_to_replicate, so there is one construction path, not two.
         n_layers = model_config_n_layers(model)
         while len(self.layers) < n_layers:
-            self.layers.append(
-                StreamingQuantizedLayer(
-                    self.k_spec,
-                    self.v_spec,
-                    self.model_config,
-                    self.recent_window,
-                    pack=self._pack_for_layer(len(self.layers)),
-                )
+            self.layers.append(self._make_layer())
+
+        decoder_layers = resolve_decoder_layers(model)
+        if not hasattr(decoder_layers[0], "self_attn") or not hasattr(
+            decoder_layers[0].self_attn, "k_proj"
+        ):
+            raise ValueError(
+                f"unsupported architecture {model.config.model_type!r} for pre-RoPE "
+                "streaming: attach() hooks self_attn.k_proj (Llama-family); GPT-2-style "
+                "fused c_attn is not supported"
             )
 
-        for i, mlayer in enumerate(resolve_decoder_layers(model)):
+        for i, mlayer in enumerate(decoder_layers):
 
             def k_hook(module, inp, out, i=i):
                 self.layers[i].stash_pre_rope(out)

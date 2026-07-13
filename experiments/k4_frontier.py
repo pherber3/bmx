@@ -53,7 +53,14 @@ from bmx.cache.spectral import (
 from bmx.decomp.lrs import truncated_svd
 from bmx.quant.hadamard import random_orthogonal
 from bmx.quant.rtn import rtn_quantize
-from experiments._k4_common import DEPLOY_S, _score_tail, load_layer_keys, setup_rope
+from experiments._k4_common import (
+    DEPLOY_S,
+    _score_tail,
+    bucket_layer_keys,
+    corpus_query_moment,
+    load_layer_keys,
+    setup_rope,
+)
 
 _W_SOURCES = {"scored", "corpus"}
 
@@ -159,8 +166,9 @@ def main(cfg: Config):
 
     corpus_caches = [load_cache(p) for p in cfg.corpus_cache_paths]
     # Per-cache layer-keyed view + per-cache RoPE, only needed for w_source
-    # "corpus" (mirrors k4_fit_packs.py's per-cache W loop exactly).
-    corpus_layer_keys = [load_layer_keys(p) for p in cfg.corpus_cache_paths]
+    # "corpus" (mirrors k4_fit_packs.py's per-cache W loop exactly). Reuses
+    # corpus_caches (already loaded above) instead of re-reading each file.
+    corpus_layer_keys = [bucket_layer_keys(c) for c in corpus_caches]
     corpus_get_cos_sins = []
     corpus_rope_ready = False
     for lk in corpus_layer_keys:
@@ -258,23 +266,15 @@ def main(cfg: Config):
         # query_position_moment over the corpus caches' own queries (equal-
         # weight per cache, same convention as k4_fit_packs.py).
         if cfg.w_source == "corpus":
-            W_sum = torch.zeros(h_kv, d, d, dtype=torch.float64)
-            for lk, c_get_cos_sin in zip(corpus_layer_keys, corpus_get_cos_sins):
-                c_q_t = lk[layer_i]["q"]
-                c_S = lk[layer_i]["k_pre"].shape[1]
-                if corpus_rope_ready:
-                    c_cos, c_sin = c_get_cos_sin(c_S)
-                else:
-                    c_cos = torch.ones(c_S, d)
-                    c_sin = torch.zeros(c_S, d)
-                W_sum += query_position_moment(
-                    c_q_t.float(),
-                    c_cos,
-                    c_sin,
-                    h_kv,
-                    position_stride=cfg.position_stride,
-                )
-            W_blocks = W_sum / len(corpus_layer_keys)
+            W_blocks = corpus_query_moment(
+                corpus_layer_keys,
+                corpus_get_cos_sins,
+                corpus_rope_ready,
+                layer_i,
+                h_kv,
+                d,
+                cfg.position_stride,
+            )
         else:  # "scored"
             W_blocks = query_position_moment(
                 q_t.float(), cos_l, sin_l, h_kv, position_stride=cfg.position_stride
