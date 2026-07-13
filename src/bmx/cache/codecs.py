@@ -56,6 +56,7 @@ _ARM_TABLE: dict[str, _ArmTraits] = {
     "lowrank_blockdiagwaterfill_channel": _ArmTraits(s_divisible=True),
     "lowrank_frozenwaterfill_channel": _ArmTraits(s_divisible=True),
     "lowrank_oraclewaterfill_channel": _ArmTraits(s_divisible=True),
+    "spectral": _ArmTraits(s_divisible=True),
 }
 
 CACHE_ARMS = tuple(_ARM_TABLE)
@@ -801,6 +802,11 @@ def quantize_cache(
         Honest bits-per-entry including ALL metadata.
     """
     assert arm in CACHE_ARMS, f"unknown arm {arm!r}; available: {CACHE_ARMS}"
+
+    if arm == "spectral":
+        raise NotImplementedError(
+            "spectral requires a fitted pack; it runs through StreamingQuantizedLayer (see bmx.cache.streaming) or spectral_quantize directly"
+        )
 
     if arm in _SPLIT_ARMS:
         packed, bpe = quantize_packed(

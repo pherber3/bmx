@@ -28,6 +28,12 @@ class CacheCodecSpec:
     pre_rope : bool
         If True, quantize keys in pre-RoPE space, then apply_rope before use.
         Ignored for V (V has no RoPE in standard transformer families).
+    pack_path : str
+        File path to a fitted pack (for ``"spectral"`` arm); empty string for
+        packless arms (default-inert).
+    budget : float
+        Quantization budget in bits (for ``"spectral"`` arm); 0.0 for packless
+        arms (default-inert).
     """
 
     arm: str = "fp16"
@@ -36,3 +42,5 @@ class CacheCodecSpec:
     group: int = 64
     seed: int = 0
     pre_rope: bool = False
+    pack_path: str = ""
+    budget: float = 0.0

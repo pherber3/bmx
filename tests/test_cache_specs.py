@@ -13,3 +13,8 @@ def test_spec_defaults():
         0,
         False,
     )
+
+
+def test_spec_pack_fields_default_inert():
+    s = CacheCodecSpec(arm="rtn_channel", bits=3)
+    assert s.pack_path == "" and s.budget == 0.0

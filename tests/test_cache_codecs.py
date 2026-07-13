@@ -89,8 +89,9 @@ class TestBitAccounting:
 
 
 class TestMonotonicity:
-    @pytest.mark.parametrize("arm", list(CACHE_ARMS))
+    @pytest.mark.parametrize("arm", [a for a in CACHE_ARMS if a != "spectral"])
     def test_higher_bits_lower_error(self, arm: str):
+        # pack-gated arm — no packless dispatch
         M = _seeded_matrix(seed=99)
         kwargs: dict = dict(seed=SEED, group=GROUP, rank=RANK)
         # b=2 and b=4 are valid for every arm (turboquant_prod requires b>=2)
@@ -1155,3 +1156,12 @@ def test_bpe_term_helpers_are_the_audit_surface():
     assert norm_bits(8, 1024) == 16.0 * 8 / 1024
     assert factor_bits(16, 256, 1024) == 16.0 * 16 * (256 + 1024) / (256 * 1024)
     assert tier_bits((0, 2, 3, 4), 256) == 2 / 256  # ceil(log2(4)) = 2
+
+
+def test_spectral_registered_but_not_dispatchable():
+    from bmx.cache.codecs import S_DIVISIBILITY_ARMS
+
+    assert "spectral" in CACHE_ARMS and "spectral" in S_DIVISIBILITY_ARMS
+    M = torch.randn(64, 16)
+    with pytest.raises(NotImplementedError, match="pack"):
+        quantize_cache("spectral", M, bits=0)
