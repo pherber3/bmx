@@ -23,6 +23,17 @@ Memory pruning:
   After committing a pre-RoPE block to _q_prefix_k, the corresponding columns of
   _k_pre are no longer needed (write-once!). We prune _k_pre to keep only the
   un-flushed tail, tracking the offset (_k_pre_offset) so indexing stays correct.
+
+Batched flush:
+  One update() may commit many PAGE-token pages at once (a 31.5k prefill is
+  ~245 pages). Codecs whose math is GEMM-free — plus spectral, which has no
+  packed twin to stay parity-bound to (_flush_batchable) — quantize ALL new
+  pages in ONE call, bit-identical to the per-page loop because their
+  scales/norms/groups never span a page boundary; both paths append to the
+  frozen prefix with ONE torch.cat per side per update (the per-page cat was
+  an O(S²/PAGE) prefix re-copy). Per-page semantics (uniform paged layout,
+  write-once from pristine source) are unchanged; the bitwise A/B gate lives
+  in tests/test_streaming_batched_flush.py.
 """
 
 from __future__ import annotations
@@ -49,12 +60,71 @@ from bmx.cache.spectral import (
     spectral_quantize,
 )
 from bmx.decomp.lrs import truncated_svd
+from bmx.quant.hadamard import is_power_of_2
 
 # Lowrank K arms that share the frozen pre-RoPE subspace path: V fitted once at
 # the first flush, later blocks projected onto it (never refit per block). Both
 # accept svd_factors=(Us, V) in quantize_cache; they differ only in how the
 # post-lowrank residual is coded (per-channel RTN vs turboquant-MSE).
 _FROZEN_SUBSPACE_ARMS = frozenset({"lowrank_rtn_channel", "lowrank_turboquant"})
+
+
+def _flush_batchable(
+    spec: CacheCodecSpec,
+    h_kv: int,
+    d_head: int,
+    page: int,
+    pack: SpectralPack | None = None,
+) -> bool:
+    """True iff N stacked PAGE-token pages can be quantized in ONE codec call
+    bit-identically to N per-page calls (the batched-flush license).
+
+    Group/window structure never spans a page boundary for the licensed arms —
+    rtn_token groups run along C (per-row); rtn_channel groups run along S but
+    stay page-aligned when PAGE % group == 0; turboquant norms are per-(row,
+    head); the Hadamard rotation is per-row butterflies (fwht). That makes the
+    elementwise/per-group arms bit-identical by construction; the per-row NORM
+    reductions (turboquant_*) and spectral's enc/dec matmuls are pinned by the
+    CPU A/B oracle (tests/test_streaming_batched_flush.py) and re-pinned on
+    CUDA by the same test's cuda parametrization at the GH200 gate — reduction
+    split config and BLAS kernel selection are shape-dependent there, so CPU
+    equality alone does not prove it. GEMM-bearing codecs (lowrank_* factor
+    products, turboquant_prod's QJL sketch, the random-orthogonal rotation
+    fallback when the rotated dim is not a power of 2) stay on the per-page
+    loop: for the lowrank_* arms even a passing CUDA A/B would not license
+    batching, because PackedStreamingLayer packs the same pages per page at
+    (PAGE, C) shapes (the GH200 streaming-vs-packed parity gate), and their
+    factor_bits accounting is S-dependent.
+
+    spectral is the licensed exception despite its enc/dec matmuls: it is
+    pack-gated and never routes through PackedStreamingCache, so no packed
+    twin — hence no GH200 packed-parity constraint — exists for it; its only
+    bitwise gate is the CPU streaming-vs-offline replay, and the batched A/B
+    test pins the enc/dec row-batch invariance there. Its RTN group windows
+    run along S and stay page-aligned (PAGE % pack.group == 0, checked below),
+    so per-group scales and mse_scale iterations are identical either way.
+    Whole-span is also the call granularity the offline G1 gauntlet
+    (k4_frontier/k4_spectra) actually measured — one spectral_quantize per
+    matrix — so the per-page loop was the deviation, not the batch.
+    """
+    C = h_kv * d_head
+    if spec.arm in ("fp16", "rtn_token"):
+        return True
+    if spec.arm == "rtn_channel":
+        # Groups run along S: page-aligned iff group divides PAGE (guaranteed
+        # when rtn_channel is the K arm by _page's construction; a V group that
+        # doesn't divide PAGE keeps the per-page loop — and its S % group
+        # assert — exactly as before).
+        return page % spec.group == 0
+    if spec.arm in ("rotate_rtn_token", "turboquant_mse"):
+        return is_power_of_2(C)  # fwht path only; non-pow2 C rotates via a GEMM
+    if spec.arm == "turboquant_mse_perhead":
+        return is_power_of_2(d_head)  # per-head fwht over d_head
+    if spec.arm == "spectral":
+        # Alignment is checked against the pack's own group (sidecar-loaded) —
+        # that is what spectral_quantize asserts along S, not spec.group.
+        return pack is not None and page % pack.group == 0
+    return False
 
 
 def compute_flush_schedule(S: int, W: int, g: int) -> int:
@@ -135,6 +205,16 @@ class StreamingQuantizedLayer(DynamicLayer):
         # uniform PAGE-token blocks -> bit-for-bit parity (the shared-schedule
         # contract). Multiple of _g; default 128.
         self._page = max(self._g, (128 // self._g) * self._g) if self._g > 1 else 128
+        # Batched-flush license per side: True iff all newly-flushable pages of
+        # one update() can go through ONE codec call bit-identically to the
+        # per-page loop (see _flush_batchable). GEMM-bearing arms stay per-page,
+        # except spectral (no packed twin; licensed whole-span with its pack).
+        self._k_flush_batchable = _flush_batchable(
+            k_spec, self._h_kv, self._d_head, self._page, pack=pack
+        )
+        self._v_flush_batchable = _flush_batchable(
+            v_spec, self._h_kv, self._d_head, self._page
+        )
         # RoPE cos/sin: one growing (max_S, d_head) table, extended per flush block
         # (covered length is self._rope_cos.shape[0]).
         self._rope_cos: torch.Tensor | None = None
@@ -226,7 +306,11 @@ class StreamingQuantizedLayer(DynamicLayer):
             k_hat_pre, codec_bpe = quantize_kv_layout(k_block_pre, spec)
 
         # Extend the growing RoPE table to cover [covered, new_committed), then
-        # slice this block's positions [committed, new_committed).
+        # slice this block's positions [committed, new_committed). Exact for the
+        # static rope_scaling types this repo targets (default, llama3 — pure
+        # outer products, position-independent); a "dynamic" NTK config would
+        # recompute inv_freq from max position, making one big extension differ
+        # from page-sized ones — batching would need a guard there.
         covered = 0 if self._rope_cos is None else self._rope_cos.shape[0]
         if new_committed > covered:
             new_cos, new_sin = rope_cos_sin(
@@ -245,6 +329,30 @@ class StreamingQuantizedLayer(DynamicLayer):
         k_block_post = apply_rope(k_hat_pre.float(), cos, sin)  # (h_kv, block_len, d)
 
         return k_block_post, codec_bpe
+
+    def _quantize_k_flush(self, keys, start: int, end: int):
+        """Quantize K tokens [start, end) from their pristine source.
+
+        Pristine source: the pre-RoPE capture buffer when k_spec.pre_rope (RoPE
+        applied at true positions after quantization), else the post-RoPE fp16
+        region inside `keys` — already RoPE'd at its correct positions, pristine
+        because it was in the fp16 tail until now. Called once with the whole
+        flush span (batchable codecs) or once per PAGE (GEMM-bearing codecs) —
+        one body for both paths so they cannot drift.
+
+        Returns (k_post (h_kv, end-start, d) fp32, codec_bpe).
+        """
+        if self.k_spec.pre_rope:
+            lo = start - self._k_pre_offset
+            k_block_pre = self._k_pre[:, lo : lo + (end - start), :].float()
+            return self._quantize_k_block_pre_rope(k_block_pre, start, end)
+        k_block_fp32 = keys.squeeze(0)[..., start:end, :].float()
+        return quantize_kv_layout(k_block_fp32, self.k_spec)
+
+    def _quantize_v_flush(self, values, start: int, end: int):
+        """Quantize V tokens [start, end) (pristine fp16 in the tail until now)."""
+        v_block_fp32 = values.squeeze(0)[..., start:end, :].float()
+        return quantize_kv_layout(v_block_fp32, self.v_spec)
 
     def update(self, key_states, value_states, *args, **kwargs):
         # Let DynamicLayer concat + return the full (post-RoPE) keys/values.
@@ -291,52 +399,68 @@ class StreamingQuantizedLayer(DynamicLayer):
         # --- New region [_committed_S_q : new_S_q] is ready to flush. ---
         # Emit it as uniform PAGE-token blocks (matching PackedStreamingLayer): each
         # page quantized ONCE from pristine source and appended to the frozen prefix.
-        for pg0 in range(self._committed_S_q, new_S_q, self._page):
-            block_start = pg0
-            block_end = pg0 + self._page
-            block_len = self._page
+        # Batchable codecs (_flush_batchable) quantize ALL new pages in one call —
+        # bit-identical to the per-page loop because their scales/norms/groups never
+        # span a page boundary; GEMM-bearing codecs (lowrank_*, turboquant_prod)
+        # keep the per-page loop so every matmul runs at the reference (PAGE, C)
+        # shape. Both paths collect blocks and extend the prefix with ONE torch.cat
+        # per side below (the per-page cat was an O(S²/PAGE) prefix re-copy at
+        # prefill).
+        committed = self._committed_S_q
+        n_pages = (new_S_q - committed) // self._page
+        page_entries = self._page * self._h_kv * self._d_head
+        if self.k_spec.pre_rope:
+            assert self._k_pre is not None, (
+                "k_spec.pre_rope=True but no captured pre-RoPE keys; "
+                "call cache.attach(model) before prefill"
+            )
 
-            # --- Quantize K page ---
-            if self.k_spec.pre_rope:
-                assert self._k_pre is not None, (
-                    "k_spec.pre_rope=True but no captured pre-RoPE keys; "
-                    "call cache.attach(model) before prefill"
+        # --- Quantize K pages ---
+        new_k_blocks: list[torch.Tensor] = []
+        if self._k_flush_batchable:
+            k_span, codec_bpe_k = self._quantize_k_flush(keys, committed, new_S_q)
+            new_k_blocks.append(k_span.to(cache_dtype))
+            # Batchable codecs report an S/data-independent codec_bpe — the exact
+            # float every per-page call returned — so accumulating page-by-page
+            # reproduces the per-page loop's float sum bit-for-bit.
+            for _ in range(n_pages):
+                self._quant_bits_k += codec_bpe_k * page_entries
+        else:
+            for pg0 in range(committed, new_S_q, self._page):
+                k_block, codec_bpe_k = self._quantize_k_flush(
+                    keys, pg0, pg0 + self._page
                 )
-                local_start = block_start - self._k_pre_offset
-                local_end = block_end - self._k_pre_offset
-                k_block_pre = self._k_pre[
-                    :, local_start:local_end, :
-                ].float()  # (h_kv, PAGE, d)
-                k_block_post, codec_bpe_k = self._quantize_k_block_pre_rope(
-                    k_block_pre, block_start, block_end
+                new_k_blocks.append(k_block.to(cache_dtype))
+                self._quant_bits_k += codec_bpe_k * page_entries
+
+        # --- Quantize V pages (pristine fp16 in the tail until now) ---
+        new_v_blocks: list[torch.Tensor] = []
+        if self._v_flush_batchable:
+            v_span, codec_bpe_v = self._quantize_v_flush(values, committed, new_S_q)
+            new_v_blocks.append(v_span.to(cache_dtype))
+            for _ in range(n_pages):
+                self._quant_bits_v += codec_bpe_v * page_entries
+        else:
+            for pg0 in range(committed, new_S_q, self._page):
+                v_block, codec_bpe_v = self._quantize_v_flush(
+                    values, pg0, pg0 + self._page
                 )
-                k_block_post = k_block_post.to(cache_dtype)
-            else:
-                # Post-RoPE keys: the page is already RoPE'd at its correct positions
-                # inside `keys`; pristine because it was in the fp16 tail until now.
-                k_block_fp32 = keys.squeeze(0)[..., block_start:block_end, :].float()
-                k_block_post_raw, codec_bpe_k = quantize_kv_layout(
-                    k_block_fp32, self.k_spec
-                )
-                k_block_post = k_block_post_raw.to(cache_dtype)
+                new_v_blocks.append(v_block.to(cache_dtype))
+                self._quant_bits_v += codec_bpe_v * page_entries
 
-            # --- Quantize V page (pristine fp16 in the tail until now) ---
-            v_block_fp32 = values.squeeze(0)[..., block_start:block_end, :].float()
-            v_block_raw, codec_bpe_v = quantize_kv_layout(v_block_fp32, self.v_spec)
-            v_block = v_block_raw.to(cache_dtype)
-
-            # --- Append page to frozen prefix ---
-            if self._q_prefix_k is None:
-                self._q_prefix_k = k_block_post
-                self._q_prefix_v = v_block
-            else:
-                self._q_prefix_k = torch.cat([self._q_prefix_k, k_block_post], dim=-2)
-                self._q_prefix_v = torch.cat([self._q_prefix_v, v_block], dim=-2)
-
-            # --- Accumulate honest bits ---
-            block_entries = block_len * self._h_kv * self._d_head
-            self._quant_bits_k += codec_bpe_k * block_entries
-            self._quant_bits_v += codec_bpe_v * block_entries
+        # --- Append to frozen prefix: ONE cat per side per update ---
+        k_parts = (
+            [self._q_prefix_k] if self._q_prefix_k is not None else []
+        ) + new_k_blocks
+        v_parts = (
+            [self._q_prefix_v] if self._q_prefix_v is not None else []
+        ) + new_v_blocks
+        self._q_prefix_k = (
+            k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts, dim=-2)
+        )
+        self._q_prefix_v = (
+            v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts, dim=-2)
+        )
 
         # --- Update committed counter ---
         self._committed_S_q = new_S_q
