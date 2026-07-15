@@ -1,0 +1,24 @@
+{
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "device": "cuda",
+  "arms": [
+    "k4_b2.5"
+  ],
+  "tasks": [
+    "lcc",
+    "repobench-p"
+  ],
+  "categories": [
+    "multi_qa"
+  ],
+  "longbench_version": "v1",
+  "n_samples": null,
+  "max_prompt_tokens": 31500,
+  "chat_wrap": false,
+  "n_prefill": 128,
+  "rank": 16,
+  "group": 64,
+  "seed": 0,
+  "pack_path": "results/cache/k4_packs_llama31_instruct.safetensors",
+  "resume": null
+}

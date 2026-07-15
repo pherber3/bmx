@@ -1,0 +1,24 @@
+{
+  "g2_pass": true,
+  "ppl_fp16": 7.231156826019287,
+  "sens_bits": 2,
+  "targets": {
+    "2.5": {
+      "ppl_allocated": 7.250401973724365,
+      "ppl_uniform": 7.4606451988220215,
+      "bpe_k_allocated": 2.515625,
+      "bpe_k_uniform": 2.515625,
+      "mean_bits_check_pass": true,
+      "pass_": true
+    },
+    "3.0": {
+      "ppl_allocated": 7.185824394226074,
+      "ppl_uniform": 7.262110710144043,
+      "bpe_k_allocated": 3.015625,
+      "bpe_k_uniform": 3.015625,
+      "mean_bits_check_pass": true,
+      "pass_": true
+    }
+  },
+  "note": "Exercises the ALLOCATION lever with existing arms (turboquant_mse at integer bit grids); the spectral codec's own across-layer allocation lands with the Stage-3 integration plan."
+}
