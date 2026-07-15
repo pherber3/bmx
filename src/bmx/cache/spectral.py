@@ -221,6 +221,7 @@ def save_pack_file(
     tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8),
     group: int = 64,
     meta: dict | None = None,
+    layer_budgets: dict[float, dict[int, float]] | None = None,
 ) -> None:
     """Save per-layer bases + per-budget bit allocations to one safetensors file.
 
@@ -229,6 +230,12 @@ def save_pack_file(
     allocator — reloaded packs are allocation-frozen artifacts, not re-fit.
     A JSON sidecar at `<path>.json` carries tiers/group/budgets/meta since
     safetensors only stores tensors.
+
+    `layer_budgets`, when given, maps each entry of `budgets` (then a target
+    MEAN label) to {layer: allocated budget}: layer i's bits are waterfilled
+    at layer_budgets[budget][i] but stored under the label `bits_b{budget:g}`,
+    so `load_packs` / streaming / recipes select an allocated pack with zero
+    changes. The allocation itself should be recorded by the caller in `meta`.
     """
     tensors: dict[str, torch.Tensor] = {}
     for i, basis in bases.items():
@@ -236,12 +243,17 @@ def save_pack_file(
         tensors[f"layer{i}.dec"] = basis.dec
         tensors[f"layer{i}.lam"] = basis.lam
         for budget in budgets:
-            pack = pack_from_basis(basis, budget, tiers=tiers, group=group)
+            b_i = budget if layer_budgets is None else layer_budgets[budget][i]
+            pack = pack_from_basis(basis, b_i, tiers=tiers, group=group)
             tensors[f"layer{i}.bits_b{budget:g}"] = pack.bits
     save_file(tensors, str(path))
 
     sidecar = {"tiers": list(tiers), "group": group, "budgets": list(budgets)}
     if meta:
+        collisions = set(meta) & set(sidecar)
+        assert not collisions, (
+            f"meta keys collide with sidecar keys: {sorted(collisions)}"
+        )
         sidecar.update(meta)
     Path(str(path) + ".json").write_text(json.dumps(sidecar))
 

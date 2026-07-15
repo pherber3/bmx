@@ -181,6 +181,116 @@ def test_k4_fit_packs_smoke(tmp_path):
     assert side["w_source"] == "corpus"
 
 
+def test_k4_fit_packs_alloc_mode(tmp_path):
+    import pandas as pd
+
+    from bmx.cache.spectral import load_packs
+    from experiments.k4_fit_packs import Config, main
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+
+    # k4_alloc Part A schema: kind=="sensitivity" rows carrying layer + s_i.
+    sens = pd.DataFrame(
+        [
+            dict(
+                model="tiny",
+                layer=layer,
+                kind="sensitivity",
+                s_i=s_i,
+                ppl=1.0,
+                sens_bits=2,
+                n_prefill=768,
+            )
+            for layer, s_i in ((0, 0.5), (1, 0.05))  # s_0 = 10 * s_1 > 0
+        ]
+    )
+    sens_path = tmp_path / "sens.parquet"
+    sens.to_parquet(sens_path)
+
+    out = tmp_path / "packs.safetensors"
+    cfg = Config(
+        corpus_cache_paths=(str(p1), str(p2)),
+        out_path=str(out),
+        model_label="tiny",
+        budgets=(2.5,),
+        group=16,
+        alloc_sens_parquet=str(sens_path),
+        out_root=str(tmp_path / "results"),
+    )
+    main(cfg)
+
+    side = json.loads(open(str(out) + ".json").read())
+    # (c) sidecar records the allocation map + provenance.
+    assert side["alloc_sens_parquet"] == str(sens_path)
+    alloc = side["alloc"]["2.5"]
+    assert set(alloc) == {"0", "1"}
+    assert set(side["alloc_sensitivities"]) == {"0", "1"}
+    # (b) across-layer mean of allocated budgets == target within the greedy
+    # step tolerance (k4_alloc's grid_step/n_layer form; grid step = 0.25).
+    realized = sum(alloc.values()) / len(alloc)
+    assert abs(realized - 2.5) <= 0.25 / 2 + 1e-9
+    # (a) the sensitive layer gets strictly more budget, hence strictly more
+    # mean per-direction bits (both layers share one spectrum by construction,
+    # so any difference is attributable to s alone).
+    assert alloc["0"] > alloc["1"]
+    packs = load_packs(out, 2.5)
+    mean_bits = {i: packs[i].bits.double().mean().item() for i in (0, 1)}
+    assert mean_bits[0] > mean_bits[1]
+    # (d) the file's bits realize the sidecar allocation: waterfill is
+    # budget-feasible (mean payload bits <= that layer's allocated budget).
+    for i in (0, 1):
+        assert mean_bits[i] <= alloc[str(i)] + 1e-9
+
+
+def test_k4_fit_packs_default_unchanged(tmp_path):
+    from safetensors.torch import load_file
+
+    from bmx.cache.collect import to_matrix
+    from bmx.cache.spectral import assemble_whitener, fit_spectral_basis, save_pack_file
+    from experiments._k4_common import corpus_query_moment, load_layer_keys, setup_rope
+    from experiments.k4_fit_packs import Config, main
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+
+    out_main = tmp_path / "packs_main.safetensors"
+    cfg = Config(
+        corpus_cache_paths=(str(p1), str(p2)),
+        out_path=str(out_main),
+        model_label="tiny",
+        budgets=(2.0, 2.5),
+        group=16,
+        out_root=str(tmp_path / "results"),
+    )
+    main(cfg)  # alloc_sens_parquet="" (default): must stay uniform
+
+    # Pre-change reference: the same fit driven directly through the library
+    # helpers + save_pack_file with uniform budgets.
+    per_cache = [load_layer_keys(str(p)) for p in (p1, p2)]
+    layers = sorted(per_cache[0].keys())
+    get_cos_sins = [setup_rope("", lk, layers)[1] for lk in per_cache]
+    bases = {}
+    for layer_i in layers:
+        M_fit = torch.cat([to_matrix(lk[layer_i]["k_pre"]) for lk in per_cache], dim=0)
+        h_kv, _, d = per_cache[0][layer_i]["k_pre"].shape
+        W_blocks = corpus_query_moment(
+            per_cache, get_cos_sins, False, layer_i, h_kv, d, cfg.position_stride
+        )
+        Wh, Wh_inv = assemble_whitener(W_blocks, ridge=cfg.ridge)
+        bases[layer_i] = fit_spectral_basis(M_fit, Wh, Wh_inv)
+    out_ref = tmp_path / "packs_ref.safetensors"
+    save_pack_file(out_ref, bases, cfg.budgets, tiers=cfg.tiers, group=cfg.group)
+
+    t_main = load_file(str(out_main))
+    t_ref = load_file(str(out_ref))
+    assert set(t_main) == set(t_ref)
+    for key in t_main:
+        assert torch.equal(t_main[key], t_ref[key]), f"tensor {key} differs"
+
+
 def test_k4_spectra_w_source_corpus(tmp_path):
     import pandas as pd
 
