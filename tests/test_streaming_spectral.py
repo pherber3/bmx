@@ -202,3 +202,66 @@ def test_spectral_pack_device_move_is_noop_on_cpu():
     assert torch.equal(moved.dec, pack.dec)
     assert torch.equal(moved.lam, pack.lam)
     assert torch.equal(moved.bits, pack.bits)
+
+
+def test_bits_per_entry_averages_layers_for_allocated_packs(tmp_path):
+    """bits_per_entry must report the ACROSS-LAYER mean payload, not layers[-1].
+
+    Regression: allocated packs (per-layer budgets, mean-preserving) put the
+    floor budget on the least-sensitive layers; reading only the last layer
+    under-reported the whole cache by ~1 bit (2026-07-15 alloc probe — bpe_k
+    identical across k4_b2.2/k4_b2.5 because layer 31 drew 1.0 in both)."""
+    import json
+
+    from bmx.cache.collect import to_matrix
+    from bmx.cache.spectral import fit_spectral_basis, identity_whitener, save_pack_file
+
+    model = tiny_llama()
+    from bmx.cache.collect import collect_cache
+
+    torch.manual_seed(0)
+    cache_d = collect_cache(model, ids(seq=64))
+    n_layer = model.config.num_hidden_layers
+    bases = {}
+    for i in range(n_layer):
+        M = to_matrix(cache_d[f"layer{i}.k_pre"]).float()
+        Wh, Wh_inv = identity_whitener(M.shape[1])
+        bases[i] = fit_spectral_basis(M, Wh, Wh_inv)
+    path = str(tmp_path / "alloc_packs.safetensors")
+    # Deliberately non-uniform: layer 0 rich, layer 1 poor, mean 2.5.
+    layer_budgets = {2.5: {0: 4.0, 1: 1.0}}
+    assert n_layer == 2, "tiny_llama fixture is expected to have 2 layers"
+    save_pack_file(
+        path,
+        bases,
+        budgets=(2.5,),
+        group=8,
+        meta={"model": "tiny"},
+        layer_budgets=layer_budgets,
+    )
+    side = json.loads(open(path + ".json").read())
+    assert "budgets" in side
+
+    k_spec = CacheCodecSpec(
+        arm="spectral", pre_rope=True, group=8, pack_path=path, budget=2.5
+    )
+    # seq=150 + recent_window=8 crosses the PAGE(128) flush threshold (the
+    # seq=64/window=32 default never flushes — same note as the parity test).
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=CacheCodecSpec(arm="fp16"), recent_window=8
+    )
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(ids(seq=150), past_key_values=cache, use_cache=True)
+    bpe_k, _ = cache.bits_per_entry()
+    per_layer = [layer.bpe_k for layer in cache.layers]
+    assert per_layer[0] != per_layer[1], "allocated layers must differ (fixture)"
+    from bmx.cache.spectral import skeptic_charge
+
+    S = cache.layers[-1].get_seq_length()
+    C = cache.layers[-1]._h_kv * cache.layers[-1]._d_head
+    expected = sum(per_layer) / len(per_layer) + skeptic_charge(
+        C, S, cache.layers[-1]._pack.tiers
+    )
+    assert abs(bpe_k - expected) < 1e-9

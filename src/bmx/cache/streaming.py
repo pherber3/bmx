@@ -634,7 +634,14 @@ class StreamingQuantizedCache(Cache):
         return layer.keys, layer.values
 
     def bits_per_entry(self):
-        """(bpe_k, bpe_v) from the last layer's last quantize (uniform across layers).
+        """(bpe_k, bpe_v) — blended payload bpe averaged across layers.
+
+        The across-layer mean, not layers[-1]: allocated spectral packs give
+        each layer its own budget (mean-preserving), so any single layer's bpe
+        misstates the cache (layer 31 draws the floor budget and under-reported
+        the whole cache by ~1 bit until this was caught). For uniform packs and
+        every non-spectral arm the layers are identical, so the mean reproduces
+        the old single-layer value exactly.
 
         For the spectral K arm, bpe_k is the layer's blended block-payload bpe
         (quantized-prefix codec_bpe + fp16-tail 16.0, both already blended in
@@ -654,15 +661,18 @@ class StreamingQuantizedCache(Cache):
         if not self.layers:
             return float("nan"), float("nan")
         last = self.layers[-1]
-        bpe_k = last.bpe_k
+        bpe_k = sum(layer.bpe_k for layer in self.layers) / len(self.layers)
+        bpe_v = sum(layer.bpe_v for layer in self.layers) / len(self.layers)
         # Only charge once something has actually flushed through the spectral
         # path (_committed_S_q > 0); an all-fp16 cache (nothing quantized yet)
         # must report bpe_k == 16.0, not 16.0 + a charge for an unused pack.
+        # The charge is layer-independent (same C/S/tiers), so adding it after
+        # the mean equals averaging per-layer charged values.
         if self.k_spec.arm == "spectral" and last._committed_S_q > 0:
             S = last.get_seq_length()
             C = last._h_kv * last._d_head
             bpe_k = bpe_k + skeptic_charge(C, S, last._pack.tiers)
-        return bpe_k, last.bpe_v
+        return bpe_k, bpe_v
 
     def memory_report(
         self, seq_len: int, h_kv: int | None = None, d_head: int | None = None
