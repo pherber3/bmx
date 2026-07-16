@@ -222,22 +222,26 @@ def save_pack_file(
     group: int = 64,
     meta: dict | None = None,
     layer_budgets: dict[float, dict[int, float]] | None = None,
-) -> None:
+) -> dict[float, dict[int, SpectralPack]]:
     """Save per-layer bases + per-budget bit allocations to one safetensors file.
 
     Bits are computed via `pack_from_basis` at save time (the fp64 allocation
     input `basis.lam64` is only needed here) so `load_packs` never re-runs the
     allocator — reloaded packs are allocation-frozen artifacts, not re-fit.
     A JSON sidecar at `<path>.json` carries tiers/group/budgets/meta since
-    safetensors only stores tensors.
+    safetensors only stores tensors. Returns the packs it computed, keyed
+    [budget][layer], so callers can read stats off the exact saved allocation
+    without re-running the waterfill.
 
     `layer_budgets`, when given, maps each entry of `budgets` (then a target
     MEAN label) to {layer: allocated budget}: layer i's bits are waterfilled
     at layer_budgets[budget][i] but stored under the label `bits_b{budget:g}`,
     so `load_packs` / streaming / recipes select an allocated pack with zero
-    changes. The allocation itself should be recorded by the caller in `meta`.
+    changes. The allocation is written into the sidecar itself under the
+    reserved key "layer_budgets" (never trusted to the caller's `meta`).
     """
     tensors: dict[str, torch.Tensor] = {}
+    packs: dict[float, dict[int, SpectralPack]] = {b: {} for b in budgets}
     for i, basis in bases.items():
         tensors[f"layer{i}.enc"] = basis.enc
         tensors[f"layer{i}.dec"] = basis.dec
@@ -246,16 +250,23 @@ def save_pack_file(
             b_i = budget if layer_budgets is None else layer_budgets[budget][i]
             pack = pack_from_basis(basis, b_i, tiers=tiers, group=group)
             tensors[f"layer{i}.bits_b{budget:g}"] = pack.bits
+            packs[budget][i] = pack
     save_file(tensors, str(path))
 
-    sidecar = {"tiers": list(tiers), "group": group, "budgets": list(budgets)}
+    sidecar: dict = {"tiers": list(tiers), "group": group, "budgets": list(budgets)}
+    if layer_budgets is not None:
+        sidecar["layer_budgets"] = {
+            f"{budget:g}": {str(layer): b for layer, b in lb.items()}
+            for budget, lb in layer_budgets.items()
+        }
     if meta:
-        collisions = set(meta) & set(sidecar)
+        collisions = set(meta) & (set(sidecar) | {"layer_budgets"})
         assert not collisions, (
             f"meta keys collide with sidecar keys: {sorted(collisions)}"
         )
         sidecar.update(meta)
     Path(str(path) + ".json").write_text(json.dumps(sidecar))
+    return packs
 
 
 def load_packs(path: str | Path, budget: float) -> dict[int, SpectralPack]:

@@ -292,8 +292,7 @@ def test_batched_flush_bitwise_matches_reference(
     committed prefixes, reassembled keys/values, and exact bpe floats — across
     a multi-page flush, a multi-token no-flush step, and 1-token appends."""
     model = tiny_llama().to(device)
-    g = torch.Generator().manual_seed(29)
-    input_ids = torch.randint(0, 97, (1, 393), generator=g).to(device)
+    input_ids = ids(vocab=97, seq=393, seed=29).to(device)
     chunks = _flush_schedule_chunks(input_ids)
 
     prod_cache, prod_logits = _run_chunked(model, k_spec, v_spec, chunks)
@@ -334,8 +333,7 @@ def test_batched_flush_bitwise_matches_reference_spectral(
     )
     v_spec = CacheCodecSpec(arm="turboquant_mse", bits=2)
 
-    g = torch.Generator().manual_seed(29)
-    input_ids = torch.randint(0, 97, (1, 393), generator=g).to(device)
+    input_ids = ids(vocab=97, seq=393, seed=29).to(device)
     chunks = _flush_schedule_chunks(input_ids)
 
     prod_cache, prod_logits = _run_chunked(model, k_spec, v_spec, chunks)
@@ -365,8 +363,7 @@ def test_batched_flush_multi_update_page_crossing(monkeypatch):
         arm="lowrank_rtn_channel", bits=3, rank=4, group=16, pre_rope=True
     )
     v_spec = CacheCodecSpec(arm="turboquant_mse", bits=2)
-    g = torch.Generator().manual_seed(3)
-    input_ids = torch.randint(0, 97, (1, 266), generator=g)
+    input_ids = ids(vocab=97, seq=266, seed=3)
     # 260-token prefill commits page 1 (S_q=128); the append at S=264 commits
     # page 2 from a 1-token update; S=265/266 are no-flush steps.
     chunks = [input_ids[:, :260]] + [input_ids[:, t : t + 1] for t in range(260, 266)]

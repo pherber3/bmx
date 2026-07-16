@@ -17,12 +17,12 @@ W (the query second moment that defines the whitener) has two sources:
 Across-layer allocation (the G2 lever): with `alloc_sens_parquet` set (a
 k4_alloc run's metrics.parquet, Part-A sensitivity rows), each entry of
 `budgets` becomes a TARGET MEAN — per-layer budgets b_l with mean(b_l) ==
-target are chosen by k4_alloc's `greedy_layer_allocation` over per-layer
-distortion-vs-budget curves built from the fitted spectra, weighted by the
-per-layer sensitivities s_l. The pack file keeps the uniform format: layer i's
-bits under label `bits_b{target:g}` are simply waterfilled at b_l instead of
-at the target, so load_packs/streaming/recipes select allocated packs
-unchanged.
+target are chosen by the shared `greedy_layer_allocation`
+(experiments._k4_common) over per-layer distortion-vs-budget curves built from
+the fitted spectra, weighted by the per-layer sensitivities s_l. The pack file
+keeps the uniform format: layer i's bits under label `bits_b{target:g}` are
+simply waterfilled at b_l instead of at the target, so
+load_packs/streaming/recipes select allocated packs unchanged.
 """
 
 from __future__ import annotations
@@ -43,8 +43,13 @@ from bmx.cache.spectral import (
     pack_from_basis,
     save_pack_file,
 )
-from experiments._k4_common import corpus_query_moment, load_layer_keys, setup_rope
-from experiments.k4_alloc import greedy_layer_allocation
+from experiments._k4_common import (
+    SENS_FLOOR,
+    corpus_query_moment,
+    greedy_layer_allocation,
+    load_layer_keys,
+    setup_rope,
+)
 
 _W_SOURCES = {"corpus", "none"}
 
@@ -55,12 +60,6 @@ _W_SOURCES = {"corpus", "none"}
 # (0..8); step 0.25 gives the greedy walk a mean-bits resolution of
 # 0.25/n_layer per upgrade.
 _ALLOC_GRID = tuple(1.0 + 0.25 * i for i in range(15))  # 1.0 .. 4.5
-
-# Same floor policy as k4_alloc Part A: ppl noise can push a truly-flat
-# layer's measured s_i to ~0 or slightly negative; a small positive floor
-# keeps every layer eligible for upgrades without changing the ranking of
-# genuinely sensitive layers.
-_SENS_FLOOR = 1e-6
 
 
 @dataclasses.dataclass
@@ -84,14 +83,14 @@ class Config:
 
 def _load_sensitivities(parquet_path: str, layers: list[int]) -> dict[int, float]:
     """Per-layer s_i from a k4_alloc run's Part-A rows (kind=="sensitivity"),
-    floored at _SENS_FLOOR (k4_alloc's own clamp policy)."""
+    floored at SENS_FLOOR (k4_alloc's own clamp policy)."""
     df = pd.read_parquet(parquet_path)
     sub = df[df.kind == "sensitivity"]
     assert not sub.empty, f"no sensitivity rows in {parquet_path!r} — wrong parquet?"
     s_raw = {int(layer): float(v) for layer, v in zip(sub.layer, sub.s_i)}
     missing = set(layers) - set(s_raw)
     assert not missing, f"sensitivity parquet missing layers {sorted(missing)}"
-    return {layer: max(v, _SENS_FLOOR) for layer, v in s_raw.items()}
+    return {layer: max(v, SENS_FLOOR) for layer, v in s_raw.items()}
 
 
 def _distortion_curves(
@@ -99,32 +98,24 @@ def _distortion_curves(
     *,
     tiers: tuple[int, ...],
     group: int,
-    grid: tuple[float, ...] = _ALLOC_GRID,
 ) -> dict[int, dict[float, float]]:
     """Per-layer distortion-vs-budget curves from the fitted spectra.
 
-    For each candidate budget b, run the REAL allocator (`pack_from_basis`,
-    i.e. allocate_bits_from_variance on `basis.lam64` — the exact fp64 tensor
-    it waterfills at save time) and score the Gaussian rate-distortion proxy
-    D(b) = Σ_i lam64_i · 4^(−bits_i); dropped (0-bit) directions contribute
-    lam_i in full (4^0 = 1).
+    For each candidate budget b on _ALLOC_GRID, run the REAL allocator
+    (`pack_from_basis`, i.e. allocate_bits_from_variance on `basis.lam64` —
+    the exact fp64 tensor it waterfills at save time) and score the Gaussian
+    rate-distortion proxy D(b) = Σ_i lam64_i · 4^(−bits_i); dropped (0-bit)
+    directions contribute lam_i in full (4^0 = 1).
     """
     curves: dict[int, dict[float, float]] = {}
     for layer_i, basis in bases.items():
-        curves[layer_i] = {
-            float(b): float(
-                (
-                    basis.lam64
-                    * torch.pow(
-                        4.0,
-                        -pack_from_basis(
-                            basis, b, tiers=tiers, group=group
-                        ).bits.double(),
-                    )
-                ).sum()
+        curve: dict[float, float] = {}
+        for b in _ALLOC_GRID:
+            bits = pack_from_basis(basis, b, tiers=tiers, group=group).bits
+            curve[float(b)] = float(
+                (basis.lam64 * torch.pow(4.0, -bits.double())).sum()
             )
-            for b in grid
-        }
+        curves[layer_i] = curve
     return curves
 
 
@@ -134,7 +125,8 @@ def _allocate_layer_budgets(
     """Greedy across-layer allocation for every target in cfg.budgets.
 
     Returns (layer_budgets, alloc_meta) — the per-target {layer: b_l} maps and
-    the sidecar-traceability block (allocation, sensitivities, parquet path).
+    the sens-provenance sidecar block (the allocation map itself is written
+    into the sidecar by save_pack_file under its reserved "layer_budgets" key).
     """
     s = _load_sensitivities(cfg.alloc_sens_parquet, layers)
     curves = _distortion_curves(bases, tiers=cfg.tiers, group=cfg.group)
@@ -157,16 +149,12 @@ def _allocate_layer_budgets(
         layer_budgets[target] = alloc
         print(
             f"  [alloc] target={target:g} realized_mean={realized:.4f}: "
-            f"{ {layer: b for layer, b in sorted(alloc.items())} }",
+            f"{dict(sorted(alloc.items()))}",
             flush=True,
         )
 
     alloc_meta = {
         "alloc_sens_parquet": cfg.alloc_sens_parquet,
-        "alloc": {
-            f"{target:g}": {str(layer): b for layer, b in sorted(a.items())}
-            for target, a in layer_budgets.items()
-        },
         "alloc_sensitivities": {str(layer): s[layer] for layer in sorted(s)},
     }
     return layer_budgets, alloc_meta
@@ -248,28 +236,9 @@ def main(cfg: Config):
     if cfg.alloc_sens_parquet:
         layer_budgets, alloc_meta = _allocate_layer_budgets(cfg, bases, layers)
 
-    for layer_i in layers:
-        basis = bases[layer_i]
-        for budget in cfg.budgets:
-            b_l = budget if layer_budgets is None else layer_budgets[budget][layer_i]
-            pack = pack_from_basis(basis, b_l, tiers=cfg.tiers, group=cfg.group)
-            lam = pack.lam
-            am_gm = (lam.mean() / lam.clamp_min(1e-12).log().mean().exp()).item()
-            top16_energy = (lam[:16].sum() / lam.sum().clamp_min(1e-12)).item()
-            n_zero_dirs = int((pack.bits == 0).sum())
-            row = dict(
-                model=model_label,
-                layer=layer_i,
-                budget=float(budget),
-                am_gm=am_gm,
-                top16_energy=top16_energy,
-                n_zero_dirs=n_zero_dirs,
-            )
-            if layer_budgets is not None:
-                row["budget_layer"] = float(b_l)
-            rows.append(row)
-
-    save_pack_file(
+    # save_pack_file runs the waterfill once per (layer, budget) and returns
+    # the exact packs it wrote; the stats below read those, never re-allocate.
+    packs = save_pack_file(
         cfg.out_path,
         bases,
         cfg.budgets,
@@ -285,6 +254,27 @@ def main(cfg: Config):
         },
         layer_budgets=layer_budgets,
     )
+
+    for layer_i in layers:
+        for budget in cfg.budgets:
+            pack = packs[budget][layer_i]
+            lam = pack.lam
+            am_gm = (lam.mean() / lam.clamp_min(1e-12).log().mean().exp()).item()
+            top16_energy = (lam[:16].sum() / lam.sum().clamp_min(1e-12)).item()
+            n_zero_dirs = int((pack.bits == 0).sum())
+            row = dict(
+                model=model_label,
+                layer=layer_i,
+                budget=float(budget),
+                am_gm=am_gm,
+                top16_energy=top16_energy,
+                n_zero_dirs=n_zero_dirs,
+            )
+            if layer_budgets is not None:
+                # pack.budget is this layer's ALLOCATED budget b_l (the label
+                # `budget` above is the target mean).
+                row["budget_layer"] = pack.budget
+            rows.append(row)
 
     df = pd.DataFrame(rows)
     write_metrics(run, df)

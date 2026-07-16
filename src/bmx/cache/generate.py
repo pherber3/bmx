@@ -8,6 +8,7 @@ prefill.
 from __future__ import annotations
 
 import gc
+import weakref
 
 import torch
 
@@ -111,14 +112,18 @@ def generate_through_cache(
                 if tid in eos_ids:
                     break
     text = tokenizer.decode(new_ids, skip_special_tokens=True)
-    # Free the cache eagerly: a reference cycle anywhere in the cache graph (ours
-    # or transformers') otherwise holds the multi-GiB dequantized K/V until a
-    # gen-2 gc pass — across 31.5k-token LongBench shards that accumulated to an
-    # 88 GiB CUDA OOM. gc cost is ~ms against multi-second generations.
+    # The cache must die by refcount right here (the self->closure->self cycle
+    # that once trapped the multi-GiB dequantized K/V until a gen-2 gc pass —
+    # an 88 GiB CUDA OOM across 31.5k-token LongBench shards — is fixed and
+    # pinned by test_cache_freed_by_refcount_after_generation). A firing probe
+    # means a NEW reference cycle appeared (leak-regression signal): collect
+    # eagerly instead of accumulating trapped caches.
+    ref = weakref.ref(cache)
     del cache
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if ref() is not None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return text.strip() if strip else text
 
 

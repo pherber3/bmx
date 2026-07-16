@@ -30,6 +30,7 @@ from bmx.cache.recipes import spec_pair
 from experiments._common import (
     assert_resume_identity,
     done_pairs,
+    load_samples_shards,
     load_shards,
     pair_key,
     print_progress,
@@ -286,6 +287,11 @@ def run(
                 )
 
     write_metrics(run_dir, load_shards(run_dir))
+    # Run-level per-sample table (bootstrap-CI enabler) beside metrics.parquet;
+    # metrics.parquet itself stays aggregate-only (pre-samples schema).
+    samples_df = load_samples_shards(run_dir)
+    if not samples_df.empty:
+        write_metrics(run_dir, samples_df, name="samples")
     return run_dir
 
 

@@ -30,7 +30,6 @@ from experiments._common import (
     load_shards,
     pair_key,
     print_progress,
-    write_samples_shard,
     write_shard,
 )
 
@@ -119,7 +118,6 @@ def run(
 
             bpe_k, bpe_v, compression = compression_for(model, k_spec, v_spec, length)
             pair_rows = []
-            samples_rows = []
             for depth_i, depth in enumerate(cfg.depths, start=1):
                 if tokenizer is None:
                     # Offline: synthetic argmax proxy at this (small) length.
@@ -179,16 +177,6 @@ def run(
                         "use_packed": cfg.use_packed,
                     }
                 )
-                # One generation per depth is the loop's natural per-sample grain.
-                samples_rows.append(
-                    {
-                        "arm": arm,
-                        "length": length,
-                        "depth": depth,
-                        "sample_idx": depth_i - 1,
-                        "recall_full": recall_full,
-                    }
-                )
                 if depth_i % 10 == 0 or depth_i == len(cfg.depths):
                     print_progress(
                         f"arm {arm} length {length} depth",
@@ -198,10 +186,9 @@ def run(
                         recall=f"{recall:.4f}",
                     )
 
-            # Per-generation recall_full (bootstrap-CI enabler); mirrors the aggregate
-            # shard's per-depth rows. Written BEFORE the aggregate shard so the
-            # aggregate's existence (the resume key) implies the samples shard exists.
-            write_samples_shard(run_dir, samples_rows, arm, str(length))
+            # No samples shard here: the aggregate already stores one row per depth
+            # (the per-generation grain), so a samples file would be a byte-for-byte
+            # subset of it. LongBench, whose aggregate is a mean, does write one.
             write_shard(run_dir, pair_rows, arm, str(length))
             print(
                 f"[k3_niah pair {pair_i}/{n_pairs}] arm={arm} length={length} "

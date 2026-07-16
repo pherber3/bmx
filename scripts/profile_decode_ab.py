@@ -30,6 +30,7 @@ import time
 import torch
 import tyro
 
+from bmx.cache.codecs import PACK_GATED_ARMS
 from bmx.cache.packed_streaming import PackedStreamingCache
 from bmx.cache.recipes import spec_pair
 from bmx.cache.streaming import StreamingQuantizedCache
@@ -53,9 +54,6 @@ class Config:
     route through PackedStreamingCache, so for them the A/B collapses to
     dense-vs-streaming: the parity gate, path probe, and packed column are
     skipped (there is no packed twin to be at parity WITH)."""
-
-    def pack_gated(self) -> bool:
-        return self.arm.startswith("k4_")
 
 
 def _prompt_ids(tokenizer, ctx_len: int, device) -> torch.Tensor:
@@ -81,24 +79,21 @@ def _timed_generate(
     return out, time.perf_counter() - t0
 
 
-def _fresh_cache(kind: str, model, cfg: Config):
+def _fresh_cache(kind: str, model, k_spec, v_spec):
     if kind == "dense":
         from transformers import DynamicCache
 
         return DynamicCache()
-    k_spec, v_spec = spec_pair(
-        cfg.arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed, pack_path=cfg.pack_path
-    )
     cls = StreamingQuantizedCache if kind == "streaming" else PackedStreamingCache
     return cls(model.config, k_spec=k_spec, v_spec=v_spec)
 
 
-def _run_one(model, tokenizer, cfg: Config, kind: str, ctx_len: int) -> dict:
+def _run_one(model, tokenizer, cfg: Config, k_spec, v_spec, kind: str, ctx_len: int):
     """One (cache-kind, ctx) cell: warm 1-token generate, then the timed pair."""
     ids_ = _prompt_ids(tokenizer, ctx_len, model.device)
 
     def gen(max_new: int):
-        cache = _fresh_cache(kind, model, cfg)
+        cache = _fresh_cache(kind, model, k_spec, v_spec)
         attach = getattr(cache, "attach", None)
         if attach is not None:
             attach(model)
@@ -129,17 +124,21 @@ def main(cfg: Config) -> None:
     from experiments._common import load_model_and_tokenizer
 
     model, tokenizer = load_model_and_tokenizer(cfg.model_name, "cuda")
+    k_spec, v_spec = spec_pair(
+        cfg.arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed, pack_path=cfg.pack_path
+    )
 
-    # --- Parity gate (oracle-gated perf: no timing is reported without it) --------
     # Pack-gated arms (spectral K) have no packed twin: skip the packed-vs-
     # streaming parity gate and path probe, and measure dense-vs-streaming only.
-    ids_p = _prompt_ids(tokenizer, min(cfg.ctx_lens), model.device)
-    if cfg.pack_gated():
-        _mode_a(model, tokenizer, cfg, kinds_override=("dense", "streaming"))
+    if k_spec.arm in PACK_GATED_ARMS:
+        _mode_a(model, tokenizer, cfg, k_spec, v_spec, kinds=("dense", "streaming"))
         return
+
+    # --- Parity gate (oracle-gated perf: no timing is reported without it) --------
+    ids_p = _prompt_ids(tokenizer, min(cfg.ctx_lens), model.device)
     outs = {}
     for kind in ("streaming", "packed"):
-        cache = _fresh_cache(kind, model, cfg)
+        cache = _fresh_cache(kind, model, k_spec, v_spec)
         cache.attach(model)
         with torch.no_grad():
             outs[kind] = model.generate(
@@ -180,7 +179,7 @@ def main(cfg: Config) -> None:
     _ps.fused_decode_attention_k2b = _wrap("fused_k2b", originals[1])
     _ps.chunked_dequant_attention = _wrap("chunked", originals[2])
     try:
-        cache = _fresh_cache("packed", model, cfg)
+        cache = _fresh_cache("packed", model, k_spec, v_spec)
         cache.attach(model)
         with torch.no_grad():
             model.generate(
@@ -206,20 +205,25 @@ def main(cfg: Config) -> None:
         f"Triton path (the exact F0 mistake). Use k2b_ph or an rtn arm."
     )
 
-    _mode_a(model, tokenizer, cfg)
+    _mode_a(model, tokenizer, cfg, k_spec, v_spec)
 
 
-def _mode_a(model, tokenizer, cfg: Config, kinds_override: tuple | None = None) -> None:
+def _mode_a(
+    model,
+    tokenizer,
+    cfg: Config,
+    k_spec,
+    v_spec,
+    kinds: tuple[str, ...] = ("dense", "streaming", "packed"),
+) -> None:
     # --- Mode A: the A/B/C table ---------------------------------------------------
+    if cfg.skip_dense:
+        kinds = tuple(k for k in kinds if k != "dense")
     rows = []
-    if kinds_override is not None:
-        kinds = [k for k in kinds_override if not (k == "dense" and cfg.skip_dense)]
-    else:
-        kinds = (["dense"] if not cfg.skip_dense else []) + ["streaming", "packed"]
     for ctx in cfg.ctx_lens:
         for kind in kinds:
             try:
-                row = _run_one(model, tokenizer, cfg, kind, ctx)
+                row = _run_one(model, tokenizer, cfg, k_spec, v_spec, kind, ctx)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 row = {"cache": kind, "ctx": ctx, "ms_per_decode_token": float("nan")}
@@ -238,14 +242,19 @@ def _mode_a(model, tokenizer, cfg: Config, kinds_override: tuple | None = None) 
     )
 
     # --- Mode B: op-level attribution on the packed path ---------------------------
-    # kinds_override (pack-gated arms) has no packed cache to attribute — skip.
-    if cfg.profile_steps > 0 and kinds_override is None:
+    if cfg.profile_steps > 0:
+        if "packed" not in kinds:
+            print(
+                f"[mode b] skipped: pack-gated arm {cfg.arm!r} has no packed cache "
+                "to profile despite --profile-steps"
+            )
+            return
         # Fresh cache; the profiled window includes ONE prefill (identifiable by its
         # flash-SDPA/is_prefill ops) followed by profile_steps decode steps whose
         # repeated per-step signature dominates the call counts.
         ctx = cfg.ctx_lens[0]
         ids_ = _prompt_ids(tokenizer, ctx, model.device)
-        cache = _fresh_cache("packed", model, cfg)
+        cache = _fresh_cache("packed", model, k_spec, v_spec)
         cache.attach(model)
         from torch.profiler import ProfilerActivity, profile
 

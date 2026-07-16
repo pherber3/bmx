@@ -222,9 +222,10 @@ def test_k4_fit_packs_alloc_mode(tmp_path):
     main(cfg)
 
     side = json.loads(open(str(out) + ".json").read())
-    # (c) sidecar records the allocation map + provenance.
+    # (c) sidecar records the allocation map (written by save_pack_file itself,
+    # under its reserved "layer_budgets" key) + the sens provenance.
     assert side["alloc_sens_parquet"] == str(sens_path)
-    alloc = side["alloc"]["2.5"]
+    alloc = side["layer_budgets"]["2.5"]
     assert set(alloc) == {"0", "1"}
     assert set(side["alloc_sensitivities"]) == {"0", "1"}
     # (b) across-layer mean of allocated budgets == target within the greedy

@@ -65,7 +65,9 @@ SAMPLES_SUFFIX = "__samples"
 
 
 def samples_shard_path(run_dir: Path, *parts: str) -> Path:
-    return Path(run_dir) / "partial" / f"{pair_key(*parts)}{SAMPLES_SUFFIX}.parquet"
+    # pair_key joins with "__", so appending a "samples" part reproduces
+    # SAMPLES_SUFFIX byte-for-byte in the filename.
+    return shard_path(run_dir, *parts, "samples")
 
 
 def write_samples_shard(run_dir: Path, rows: list[dict], *parts: str) -> Path | None:
@@ -76,10 +78,7 @@ def write_samples_shard(run_dir: Path, rows: list[dict], *parts: str) -> Path | 
     writes leaves an orphan samples shard, which a resumed run simply overwrites)."""
     if not rows:
         return None
-    path = samples_shard_path(run_dir, *parts)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_parquet(path, index=False)
-    return path
+    return write_shard(run_dir, rows, *parts, "samples")
 
 
 def _is_samples_shard(p: Path) -> bool:
@@ -96,6 +95,20 @@ def load_shards(run_dir: Path) -> pd.DataFrame:
     shards = sorted(
         p for p in partial_dir.glob("*.parquet") if not _is_samples_shard(p)
     )
+    if not shards:
+        return pd.DataFrame()
+    return pd.concat([pd.read_parquet(s) for s in shards], ignore_index=True)
+
+
+def load_samples_shards(run_dir: Path) -> pd.DataFrame:
+    """Concat every completed pair's SAMPLES shard rows (empty frame if none yet).
+
+    The filter-inverted twin of load_shards: the input for a run-level
+    samples.parquet written beside metrics.parquet at run completion."""
+    partial_dir = Path(run_dir) / "partial"
+    if not partial_dir.exists():
+        return pd.DataFrame()
+    shards = sorted(p for p in partial_dir.glob("*.parquet") if _is_samples_shard(p))
     if not shards:
         return pd.DataFrame()
     return pd.concat([pd.read_parquet(s) for s in shards], ignore_index=True)

@@ -25,15 +25,9 @@ Memory pruning:
   un-flushed tail, tracking the offset (_k_pre_offset) so indexing stays correct.
 
 Batched flush:
-  One update() may commit many PAGE-token pages at once (a 31.5k prefill is
-  ~245 pages). Codecs whose math is GEMM-free — plus spectral, which has no
-  packed twin to stay parity-bound to (_flush_batchable) — quantize ALL new
-  pages in ONE call, bit-identical to the per-page loop because their
-  scales/norms/groups never span a page boundary; both paths append to the
-  frozen prefix with ONE torch.cat per side per update (the per-page cat was
-  an O(S²/PAGE) prefix re-copy). Per-page semantics (uniform paged layout,
-  write-once from pristine source) are unchanged; the bitwise A/B gate lives
-  in tests/test_streaming_batched_flush.py.
+  Batchable codecs quantize many pages per codec call (super-block capped),
+  bit-identical to the per-page loop — see _flush_batchable for the full
+  license and tests/test_streaming_batched_flush.py for the bitwise A/B gate.
 """
 
 from __future__ import annotations
@@ -127,6 +121,25 @@ def _flush_batchable(
     return False
 
 
+# Super-block cap for batched flush spans, in pages: batchable codecs quantize
+# at most this many pages per codec call. Caps the transient fp32
+# materialization of the flush span (an uncapped whole-span flush regressed
+# peak memory exactly where the 128k margin is thin) while keeping call counts
+# tiny — 64 pages ≈ 8k tokens holds a 31.5k prefill to ~4 codec calls per side.
+_SUPER_PAGES = 64
+
+
+def _flush_spans(
+    start: int, end: int, page: int, batchable: bool
+) -> list[tuple[int, int]]:
+    """Codec-call spans covering [start, end) on the PAGE grid: super-block
+    spans (<= _SUPER_PAGES pages each) for batchable codecs; one span per page
+    for loop-kept codecs, so every matmul runs at the reference (PAGE, C) shape.
+    """
+    step = page * _SUPER_PAGES if batchable else page
+    return [(s, min(s + step, end)) for s in range(start, end, step)]
+
+
 def compute_flush_schedule(S: int, W: int, g: int) -> int:
     """Largest multiple of g that leaves >= W recent tokens fp16, else 0.
 
@@ -205,10 +218,7 @@ class StreamingQuantizedLayer(DynamicLayer):
         # uniform PAGE-token blocks -> bit-for-bit parity (the shared-schedule
         # contract). Multiple of _g; default 128.
         self._page = max(self._g, (128 // self._g) * self._g) if self._g > 1 else 128
-        # Batched-flush license per side: True iff all newly-flushable pages of
-        # one update() can go through ONE codec call bit-identically to the
-        # per-page loop (see _flush_batchable). GEMM-bearing arms stay per-page,
-        # except spectral (no packed twin; licensed whole-span with its pack).
+        # Batched-flush license per side (full rationale: _flush_batchable).
         self._k_flush_batchable = _flush_batchable(
             k_spec, self._h_kv, self._d_head, self._page, pack=pack
         )
@@ -399,15 +409,11 @@ class StreamingQuantizedLayer(DynamicLayer):
         # --- New region [_committed_S_q : new_S_q] is ready to flush. ---
         # Emit it as uniform PAGE-token blocks (matching PackedStreamingLayer): each
         # page quantized ONCE from pristine source and appended to the frozen prefix.
-        # Batchable codecs (_flush_batchable) quantize ALL new pages in one call —
-        # bit-identical to the per-page loop because their scales/norms/groups never
-        # span a page boundary; GEMM-bearing codecs (lowrank_*, turboquant_prod)
-        # keep the per-page loop so every matmul runs at the reference (PAGE, C)
-        # shape. Both paths collect blocks and extend the prefix with ONE torch.cat
-        # per side below (the per-page cat was an O(S²/PAGE) prefix re-copy at
-        # prefill).
+        # Span granularity per side comes from _flush_spans — super-block spans for
+        # batchable codecs, per-page spans for the loop-kept GEMM-bearing codecs
+        # (license: _flush_batchable). Blocks collect into ONE torch.cat per side
+        # below (the per-page cat was an O(S²/PAGE) prefix re-copy at prefill).
         committed = self._committed_S_q
-        n_pages = (new_S_q - committed) // self._page
         page_entries = self._page * self._h_kv * self._d_head
         if self.k_spec.pre_rope:
             assert self._k_pre is not None, (
@@ -415,37 +421,28 @@ class StreamingQuantizedLayer(DynamicLayer):
                 "call cache.attach(model) before prefill"
             )
 
-        # --- Quantize K pages ---
+        # --- Quantize K spans ---
         new_k_blocks: list[torch.Tensor] = []
-        if self._k_flush_batchable:
-            k_span, codec_bpe_k = self._quantize_k_flush(keys, committed, new_S_q)
-            new_k_blocks.append(k_span.to(cache_dtype))
+        for s0, s1 in _flush_spans(
+            committed, new_S_q, self._page, self._k_flush_batchable
+        ):
+            k_block, codec_bpe_k = self._quantize_k_flush(keys, s0, s1)
+            new_k_blocks.append(k_block.to(cache_dtype))
             # Batchable codecs report an S/data-independent codec_bpe — the exact
             # float every per-page call returned — so accumulating page-by-page
-            # reproduces the per-page loop's float sum bit-for-bit.
-            for _ in range(n_pages):
-                self._quant_bits_k += codec_bpe_k * page_entries
-        else:
-            for pg0 in range(committed, new_S_q, self._page):
-                k_block, codec_bpe_k = self._quantize_k_flush(
-                    keys, pg0, pg0 + self._page
-                )
-                new_k_blocks.append(k_block.to(cache_dtype))
+            # reproduces the per-page loop's float sum bit-for-bit (pinned by the
+            # bitwise oracle; do NOT collapse into a multiply).
+            for _ in range((s1 - s0) // self._page):
                 self._quant_bits_k += codec_bpe_k * page_entries
 
-        # --- Quantize V pages (pristine fp16 in the tail until now) ---
+        # --- Quantize V spans (pristine fp16 in the tail until now) ---
         new_v_blocks: list[torch.Tensor] = []
-        if self._v_flush_batchable:
-            v_span, codec_bpe_v = self._quantize_v_flush(values, committed, new_S_q)
-            new_v_blocks.append(v_span.to(cache_dtype))
-            for _ in range(n_pages):
-                self._quant_bits_v += codec_bpe_v * page_entries
-        else:
-            for pg0 in range(committed, new_S_q, self._page):
-                v_block, codec_bpe_v = self._quantize_v_flush(
-                    values, pg0, pg0 + self._page
-                )
-                new_v_blocks.append(v_block.to(cache_dtype))
+        for s0, s1 in _flush_spans(
+            committed, new_S_q, self._page, self._v_flush_batchable
+        ):
+            v_block, codec_bpe_v = self._quantize_v_flush(values, s0, s1)
+            new_v_blocks.append(v_block.to(cache_dtype))
+            for _ in range((s1 - s0) // self._page):
                 self._quant_bits_v += codec_bpe_v * page_entries
 
         # --- Append to frozen prefix: ONE cat per side per update ---

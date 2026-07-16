@@ -8,10 +8,11 @@ A — sensitivity census: one shared `run_prefill` state, then per layer i,
     fp16 (both K and V). `s_i = log(ppl_i) - log(ppl_fp16)`: the marginal NLL
     cost of degrading layer i alone, holding everything else exact.
 
-B — allocation: `greedy_layer_allocation` (public, module-level) does a
-    greedy marginal-upgrade walk over the Task-7 frontier's per-layer
-    distortion-vs-bits curves (`turboquant_mse`, kind="k_pre"), weighted by
-    Part A's sensitivities. Provably optimal for convex per-layer curves:
+B — allocation: `greedy_layer_allocation` (shared, in experiments._k4_common;
+    re-exported here) does a greedy marginal-upgrade walk over the Task-7
+    frontier's per-layer distortion-vs-bits curves (`turboquant_mse`,
+    kind="k_pre"), weighted by Part A's sensitivities. Provably optimal for
+    convex per-layer curves:
     at each step it buys the cheapest-per-bit distortion reduction available
     anywhere, so the final allocation minimizes sum_l s_l * D_l(bits_l)
     subject to mean(bits) == target_mean (a discrete water-filling argument).
@@ -43,6 +44,9 @@ import tyro
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.ppl_eval import CacheCodecSpec, quantized_prefill_ppl, run_prefill
 from bmx.eval.layer_swap import load_eval_tokens
+from experiments._k4_common import SENS_FLOOR, greedy_layer_allocation
+
+__all__ = ["Config", "greedy_layer_allocation", "main"]
 
 
 @dataclasses.dataclass
@@ -54,43 +58,6 @@ class Config:
     target_means: tuple[float, ...] = (2.5, 3.0)
     sens_bits: int = 2
     out_root: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Part B: greedy across-layer allocation (verbatim from the task brief).
-# ---------------------------------------------------------------------------
-
-
-def greedy_layer_allocation(
-    curves: dict[int, dict[float, float]],
-    s: dict[int, float],
-    budgets: tuple[float, ...],
-    target_mean: float,
-) -> dict[int, float]:
-    """curves[layer][budget] = distortion; start every layer at min(budgets),
-    repeatedly upgrade the layer with the largest s[l]*(D[cur]-D[next]) per
-    budget-unit until the mean budget reaches target_mean. Deterministic
-    (ties broken by layer index)."""
-    grid = sorted(budgets)
-    cur = {l: 0 for l in curves}  # noqa: E741 (index into grid)
-
-    def mean_b():
-        return sum(grid[i] for i in cur.values()) / len(cur)
-
-    while mean_b() < target_mean - 1e-9:
-        best, best_gain = None, -1.0
-        for l in sorted(curves):  # noqa: E741
-            i = cur[l]
-            if i + 1 >= len(grid):
-                continue
-            gain = s[l] * (curves[l][grid[i]] - curves[l][grid[i + 1]])
-            gain /= grid[i + 1] - grid[i]
-            if gain > best_gain:
-                best, best_gain = l, gain
-        if best is None:
-            break
-        cur[best] += 1
-    return {l: grid[i] for l, i in cur.items()}  # noqa: E741
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +200,8 @@ def main(cfg: Config):
     # ---- Part A: sensitivity census -----------------------------------
     print("\n=== Part A: sensitivity census ===")
     sens_rows, s_raw = _sensitivity_census(model, ids, cfg, state, n_layer, ppl_fp16)
-    # Clamp s_i to a small positive floor: ppl noise can push a truly-flat
-    # layer's measured s_i to ~0 or slightly negative, which would zero out
-    # (or invert) its weight in the greedy allocator. A floor keeps every
-    # layer eligible for upgrades without materially changing the ranking
-    # of genuinely sensitive layers (whose s_i is orders of magnitude larger).
-    s = {layer: max(v, 1e-6) for layer, v in s_raw.items()}
+    # Clamp s_i to a small positive floor (rationale at SENS_FLOOR's definition).
+    s = {layer: max(v, SENS_FLOOR) for layer, v in s_raw.items()}
 
     # ---- Part B: greedy allocation over the frontier curves -------------
     print("\n=== Part B: greedy allocation ===")

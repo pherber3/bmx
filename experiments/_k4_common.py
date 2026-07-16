@@ -1,5 +1,6 @@
-"""Shared pieces for the K4 experiment family (k4_spectra, k4_frontier):
-layer-keyed cache loading, RoPE setup + self-validation, and tail scoring.
+"""Shared pieces for the K4 experiment family (k4_spectra, k4_frontier,
+k4_alloc, k4_fit_packs): layer-keyed cache loading, RoPE setup +
+self-validation, tail scoring, and the across-layer greedy allocator.
 """
 
 from __future__ import annotations
@@ -15,6 +16,46 @@ from bmx.cache.spectral import query_position_moment
 
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
 DEPLOY_S = 32768
+
+# Floor for measured per-layer sensitivities s_i: ppl noise can push a
+# truly-flat layer's measured s_i to ~0 or slightly negative, which would zero
+# out (or invert) its weight in the greedy allocator. A small positive floor
+# keeps every layer eligible for upgrades without materially changing the
+# ranking of genuinely sensitive layers (whose s_i is orders of magnitude
+# larger).
+SENS_FLOOR = 1e-6
+
+
+def greedy_layer_allocation(
+    curves: dict[int, dict[float, float]],
+    s: dict[int, float],
+    budgets: tuple[float, ...],
+    target_mean: float,
+) -> dict[int, float]:
+    """curves[layer][budget] = distortion; start every layer at min(budgets),
+    repeatedly upgrade the layer with the largest s[l]*(D[cur]-D[next]) per
+    budget-unit until the mean budget reaches target_mean. Deterministic
+    (ties broken by layer index)."""
+    grid = sorted(budgets)
+    cur = {l: 0 for l in curves}  # noqa: E741 (index into grid)
+
+    def mean_b():
+        return sum(grid[i] for i in cur.values()) / len(cur)
+
+    while mean_b() < target_mean - 1e-9:
+        best, best_gain = None, -1.0
+        for l in sorted(curves):  # noqa: E741
+            i = cur[l]
+            if i + 1 >= len(grid):
+                continue
+            gain = s[l] * (curves[l][grid[i]] - curves[l][grid[i + 1]])
+            gain /= grid[i + 1] - grid[i]
+            if gain > best_gain:
+                best, best_gain = l, gain
+        if best is None:
+            break
+        cur[best] += 1
+    return {l: grid[i] for l, i in cur.items()}  # noqa: E741
 
 
 def bucket_layer_keys(cache: dict) -> dict[int, dict[str, torch.Tensor]]:
