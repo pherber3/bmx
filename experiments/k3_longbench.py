@@ -33,6 +33,7 @@ from experiments._common import (
     load_shards,
     pair_key,
     print_progress,
+    write_samples_shard,
     write_shard,
 )
 
@@ -199,6 +200,7 @@ def run(
                 )
                 score = code_sim(resp, resp)
                 n_used = 1
+                sample_scores = [score]
                 print_progress(
                     "k3_longbench sample",
                     1,
@@ -234,6 +236,7 @@ def run(
                         )
                 score = sum(scores) / len(scores) if scores else float("nan")
                 n_used = len(items)
+                sample_scores = scores
 
             pair_rows = [
                 {
@@ -255,6 +258,18 @@ def run(
                     "chat_wrap": cfg.chat_wrap,
                 }
             ]
+            # Per-sample scores (bootstrap-CI enabler); the aggregate `code_sim` above is
+            # their plain mean. Written BEFORE the aggregate shard so the aggregate's
+            # existence (the resume key) implies the samples shard exists.
+            write_samples_shard(
+                run_dir,
+                [
+                    {"arm": arm, "task": task, "sample_idx": i, "score": s}
+                    for i, s in enumerate(sample_scores)
+                ],
+                arm,
+                task,
+            )
             write_shard(run_dir, pair_rows, arm, task)
             print(
                 f"[k3_longbench pair {pair_i}/{n_pairs}] arm={arm} task={task} "

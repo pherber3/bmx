@@ -48,6 +48,14 @@ class Config:
     seed: int = 0
     profile_steps: int = 0  # >0: also run Mode B on the packed cache at ctx_lens[0]
     skip_dense: bool = False  # dense fp16 OOMs first at long ctx; skip to keep sweeping
+    pack_path: str = ""
+    """Fitted spectral pack file — required for k4_* arms. Pack-gated arms never
+    route through PackedStreamingCache, so for them the A/B collapses to
+    dense-vs-streaming: the parity gate, path probe, and packed column are
+    skipped (there is no packed twin to be at parity WITH)."""
+
+    def pack_gated(self) -> bool:
+        return self.arm.startswith("k4_")
 
 
 def _prompt_ids(tokenizer, ctx_len: int, device) -> torch.Tensor:
@@ -78,7 +86,9 @@ def _fresh_cache(kind: str, model, cfg: Config):
         from transformers import DynamicCache
 
         return DynamicCache()
-    k_spec, v_spec = spec_pair(cfg.arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed)
+    k_spec, v_spec = spec_pair(
+        cfg.arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed, pack_path=cfg.pack_path
+    )
     cls = StreamingQuantizedCache if kind == "streaming" else PackedStreamingCache
     return cls(model.config, k_spec=k_spec, v_spec=v_spec)
 
@@ -121,7 +131,12 @@ def main(cfg: Config) -> None:
     model, tokenizer = load_model_and_tokenizer(cfg.model_name, "cuda")
 
     # --- Parity gate (oracle-gated perf: no timing is reported without it) --------
+    # Pack-gated arms (spectral K) have no packed twin: skip the packed-vs-
+    # streaming parity gate and path probe, and measure dense-vs-streaming only.
     ids_p = _prompt_ids(tokenizer, min(cfg.ctx_lens), model.device)
+    if cfg.pack_gated():
+        _mode_a(model, tokenizer, cfg, kinds_override=("dense", "streaming"))
+        return
     outs = {}
     for kind in ("streaming", "packed"):
         cache = _fresh_cache(kind, model, cfg)
@@ -191,9 +206,16 @@ def main(cfg: Config) -> None:
         f"Triton path (the exact F0 mistake). Use k2b_ph or an rtn arm."
     )
 
+    _mode_a(model, tokenizer, cfg)
+
+
+def _mode_a(model, tokenizer, cfg: Config, kinds_override: tuple | None = None) -> None:
     # --- Mode A: the A/B/C table ---------------------------------------------------
     rows = []
-    kinds = (["dense"] if not cfg.skip_dense else []) + ["streaming", "packed"]
+    if kinds_override is not None:
+        kinds = [k for k in kinds_override if not (k == "dense" and cfg.skip_dense)]
+    else:
+        kinds = (["dense"] if not cfg.skip_dense else []) + ["streaming", "packed"]
     for ctx in cfg.ctx_lens:
         for kind in kinds:
             try:
@@ -216,7 +238,8 @@ def main(cfg: Config) -> None:
     )
 
     # --- Mode B: op-level attribution on the packed path ---------------------------
-    if cfg.profile_steps > 0:
+    # kinds_override (pack-gated arms) has no packed cache to attribute — skip.
+    if cfg.profile_steps > 0 and kinds_override is None:
         # Fresh cache; the profiled window includes ONE prefill (identifiable by its
         # flash-SDPA/is_prefill ops) followed by profile_steps decode steps whose
         # repeated per-step signature dominates the call counts.

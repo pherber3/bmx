@@ -88,8 +88,12 @@ def test_niah_checkpoint_resume(tmp_path):
     run_dir = runs[0]
 
     partial_dir = run_dir / "partial"
-    shards = list(partial_dir.glob("*.parquet"))
+    shards = [
+        p for p in partial_dir.glob("*.parquet") if not p.stem.endswith("__samples")
+    ]
     assert len(shards) == 1, "exactly one (arm, length) pair should have checkpointed"
+    # The samples shard rides along with its aggregate (same checkpoint moment).
+    assert shards[0].with_name(f"{shards[0].stem}__samples.parquet").exists()
     assert not (run_dir / "metrics.parquet").exists()
 
     resume_cfg = dataclasses.replace(cfg, resume=str(run_dir))
@@ -101,7 +105,91 @@ def test_niah_checkpoint_resume(tmp_path):
     assert len(df) == 8
     pairs = list(zip(df["arm"], df["length"]))
     assert len(set(pairs)) == 4
-    assert len(list(partial_dir.glob("*.parquet"))) == 4
+    all_shards = list(partial_dir.glob("*.parquet"))
+    agg = [p for p in all_shards if not p.stem.endswith("__samples")]
+    samples = [p for p in all_shards if p.stem.endswith("__samples")]
+    assert len(agg) == 4
+    assert len(samples) == 4
+
+
+def test_niah_samples_parquet_written(tmp_path):
+    """Each (arm, length) pair gets a per-generation shard alongside its aggregate shard.
+
+    The loop's natural grain is one generation per depth, so the samples shard has schema
+    {arm, length, depth, sample_idx, recall_full} with one row per depth. The aggregate
+    shard already stores per-depth rows (no averaging in the harness), so the samples
+    rows must reproduce its recall_full values exactly, row for row (joined on depth).
+    """
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        lengths=(32, 48),
+        depths=(0.25, 0.5),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+    run_dir = run(cfg, model=model, root=str(tmp_path))
+    partial_dir = run_dir / "partial"
+    for arm in cfg.arms:
+        for length in cfg.lengths:
+            agg_path = partial_dir / f"{arm}__{length}.parquet"
+            samples_path = partial_dir / f"{arm}__{length}__samples.parquet"
+            assert agg_path.exists(), f"missing aggregate shard for {arm}/{length}"
+            assert samples_path.exists(), f"missing samples shard for {arm}/{length}"
+            agg = pd.read_parquet(agg_path)
+            samples = pd.read_parquet(samples_path)
+            assert list(samples.columns) == [
+                "arm",
+                "length",
+                "depth",
+                "sample_idx",
+                "recall_full",
+            ]
+            assert len(samples) == len(cfg.depths)
+            assert list(samples["sample_idx"]) == list(range(len(cfg.depths)))
+            assert list(samples["depth"]) == list(cfg.depths)
+            assert (samples["arm"] == arm).all()
+            assert (samples["length"] == length).all()
+            merged = samples.merge(
+                agg[["depth", "recall_full"]], on="depth", suffixes=("_s", "_a")
+            )
+            assert len(merged) == len(cfg.depths)
+            assert (merged["recall_full_s"] == merged["recall_full_a"]).all()
+    # The final metrics.parquet is unchanged: aggregate rows only, no per-sample columns.
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert len(df) == 8
+    assert "sample_idx" not in df.columns
+
+
+def test_niah_samples_written_before_aggregate(tmp_path, monkeypatch):
+    """A crash between the two writes leaves samples WITHOUT aggregate — never the reverse.
+
+    The aggregate shard's existence is the resume key, so it must imply the samples shard
+    exists (samples first, then aggregate)."""
+    import experiments.k3_niah as mod
+
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16",),
+        lengths=(32,),
+        depths=(0.25, 0.5),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected write_shard failure")
+
+    monkeypatch.setattr(mod, "write_shard", boom)
+    with pytest.raises(RuntimeError, match="injected write_shard failure"):
+        run(cfg, model=model, root=str(tmp_path))
+
+    run_dir = next((tmp_path / "k3_niah").iterdir())
+    partial_dir = run_dir / "partial"
+    assert (partial_dir / "fp16__32__samples.parquet").exists()
+    assert not (partial_dir / "fp16__32.parquet").exists()
 
 
 def test_niah_resume_rejects_config_mismatch(tmp_path):

@@ -132,8 +132,12 @@ def test_longbench_checkpoint_resume(tmp_path):
     run_dir = runs[0]
 
     partial_dir = run_dir / "partial"
-    shards = list(partial_dir.glob("*.parquet"))
+    shards = [
+        p for p in partial_dir.glob("*.parquet") if not p.stem.endswith("__samples")
+    ]
     assert len(shards) == 1, "exactly one (arm, task) pair should have checkpointed"
+    # The samples shard rides along with its aggregate (same checkpoint moment).
+    assert shards[0].with_name(f"{shards[0].stem}__samples.parquet").exists()
 
     # metrics.parquet must NOT exist yet — the crash happened before the final write.
     assert not (run_dir / "metrics.parquet").exists()
@@ -149,8 +153,83 @@ def test_longbench_checkpoint_resume(tmp_path):
     pairs = list(zip(df["arm"], df["task"]))
     assert len(set(pairs)) == 4
 
-    # All 4 shards should now exist under partial/ (one per completed pair).
-    assert len(list(partial_dir.glob("*.parquet"))) == 4
+    # All 4 aggregate shards (+ their 4 samples shards) should now exist under partial/.
+    all_shards = list(partial_dir.glob("*.parquet"))
+    agg = [p for p in all_shards if not p.stem.endswith("__samples")]
+    samples = [p for p in all_shards if p.stem.endswith("__samples")]
+    assert len(agg) == 4
+    assert len(samples) == 4
+
+
+def test_longbench_samples_parquet_written(tmp_path):
+    """Each (arm, task) pair gets a per-sample shard alongside its aggregate shard.
+
+    Schema {arm, task, sample_idx, score}; row count == the aggregate's n_samples; the
+    aggregate `code_sim` column is the PLAIN MEAN of the per-sample scores (run() computes
+    `sum(scores)/len(scores)`; the max-over-ground-truths happens per sample INSIDE
+    longbench_score, before the sample score is emitted). This is the bootstrap-CI enabler.
+    """
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        tasks=("lcc", "repobench-p"),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+    run_dir = run(cfg, model=model, root=str(tmp_path))
+    partial_dir = run_dir / "partial"
+    for arm in cfg.arms:
+        for task in cfg.tasks:
+            agg_path = partial_dir / f"{arm}__{task}.parquet"
+            samples_path = partial_dir / f"{arm}__{task}__samples.parquet"
+            assert agg_path.exists(), f"missing aggregate shard for {arm}/{task}"
+            assert samples_path.exists(), f"missing samples shard for {arm}/{task}"
+            agg = pd.read_parquet(agg_path)
+            samples = pd.read_parquet(samples_path)
+            assert list(samples.columns) == ["arm", "task", "sample_idx", "score"]
+            assert len(samples) == int(agg["n_samples"].iloc[0])
+            assert list(samples["sample_idx"]) == list(range(len(samples)))
+            assert (samples["arm"] == arm).all()
+            assert (samples["task"] == task).all()
+            assert samples["score"].mean() == pytest.approx(agg["code_sim"].iloc[0])
+    # The final metrics.parquet is unchanged: aggregate rows only, no per-sample columns.
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert len(df) == 4
+    assert "sample_idx" not in df.columns
+
+
+def test_longbench_samples_written_before_aggregate(tmp_path, monkeypatch):
+    """A crash between the two writes leaves samples WITHOUT aggregate — never the reverse.
+
+    The aggregate shard's existence is the resume key, so it must imply the samples shard
+    exists (samples first, then aggregate)."""
+    import experiments.k3_longbench as mod
+
+    model = tiny_llama()
+    cfg = Config(arms=("fp16",), tasks=("lcc",), n_prefill=16, group=16, rank=4)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected write_shard failure")
+
+    monkeypatch.setattr(mod, "write_shard", boom)
+    with pytest.raises(RuntimeError, match="injected write_shard failure"):
+        run(cfg, model=model, root=str(tmp_path))
+
+    run_dir = next((tmp_path / "k3_longbench").iterdir())
+    partial_dir = run_dir / "partial"
+    assert (partial_dir / "fp16__lcc__samples.parquet").exists()
+    assert not (partial_dir / "fp16__lcc.parquet").exists()
+
+
+def test_write_samples_shard_empty_writes_nothing(tmp_path):
+    """0 samples -> no samples file (the aggregate-implies-samples rule only holds
+    for pairs that actually evaluated at least one sample)."""
+    from experiments._common import write_samples_shard
+
+    out = write_samples_shard(tmp_path, [], "fp16", "lcc")
+    assert out is None
+    assert not (tmp_path / "partial" / "fp16__lcc__samples.parquet").exists()
 
 
 def test_longbench_resume_rejects_config_mismatch(tmp_path):

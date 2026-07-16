@@ -36,6 +36,12 @@ def load_model_and_tokenizer(model_name: str, device: str):
 # via bmx.artifacts.write_metrics) stays the only file plot code reads; its rows are the
 # concat of every shard. Parquet has no append, so each (arm, task)-style pair gets
 # exactly one shard file, written once when that pair completes.
+#
+# Per-sample shards (bootstrap-CI enabler) ride alongside each aggregate shard at
+# <run_dir>/partial/<pair_key>__samples.parquet — written BEFORE the aggregate shard, so
+# the aggregate's existence (the resume key) implies its samples shard exists. Both
+# load_shards and done_pairs IGNORE samples shards: metrics.parquet stays aggregate-only
+# (byte-identical schema to before samples existed) and resume keys stay aggregate-only.
 
 
 def pair_key(*parts: str) -> str:
@@ -55,23 +61,55 @@ def write_shard(run_dir: Path, rows: list[dict], *parts: str) -> Path:
     return path
 
 
+SAMPLES_SUFFIX = "__samples"
+
+
+def samples_shard_path(run_dir: Path, *parts: str) -> Path:
+    return Path(run_dir) / "partial" / f"{pair_key(*parts)}{SAMPLES_SUFFIX}.parquet"
+
+
+def write_samples_shard(run_dir: Path, rows: list[dict], *parts: str) -> Path | None:
+    """Write one pair's per-sample rows next to its aggregate shard; None if no rows.
+
+    Call BEFORE write_shard for the same pair: the aggregate shard is the resume key,
+    so its existence must imply the samples shard exists (a crash between the two
+    writes leaves an orphan samples shard, which a resumed run simply overwrites)."""
+    if not rows:
+        return None
+    path = samples_shard_path(run_dir, *parts)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(path, index=False)
+    return path
+
+
+def _is_samples_shard(p: Path) -> bool:
+    return p.stem.endswith(SAMPLES_SUFFIX)
+
+
 def load_shards(run_dir: Path) -> pd.DataFrame:
-    """Concat every completed pair's shard rows (empty frame if none exist yet)."""
+    """Concat every completed pair's AGGREGATE shard rows (empty frame if none yet).
+
+    Samples shards are excluded: metrics.parquet must keep its pre-samples schema."""
     partial_dir = Path(run_dir) / "partial"
     if not partial_dir.exists():
         return pd.DataFrame()
-    shards = sorted(partial_dir.glob("*.parquet"))
+    shards = sorted(
+        p for p in partial_dir.glob("*.parquet") if not _is_samples_shard(p)
+    )
     if not shards:
         return pd.DataFrame()
     return pd.concat([pd.read_parquet(s) for s in shards], ignore_index=True)
 
 
 def done_pairs(run_dir: Path) -> set[str]:
-    """Pair keys (filenames without .parquet) that already have a shard."""
+    """Pair keys (filenames without .parquet) that already have an AGGREGATE shard.
+
+    Samples shards are excluded — an orphan samples shard (crash between the samples
+    write and the aggregate write) must NOT mark its pair as done."""
     partial_dir = Path(run_dir) / "partial"
     if not partial_dir.exists():
         return set()
-    return {p.stem for p in partial_dir.glob("*.parquet")}
+    return {p.stem for p in partial_dir.glob("*.parquet") if not _is_samples_shard(p)}
 
 
 # Config fields that legitimately differ between the original run and a --resume
