@@ -54,11 +54,13 @@ collapse — and k4_b3.0 as non-additive over k4_b2.5.)
   the K1-era finding that ppl-adjacent metrics can't attribute component choices.
 - `kv_size_bits` is skeptic-at-actual-S (per-sequence pack charge 16·C/S +
   tier map): the honest-but-harshest view, dominated by short tasks.
-- **Bootstrap CI on the headline edge (per-sample shards, 10k resamples,
-  full synthetic sets):** K4−b3 synthetic delta = **+3.25 [95% CI +1.02,
-  +5.56], P(Δ>0) = 0.9975** — the retrieval-category edge is statistically
-  solid. (Rerun scores replicated the banked table's values across code
-  versions — measurement stability under the bitwise gates.)
+- **Bootstrap CIs on the category edges (per-sample shards, 10k resamples,
+  full sets):** K4−b3 synthetic delta = **+3.25 [95% CI +1.02, +5.56],
+  P(Δ>0) = 0.9975** — the retrieval-category edge is statistically solid.
+  Code delta = +0.41 [−2.21, +3.06], P(Δ>0) = 0.62 — code is parity, not a
+  win; the paper's significant quality edge is retrieval/synthetic ONLY.
+  (Rerun scores replicated the banked table's values across code versions —
+  measurement stability under the bitwise gates.)
 - **Paired per-task statistics (16 tasks):** uniform k4_b2.5 vs b3 is
   quality-PARITY, not a quality win (5/16 task wins, Wilcoxon p=0.74 — the
   +0.35 Avg is synthetic-category-driven); vs k3v2 the gap is significant
