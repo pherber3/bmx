@@ -47,6 +47,14 @@ collapse — and k4_b3.0 as non-additive over k4_b2.5.)
   the K1-era finding that ppl-adjacent metrics can't attribute component choices.
 - `kv_size_bits` is skeptic-at-actual-S (per-sequence pack charge 16·C/S +
   tier map): the honest-but-harshest view, dominated by short tasks.
+- **Paired per-task statistics (16 tasks):** uniform k4_b2.5 vs b3 is
+  quality-PARITY, not a quality win (5/16 task wins, Wilcoxon p=0.74 — the
+  +0.35 Avg is synthetic-category-driven); vs k3v2 the gap is significant
+  (13/16, p=0.003); vs fp16 K4 loses small-but-consistently per task (1/15,
+  p=0.002, median −0.9). The defensible uniform-K4 claim is therefore
+  "b3-parity quality at strictly fewer deployment bits, with a significant
+  retrieval-category edge" — whether the allocated arm upgrades parity to a
+  per-task win is measured by the allocated full-table run (in flight).
 
 ## 3. The bits-vs-context curve (measured, NIAH runs, skeptic accounting)
 
