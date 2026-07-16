@@ -27,6 +27,13 @@ fit offsets {2048..8192}, scored {10240..16384}; ~270 MB, regenerable, never
 committed). The gpt2 corpus-retention yellow flag replicated on Llama: the
 query-weighted basis transfers at ~0.6 of its oracle win. Honest negative.
 
+**Corpus-scale ablation (2026-07-16):** tripling the fit corpus (4→12 caches,
+8k→24k rows) moves retention only 0.56–0.64 → 0.61–0.69. The transfer ceiling
+is STRUCTURAL, not data-limited — the query-weighted basis is genuinely
+sequence-dependent to a degree no corpus size fixes. Gate A's fail is
+fundamental; skeptic-primary accounting is settled, and the paper can say so
+with a measured scaling curve instead of a caveat.
+
 ## 2. LongBench duel (full sets, n=2,930 samples/arm across 16 datasets)
 
 | arm | single_qa | multi_qa | few_shot | summ. | synthetic | code | **AVG** | kv bits (task-S) |
@@ -47,6 +54,11 @@ collapse — and k4_b3.0 as non-additive over k4_b2.5.)
   the K1-era finding that ppl-adjacent metrics can't attribute component choices.
 - `kv_size_bits` is skeptic-at-actual-S (per-sequence pack charge 16·C/S +
   tier map): the honest-but-harshest view, dominated by short tasks.
+- **Bootstrap CI on the headline edge (per-sample shards, 10k resamples,
+  full synthetic sets):** K4−b3 synthetic delta = **+3.25 [95% CI +1.02,
+  +5.56], P(Δ>0) = 0.9975** — the retrieval-category edge is statistically
+  solid. (Rerun scores replicated the banked table's values across code
+  versions — measurement stability under the bitwise gates.)
 - **Paired per-task statistics (16 tasks):** uniform k4_b2.5 vs b3 is
   quality-PARITY, not a quality win (5/16 task wins, Wilcoxon p=0.74 — the
   +0.35 Avg is synthetic-category-driven); vs k3v2 the gap is significant
@@ -124,16 +136,38 @@ allocated packs and fixed + regression-pinned):
 | k4_b2.2 | 55.97 | 55.74 | +0.23 | 3.77 (=uniform) | 2.54 | 2.39 |
 | k4_b2.5 | **56.83** | 56.34 | **+0.49** | 3.92 (=uniform) | 2.69 | 2.53 |
 
-Allocation is a pure quality upgrade at measured-identical bits — allocated
-k4_b2.5 sits +1.15 ABOVE fp16 and +2.98 above b3 on the probe tasks, with
-long-context recall ≥ fp16 (7.8–8.1 at 64k). The allocated full-table row is
-PROJECTED at ≈40.8–41.0 AVG (language categories assumed at uniform-K4 values,
-which G2 says allocation can only help); making it fully measured = rerunning
-the 4 language categories full-set with allocated packs (~8–10 h GPU).
+Probe read (n=100): allocation looked like +0.23/+0.49 avg4 at identical bits.
+**Full-table verdict (measured 2026-07-16, 2 arms × 16 tasks full sets):
+allocation is a TASK-LEVEL NULL** — allocated k4_b2.5 = 40.70 AVG vs uniform
+40.72; allocated k4_b2.2 = 40.48 vs 40.56, at identical measured bits. The
+probe delta was n=100 subsample noise concentrated in synthetic (allocated
+synthetic did hold +0.57 for b2.5, offset by small language-category dips).
+The G2 ppl improvement (7.250 vs 7.461 @2.5b) is real but does not move
+LongBench Avg at these budgets. Consequence: **uniform K4 stays the headline
+arm** (fewer moving parts, no sensitivity-census dependency); allocation is
+reported as ppl-proven / task-neutral — an honest null that also demonstrates
+why headlines are written from full sets, not probes.
 
 Still unexercised: **mse_scale for V / baselines** (−15–21% distortion, applies
 to any arm — a fairness item for the final table) and **asymmetric K/V budget
 search** beyond the probed points.
+
+## 6b. Decode latency (measured 2026-07-16, GH200, idle GPU, oracle-gated)
+
+`profile_decode_ab --arm k4_b2.5` (dense-vs-streaming; spectral is pack-gated,
+no packed twin), ms per decode token:
+
+| ctx | dense fp16 | K4 streaming |
+|---|---|---|
+| 4,096 | 58.5 | **37.4** |
+| 16,384 | 57.7 | **37.7** |
+| 65,536 | 57.9 | **38.7** |
+
+K4 decodes ~1.5× FASTER than the dense fp16 cache, flat in context length
+(and faster at 64k than the k2b_ph streaming path's 60.0). Scope honestly:
+this is a LATENCY claim only — StreamingQuantizedCache keeps the dequantized
+prefix resident, so resident memory matches fp16; the packed-resident memory
+story requires a packed spectral path (future work, explicitly out of scope).
 
 ## 7. Program context
 
