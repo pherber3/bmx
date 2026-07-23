@@ -663,3 +663,37 @@ def test_k4_corpus_transfer_hybrid_and_wcross(tmp_path):
     for h in pb["hybrid"].values():
         assert "recovery" in h and isinstance(h["h3_pass"], bool)
     assert len(pb["wcross"]) == 4  # 2 directions × 2 eval sides
+
+
+def test_k4_corpus_transfer_diagnostics(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_corpus_transfer import main
+
+    run_dir = main(_tiny_corpus_transfer_cfg(tmp_path))
+    ov = pd.read_parquet(run_dir / "overlap.parquet")
+    assert {"overlap", "tier_agreement", "zero_jaccard", "spectrum", "xretention"} <= (
+        set(ov.kind)
+    )
+
+    o = ov[ov.kind == "overlap"]
+    assert set(o.pair) == {"wiki-code", "wiki-null", "code-null"}
+    assert set(o["rank"]) == {4, 8}  # cfg.overlap_ranks, both <= C=16
+    assert set(o.centered) == {True, False}
+    assert ((o.value >= -1e-9) & (o.value <= 1 + 1e-9)).all()
+
+    t = ov[ov.kind == "tier_agreement"]
+    assert ((t.value >= 0) & (t.value <= 1)).all()
+    assert (t.tier >= 0).all()
+
+    s = ov[ov.kind == "spectrum"]
+    assert set(s.corpus) == {"wiki", "code", "null"}
+    # descending spectra per (corpus, layer)
+    for _, g in s.groupby(["corpus", "layer"]):
+        vals = g.sort_values("rank").value.to_numpy()
+        assert (vals[:-1] >= vals[1:] - 1e-12).all()
+
+    x = ov[ov.kind == "xretention"]
+    # nothing is evaluated UNDER the null's covariance (fit-side only)
+    assert all(not p.endswith("->null") for p in x.pair)
+    assert (x.value > 0).all()

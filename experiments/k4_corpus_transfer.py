@@ -27,6 +27,7 @@ import dataclasses
 import json
 
 import pandas as pd
+import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
@@ -38,6 +39,8 @@ from bmx.cache.spectral import (
     skeptic_charge,
     spectral_quantize,
 )
+from bmx.census import subspace_overlap
+from bmx.quant.hadamard import orthogonalize
 from experiments._k4_common import (
     DEPLOY_S,
     CorpusFit,
@@ -56,6 +59,177 @@ EVAL_CORPORA = ("wiki", "code")
 _HYBRID_CELLS = (("wiki", "code"), ("code", "wiki"))
 # (sigma_corpus, w_corpus) — scored on BOTH eval sides (binding decision 2).
 _WCROSS_CELLS = (("wiki", "code"), ("code", "wiki"))
+
+_PAIRS = (("wiki", "code"), ("wiki", "null"), ("code", "null"))
+
+
+def _rank_overlap(dec_a: torch.Tensor, dec_b: torch.Tensor, r: int) -> float:
+    """Mean squared principal cosine between the top-r reconstruction
+    subspaces span(dec[:, :r]) of two fits, in [0, 1]."""
+    return subspace_overlap(dec_a[:, :r].double(), orthogonalize(dec_b[:, :r].double()))
+
+
+def _proxy_distortion(lam64: torch.Tensor, bits: torch.Tensor) -> float:
+    """Gaussian rate-distortion proxy Σ_i lam_i · 4^(−bits_i) (same form as
+    k4_fit_packs._distortion_curves)."""
+    return float((lam64 * torch.pow(4.0, -bits.double())).sum())
+
+
+def _diagnostics(
+    fits: dict[str, CorpusFit], layers: list[int], cfg: Config
+) -> pd.DataFrame:
+    from bmx.cache.spectral import fit_spectral_basis
+
+    rows: list[dict] = []
+
+    def emit(**kw):
+        base = dict(
+            kind="",
+            pair="",
+            corpus="",
+            layer=-1,
+            rank=-1,
+            budget=float("nan"),
+            tier=-1,
+            centered=False,
+            value=float("nan"),
+        )
+        base.update(kw)
+        rows.append(base)
+
+    C = fits["wiki"].bases[layers[0]].lam64.numel()
+    ranks = [r for r in cfg.overlap_ranks if r <= C]
+    assert ranks, f"no overlap_ranks <= C={C}"
+
+    # Centered refits (Cov(k) instead of E[kkᵀ]), same whitener — H1 probe.
+    centered_bases: dict[str, dict[int, object]] = {}
+    for corpus, fit in fits.items():
+        centered_bases[corpus] = {}
+        for layer_i in layers:
+            M = fit.M_fits[layer_i]
+            Wh, Wh_inv = fit.whiteners[layer_i]
+            centered_bases[corpus][layer_i] = fit_spectral_basis(
+                M - M.mean(dim=0, keepdim=True), Wh, Wh_inv
+            )
+
+    for a, b in _PAIRS:
+        for layer_i in layers:
+            for r in ranks:
+                emit(
+                    kind="overlap",
+                    pair=f"{a}-{b}",
+                    layer=layer_i,
+                    rank=r,
+                    centered=False,
+                    value=_rank_overlap(
+                        fits[a].bases[layer_i].dec, fits[b].bases[layer_i].dec, r
+                    ),
+                )
+                emit(
+                    kind="overlap",
+                    pair=f"{a}-{b}",
+                    layer=layer_i,
+                    rank=r,
+                    centered=True,
+                    value=_rank_overlap(
+                        centered_bases[a][layer_i].dec,
+                        centered_bases[b][layer_i].dec,
+                        r,
+                    ),
+                )
+
+    # Tier-map agreement, rank-index-aligned (both spectra descending).
+    for a, b in _PAIRS:
+        for layer_i in layers:
+            for budget in cfg.budgets:
+                bits_a = pack_from_basis(
+                    fits[a].bases[layer_i], budget, tiers=cfg.tiers, group=cfg.group
+                ).bits
+                bits_b = pack_from_basis(
+                    fits[b].bases[layer_i], budget, tiers=cfg.tiers, group=cfg.group
+                ).bits
+                for tier in cfg.tiers:
+                    mask = bits_a == tier
+                    if mask.any():
+                        emit(
+                            kind="tier_agreement",
+                            pair=f"{a}-{b}",
+                            layer=layer_i,
+                            budget=float(budget),
+                            tier=int(tier),
+                            value=float((bits_b[mask] == tier).float().mean()),
+                        )
+                za, zb = bits_a == 0, bits_b == 0
+                union = int((za | zb).sum())
+                emit(
+                    kind="zero_jaccard",
+                    pair=f"{a}-{b}",
+                    layer=layer_i,
+                    budget=float(budget),
+                    value=float((za & zb).sum()) / union if union else float("nan"),
+                )
+
+    # Eigenvalue-spectrum overlay.
+    for corpus, fit in fits.items():
+        for layer_i in layers:
+            lam = fit.bases[layer_i].lam64
+            for r in range(lam.numel()):
+                emit(
+                    kind="spectrum",
+                    corpus=corpus,
+                    layer=layer_i,
+                    rank=r,
+                    value=float(lam[r]),
+                )
+
+    # Analytic cross-corpus retention (Gate-A machinery pointed across
+    # corpora): src basis+alloc under dst's covariance vs dst's own fit.
+    # Never INTO null (nothing is evaluated on shuffled text, spec §2).
+    for a, b in _PAIRS:
+        for src, dst in ((a, b), (b, a)):
+            if dst == "null":
+                continue
+            for layer_i in layers:
+                for budget in cfg.budgets:
+                    pack_src = pack_from_basis(
+                        fits[src].bases[layer_i],
+                        budget,
+                        tiers=cfg.tiers,
+                        group=cfg.group,
+                    )
+                    lam_dst_given_src = basis_alloc_moment(
+                        fits[src].bases[layer_i], fits[dst].M_fits[layer_i]
+                    )
+                    D_cross = _proxy_distortion(lam_dst_given_src, pack_src.bits)
+                    pack_dst = pack_from_basis(
+                        fits[dst].bases[layer_i],
+                        budget,
+                        tiers=cfg.tiers,
+                        group=cfg.group,
+                    )
+                    D_own = _proxy_distortion(
+                        fits[dst].bases[layer_i].lam64, pack_dst.bits
+                    )
+                    emit(
+                        kind="xretention",
+                        pair=f"{src}->{dst}",
+                        layer=layer_i,
+                        budget=float(budget),
+                        value=D_own / max(D_cross, 1e-300),
+                    )
+
+    cols = [
+        "kind",
+        "pair",
+        "corpus",
+        "layer",
+        "rank",
+        "budget",
+        "tier",
+        "centered",
+        "value",
+    ]
+    return pd.DataFrame(rows)[cols]
 
 
 @dataclasses.dataclass
@@ -353,7 +527,9 @@ def main(cfg: Config):
                             budget=budget,
                         )
 
-    # ---- Task 6 seam: overlap.parquet diagnostics appended here ------------
+    ov_df = _diagnostics(fits, layers, cfg)
+    write_metrics(run, ov_df, name="overlap")
+    print(f"overlap.parquet: {len(ov_df)} diagnostic rows", flush=True)
 
     cols = [
         "model",
