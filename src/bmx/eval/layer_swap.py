@@ -83,11 +83,38 @@ def load_eval_tokens(
     assert text_field in cols, (
         f"text_field {text_field!r} not a column of {dataset_id}: {cols}"
     )
-    text = "\n\n".join(ds[text_field])
-    # truncation at the tokenizer avoids encoding the full split
-    ids = tok(
-        text, return_tensors="pt", truncation=True, max_length=token_offset + n_tokens
-    )
+    rows = ds[text_field]
+    n_rows = len(rows)
+    max_length = token_offset + n_tokens
+    # Accumulate only as many rows as needed before joining — joining the
+    # ENTIRE text column first (e.g. 61,373 rows on codeparrot) allocated
+    # 24.5 GB before tokenizer truncation ever got a chance to help. Slice a
+    # prefix whose char count generously covers the requested token budget,
+    # doubling the margin and retrying if that prefix under-tokenizes.
+    # margin=16 chars/token is generous for wikitext (~5-6) and most code
+    # (denser); the loop makes it correct even when it isn't. Preserves row
+    # order and the "\n\n" separator exactly, so for any sufficient prefix
+    # the first max_length tokens are IDENTICAL to the full-join result —
+    # the final iteration (k == n_rows) is byte-identical to a full join.
+    margin = 16
+    k = n_rows
+    text = None
+    ids = None
+    while True:
+        need_chars = max_length * margin
+        acc_chars = 0
+        k = n_rows
+        for i, row in enumerate(rows):
+            acc_chars += len(row) + (2 if i > 0 else 0)  # "\n\n" separator
+            if acc_chars >= need_chars:
+                k = i + 1
+                break
+        text = "\n\n".join(rows[:k])
+        # truncation at the tokenizer avoids encoding the full prefix
+        ids = tok(text, return_tensors="pt", truncation=True, max_length=max_length)
+        if ids.input_ids.shape[1] >= max_length or k >= n_rows:
+            break
+        margin *= 2
     out = ids.input_ids[0][token_offset:]
     if shuffle_seed >= 0:
         g = torch.Generator().manual_seed(shuffle_seed + token_offset)

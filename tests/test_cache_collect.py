@@ -318,6 +318,154 @@ def test_load_eval_tokens_text_field_assert(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# load_eval_tokens capped-accumulation — must not join the ENTIRE text
+# column before tokenizing (that allocated 24.5 GB on the 61,373-row
+# codeparrot split). Correctness pin: the capped-accumulation result must be
+# BYTE-IDENTICAL to the old full-join algorithm, for both a sufficient first
+# pass and a case that forces the margin-doubling retry.
+# ---------------------------------------------------------------------------
+
+
+def _char_proportional_tokenizer(chars_per_token: int = 4):
+    """A fake tokenizer where token count actually depends on text length
+    (1 token per `chars_per_token` chars, deterministic), so
+    prefix-sufficiency matters. Unlike the arange fake in
+    _patch_eval_tokens_io (blind to text content and thus blind to
+    under-accumulation bugs), this fake can distinguish 'tokenized a
+    prefix' from 'tokenized the full text'.
+    """
+
+    class _CharPropTok:
+        def __call__(self, text, return_tensors, truncation, max_length):
+            n = min(len(text) // chars_per_token, max_length)
+            ids = torch.arange(n).unsqueeze(0)
+            return type("E", (), {"input_ids": ids})()
+
+    return _CharPropTok()
+
+
+def _patch_eval_tokens_rows(monkeypatch, rows, chars_per_token: int = 4):
+    """Patch load_dataset to return the given list of text rows, and the
+    tokenizer to the char-proportional fake."""
+    monkeypatch.setattr(
+        "datasets.load_dataset", lambda *a, **k: {"text": rows}, raising=False
+    )
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda *a, **k: _char_proportional_tokenizer(chars_per_token),
+    )
+
+
+def _old_full_join_tokens(rows, n_tokens, token_offset, tok):
+    """The pre-fix algorithm: join the ENTIRE column, then tokenize. Used
+    in-test as the reference/expected value — NOT imported from production
+    code (that's exactly the code path we're replacing)."""
+    text = "\n\n".join(rows)
+    ids = tok(
+        text, return_tensors="pt", truncation=True, max_length=token_offset + n_tokens
+    )
+    return ids.input_ids[0][token_offset:]
+
+
+class _PoisonedTail(list):
+    """A list where indexing/iterating past `safe_upto` raises — proves the
+    production code only ever touches a PREFIX of the rows, never the whole
+    column (the actual defect: joining ALL 61,373 codeparrot rows before
+    tokenizing, which allocated 24.5 GB)."""
+
+    def __init__(self, rows, safe_upto):
+        super().__init__(rows)
+        self.safe_upto = safe_upto
+
+    def __iter__(self):
+        for i in range(len(self)):
+            if i >= self.safe_upto:
+                raise AssertionError(
+                    f"row {i} touched but only a prefix < {self.safe_upto} "
+                    "should ever be accumulated/joined"
+                )
+            yield list.__getitem__(self, i)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            stop = key.stop if key.stop is not None else len(self)
+            if stop > self.safe_upto:
+                raise AssertionError(
+                    f"slice stop={stop} exceeds safe_upto={self.safe_upto}: "
+                    "accumulation read past the needed prefix"
+                )
+            return _PoisonedTail(list.__getitem__(self, key), self.safe_upto)
+        if key >= self.safe_upto:
+            raise AssertionError(
+                f"row {key} touched but only a prefix < {self.safe_upto} "
+                "should ever be accumulated/joined"
+            )
+        return list.__getitem__(self, key)
+
+
+def test_load_eval_tokens_does_not_touch_rows_past_needed_prefix(monkeypatch):
+    """The core memory-safety property: with many more rows than needed,
+    accumulation must stop well short of the full column. A dataset with
+    10,000 rows requesting only 8 tokens must never read row 10 (each row
+    is 40 chars => margin=16 chars/token covers 8 tokens in ~4 rows; give
+    generous headroom at row 10 to avoid a flaky off-by-one, while row 9990
+    would blow the old full-join allocation on a real 24.5 GB-sized split)."""
+    import bmx.eval.layer_swap as ls
+
+    rows = _PoisonedTail(
+        [f"row {i:05d} padded to forty characters!!" for i in range(10_000)],
+        safe_upto=10,
+    )
+    _patch_eval_tokens_rows(monkeypatch, rows)
+
+    got = ls.load_eval_tokens("gpt2", n_tokens=8, token_offset=0)
+    assert got.shape == (8,)
+
+
+def test_load_eval_tokens_capped_accumulation_matches_full_join(monkeypatch):
+    """~10 short rows, sufficient margin on the first pass: capped
+    accumulation must equal the old full-join result exactly."""
+    import bmx.eval.layer_swap as ls
+
+    rows = [f"row {i} has some words in it" for i in range(10)]
+    _patch_eval_tokens_rows(monkeypatch, rows)
+
+    n_tokens, token_offset = 8, 2
+    got = ls.load_eval_tokens("gpt2", n_tokens=n_tokens, token_offset=token_offset)
+    expected = _old_full_join_tokens(
+        rows, n_tokens, token_offset, _char_proportional_tokenizer()
+    )
+    assert torch.equal(got, expected)
+    assert got.shape == (n_tokens,)
+
+
+def test_load_eval_tokens_capped_accumulation_retries_when_undercovered(monkeypatch):
+    """A tokenizer that is DENSER than the margin=16 chars/token assumption
+    (here: 1 token per 30 chars, i.e. code-like — real code is denser in
+    tokens/char than the margin's generous wikitext-calibrated assumption of
+    16): the first accumulation pass under-covers the requested token
+    budget, forcing at least one margin-doubling retry. Must still land on
+    the full-join-equivalent result — the retry loop is transparent to
+    correctness, only to how much text got joined along the way."""
+    import bmx.eval.layer_swap as ls
+
+    chars_per_token = 30
+    rows = [f"row number {i:04d} of the corpus text body" for i in range(400)]
+    _patch_eval_tokens_rows(monkeypatch, rows, chars_per_token=chars_per_token)
+
+    n_tokens, token_offset = 300, 10
+    got = ls.load_eval_tokens("gpt2", n_tokens=n_tokens, token_offset=token_offset)
+    expected = _old_full_join_tokens(
+        rows,
+        n_tokens,
+        token_offset,
+        _char_proportional_tokenizer(chars_per_token),
+    )
+    assert torch.equal(got, expected)
+    assert got.shape == (n_tokens,)
+
+
+# ---------------------------------------------------------------------------
 # collect_cache.py corpus passthrough — output naming + corpus-default guard
 # ---------------------------------------------------------------------------
 
