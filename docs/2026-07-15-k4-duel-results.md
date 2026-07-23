@@ -97,7 +97,10 @@ accounting modes that charge only the decoder columns the dequant provably
 reads. **No old parquet was edited or re-run** — every number below derives
 from the committed §3 NIAH parquets' recorded `(arm, length, kv_size_bits)`
 plus the committed fit-pack parquet's per-layer `n_zero_dirs`, via
-`experiments/k4_charge_curve.py`.
+`experiments/k4_charge_curve.py`. Scope: this correction pass covers the
+NIAH bits-vs-context curve only — the LongBench task-S `kv_size_bits`
+columns in §2 and §6 remain skeptic-v1 as-measured (conservative: they
+overstate K4's bits by the same mechanism, uncorrected here).
 
 **Mode definitions** (expressions verbatim from `spectral.py`'s "Accounting
 modes" docstring; `C=1024`, `group=64`, `tiers=(0,2,3,4,5,6,8)`):
