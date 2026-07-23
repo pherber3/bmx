@@ -635,3 +635,31 @@ def test_k4_corpus_transfer_matched_fit_budget_guard(tmp_path):
     cfg = dataclasses.replace(cfg, code_fit_paths=cfg.code_fit_paths[:1])
     with pytest.raises(AssertionError, match="matched fit"):
         main(cfg)
+
+
+def test_k4_corpus_transfer_hybrid_and_wcross(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_corpus_transfer import main
+
+    run_dir = main(_tiny_corpus_transfer_cfg(tmp_path))
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+
+    hyb = df[df.arm == "spectral_hybrid"]
+    assert set(zip(hyb.fit_corpus, hyb.alloc_corpus, hyb.eval_corpus)) == {
+        ("wiki", "code", "code"),
+        ("code", "wiki", "wiki"),
+    }
+    assert (hyb.w_corpus == hyb.fit_corpus).all()
+
+    wx = df[df.arm == "spectral_wcross"]
+    assert set(zip(wx.fit_corpus, wx.w_corpus)) == {("wiki", "code"), ("code", "wiki")}
+    assert set(wx.eval_corpus) == {"wiki", "code"}
+    assert (wx.alloc_corpus == wx.fit_corpus).all()
+
+    v = json.loads((run_dir / "corpus_transfer_verdict.json").read_text())
+    pb = v["per_budget"]["2.5"]
+    assert set(pb["hybrid"]) == {"basis_wiki_alloc_code", "basis_code_alloc_wiki"}
+    for h in pb["hybrid"].values():
+        assert "recovery" in h and isinstance(h["h3_pass"], bool)
+    assert len(pb["wcross"]) == 4  # 2 directions × 2 eval sides

@@ -32,6 +32,8 @@ import tyro
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.codecs import quantize_cache
 from bmx.cache.spectral import (
+    basis_alloc_moment,
+    fit_spectral_basis,
     pack_from_basis,
     skeptic_charge,
     spectral_quantize,
@@ -50,6 +52,10 @@ from experiments._k4_common import (
 
 FIT_CORPORA = ("wiki", "code", "null")
 EVAL_CORPORA = ("wiki", "code")
+# (basis_corpus, alloc_corpus) — scored on the alloc corpus's eval side (H3).
+_HYBRID_CELLS = (("wiki", "code"), ("code", "wiki"))
+# (sigma_corpus, w_corpus) — scored on BOTH eval sides (binding decision 2).
+_WCROSS_CELLS = (("wiki", "code"), ("code", "wiki"))
 
 
 @dataclasses.dataclass
@@ -295,7 +301,58 @@ def main(cfg: Config):
                             budget=budget,
                         )
 
-    # ---- Task 5 seam: hybrid + W-cross arms appended here ------------------
+    # ---- hybrid (H3): basis from A, lam measured on B, waterfill rerun -----
+    for basis_c, alloc_c in _HYBRID_CELLS:
+        for budget in cfg.budgets:
+            for layer_i in layers:
+                lam_alloc = basis_alloc_moment(
+                    fits[basis_c].bases[layer_i], fits[alloc_c].M_fits[layer_i]
+                )
+                pack = pack_from_basis(
+                    fits[basis_c].bases[layer_i],
+                    budget,
+                    tiers=cfg.tiers,
+                    group=cfg.group,
+                    lam_alloc=lam_alloc,
+                )
+                for path in eval_paths[alloc_c]:
+                    label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                    score_pack(
+                        pack,
+                        alloc_c,
+                        label,
+                        layer_i,
+                        arm="spectral_hybrid",
+                        fit_c=basis_c,
+                        w_c=basis_c,
+                        alloc_c=alloc_c,
+                        budget=budget,
+                    )
+
+    # ---- W-cross (binding decision 2): Σ from A, W (whitener) from B -------
+    for sigma_c, w_c in _WCROSS_CELLS:
+        for layer_i in layers:
+            Wh_b, Wh_inv_b = fits[w_c].whiteners[layer_i]
+            basis_x = fit_spectral_basis(fits[sigma_c].M_fits[layer_i], Wh_b, Wh_inv_b)
+            for budget in cfg.budgets:
+                pack = pack_from_basis(
+                    basis_x, budget, tiers=cfg.tiers, group=cfg.group
+                )
+                for eval_c, paths in eval_paths.items():
+                    for path in paths:
+                        label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                        score_pack(
+                            pack,
+                            eval_c,
+                            label,
+                            layer_i,
+                            arm="spectral_wcross",
+                            fit_c=sigma_c,
+                            w_c=w_c,
+                            alloc_c=sigma_c,
+                            budget=budget,
+                        )
+
     # ---- Task 6 seam: overlap.parquet diagnostics appended here ------------
 
     cols = [
@@ -347,7 +404,7 @@ def _cell_wins(
     wins: dict[str, list[float]] = {}
     extrapolated = False
     for _, row in sub.iterrows():
-        pts = tq_curves.get(row.cache, {}).get(int(row.layer))
+        pts = tq_curves.get((row.eval_corpus, row.cache), {}).get(int(row.layer))
         if not pts:
             continue
         tq_dist, ex = _log_interp(pts, float(row.bpe_skeptic_deploy))
@@ -363,10 +420,14 @@ def _cell_wins(
 def _transfer_verdict(
     df: pd.DataFrame, tq_df: pd.DataFrame, headline_col: str, cfg: Config
 ) -> dict:
-    # TQ curves keyed per cache (never pooled across caches — same reasoning
-    # as k4_dec_quant._dec_quant_verdict).
+    # TQ curves keyed per (eval_corpus, cache) — never pooled across caches
+    # (same reasoning as k4_dec_quant._dec_quant_verdict) and never keyed by
+    # bare cache basename, which would collide if eval filenames ever repeat
+    # across corpora (e.g. both wiki_eval_paths and code_eval_paths pointing
+    # at a cache named the same thing).
     tq_curves = {
-        cache: _tq_layer_curve(g, headline_col) for cache, g in tq_df.groupby("cache")
+        key: _tq_layer_curve(g, headline_col)
+        for key, g in tq_df.groupby(["eval_corpus", "cache"])
     }
 
     per_budget: dict[str, dict] = {}
@@ -420,13 +481,53 @@ def _transfer_verdict(
                     label=label,
                 )
 
+        hybrid: dict[str, dict] = {}
+        for basis_c, alloc_c in _HYBRID_CELLS:
+            sub = df[
+                (df.arm == "spectral_hybrid")
+                & (df.budget == float(budget))
+                & (df.fit_corpus == basis_c)
+                & (df.alloc_corpus == alloc_c)
+            ]
+            matched = cells.get(f"{alloc_c}->{alloc_c}")
+            if sub.empty or matched is None:
+                continue
+            wins, ex = _cell_wins(sub, tq_curves, headline_col)
+            win_mean = float(pd.Series(list(wins.values())).mean())
+            recovery = win_mean / matched["win_mean"]
+            hybrid[f"basis_{basis_c}_alloc_{alloc_c}"] = dict(
+                win_mean=win_mean,
+                recovery=recovery,
+                h3_pass=bool(recovery >= 0.9),
+                extrapolated=bool(ex),
+            )
+
+        wcross: dict[str, dict] = {}
+        for sigma_c, w_c in _WCROSS_CELLS:
+            for eval_c in EVAL_CORPORA:
+                sub = df[
+                    (df.arm == "spectral_wcross")
+                    & (df.budget == float(budget))
+                    & (df.fit_corpus == sigma_c)
+                    & (df.w_corpus == w_c)
+                    & (df.eval_corpus == eval_c)
+                ]
+                if sub.empty:
+                    continue
+                wins, ex = _cell_wins(sub, tq_curves, headline_col)
+                wcross[f"sigma_{sigma_c}_W_{w_c}->{eval_c}"] = dict(
+                    win_mean=float(pd.Series(list(wins.values())).mean()),
+                    extrapolated=bool(ex),
+                )
+
         null_wiki = D.get("null->wiki", {}).get("mean")
         per_budget[f"{budget:g}"] = dict(
             cells=cells,
             D=D,
             model_intrinsic_flag=bool(null_wiki is not None and null_wiki < 0.10),
+            hybrid=hybrid,
+            wcross=wcross,
         )
-        # Task 5 seam: per_budget[...] gains "hybrid" and "wcross" keys.
 
     return dict(
         headline_metric=headline_col,

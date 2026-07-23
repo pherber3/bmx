@@ -190,10 +190,22 @@ def pack_from_basis(
     *,
     tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8),
     group: int = 64,
+    lam_alloc: torch.Tensor | None = None,
 ) -> SpectralPack:
-    """Allocate bits for one budget against an already-fit SpectralBasis."""
+    """Allocate bits for one budget against an already-fit SpectralBasis.
+
+    `lam_alloc` (fp64, (C,), index-aligned with enc's columns) substitutes the
+    waterfill input — the K4 corpus-transfer hybrid path ("basis transfers,
+    allocation adapts": basis from corpus A, per-direction variances measured
+    on corpus B via basis_alloc_moment). Default None reproduces the prior
+    behavior bit-exactly (allocates on basis.lam64).
+    """
     assert 1 not in tiers, "symmetric RTN is undefined at 1 bit (qmax=0)"
-    bits = allocate_bits_from_variance(basis.lam64, budget, tiers)
+    alloc_input = basis.lam64 if lam_alloc is None else lam_alloc
+    assert alloc_input.shape == basis.lam64.shape, (
+        f"lam_alloc shape {tuple(alloc_input.shape)} != {tuple(basis.lam64.shape)}"
+    )
+    bits = allocate_bits_from_variance(alloc_input, budget, tiers)
     return SpectralPack(
         enc=basis.enc,
         dec=basis.dec,
@@ -203,6 +215,15 @@ def pack_from_basis(
         tiers=tuple(tiers),
         budget=float(budget),
     )
+
+
+def basis_alloc_moment(basis: SpectralBasis, M_alloc: torch.Tensor) -> torch.Tensor:
+    """Per-direction second moments of M_alloc's rows in `basis`'s coordinate
+    system: diag(encᵀ Σ_alloc enc) = E[(M_alloc @ enc)_i²], fp64 (C,), clamped
+    ≥ 0. The waterfill input for the H3 hybrid (pack_from_basis lam_alloc)."""
+    Sigma = key_second_moment(M_alloc)
+    enc64 = basis.enc.double()
+    return torch.einsum("ci,cd,di->i", enc64, Sigma, enc64).clamp_min(0.0)
 
 
 def fit_spectral_pack(

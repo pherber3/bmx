@@ -302,3 +302,45 @@ def test_int8_decoder_roundtrip():
     step = dec[:, used].abs().amax(dim=0) / 127.0
     assert (dec_rt[:, used] - dec[:, used]).abs().amax(dim=0).le(step + 1e-6).all()
     assert torch.equal(dec_rt, int8_decoder_roundtrip(dec, bits))  # deterministic
+
+
+def test_pack_from_basis_lam_alloc_default_unchanged():
+    import torch
+
+    from bmx.cache.spectral import (
+        fit_spectral_basis,
+        identity_whitener,
+        pack_from_basis,
+    )
+
+    g = torch.Generator().manual_seed(0)
+    M = torch.randn(128, 16, generator=g)
+    Ih, Ih_inv = identity_whitener(16)
+    basis = fit_spectral_basis(M, Ih, Ih_inv)
+    default = pack_from_basis(basis, 2.5, group=16)
+    explicit_none = pack_from_basis(basis, 2.5, group=16, lam_alloc=None)
+    own_lam = pack_from_basis(basis, 2.5, group=16, lam_alloc=basis.lam64)
+    assert torch.equal(default.bits, explicit_none.bits)
+    assert torch.equal(default.bits, own_lam.bits)
+
+
+def test_basis_alloc_moment_matches_projection_variance():
+    import torch
+
+    from bmx.cache.spectral import (
+        basis_alloc_moment,
+        fit_spectral_basis,
+        identity_whitener,
+    )
+
+    g = torch.Generator().manual_seed(0)
+    M_fit = torch.randn(64, 8, generator=g)
+    M_alloc = torch.randn(96, 8, generator=g)
+    Ih, Ih_inv = identity_whitener(8)
+    basis = fit_spectral_basis(M_fit, Ih, Ih_inv)
+    lam = basis_alloc_moment(basis, M_alloc)
+    Y = M_alloc.double() @ basis.enc.double()
+    ref = (Y**2).mean(dim=0)
+    assert lam.dtype == torch.float64 and lam.shape == (8,)
+    assert torch.allclose(lam, ref, rtol=1e-10, atol=1e-12)
+    assert (lam >= 0).all()
