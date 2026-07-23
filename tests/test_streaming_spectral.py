@@ -261,7 +261,13 @@ def test_bits_per_entry_averages_layers_for_allocated_packs(tmp_path):
 
     S = cache.layers[-1].get_seq_length()
     C = cache.layers[-1]._h_kv * cache.layers[-1]._d_head
+    mean_c_used = sum(ly._pack.c_used for ly in cache.layers) / len(cache.layers)
     expected = sum(per_layer) / len(per_layer) + skeptic_charge(
-        C, S, cache.layers[-1]._pack.tiers
+        C, S, cache.layers[-1]._pack.tiers, c_used=mean_c_used
     )
     assert abs(bpe_k - expected) < 1e-9
+    # v2 must charge strictly less than v1 whenever dirs were dropped (additive pin).
+    expected_v1 = sum(per_layer) / len(per_layer) + skeptic_charge(
+        C, S, cache.layers[-1]._pack.tiers
+    )
+    assert mean_c_used < C and bpe_k < expected_v1

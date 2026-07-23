@@ -558,6 +558,10 @@ class StreamingQuantizedCache(Cache):
         self.v_spec = v_spec
         self.recent_window = recent_window
         self._handles: list = []
+        # self._dec_bits hook: hardcode 16.0 until Task 5 wires
+        # k_spec.dec_quant == "int8" -> 8.0 (the CacheCodecSpec field doesn't
+        # exist yet). bits_per_entry()'s spectral branch reads this.
+        self._dec_bits = 16.0
 
     def _pack_for_layer(self, i: int) -> "SpectralPack | None":
         """Look up layer i's spectral pack, asserting it's present when spectral."""
@@ -643,9 +647,24 @@ class StreamingQuantizedCache(Cache):
         For the spectral K arm, bpe_k is the layer's blended block-payload bpe
         (quantized-prefix codec_bpe + fp16-tail 16.0, both already blended in
         StreamingQuantizedLayer.update — see bpe_k there) PLUS the per-sequence
-        skeptic pack charge:
+        skeptic pack charge, skeptic-v2 (used-columns; see spectral.py's
+        "Accounting modes" docstring):
 
-            bpe_k = (blended block payload bpe) + skeptic_charge(C, S, pack.tiers)
+            bpe_k = (blended block payload bpe)
+                    + skeptic_charge(C, S, tiers, c_used=mean_c_used, dec_bits=self._dec_bits)
+
+        where mean_c_used = mean over layers of layer._pack.c_used (the number
+        of decoder columns actually carrying nonzero bits — see
+        SpectralPack.c_used). skeptic_charge is linear in c_used, so the
+        across-layer mean of per-layer v2 charges equals the charge evaluated
+        at mean_c_used; this is exact for allocated packs too, where each
+        layer's own budget gives it a different c_used (range 139-423 zero
+        dirs at b2.5). skeptic-v1 (the expression every parquet before
+        2026-07-23 measured) was the same call with c_used left at its
+        default (None -> C, the full decoder charged regardless of how many
+        columns are actually read at decode):
+
+            bpe_k = (blended block payload bpe) + skeptic_charge(C, S, tiers)
 
         where S = last.get_seq_length() (the full committed sequence length, fp16
         tail included — NOT just the quantized-committed count) and
@@ -663,12 +682,23 @@ class StreamingQuantizedCache(Cache):
         # Only charge once something has actually flushed through the spectral
         # path (_committed_S_q > 0); an all-fp16 cache (nothing quantized yet)
         # must report bpe_k == 16.0, not 16.0 + a charge for an unused pack.
-        # The charge is layer-independent (same C/S/tiers), so adding it after
-        # the mean equals averaging per-layer charged values.
+        # The charge is layer-independent (same C/S/tiers) but NOT c_used-
+        # independent (each layer's pack can have a different c_used under
+        # per-layer allocation), so the mean_c_used passed to skeptic_charge
+        # must be computed BEFORE this single call — linearity in c_used
+        # (see spectral.skeptic_charge) makes that equal to averaging
+        # per-layer charged values.
         if self.k_spec.arm == "spectral" and last._committed_S_q > 0:
             S = last.get_seq_length()
             C = last._h_kv * last._d_head
-            bpe_k = bpe_k + skeptic_charge(C, S, last._pack.tiers)
+            mean_c_used = sum(layer._pack.c_used for layer in self.layers) / len(
+                self.layers
+            )
+            # self._dec_bits hook: hardcode 16.0 until Task 5 wires
+            # k_spec.dec_quant == "int8" -> 8.0 (field doesn't exist yet).
+            bpe_k = bpe_k + skeptic_charge(
+                C, S, last._pack.tiers, c_used=mean_c_used, dec_bits=self._dec_bits
+            )
         return bpe_k, bpe_v
 
     def memory_report(
