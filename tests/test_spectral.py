@@ -237,3 +237,53 @@ def test_pack_file_roundtrip(tmp_path):
 
     with pytest.raises(KeyError):
         load_packs(path, 4.0)
+
+
+def test_skeptic_charge_v2_hand_computed():
+    """v2 arithmetic pinned exactly; defaults reproduce v1 bit-exactly."""
+    tiers7 = (0, 2, 3, 4, 5, 6, 8)
+    # c_used == C reproduces the old value exactly (continuity pin).
+    assert skeptic_charge(1024, 32768, tiers7, c_used=1024) == skeptic_charge(
+        1024, 32768, tiers7
+    )
+    assert skeptic_charge(1024, 32768, tiers7) == 0.500091552734375  # v1, hand
+    # Hand-computed v2 fp16 case: 16*400/8192 + 3/8192.
+    assert skeptic_charge(1024, 8192, tiers7, c_used=400) == 0.7816162109375
+    # Hand-computed v2 int8 case: 8*400/8192 + 16*400/(8192*1024) + 3/8192.
+    assert (
+        skeptic_charge(1024, 8192, tiers7, c_used=400, dec_bits=8.0)
+        == 0.391754150390625
+    )
+
+
+def test_spectral_payload_bpe_v2():
+    import dataclasses as _dc
+
+    from bmx.cache.spectral import spectral_payload_bpe
+
+    M, _ = _spiked_keys(S=256, C=8, seed=0)
+    Wh, Wh_inv = identity_whitener(8)
+    pack = fit_spectral_pack(M, Wh, Wh_inv, 2.0, group=4)
+    pack = _dc.replace(pack, bits=torch.tensor([8, 4, 2, 0, 0, 0, 0, 0]))
+    assert pack.c_used == 3
+    # v2 = mean(bits) + scale_bits(4) * 3/8 = 1.75 + 4.0*0.375 = 3.25 (v1 was 5.75).
+    assert spectral_payload_bpe(pack) == 3.25
+    # spectral_quantize returns the same payload-v2 number.
+    _, bpe = spectral_quantize(M, pack)
+    assert bpe == 3.25
+
+
+def test_dropped_decoder_columns_never_read():
+    """THE license for charging C×C_used: mutating dec columns of zero-bit dirs
+    must not change the reconstruction by a single bit."""
+    M, _ = _spiked_keys(S=256, C=64, seed=1)
+    Wh, Wh_inv = identity_whitener(64)
+    pack = fit_spectral_pack(M, Wh, Wh_inv, 1.5, group=16)  # low budget => dropped dirs
+    assert pack.c_used < 64, "fixture must produce zero-bit dirs"
+    M_hat_ref, _ = spectral_quantize(M, pack)
+    import dataclasses as _dc
+
+    dec_mut = pack.dec.clone()
+    dec_mut[:, pack.bits == 0] = torch.randn_like(dec_mut[:, pack.bits == 0])
+    M_hat_mut, _ = spectral_quantize(M, _dc.replace(pack, dec=dec_mut))
+    assert torch.equal(M_hat_ref, M_hat_mut)

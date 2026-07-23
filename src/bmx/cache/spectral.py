@@ -9,6 +9,32 @@ waterfill on its eigenvalues (spec §3, theory grounding §8 of
 docs/superpowers/specs/2026-07-12-k4-spectral-codec-design.md).
 
 All moment/eig math is fp64; codec application is fp32.
+
+Accounting modes (expressions are the scientific record; never re-derive or
+reassociate — every change to these is a NEW NAMED MODE with the prior
+expression documented beside it):
+
+- skeptic-v1 (full-C fp16): `16·C/S + tier_bits(tiers, S)`. Charges a full
+  C×C fp16 decoder matrix regardless of how many directions actually carry
+  nonzero bits. This is the expression every parquet before 2026-07-23
+  measured. `skeptic_charge`'s defaults reproduce this bit-exactly forever.
+- skeptic-v2 (used-columns): `16·c_used/S + tier_bits(tiers, S)`. Only the
+  `c_used` decoder columns whose direction carries nonzero bits are ever
+  read at decode (see `test_dropped_decoder_columns_never_read` — the
+  license for this: mutating a dropped column provably cannot change the
+  reconstruction). Charging the full C columns over-counts by
+  `16·(C - c_used)/S`.
+- skeptic-v2-int8 (used-columns, int8 decoder): `8·c_used/S +
+  16·c_used/(S·C) + tier_bits(tiers, S)`. Same used-columns charge but the
+  decoder itself is stored int8 (8 bits/entry) plus one fp16 per-column
+  scale amortized over S rows (16·c_used/(S·C)).
+- payload-v1: `mean(bits) + scale_bits(group)`. Charges the groupwise fp16
+  scale for every one of the C directions, including zero-bit (dropped)
+  ones that store no payload and so need no scale.
+  See `test_dropped_decoder_columns_never_read`.
+- payload-v2: `mean(bits) + scale_bits(group)·(c_used/C)`. Prorates the
+  scale term by the fraction of directions actually carrying bits, removing
+  payload-v1's phantom scales on dropped directions.
 """
 
 from __future__ import annotations
@@ -117,6 +143,12 @@ class SpectralPack:
     tiers: tuple[int, ...]
     budget: float
 
+    @property
+    def c_used(self) -> int:
+        """Number of directions carrying nonzero bits — the decoder columns
+        actually read at decode (see skeptic-v2 / payload-v2 above)."""
+        return int((self.bits != 0).sum())
+
 
 @dataclasses.dataclass
 class SpectralBasis:
@@ -188,12 +220,28 @@ def fit_spectral_pack(
     )
 
 
+def spectral_payload_bpe(pack: SpectralPack) -> float:
+    """Model-level payload bpe for a fitted pack (payload-v2, see module
+    docstring): mean(bits) + scale_bits(group)·(c_used/C).
+
+    payload-v1 was `mean(bits) + scale_bits(group)` — a full groupwise-scale
+    charge regardless of how many directions actually carry bits. Directions
+    with bits == 0 store no payload at all, so they need no scale either;
+    payload-v1 over-counts those phantom scales. payload-v2 prorates the
+    scale term by the used fraction c_used/C.
+    """
+    C = pack.bits.shape[0]
+    return float(pack.bits.float().mean().item()) + scale_bits(pack.group) * (
+        pack.c_used / C
+    )
+
+
 def spectral_quantize(
     M: torch.Tensor, pack: SpectralPack, *, mse_scale: bool = True
 ) -> tuple[torch.Tensor, float]:
     """Quantize (S, C) M with a fitted pack. Returns (M_hat, bpe_model).
 
-    bpe_model = mean payload + groupwise-scale term (model-level accounting —
+    bpe_model = spectral_payload_bpe(pack) (payload-v2 model-level accounting —
     the pack itself ships with the model). Add skeptic_charge(C, S, tiers) for
     the per-sequence-charged view.
     """
@@ -203,14 +251,42 @@ def spectral_quantize(
     Y = M @ pack.enc.to(M.dtype)
     Y_hat = quantize_by_bits(Y, pack.bits, pack.group, mse_scale=mse_scale)
     M_hat = Y_hat @ pack.dec.mT.to(M.dtype)
-    bpe = float(pack.bits.float().mean().item()) + scale_bits(pack.group)
+    bpe = spectral_payload_bpe(pack)
     return M_hat, bpe
 
 
-def skeptic_charge(C: int, S: int, tiers: tuple[int, ...]) -> float:
-    """Per-sequence charge when the pack is NOT granted model-level status:
-    one fp16 C×C decoder matrix (16·C/S) + the per-direction bit map."""
-    return 16.0 * C / S + tier_bits(tiers, S)
+def skeptic_charge(
+    C: int,
+    S: int,
+    tiers: tuple[int, ...],
+    *,
+    c_used: float | None = None,
+    dec_bits: float = 16.0,
+) -> float:
+    """Per-sequence charge when the pack is NOT granted model-level status.
+
+    skeptic-v1 (defaults, c_used=None -> C, dec_bits=16.0; the expression every
+    parquet before 2026-07-23 measured, reproduced bit-exactly forever):
+        16·C/S + tier_bits(tiers, S)
+    charges a full C×C fp16 decoder matrix.
+
+    skeptic-v2 (c_used given, dec_bits=16.0) charges only the c_used decoder
+    columns actually read at decode (see test_dropped_decoder_columns_never_read
+    for the license — mutating a dropped column can't change the
+    reconstruction):
+        16·c_used/S + tier_bits(tiers, S)
+
+    skeptic-v2-int8 (c_used given, dec_bits=8.0) additionally stores the
+    decoder int8 (8 bits/entry) plus one fp16 per-column scale amortized over
+    S rows:
+        8·c_used/S + 16·c_used/(S·C) + tier_bits(tiers, S)
+    """
+    assert dec_bits in (8.0, 16.0), f"dec_bits must be 8.0 or 16.0; got {dec_bits}"
+    if c_used is None:
+        c_used = C
+    assert 0 < c_used <= C, f"c_used must be in (0, C]; got {c_used}, C={C}"
+    int8_scale_term = 16.0 * c_used / (S * C) if dec_bits < 16.0 else 0.0
+    return dec_bits * c_used / S + int8_scale_term + tier_bits(tiers, S)
 
 
 def save_pack_file(
