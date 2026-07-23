@@ -568,3 +568,70 @@ def test_layer_ctx_importable_from_k4_common(tmp_path):
     assert ctx.M_pre.shape == (128, 16)
     assert ctx.tail == slice(64, 128)
     assert ctx.K_post_true is None
+
+
+def _tiny_corpus_transfer_cfg(tmp_path, budgets=(2.5,)):
+    """Matched fit budgets (binding decision 1): 2 fit slices per corpus,
+    1 eval cache per side, all S=128/C=16 tiny caches."""
+    from experiments.k4_corpus_transfer import Config
+
+    paths, seed = {}, 0
+    for name, n in (("wf", 2), ("cf", 2), ("nf", 2), ("we", 1), ("ce", 1)):
+        group = []
+        for j in range(n):
+            p = tmp_path / f"{name}{j}.safetensors"
+            _tiny_cache(p, seed=seed)
+            seed += 1
+            group.append(str(p))
+        paths[name] = tuple(group)
+    return Config(
+        wiki_fit_paths=paths["wf"],
+        code_fit_paths=paths["cf"],
+        null_fit_paths=paths["nf"],
+        wiki_eval_paths=paths["we"],
+        code_eval_paths=paths["ce"],
+        model_label="tiny",
+        budgets=budgets,
+        group=16,
+        overlap_ranks=(4, 8),
+        out_root=str(tmp_path / "results"),
+    )
+
+
+def test_k4_corpus_transfer_smoke(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_corpus_transfer import main
+
+    run_dir = main(_tiny_corpus_transfer_cfg(tmp_path))
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    spec = df[df.arm == "spectral"]
+    assert set(spec.fit_corpus) == {"wiki", "code", "null"}
+    assert set(spec.eval_corpus) == {"wiki", "code"}
+    # plain cells: fit==w==alloc corpus
+    assert (spec.w_corpus == spec.fit_corpus).all()
+    assert (spec.alloc_corpus == spec.fit_corpus).all()
+    tq = pd.read_parquet(run_dir / "tq_curve.parquet")
+    assert (tq.arm == "turboquant_mse").all()
+
+    v = json.loads((run_dir / "corpus_transfer_verdict.json").read_text())
+    assert "gpt2_yellow_flag" in v and "verdict_rule" in v
+    pb = v["per_budget"]["2.5"]
+    assert set(pb["D"]) == {"code->wiki", "null->wiki", "wiki->code", "null->code"}
+    for cell in pb["D"].values():
+        assert cell["label"] in ("insensitive", "domain-sensitive", "as-measured")
+        assert cell["min"] <= cell["mean"] <= cell["max"]
+    assert isinstance(pb["model_intrinsic_flag"], bool)
+
+
+def test_k4_corpus_transfer_matched_fit_budget_guard(tmp_path):
+    import dataclasses
+
+    import pytest
+
+    from experiments.k4_corpus_transfer import main
+
+    cfg = _tiny_corpus_transfer_cfg(tmp_path)
+    cfg = dataclasses.replace(cfg, code_fit_paths=cfg.code_fit_paths[:1])
+    with pytest.raises(AssertionError, match="matched fit"):
+        main(cfg)

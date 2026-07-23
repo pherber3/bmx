@@ -1,0 +1,444 @@
+"""K4 corpus-transfer gate: fit-corpus × eval-corpus win matrix + mechanism
+decomposition (spec: docs/superpowers/specs/2026-07-23-k4-corpus-transfer-design.md).
+
+Cells: plain matrix fit ∈ {wiki, code, null} × eval ∈ {wiki, code} (this
+task); hybrid basis-A+alloc-B and W-cross Σ_A×W_B (Task 5); per-rank overlap
+/ tier-agreement / spectrum / analytic cross-retention diagnostics in
+overlap.parquet (Task 6). "null" = token-shuffled wikitext, fit-side only.
+
+Win metric (BINDING — do not "fix" into a matched-bpe constraint): per
+(cell, budget, eval cache, layer), win = TQ curve (turboquant_mse on k_pre,
+per eval cache + layer) log-interpolated at the pack's OWN
+bpe_skeptic_deploy (bpe_model + skeptic_charge(C, DEPLOY_S, tiers,
+c_used=pack.c_used)) ÷ the pack's tail distortion. Bits-normalized PER PACK,
+so cross-fit win ratios stay fair even when packs' bpe differ slightly.
+
+Verdict (spec §4): D = 1 − win(fit≠eval)/win(fit=eval), computed per eval
+cache (win = mean over layers), then mean/min/max across the eval caches.
+D < 10% → corpus-insensitive; D > 25% → domain-sensitive; between → reported
+as measured. Null-fit ≈ wikitext-fit on the wiki eval side (D < 10%) raises
+model_intrinsic_flag — the stronger "basis is model-intrinsic" claim. All
+gpt2-scale numbers are MECHANISM verdicts only (yellow flag in the JSON).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+
+import pandas as pd
+import tyro
+
+from bmx.artifacts import create_run, write_metrics
+from bmx.cache.codecs import quantize_cache
+from bmx.cache.spectral import (
+    pack_from_basis,
+    skeptic_charge,
+    spectral_quantize,
+)
+from experiments._k4_common import (
+    DEPLOY_S,
+    CorpusFit,
+    _layer_ctx,
+    _log_interp,
+    _score_tail,
+    _tq_layer_curve,
+    corpus_fit_bases,
+    load_layer_keys,
+    setup_rope,
+)
+
+FIT_CORPORA = ("wiki", "code", "null")
+EVAL_CORPORA = ("wiki", "code")
+
+
+@dataclasses.dataclass
+class Config:
+    wiki_fit_paths: tuple[str, ...]
+    code_fit_paths: tuple[str, ...]
+    null_fit_paths: tuple[str, ...]
+    wiki_eval_paths: tuple[str, ...]
+    code_eval_paths: tuple[str, ...]
+    model_label: str = ""
+    model_name: str = ""  # HF repo id for RoPE; empty => no-RoPE (gpt2), headline=logit
+    budgets: tuple[float, ...] = (2.2, 2.5)
+    tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8)
+    group: int = 64
+    ridge: float = 1e-3
+    position_stride: int = 8
+    tq_bits: tuple[int, ...] = (2, 3, 4)
+    overlap_ranks: tuple[int, ...] = (8, 16, 32, 64)  # Task 6 diagnostics
+    seed: int = 0
+    out_root: str = ""
+
+
+def _load_side(paths: tuple[str, ...], model_name: str):
+    """Load caches + per-cache RoPE. Returns (per_cache_layer_keys,
+    get_cos_sins, rope_ready, layers)."""
+    per_cache = [load_layer_keys(p) for p in paths]
+    layers = sorted(per_cache[0].keys())
+    for lk in per_cache[1:]:
+        assert sorted(lk.keys()) == layers, "caches disagree on layer set"
+    rope_ready, get_cos_sins = False, []
+    for lk in per_cache:
+        ready, gcs = setup_rope(model_name, lk, layers)
+        rope_ready = rope_ready or ready
+        get_cos_sins.append(gcs)
+    return per_cache, get_cos_sins, rope_ready, layers
+
+
+def _fit_rows(per_cache, layers) -> int:
+    return sum(lk[layers[0]]["k_pre"].shape[1] for lk in per_cache)
+
+
+def main(cfg: Config):
+    fit_paths = {
+        "wiki": cfg.wiki_fit_paths,
+        "code": cfg.code_fit_paths,
+        "null": cfg.null_fit_paths,
+    }
+    for name, paths in fit_paths.items():
+        assert paths, f"{name}_fit_paths must be non-empty"
+    assert cfg.wiki_eval_paths and cfg.code_eval_paths, "eval paths must be non-empty"
+
+    run = (
+        create_run("k4_corpus_transfer", cfg, root=cfg.out_root)
+        if cfg.out_root
+        else create_run("k4_corpus_transfer", cfg)
+    )
+    model_label = cfg.model_label or "unknown"
+
+    # ---- fit side: one CorpusFit per corpus, matched budgets asserted ------
+    fits: dict[str, CorpusFit] = {}
+    layers = None
+    fit_row_counts: dict[str, int] = {}
+    for name, paths in fit_paths.items():
+        per_cache, get_cos_sins, rope_ready, this_layers = _load_side(
+            paths, cfg.model_name
+        )
+        if layers is None:
+            layers = this_layers
+        assert this_layers == layers, f"{name} fit caches disagree on layer set"
+        fit_row_counts[name] = _fit_rows(per_cache, layers)
+        print(f"\n== fitting corpus {name!r} ({len(paths)} caches) ==", flush=True)
+        fits[name] = corpus_fit_bases(
+            per_cache,
+            get_cos_sins,
+            rope_ready,
+            layers,
+            w_source="corpus",
+            ridge=cfg.ridge,
+            position_stride=cfg.position_stride,
+        )
+    # Binding decision 1: matched fit-token budgets across corpora.
+    assert len({len(p) for p in fit_paths.values()}) == 1, (
+        f"matched fit budgets violated: slice counts "
+        f"{ {k: len(v) for k, v in fit_paths.items()} }"
+    )
+    assert len(set(fit_row_counts.values())) == 1, (
+        f"matched fit budgets violated: total fit rows {fit_row_counts}"
+    )
+
+    # ---- eval side: per-cache layer ctxs (built once, reused by all arms) --
+    eval_paths = {"wiki": cfg.wiki_eval_paths, "code": cfg.code_eval_paths}
+    # ctxs[(eval_corpus, cache_label)][layer] = _LayerCtx; rope flags per cache
+    ctxs: dict[tuple[str, str], dict] = {}
+    cache_rope: dict[tuple[str, str], bool] = {}
+    any_rope_ready = False
+    for eval_c, paths in eval_paths.items():
+        for path in paths:
+            label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            layer_keys = load_layer_keys(path)
+            assert sorted(layer_keys.keys()) == layers, (
+                f"eval cache {label} layer set mismatch"
+            )
+            rope_ready, get_cos_sin = setup_rope(cfg.model_name, layer_keys, layers)
+            any_rope_ready = any_rope_ready or rope_ready
+            cache_rope[(eval_c, label)] = rope_ready
+            ctxs[(eval_c, label)] = {
+                layer_i: _layer_ctx(
+                    layer_keys[layer_i],
+                    rope_ready=rope_ready,
+                    get_cos_sin=get_cos_sin,
+                )
+                for layer_i in layers
+            }
+    headline_col = "logit_rope" if any_rope_ready else "logit"
+
+    rows: list[dict] = []
+    tq_rows: list[dict] = []
+
+    def emit(dest, **kw):
+        base = dict(
+            model=model_label,
+            kind="k_pre",  # _tq_layer_curve filters on kind == "k_pre"
+            fit_corpus="",
+            w_corpus="",
+            alloc_corpus="",
+            eval_corpus="",
+            cache="",
+            layer=-1,
+            arm="",
+            budget=float("nan"),
+            bpe_model=float("nan"),
+            bpe_skeptic_deploy=float("nan"),
+            c_used=float("nan"),
+            rel_fro=float("nan"),
+            logit=float("nan"),
+            logit_rope=float("nan"),
+        )
+        base.update(kw)
+        dest.append(base)
+        print(
+            f"  {base['arm']:16s} fit={base['fit_corpus']:4s} "
+            f"eval={base['eval_corpus']:4s} cache={base['cache']:28s} "
+            f"layer={base['layer']:2d} budget={base['budget']:5.2f} "
+            f"logit={base['logit']:.4f}",
+            flush=True,
+        )
+
+    def score_pack(pack, eval_c, label, layer_i, *, arm, fit_c, w_c, alloc_c, budget):
+        ctx = ctxs[(eval_c, label)][layer_i]
+        rope_ready = cache_rope[(eval_c, label)]
+        assert pack.enc.shape == (ctx.C, ctx.C), (
+            f"pack C mismatch at layer {layer_i}: {pack.enc.shape} vs C={ctx.C}"
+        )
+        M_hat, bpe_model = spectral_quantize(ctx.M_pre, pack)
+        rf, lg, lg_rope = _score_tail(
+            M_hat,
+            ctx.h_kv,
+            ctx.tail,
+            ctx.K_post_true,
+            ctx.Q_fp32,
+            ctx.cos_l,
+            ctx.sin_l,
+            rope_ready,
+            ctx.k_pre_t,
+            ctx.M_pre,
+        )
+        bpe_deploy = bpe_model + skeptic_charge(
+            ctx.C, DEPLOY_S, cfg.tiers, c_used=pack.c_used
+        )
+        emit(
+            rows,
+            fit_corpus=fit_c,
+            w_corpus=w_c,
+            alloc_corpus=alloc_c,
+            eval_corpus=eval_c,
+            cache=label,
+            layer=layer_i,
+            arm=arm,
+            budget=float(budget),
+            bpe_model=bpe_model,
+            bpe_skeptic_deploy=bpe_deploy,
+            c_used=float(pack.c_used),
+            rel_fro=rf,
+            logit=lg,
+            logit_rope=lg_rope,
+        )
+
+    # ---- TQ baseline curves, per (eval cache, layer), computed ONCE --------
+    for (eval_c, label), layer_ctxs in ctxs.items():
+        rope_ready = cache_rope[(eval_c, label)]
+        for layer_i, ctx in layer_ctxs.items():
+            for b in cfg.tq_bits:
+                M_hat_tq, bpe_tq = quantize_cache(
+                    "turboquant_mse", ctx.M_pre, bits=b, seed=cfg.seed
+                )
+                rf, lg, lg_rope = _score_tail(
+                    M_hat_tq,
+                    ctx.h_kv,
+                    ctx.tail,
+                    ctx.K_post_true,
+                    ctx.Q_fp32,
+                    ctx.cos_l,
+                    ctx.sin_l,
+                    rope_ready,
+                    ctx.k_pre_t,
+                    ctx.M_pre,
+                )
+                emit(
+                    tq_rows,
+                    eval_corpus=eval_c,
+                    cache=label,
+                    layer=layer_i,
+                    arm="turboquant_mse",
+                    bpe_model=bpe_tq,
+                    bpe_skeptic_deploy=bpe_tq,
+                    rel_fro=rf,
+                    logit=lg,
+                    logit_rope=lg_rope,
+                )
+
+    # ---- plain matrix: fit ∈ FIT_CORPORA × every eval cache ----------------
+    for fit_c in FIT_CORPORA:
+        for budget in cfg.budgets:
+            for layer_i in layers:
+                pack = pack_from_basis(
+                    fits[fit_c].bases[layer_i],
+                    budget,
+                    tiers=cfg.tiers,
+                    group=cfg.group,
+                )
+                for eval_c, paths in eval_paths.items():
+                    for path in paths:
+                        label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                        score_pack(
+                            pack,
+                            eval_c,
+                            label,
+                            layer_i,
+                            arm="spectral",
+                            fit_c=fit_c,
+                            w_c=fit_c,
+                            alloc_c=fit_c,
+                            budget=budget,
+                        )
+
+    # ---- Task 5 seam: hybrid + W-cross arms appended here ------------------
+    # ---- Task 6 seam: overlap.parquet diagnostics appended here ------------
+
+    cols = [
+        "model",
+        "kind",
+        "fit_corpus",
+        "w_corpus",
+        "alloc_corpus",
+        "eval_corpus",
+        "cache",
+        "layer",
+        "arm",
+        "budget",
+        "bpe_model",
+        "bpe_skeptic_deploy",
+        "c_used",
+        "rel_fro",
+        "logit",
+        "logit_rope",
+    ]
+    df = pd.DataFrame(rows)[cols]
+    tq_df = pd.DataFrame(tq_rows)[cols]
+    write_metrics(run, df)
+    write_metrics(run, tq_df, name="tq_curve")
+
+    verdict = _transfer_verdict(df, tq_df, headline_col, cfg)
+    (run / "corpus_transfer_verdict.json").write_text(json.dumps(verdict, indent=2))
+
+    print("\n" + "=" * 88)
+    print("CORPUS-TRANSFER VERDICT (spec §4)")
+    print("=" * 88)
+    print(json.dumps(verdict, indent=2))
+    print(f"\nTotal rows: {len(df)}")
+    print(f"-> {run}")
+    return run
+
+
+# ---------------------------------------------------------------------------
+# Verdict
+# ---------------------------------------------------------------------------
+
+
+def _cell_wins(
+    sub: pd.DataFrame, tq_curves: dict, headline_col: str
+) -> tuple[dict[str, float], bool]:
+    """Per eval cache: mean over layers of tq_dist(at the pack's OWN
+    bpe_skeptic_deploy) / pack distortion (bits-normalized per pack —
+    binding decision 3)."""
+    wins: dict[str, list[float]] = {}
+    extrapolated = False
+    for _, row in sub.iterrows():
+        pts = tq_curves.get(row.cache, {}).get(int(row.layer))
+        if not pts:
+            continue
+        tq_dist, ex = _log_interp(pts, float(row.bpe_skeptic_deploy))
+        extrapolated = extrapolated or ex
+        dist = max(float(row[headline_col]), 1e-300)
+        wins.setdefault(row.cache, []).append(tq_dist / dist)
+    return (
+        {c: float(pd.Series(v).mean()) for c, v in wins.items()},
+        extrapolated,
+    )
+
+
+def _transfer_verdict(
+    df: pd.DataFrame, tq_df: pd.DataFrame, headline_col: str, cfg: Config
+) -> dict:
+    # TQ curves keyed per cache (never pooled across caches — same reasoning
+    # as k4_dec_quant._dec_quant_verdict).
+    tq_curves = {
+        cache: _tq_layer_curve(g, headline_col) for cache, g in tq_df.groupby("cache")
+    }
+
+    per_budget: dict[str, dict] = {}
+    for budget in cfg.budgets:
+        cells: dict[str, dict] = {}
+        for fit_c in FIT_CORPORA:
+            for eval_c in EVAL_CORPORA:
+                sub = df[
+                    (df.arm == "spectral")
+                    & (df.budget == float(budget))
+                    & (df.fit_corpus == fit_c)
+                    & (df.eval_corpus == eval_c)
+                ]
+                if sub.empty:
+                    continue
+                wins, ex = _cell_wins(sub, tq_curves, headline_col)
+                cells[f"{fit_c}->{eval_c}"] = dict(
+                    win_per_cache=wins,
+                    win_mean=float(pd.Series(list(wins.values())).mean()),
+                    extrapolated=bool(ex),
+                )
+
+        D: dict[str, dict] = {}
+        for eval_c in EVAL_CORPORA:
+            matched = cells.get(f"{eval_c}->{eval_c}")
+            if matched is None:
+                continue
+            for fit_c in FIT_CORPORA:
+                if fit_c == eval_c:
+                    continue
+                cross = cells.get(f"{fit_c}->{eval_c}")
+                if cross is None:
+                    continue
+                ds = [
+                    1.0 - cross["win_per_cache"][c] / matched["win_per_cache"][c]
+                    for c in matched["win_per_cache"]
+                    if c in cross["win_per_cache"]
+                ]
+                d_mean = float(pd.Series(ds).mean())
+                label = (
+                    "insensitive"
+                    if d_mean < 0.10
+                    else "domain-sensitive"
+                    if d_mean > 0.25
+                    else "as-measured"
+                )
+                D[f"{fit_c}->{eval_c}"] = dict(
+                    mean=d_mean,
+                    min=float(min(ds)),
+                    max=float(max(ds)),
+                    label=label,
+                )
+
+        null_wiki = D.get("null->wiki", {}).get("mean")
+        per_budget[f"{budget:g}"] = dict(
+            cells=cells,
+            D=D,
+            model_intrinsic_flag=bool(null_wiki is not None and null_wiki < 0.10),
+        )
+        # Task 5 seam: per_budget[...] gains "hybrid" and "wcross" keys.
+
+    return dict(
+        headline_metric=headline_col,
+        verdict_rule="D<0.10 insensitive; D>0.25 domain-sensitive; else as-measured",
+        gpt2_yellow_flag=(
+            "gpt2 scale = mechanism verdict only (corpus-W retention ~0.47-0.52, "
+            "docs/2026-07-15-k4-duel-results.md); Llama fit-side replication "
+            "pre-registered before any paper claim"
+        ),
+        per_budget=per_budget,
+    )
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Config))
