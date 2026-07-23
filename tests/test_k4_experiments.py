@@ -336,3 +336,57 @@ def test_k4_spectra_w_source_corpus(tmp_path):
     run_dir = main(cfg)
     df = pd.read_parquet(run_dir / "metrics.parquet")
     assert (df.w_source == "corpus").all()
+
+
+def test_k4_charge_curve_smoke(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_charge_curve import Config, main
+
+    run = tmp_path / "niah" / "r1"
+    run.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "arm": ["k4_b2.5", "k4_b2.5"],
+            "length": [8192, 32768],
+            "kv_size_bits": [3.60, 2.69],
+        }
+    ).to_parquet(run / "metrics.parquet")
+    fp = tmp_path / "fit.parquet"
+    pd.DataFrame(
+        {
+            "model": ["m"] * 2,
+            "layer": [0, 1],
+            "budget": [2.5] * 2,
+            "n_zero_dirs": [190, 198],
+        }
+    ).to_parquet(fp)
+    out = tmp_path / "table.md"
+    main(
+        Config(
+            niah_run_dirs=(str(run),),
+            fit_packs_parquet=str(fp),
+            budgets=(2.5,),
+            out_path=str(out),
+        )
+    )
+    text = out.read_text()
+    assert "skeptic-v2" in text and "as-measured" in text
+    # 8k row, mean n_zero = 194 => C_used = 830:
+    # v2 = 3.60 - 16*194/(2*8192) - 0.25*(194/1024)/2 = 3.60 - 0.18945 - 0.02368 = 3.3869
+    assert "3.39" in text
+
+    # Belt-and-braces: compute the expected value from skeptic_charge/scale_bits
+    # directly (the regression pin) and assert the rendered digits match it —
+    # never adjust the literal above to make this pass.
+    from bmx.cache.codecs import scale_bits
+    from bmx.cache.spectral import skeptic_charge
+
+    C, S, tiers, group = 1024, 8192, (0, 2, 3, 4, 5, 6, 8), 64
+    c_used = 1024 - (190 + 198) / 2
+    expected = (
+        3.60
+        - (skeptic_charge(C, S, tiers) - skeptic_charge(C, S, tiers, c_used=c_used)) / 2
+        - (scale_bits(group) * (1 - c_used / C)) / 2
+    )
+    assert f"{expected:.2f}" in text

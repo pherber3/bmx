@@ -88,6 +88,105 @@ as calibration artifacts do in the weight-quantization literature) puts
 k4_b2.5 at a flat ~2.48 / k4_b2.2 at ~2.23 at every length; Gate A's
 pre-registered rule keeps this SECONDARY.
 
+## 3b. Charge-corrected companion curve (skeptic-v2, computed 2026-07-23 — analytic re-derivation; §3 stays as-measured)
+
+§3 above charges a full C×C fp16 decoder matrix regardless of how many
+spectral directions actually carry nonzero bits (skeptic-v1). This section
+is an ANALYTIC companion: the same §3 rows, recomputed under two new
+accounting modes that charge only the decoder columns the dequant provably
+reads. **No old parquet was edited or re-run** — every number below derives
+from the committed §3 NIAH parquets' recorded `(arm, length, kv_size_bits)`
+plus the committed fit-pack parquet's per-layer `n_zero_dirs`, via
+`experiments/k4_charge_curve.py`.
+
+**Mode definitions** (expressions verbatim from `spectral.py`'s "Accounting
+modes" docstring; `C=1024`, `group=64`, `tiers=(0,2,3,4,5,6,8)`):
+
+- **skeptic-v1 (full-C fp16)** — `16·C/S + tier_bits(tiers, S)`. Charges a
+  full C×C fp16 decoder matrix regardless of how many directions actually
+  carry nonzero bits. This is the expression every parquet before
+  2026-07-23 measured (§3, verbatim).
+- **skeptic-v2 (used-columns)** — `16·C_used/S + tier_bits(tiers, S)`. Only
+  the `C_used` decoder columns whose direction carries nonzero bits are ever
+  read at decode (dropped columns provably never read — mutating them can't
+  change the reconstruction). Charging the full C columns over-counts by
+  `16·(C − C_used)/S`.
+- **skeptic-v2-int8 (used-columns, int8 decoder)** — `8·C_used/S +
+  16·C_used/(S·C) + tier_bits(tiers, S)`. Same used-columns charge but the
+  decoder itself is stored int8 (8 bits/entry) plus one fp16 per-column
+  scale amortized over S rows (`16·C_used/(S·C)`). This is an ACCOUNTING
+  projection only here — it assumes the int8-decoder roundtrip (Lever 2,
+  `int8_decoder_roundtrip`) ships; the corresponding quality gate is
+  separate, out of this table's scope.
+
+The blended `kv_size_bits` column charges K and V equally
+(`bmx.cache.generate.avg_bpe`); only K carries the spectral pack, so the
+correction is halved: `corrected = measured − [charge_v1(S) −
+charge_v2(S)]/2 − [scale_bits(group)·(1 − C_used/C)]/2` (the second term is
+the payload-v2 correction — group scales aren't stored for zero-bit dirs
+either).
+
+**C̄_used table** (mean over 32 layers, from
+`results/k4_fit_packs/20260713-133628-798d0ef/metrics.parquet`,
+model=llama-3.1-8b-instruct, the run that fit the duel's uniform packs):
+
+| budget | mean n_zero_dirs | per-layer range | **mean C̄_used** | decoder-charge reduction |
+|---|---|---|---|---|
+| 2.2 | 263.4 | 210–475 | **760.6** | 1.35× |
+| 2.5 | 194.3 | 139–423 | **829.7** | 1.23× |
+
+**Diagnosed ~400-vs-830 discrepancy:** an earlier back-of-envelope estimate
+assumed C_used ≈ 400 ("~300–500 of 1024 at budget 2.5"). The committed
+fit-pack parquet for the actual duel packs says otherwise: mean C̄_used is
+829.7 at budget 2.5 and 760.6 at budget 2.2 — roughly double the estimate.
+The ~400 figure matches the ZERO-dir counts at low budgets (194.3 at b2.5)
+and the stage-0 gpt2 heldout fit's 332-of-768, not the USED-dir counts of
+the Llama corpus-fitted packs — corpus-pooled covariances have fuller
+spectral tails than the earlier single-sequence/gpt2 estimate assumed, so
+fewer directions get zero-bit tiers and more decoder columns stay live.
+Consequence: the charge reduction from Lever 1 alone is 1.23–1.35×, not the
+~2.5× the ~400 estimate implied.
+
+**The corrected curve** (real run, `experiments/k4_charge_curve.py
+--niah-run-dirs results/k3_niah/20260715-{080730,080909,081107,081253,110927,111108,111257,111443,111948}-21e6d81 --fit-packs-parquet results/k4_fit_packs/20260713-133628-798d0ef/metrics.parquet --budgets 2.2 2.5`):
+
+| arm | length | v1 as-measured | skeptic-v2 | skeptic-v2-int8 |
+|---|---|---|---|---|
+| k4_b2.2 | 32768 | 2.54 | 2.44 | 2.35 |
+| k4_b2.2 | 65536 | 2.38 | 2.32 | 2.27 |
+| k4_b2.5 | 4096 | 4.81 | 4.41 | 3.60 |
+| k4_b2.5 | 8192 | 3.60 | 3.38 | 2.98 |
+| k4_b2.5 | 16384 | 2.99 | 2.87 | 2.67 |
+| k4_b2.5 | 32768 | 2.69 | 2.61 | 2.51 |
+| k4_b2.5 | 65536 | 2.53 | 2.49 | 2.44 |
+| tq_b3 | 4096–65536 | 3.42 / 3.22 / 3.12 / 3.07 / 3.04 | unchanged | unchanged |
+| tq_k3v2 | 4096–65536 | 2.94 / 2.73 / 2.62 / 2.57 / 2.54 | unchanged | unchanged |
+
+(TurboQuant baseline rows have no spectral pack and so no `C_used` — they
+pass through into every column unchanged, per the plan's rule.)
+
+Sanity gate (plan's projection table, ±0.05): v2 measured
+4.41/3.38/2.87/2.61/2.49 vs projected 4.41/3.39/2.87/2.62/2.48 (max Δ 0.01);
+v2-int8 measured 3.60/2.98/2.67/2.51/2.44 vs projected
+3.60/2.98/2.67/2.52/2.43 (max Δ 0.01). Both well within tolerance — no
+diagnosis needed, the small residual is rounding in the plan's hand-arithmetic.
+
+**New crossover statements** (k4_b2.5 vs baselines, linear interpolation in
+1/S; k4_b2.2 has no crossover to state — it sits below both baselines at
+every measured length, 32k and 64k, under every accounting mode):
+
+| comparison | v1 as-measured | skeptic-v2 | skeptic-v2-int8 |
+|---|---|---|---|
+| k4_b2.5 vs tq_b3 | between 8k and 16k (~13.1k) | between 8k and 16k (~10.2k) | between 4k and 8k (~5.2k) |
+| k4_b2.5 vs tq_k3v2 | between 32k and 64k (~61.8k) | between 32k and 64k (~42.5k) | between 16k and 32k (~21.4k) |
+
+Under skeptic-v2 (Lever 1 alone — a free, honest accounting correction, no
+codec change), the b3 crossover moves left from ~13.1k to ~10.2k; under
+skeptic-v2-int8 (Lever 2, an accounting projection pending its own quality
+gate) it moves to ~5.2k, clearing the <8k target. The k3v2 crossover moves
+from ~61.8k (v1) to ~42.5k (v2) to ~21.4k (v2-int8). No quality number in
+§2 or §4 changed — this section is an accounting correction only.
+
 ## 4. NIAH (real-text PG-essay, 4k–32k × 5 depths, recall_full /10)
 
 | arm | 4k | 8k | 16k | 32k | 64k | mean |
