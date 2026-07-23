@@ -237,7 +237,14 @@ def test_load_eval_tokens_offset(monkeypatch):
 
 def _patch_eval_tokens_io(monkeypatch):
     """Fake tokenizer (arange ids) + fake dataset with 'text' and 'content'
-    columns, so no download happens and byte-identity is checkable."""
+    columns, so no download happens and byte-identity is checkable.
+
+    Returns a recorder list of (args, kwargs) for every load_dataset call, so
+    tests can pin WHICH dataset/config/split the defaults fetch (the arange
+    tokenizer is blind to text content — without the recorder, a drifted
+    default dataset_id/split would pass silently)."""
+
+    calls: list[tuple[tuple, dict]] = []
 
     class _FakeTok:
         def __call__(self, text, return_tensors, truncation, max_length):
@@ -246,21 +253,26 @@ def _patch_eval_tokens_io(monkeypatch):
             ids = torch.arange(max_length).unsqueeze(0)
             return type("E", (), {"input_ids": ids})()
 
-    monkeypatch.setattr(
-        "datasets.load_dataset",
-        lambda *a, **k: {"text": ["x"], "content": ["y"]},
-        raising=False,
-    )
+    def _fake_load_dataset(*a, **k):
+        calls.append((a, k))
+        return {"text": ["x"], "content": ["y"]}
+
+    monkeypatch.setattr("datasets.load_dataset", _fake_load_dataset, raising=False)
     monkeypatch.setattr(
         "transformers.AutoTokenizer.from_pretrained", lambda *a, **k: _FakeTok()
     )
+    return calls
 
 
 def test_load_eval_tokens_generalized_defaults(monkeypatch):
     import bmx.eval.layer_swap as ls
 
-    _patch_eval_tokens_io(monkeypatch)
+    calls = _patch_eval_tokens_io(monkeypatch)
     base = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=8)
+    # Dataset-identity pin: the default path must fetch EXACTLY the pre-change
+    # dataset/config/split (the arange tokenizer can't see text, so this
+    # recorder is what catches a drifted default dataset_id/split).
+    assert calls == [(("Salesforce/wikitext", "wikitext-2-raw-v1"), {"split": "test"})]
     explicit = ls.load_eval_tokens(
         "gpt2",
         "wikitext-2-raw-v1",
