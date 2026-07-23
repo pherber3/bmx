@@ -228,3 +228,78 @@ def test_load_eval_tokens_offset(monkeypatch):
     off = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=8)
     assert base.shape == off.shape == (16,)
     assert off[0].item() == base[0].item() + 8
+
+
+# ---------------------------------------------------------------------------
+# load_eval_tokens generalization — corpus passthrough + shuffled-token null
+# ---------------------------------------------------------------------------
+
+
+def _patch_eval_tokens_io(monkeypatch):
+    """Fake tokenizer (arange ids) + fake dataset with 'text' and 'content'
+    columns, so no download happens and byte-identity is checkable."""
+
+    class _FakeTok:
+        def __call__(self, text, return_tensors, truncation, max_length):
+            import torch
+
+            ids = torch.arange(max_length).unsqueeze(0)
+            return type("E", (), {"input_ids": ids})()
+
+    monkeypatch.setattr(
+        "datasets.load_dataset",
+        lambda *a, **k: {"text": ["x"], "content": ["y"]},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained", lambda *a, **k: _FakeTok()
+    )
+
+
+def test_load_eval_tokens_generalized_defaults(monkeypatch):
+    import bmx.eval.layer_swap as ls
+
+    _patch_eval_tokens_io(monkeypatch)
+    base = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=8)
+    explicit = ls.load_eval_tokens(
+        "gpt2",
+        "wikitext-2-raw-v1",
+        n_tokens=16,
+        token_offset=8,
+        dataset_id="Salesforce/wikitext",
+        data_dir="",
+        split="test",
+        text_field="text",
+        shuffle_seed=-1,
+    )
+    assert torch.equal(base, explicit)
+    # pre-change behavior pin: arange slice starting at token_offset
+    assert base.shape == (16,) and base[0].item() == 8
+
+
+def test_load_eval_tokens_shuffle_after_slice(monkeypatch):
+    import bmx.eval.layer_swap as ls
+
+    _patch_eval_tokens_io(monkeypatch)
+    nat = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=8)
+    shuf1 = ls.load_eval_tokens(
+        "gpt2", n_tokens=16, token_offset=8, shuffle_seed=20260723
+    )
+    shuf2 = ls.load_eval_tokens(
+        "gpt2", n_tokens=16, token_offset=8, shuffle_seed=20260723
+    )
+    assert torch.equal(shuf1, shuf2)  # deterministic under the recorded seed
+    assert not torch.equal(shuf1, nat)  # actually permuted
+    # shuffle AFTER slicing: same token multiset as the natural slice
+    assert torch.equal(shuf1.sort().values, nat.sort().values)
+
+
+def test_load_eval_tokens_text_field_assert(monkeypatch):
+    import bmx.eval.layer_swap as ls
+
+    _patch_eval_tokens_io(monkeypatch)
+    # 'content' exists in the fake dataset -> passes; 'nope' must assert.
+    ok = ls.load_eval_tokens("gpt2", n_tokens=8, text_field="content")
+    assert ok.shape == (8,)
+    with pytest.raises(AssertionError, match="text_field"):
+        ls.load_eval_tokens("gpt2", n_tokens=8, text_field="nope")

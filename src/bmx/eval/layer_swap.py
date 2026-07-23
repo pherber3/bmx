@@ -50,19 +50,49 @@ def load_eval_tokens(
     dataset: str = "wikitext-2-raw-v1",
     n_tokens: int = 65536,
     token_offset: int = 0,
+    *,
+    dataset_id: str = "Salesforce/wikitext",
+    data_dir: str = "",
+    split: str = "test",
+    text_field: str = "text",
+    shuffle_seed: int = -1,
 ) -> torch.Tensor:
+    """Tokenize a corpus slice for eval/calibration. Defaults reproduce the
+    original wikitext-test path byte-identically.
+
+    `dataset` is the HF config name ("" = dataset has no named config);
+    `data_dir` selects a sub-directory dataset (the-stack-smol style) and
+    overrides the config name. `shuffle_seed >= 0` permutes the RETURNED
+    slice (shuffle AFTER slicing: the null slice covers the same token
+    multiset as the natural slice at this offset); the generator is seeded
+    `shuffle_seed + token_offset` so distinct slices get distinct — but fully
+    recorded — permutations.
+    """
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_name)
-    text = "\n\n".join(
-        load_dataset("Salesforce/wikitext", dataset, split="test")["text"]
+    if data_dir:
+        ds = load_dataset(dataset_id, data_dir=data_dir, split=split)
+    elif dataset:
+        ds = load_dataset(dataset_id, dataset, split=split)
+    else:
+        ds = load_dataset(dataset_id, split=split)
+    # Dataset objects expose column_names; test fakes are plain dicts.
+    cols = getattr(ds, "column_names", None) or list(ds.keys())
+    assert text_field in cols, (
+        f"text_field {text_field!r} not a column of {dataset_id}: {cols}"
     )
-    # truncation at the tokenizer avoids encoding the full ~289k-token split
+    text = "\n\n".join(ds[text_field])
+    # truncation at the tokenizer avoids encoding the full split
     ids = tok(
         text, return_tensors="pt", truncation=True, max_length=token_offset + n_tokens
     )
-    return ids.input_ids[0][token_offset:]
+    out = ids.input_ids[0][token_offset:]
+    if shuffle_seed >= 0:
+        g = torch.Generator().manual_seed(shuffle_seed + token_offset)
+        out = out[torch.randperm(out.numel(), generator=g)]
+    return out
 
 
 def swap_and_perplexity(
