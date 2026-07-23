@@ -40,7 +40,10 @@ class CacheCodecSpec:
         ``"int8"`` roundtrips the loaded pack's decoder matrix once at cache
         init (see ``spectral.int8_decoder_roundtrip``) and charges
         ``dec_bits=8`` instead of 16 in the skeptic accounting. Ignored by
-        every other arm.
+        every other arm. A third mode, fp16 (``dec.half().float()``), exists
+        only as a measurement arm in ``experiments/k4_dec_quant.py`` (the
+        shippability check for what skeptic-v1 charges) and is deliberately
+        not a streaming ``dec_quant`` value here.
     """
 
     arm: str = "fp16"

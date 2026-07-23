@@ -36,7 +36,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.codecs import quantize_cache, scale_bits
+from bmx.cache.codecs import quantize_cache
 from bmx.cache.collect import to_matrix
 from bmx.cache.rope import apply_rope
 from bmx.cache.spectral import (
@@ -48,6 +48,7 @@ from bmx.cache.spectral import (
     pack_from_basis,
     query_position_moment,
     skeptic_charge,
+    spectral_payload_v1_bpe,
     spectral_quantize,
 )
 from bmx.decomp.lrs import truncated_svd
@@ -319,20 +320,11 @@ def main(cfg: Config):
                     bpe_skeptic_deploy = bpe_model + skeptic_charge(
                         C, DEPLOY_S, cfg.tiers, c_used=pack.c_used
                     )
-                    # bpe_model is payload-v2 (mean(bits) + scale_bits(group)*
-                    # c_used/C); the true pre-2026-07-23 payload-v1 value adds
-                    # back the phantom scale on the dropped (c_used..C)
-                    # directions, restoring bpe_skeptic_fullc to the exact v1
-                    # value so it's joinable against old parquets.
-                    bpe_skeptic_fullc = (
-                        bpe_model
-                        + scale_bits(cfg.group) * (1 - pack.c_used / C)
-                        + skeptic_charge(C, S, cfg.tiers)
-                    )
-                    bpe_skeptic_deploy_fullc = (
-                        bpe_model
-                        + scale_bits(cfg.group) * (1 - pack.c_used / C)
-                        + skeptic_charge(C, DEPLOY_S, cfg.tiers)
+                    # payload-v1 + charge-v1, joinable against pre-2026-07-23 parquets.
+                    bpe_v1 = spectral_payload_v1_bpe(pack)
+                    bpe_skeptic_fullc = bpe_v1 + skeptic_charge(C, S, cfg.tiers)
+                    bpe_skeptic_deploy_fullc = bpe_v1 + skeptic_charge(
+                        C, DEPLOY_S, cfg.tiers
                     )
                     emit(
                         full_row(
@@ -372,19 +364,11 @@ def main(cfg: Config):
                 bpe_skeptic_deploy = bpe_model + skeptic_charge(
                     C, DEPLOY_S, cfg.tiers, c_used=pack.c_used
                 )
-                # See the spectral/spectral_unweighted emit site above: bpe_model
-                # is payload-v2, so restore the payload-v1 phantom-scale term
-                # before adding the v1 charge, keeping bpe_skeptic_fullc equal
-                # to the true pre-2026-07-23 v1 value.
-                bpe_skeptic_fullc = (
-                    bpe_model
-                    + scale_bits(cfg.group) * (1 - pack.c_used / C)
-                    + skeptic_charge(C, S, cfg.tiers)
-                )
-                bpe_skeptic_deploy_fullc = (
-                    bpe_model
-                    + scale_bits(cfg.group) * (1 - pack.c_used / C)
-                    + skeptic_charge(C, DEPLOY_S, cfg.tiers)
+                # payload-v1 + charge-v1, joinable against pre-2026-07-23 parquets.
+                bpe_v1 = spectral_payload_v1_bpe(pack)
+                bpe_skeptic_fullc = bpe_v1 + skeptic_charge(C, S, cfg.tiers)
+                bpe_skeptic_deploy_fullc = bpe_v1 + skeptic_charge(
+                    C, DEPLOY_S, cfg.tiers
                 )
                 emit(
                     full_row(

@@ -236,6 +236,19 @@ def spectral_payload_bpe(pack: SpectralPack) -> float:
     )
 
 
+def spectral_payload_v1_bpe(pack: SpectralPack) -> float:
+    """Model-level payload bpe, payload-v1 (see module docstring):
+    mean(bits) + scale_bits(group) — the full groupwise-scale charge
+    regardless of how many directions actually carry bits. This is the
+    expression every parquet before 2026-07-23 measured; kept callable so
+    `_fullc` companion columns can be joined against those old parquets.
+
+    Identity: payload_v1(pack) == spectral_payload_bpe(pack) +
+    scale_bits(group)·(1 − c_used/C).
+    """
+    return float(pack.bits.float().mean().item()) + scale_bits(pack.group)
+
+
 def spectral_quantize(
     M: torch.Tensor, pack: SpectralPack, *, mse_scale: bool = True
 ) -> tuple[torch.Tensor, float]:

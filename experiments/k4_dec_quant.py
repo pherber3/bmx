@@ -35,6 +35,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+from typing import Callable, NamedTuple
 
 import pandas as pd
 import torch
@@ -84,6 +85,58 @@ def _dec_variant(dec: torch.Tensor, bits_pc: torch.Tensor, mode: str) -> torch.T
     raise AssertionError(f"unknown dec_mode {mode!r}")
 
 
+class _LayerCtx(NamedTuple):
+    """Per-(cache, layer) setup shared by the tq-curve and dec-mode loops."""
+
+    k_pre_t: torch.Tensor  # (h_kv, S, d) fp16, pre-RoPE
+    h_kv: int
+    S: int
+    d: int
+    C: int
+    Q_fp32: torch.Tensor
+    cos_l: torch.Tensor
+    sin_l: torch.Tensor
+    K_post_true: torch.Tensor | None
+    M_pre: torch.Tensor  # (S, C) fp32
+    tail: slice
+
+
+def _layer_ctx(
+    kinds_map: dict[str, torch.Tensor],
+    *,
+    rope_ready: bool,
+    get_cos_sin: Callable[[int], tuple[torch.Tensor, torch.Tensor]],
+) -> _LayerCtx:
+    k_pre_t = kinds_map["k_pre"]  # (h_kv, S, d) fp16, pre-RoPE
+    q_t = kinds_map["q"]  # (h, T, d) fp16
+    h_kv, S, d = k_pre_t.shape
+    Q_fp32 = q_t.float()
+
+    if rope_ready:
+        cos_l, sin_l = get_cos_sin(S)
+    else:
+        cos_l = torch.ones(S, d)
+        sin_l = torch.zeros(S, d)
+    K_post_true = apply_rope(k_pre_t.float(), cos_l, sin_l) if rope_ready else None
+
+    M_pre = to_matrix(k_pre_t)  # (S, C) fp32
+    tail = slice(S // 2, S)
+
+    return _LayerCtx(
+        k_pre_t=k_pre_t,
+        h_kv=h_kv,
+        S=S,
+        d=d,
+        C=h_kv * d,
+        Q_fp32=Q_fp32,
+        cos_l=cos_l,
+        sin_l=sin_l,
+        K_post_true=K_post_true,
+        M_pre=M_pre,
+        tail=tail,
+    )
+
+
 def main(cfg: Config):
     assert cfg.cache_paths, "cache_paths must be non-empty"
 
@@ -122,39 +175,25 @@ def main(cfg: Config):
         # hoisting this out of the budget loop below avoids writing
         # exact-duplicate rows into tq_curve.parquet once per budget).
         for layer_i in layers:
-            kinds_map = layer_keys[layer_i]
-            k_pre_t = kinds_map["k_pre"]  # (h_kv, S, d) fp16, pre-RoPE
-            q_t = kinds_map["q"]  # (h, T, d) fp16
-            h_kv, S, d = k_pre_t.shape
-            Q_fp32 = q_t.float()
-
-            if rope_ready:
-                cos_l, sin_l = get_cos_sin(S)
-            else:
-                cos_l = torch.ones(S, d)
-                sin_l = torch.zeros(S, d)
-            K_post_true = (
-                apply_rope(k_pre_t.float(), cos_l, sin_l) if rope_ready else None
+            ctx = _layer_ctx(
+                layer_keys[layer_i], rope_ready=rope_ready, get_cos_sin=get_cos_sin
             )
-
-            M_pre = to_matrix(k_pre_t)  # (S, C) fp32
-            tail = slice(S // 2, S)
 
             for b in cfg.tq_bits:
                 M_hat_tq, bpe_tq = quantize_cache(
-                    "turboquant_mse", M_pre, bits=b, seed=cfg.seed
+                    "turboquant_mse", ctx.M_pre, bits=b, seed=cfg.seed
                 )
                 rf_tq, lg_tq, lg_rope_tq = _score_tail(
                     M_hat_tq,
-                    h_kv,
-                    tail,
-                    K_post_true,
-                    Q_fp32,
-                    cos_l,
-                    sin_l,
+                    ctx.h_kv,
+                    ctx.tail,
+                    ctx.K_post_true,
+                    ctx.Q_fp32,
+                    ctx.cos_l,
+                    ctx.sin_l,
                     rope_ready,
-                    k_pre_t,
-                    M_pre,
+                    ctx.k_pre_t,
+                    ctx.M_pre,
                 )
                 emit(
                     dict(
@@ -180,50 +219,39 @@ def main(cfg: Config):
             for layer_i in layers:
                 if layer_i not in packs:
                     continue
-                kinds_map = layer_keys[layer_i]
-                k_pre_t = kinds_map["k_pre"]  # (h_kv, S, d) fp16, pre-RoPE
-                q_t = kinds_map["q"]  # (h, T, d) fp16
-                h_kv, S, d = k_pre_t.shape
-                C = h_kv * d
-                Q_fp32 = q_t.float()
-
-                if rope_ready:
-                    cos_l, sin_l = get_cos_sin(S)
-                else:
-                    cos_l = torch.ones(S, d)
-                    sin_l = torch.zeros(S, d)
-                K_post_true = (
-                    apply_rope(k_pre_t.float(), cos_l, sin_l) if rope_ready else None
+                ctx = _layer_ctx(
+                    layer_keys[layer_i], rope_ready=rope_ready, get_cos_sin=get_cos_sin
                 )
 
-                M_pre = to_matrix(k_pre_t)  # (S, C) fp32
-                tail = slice(S // 2, S)
-
                 pack = packs[layer_i]
-                assert pack.enc.shape == (C, C), (
-                    f"pack C mismatch at layer {layer_i}: {pack.enc.shape} vs C={C}"
+                assert pack.enc.shape == (ctx.C, ctx.C), (
+                    f"pack C mismatch at layer {layer_i}: {pack.enc.shape} vs C={ctx.C}"
                 )
 
                 # ---- fp32 / fp16 / int8 decoder-precision arms ---------------
                 for mode in DEC_MODES:
                     dec_variant = _dec_variant(pack.dec, pack.bits, mode)
                     pack_variant = dataclasses.replace(pack, dec=dec_variant)
-                    M_hat, bpe_model = spectral_quantize(M_pre, pack_variant)
+                    M_hat, bpe_model = spectral_quantize(ctx.M_pre, pack_variant)
                     rf, lg, lg_rope = _score_tail(
                         M_hat,
-                        h_kv,
-                        tail,
-                        K_post_true,
-                        Q_fp32,
-                        cos_l,
-                        sin_l,
+                        ctx.h_kv,
+                        ctx.tail,
+                        ctx.K_post_true,
+                        ctx.Q_fp32,
+                        ctx.cos_l,
+                        ctx.sin_l,
                         rope_ready,
-                        k_pre_t,
-                        M_pre,
+                        ctx.k_pre_t,
+                        ctx.M_pre,
                     )
                     dec_bits = 8.0 if mode == "int8" else 16.0
                     bpe_skeptic_deploy = bpe_model + skeptic_charge(
-                        C, DEPLOY_S, pack.tiers, c_used=pack.c_used, dec_bits=dec_bits
+                        ctx.C,
+                        DEPLOY_S,
+                        pack.tiers,
+                        c_used=pack.c_used,
+                        dec_bits=dec_bits,
                     )
                     emit(
                         dict(
