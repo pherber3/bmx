@@ -87,12 +87,19 @@ def spec_pair(
         )
     if arm.startswith("k4_b"):
         # k4_b{budget}: corpus-fitted spectral K via packs + proven turboquant V@2b.
-        # Requires --pack-path (a fitted spectral pack file).
+        # Requires --pack-path (a fitted spectral pack file). Optional "_dec8"
+        # suffix (e.g. "k4_b2.5_dec8") selects the int8-decoder Lever-2 variant
+        # (same spec, dec_quant="int8"); parsed BEFORE the float since the
+        # budget itself may contain no further "_" delimiters.
         if not pack_path:
             raise ValueError(
                 "k4 arms require --pack-path (a fitted spectral pack file)"
             )
         budget_str = arm[len("k4_b") :]
+        dec_quant = "fp32"
+        if budget_str.endswith("_dec8"):
+            dec_quant = "int8"
+            budget_str = budget_str[: -len("_dec8")]
         budget = float(budget_str)
         return (
             CacheCodecSpec(
@@ -101,6 +108,7 @@ def spec_pair(
                 group=group,
                 pack_path=pack_path,
                 budget=budget,
+                dec_quant=dec_quant,
             ),
             CacheCodecSpec(arm="turboquant_mse", bits=2, seed=seed),
         )

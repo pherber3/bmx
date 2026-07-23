@@ -34,6 +34,13 @@ class CacheCodecSpec:
     budget : float
         Quantization budget in bits (for ``"spectral"`` arm); 0.0 for packless
         arms (default-inert).
+    dec_quant : str
+        Decoder storage precision for the ``"spectral"`` arm (Lever 2).
+        ``"fp32"`` (default) is inert -- today's byte-identical compute path.
+        ``"int8"`` roundtrips the loaded pack's decoder matrix once at cache
+        init (see ``spectral.int8_decoder_roundtrip``) and charges
+        ``dec_bits=8`` instead of 16 in the skeptic accounting. Ignored by
+        every other arm.
     """
 
     arm: str = "fp16"
@@ -44,3 +51,4 @@ class CacheCodecSpec:
     pre_rope: bool = False
     pack_path: str = ""
     budget: float = 0.0
+    dec_quant: str = "fp32"

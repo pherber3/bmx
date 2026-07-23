@@ -289,6 +289,26 @@ def skeptic_charge(
     return dec_bits * c_used / S + int8_scale_term + tier_bits(tiers, S)
 
 
+def int8_decoder_roundtrip(dec: torch.Tensor, bits_pc: torch.Tensor) -> torch.Tensor:
+    """Simulate int8 storage of a decoder matrix's USED columns (Lever 2).
+
+    Per-column symmetric absmax int8: scale = absmax/127, cast to fp16 (the
+    shipped scale dtype) then back to fp32 BEFORE dequant so the roundtrip
+    reflects the exact precision an int8-stored decoder would reconstruct at.
+    Unused columns (bits_pc == 0 -- never read at decode, see
+    test_dropped_decoder_columns_never_read) are returned untouched.
+    Deterministic; fp32 in, fp32 out. Refits nothing -- this operates on an
+    already-fitted pack's dec tensor.
+    """
+    used = bits_pc != 0
+    dec_rt = dec.clone()
+    dec_used = dec[:, used]
+    scale = (dec_used.abs().amax(dim=0) / 127.0).clamp_min(1e-12).half().float()
+    codes = (dec_used / scale).round().clamp(-127, 127)
+    dec_rt[:, used] = codes * scale
+    return dec_rt
+
+
 def save_pack_file(
     path: str | Path,
     bases: dict[int, SpectralBasis],

@@ -287,3 +287,18 @@ def test_dropped_decoder_columns_never_read():
     dec_mut[:, pack.bits == 0] = torch.randn_like(dec_mut[:, pack.bits == 0])
     M_hat_mut, _ = spectral_quantize(M, _dc.replace(pack, dec=dec_mut))
     assert torch.equal(M_hat_ref, M_hat_mut)
+
+
+def test_int8_decoder_roundtrip():
+    from bmx.cache.spectral import int8_decoder_roundtrip
+
+    torch.manual_seed(0)
+    dec = torch.randn(32, 32)
+    bits = torch.tensor([3] * 20 + [0] * 12)
+    dec_rt = int8_decoder_roundtrip(dec, bits)
+    used = bits != 0
+    # Unused columns untouched; used columns within one int8 step of source.
+    assert torch.equal(dec_rt[:, ~used], dec[:, ~used])
+    step = dec[:, used].abs().amax(dim=0) / 127.0
+    assert (dec_rt[:, used] - dec[:, used]).abs().amax(dim=0).le(step + 1e-6).all()
+    assert torch.equal(dec_rt, int8_decoder_roundtrip(dec, bits))  # deterministic

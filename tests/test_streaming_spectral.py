@@ -271,3 +271,47 @@ def test_bits_per_entry_averages_layers_for_allocated_packs(tmp_path):
         C, S, cache.layers[-1]._pack.tiers
     )
     assert mean_c_used < C and bpe_k < expected_v1
+
+
+def test_streaming_dec8_charges_int8_and_degrades_gracefully(tmp_path):
+    from bmx.cache.spectral import skeptic_charge
+
+    path = str(tmp_path / "packs.safetensors")
+    model = tiny_llama()
+    _fit_tiny_packs(model, path)
+    caches = {}
+    for dq in ("fp32", "int8"):
+        k_spec = CacheCodecSpec(
+            arm="spectral",
+            pre_rope=True,
+            group=8,
+            pack_path=path,
+            budget=2.5,
+            dec_quant=dq,
+        )
+        cache = StreamingQuantizedCache(
+            model.config,
+            k_spec=k_spec,
+            v_spec=CacheCodecSpec(arm="fp16"),
+            recent_window=8,
+        )
+        cache.attach(model)
+        with cache:
+            with torch.no_grad():
+                model(ids(seq=150), past_key_values=cache, use_cache=True)
+        caches[dq] = cache
+    bpe_fp32, _ = caches["fp32"].bits_per_entry()
+    bpe_int8, _ = caches["int8"].bits_per_entry()
+    assert bpe_int8 < bpe_fp32  # 8-bit decoder charge strictly cheaper
+    # And the delta equals the charge arithmetic exactly (payloads identical).
+    layer = caches["fp32"].layers[-1]
+    C = layer._h_kv * layer._d_head
+    S = layer.get_seq_length()
+    mc = sum(ly._pack.c_used for ly in caches["fp32"].layers) / len(
+        caches["fp32"].layers
+    )
+    t = layer._pack.tiers
+    expected_delta = skeptic_charge(C, S, t, c_used=mc) - skeptic_charge(
+        C, S, t, c_used=mc, dec_bits=8.0
+    )
+    assert abs((bpe_fp32 - bpe_int8) - expected_delta) < 1e-9

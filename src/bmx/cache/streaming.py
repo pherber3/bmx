@@ -49,6 +49,7 @@ from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.spectral import (
     SpectralPack,
+    int8_decoder_roundtrip,
     load_packs,
     skeptic_charge,
     spectral_quantize,
@@ -517,6 +518,9 @@ class StreamingQuantizedCache(Cache):
     ):
         # Spectral K arm: pre-RoPE only, and the corpus pack file is loaded ONCE
         # here (never per-layer, never per-call) then handed out by layer_idx.
+        assert k_spec.dec_quant in ("fp32", "int8"), (
+            f"dec_quant must be 'fp32' or 'int8'; got {k_spec.dec_quant!r}"
+        )
         self._packs: dict[int, SpectralPack] = {}
         if k_spec.arm == "spectral":
             assert k_spec.pre_rope, (
@@ -524,6 +528,18 @@ class StreamingQuantizedCache(Cache):
             )
             assert k_spec.pack_path, "spectral requires pack_path"
             self._packs = load_packs(k_spec.pack_path, k_spec.budget)
+            if k_spec.dec_quant == "int8":
+                # Lever 2 (gated on a later VM quality measurement): roundtrip
+                # each layer pack's decoder through int8 ONCE, here, at init --
+                # never refit, never re-applied per call. dataclasses.replace
+                # keeps every other pack field (enc, lam, bits, tiers, ...)
+                # untouched; only dec's stored precision changes.
+                self._packs = {
+                    i: dataclasses.replace(
+                        pack, dec=int8_decoder_roundtrip(pack.dec, pack.bits)
+                    )
+                    for i, pack in self._packs.items()
+                }
 
         # layer_class_to_replicate lazily appends one layer per new layer_idx, always
         # in order (transformers' Cache.update appends up to layer_idx while
@@ -558,10 +574,10 @@ class StreamingQuantizedCache(Cache):
         self.v_spec = v_spec
         self.recent_window = recent_window
         self._handles: list = []
-        # self._dec_bits hook: hardcode 16.0 until Task 5 wires
-        # k_spec.dec_quant == "int8" -> 8.0 (the CacheCodecSpec field doesn't
-        # exist yet). bits_per_entry()'s spectral branch reads this.
-        self._dec_bits = 16.0
+        # dec_quant=="int8" charges the skeptic decoder term at 8 bits/entry
+        # (the pack's dec was already roundtripped to int8 precision above);
+        # bits_per_entry()'s spectral branch reads this.
+        self._dec_bits = 8.0 if k_spec.dec_quant == "int8" else 16.0
 
     def _pack_for_layer(self, i: int) -> "SpectralPack | None":
         """Look up layer i's spectral pack, asserting it's present when spectral."""
@@ -694,8 +710,6 @@ class StreamingQuantizedCache(Cache):
             mean_c_used = sum(layer._pack.c_used for layer in self.layers) / len(
                 self.layers
             )
-            # self._dec_bits hook: hardcode 16.0 until Task 5 wires
-            # k_spec.dec_quant == "int8" -> 8.0 (field doesn't exist yet).
             bpe_k = bpe_k + skeptic_charge(
                 C, S, last._pack.tiers, c_used=mean_c_used, dec_bits=self._dec_bits
             )
