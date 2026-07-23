@@ -1,4 +1,5 @@
 import json
+import math
 
 import torch
 
@@ -118,10 +119,36 @@ def test_k4_frontier_emits_v2_and_fullc(tmp_path):
     run_dir = main(cfg)
     df = pd.read_parquet(run_dir / "metrics.parquet")
     spec = df[(df.arm == "spectral") & (df.fit_mode == "oracle")]
-    assert {"bpe_skeptic_fullc", "bpe_skeptic_deploy_fullc"} <= set(df.columns)
+    assert {"bpe_skeptic_fullc", "bpe_skeptic_deploy_fullc", "c_used"} <= set(
+        df.columns
+    )
     # v2 <= v1 always; strict where the allocation dropped dirs.
     assert (spec.bpe_skeptic <= spec.bpe_skeptic_fullc + 1e-12).all()
     assert (spec.bpe_skeptic < spec.bpe_skeptic_fullc).any()
+
+    # Exact pin: bpe_skeptic_fullc must carry the TRUE pre-2026-07-23
+    # payload-v1 + charge-v1 value, not a payload-v2 + charge-v1 hybrid.
+    # For every spectral row, bpe_skeptic_fullc - bpe_skeptic must equal the
+    # sum of the charge-side v1-vs-v2 delta and the payload-side v1-vs-v2
+    # delta, both computed from that row's own pack c_used.
+    from bmx.cache.codecs import scale_bits
+    from bmx.cache.spectral import skeptic_charge
+
+    S, C_row, group = (
+        128,
+        16,
+        cfg.group,
+    )  # _tiny_cache defaults (S=128, h_kv=2*d=8=>C=16)
+    for _, row in spec.iterrows():
+        cu = float(row.c_used)
+        expected_delta = (
+            skeptic_charge(C_row, S, cfg.tiers)
+            - skeptic_charge(C_row, S, cfg.tiers, c_used=cu)
+        ) + scale_bits(group) * (1 - cu / C_row)
+        actual_delta = float(row.bpe_skeptic_fullc) - float(row.bpe_skeptic)
+        assert abs(actual_delta - expected_delta) < 1e-9, (
+            f"{actual_delta} != {expected_delta} (c_used={cu})"
+        )
 
 
 def test_k4_frontier_figures(tmp_path):
@@ -438,3 +465,64 @@ def test_k4_dec_quant_smoke(tmp_path):
     assert set(df.dec_mode) == {"fp32", "fp16", "int8"}
     v = json.loads((run_dir / "dec_quant_verdict.json").read_text())
     assert "gate_pass" in v and "rel_degradation_int8" in str(v)
+
+
+def test_k4_dec_quant_two_caches_keys_tq_curve_per_cache(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from experiments.k4_dec_quant import Config, main
+
+    fit = tmp_path / "f.safetensors"
+    scored_a = tmp_path / "s_a.safetensors"
+    scored_b = tmp_path / "s_b.safetensors"
+    _tiny_cache(fit, seed=0)
+    _tiny_cache(scored_a, seed=1)
+    _tiny_cache(scored_b, seed=2)  # different seed => different distortions
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            cache_paths=(str(scored_a), str(scored_b)),
+            model_label="tiny",
+            budgets=(2.5,),
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    v = json.loads((run_dir / "dec_quant_verdict.json").read_text())
+    assert "gate_pass" in v
+    assert math.isfinite(v["per_budget"]["2.5"]["win_fp16"])
+
+    tq_df = pd.read_parquet(run_dir / "tq_curve.parquet")
+    # One curve row per (cache, layer, tq_bit) — no exact-duplicate rows from
+    # being recomputed once per budget (budgets=(2.5,) has only one budget
+    # here, so re-run with two budgets to actually exercise the hoist).
+    assert not tq_df.duplicated(subset=["cache", "layer", "bpe_model"]).any()
+
+    # Per-cache curves must differ (different seeds => different distortions):
+    # same (layer, bpe_model) turboquant_mse point scored against each
+    # cache's own k_pre should give different logit distortion.
+    piv = tq_df.pivot_table(
+        index=["layer", "bpe_model"], columns="cache", values="logit"
+    )
+    assert (piv.iloc[:, 0] != piv.iloc[:, 1]).any()
+
+    # Re-run with two budgets (pack file fit for both) to confirm the TQ pass
+    # is hoisted out of the budget loop: exact-duplicate (cache, layer,
+    # bpe_model) rows must not appear (previously one identical row was
+    # written per budget).
+    packs_path2 = tmp_path / "packs2.safetensors"
+    _fit_tiny_pack_file(fit, packs_path2, budgets=(2.0, 2.5), group=16)
+    run_dir2 = main(
+        Config(
+            pack_path=str(packs_path2),
+            cache_paths=(str(scored_a), str(scored_b)),
+            model_label="tiny",
+            budgets=(2.0, 2.5),
+            out_root=str(tmp_path / "results2"),
+        )
+    )
+    tq_df2 = pd.read_parquet(run_dir2 / "tq_curve.parquet")
+    assert not tq_df2.duplicated(subset=["cache", "layer", "bpe_model"]).any()

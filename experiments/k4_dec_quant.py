@@ -117,6 +117,63 @@ def main(cfg: Config):
         rope_ready, get_cos_sin = setup_rope(cfg.model_name, layer_keys, layers)
         any_rope_ready = any_rope_ready or rope_ready
 
+        # ---- per (cache, layer) turboquant_mse k_pre curve, computed ONCE --
+        # (identical across budgets — M_pre/tail don't depend on budget, so
+        # hoisting this out of the budget loop below avoids writing
+        # exact-duplicate rows into tq_curve.parquet once per budget).
+        for layer_i in layers:
+            kinds_map = layer_keys[layer_i]
+            k_pre_t = kinds_map["k_pre"]  # (h_kv, S, d) fp16, pre-RoPE
+            q_t = kinds_map["q"]  # (h, T, d) fp16
+            h_kv, S, d = k_pre_t.shape
+            Q_fp32 = q_t.float()
+
+            if rope_ready:
+                cos_l, sin_l = get_cos_sin(S)
+            else:
+                cos_l = torch.ones(S, d)
+                sin_l = torch.zeros(S, d)
+            K_post_true = (
+                apply_rope(k_pre_t.float(), cos_l, sin_l) if rope_ready else None
+            )
+
+            M_pre = to_matrix(k_pre_t)  # (S, C) fp32
+            tail = slice(S // 2, S)
+
+            for b in cfg.tq_bits:
+                M_hat_tq, bpe_tq = quantize_cache(
+                    "turboquant_mse", M_pre, bits=b, seed=cfg.seed
+                )
+                rf_tq, lg_tq, lg_rope_tq = _score_tail(
+                    M_hat_tq,
+                    h_kv,
+                    tail,
+                    K_post_true,
+                    Q_fp32,
+                    cos_l,
+                    sin_l,
+                    rope_ready,
+                    k_pre_t,
+                    M_pre,
+                )
+                emit(
+                    dict(
+                        model=model_label,
+                        cache=cache_label,
+                        layer=layer_i,
+                        kind="k_pre",
+                        arm="turboquant_mse",
+                        dec_mode="",
+                        budget=float("nan"),
+                        bpe_model=bpe_tq,
+                        bpe_skeptic_deploy=bpe_tq,
+                        rel_fro=rf_tq,
+                        logit=lg_tq,
+                        logit_rope=lg_rope_tq,
+                    ),
+                    dest=tq_rows,
+                )
+
         for budget in cfg.budgets:
             packs = load_packs(cfg.pack_path, budget)
 
@@ -146,41 +203,6 @@ def main(cfg: Config):
                 assert pack.enc.shape == (C, C), (
                     f"pack C mismatch at layer {layer_i}: {pack.enc.shape} vs C={C}"
                 )
-
-                # ---- per-layer turboquant_mse k_pre curve (for the win interp)
-                for b in cfg.tq_bits:
-                    M_hat_tq, bpe_tq = quantize_cache(
-                        "turboquant_mse", M_pre, bits=b, seed=cfg.seed
-                    )
-                    rf_tq, lg_tq, lg_rope_tq = _score_tail(
-                        M_hat_tq,
-                        h_kv,
-                        tail,
-                        K_post_true,
-                        Q_fp32,
-                        cos_l,
-                        sin_l,
-                        rope_ready,
-                        k_pre_t,
-                        M_pre,
-                    )
-                    emit(
-                        dict(
-                            model=model_label,
-                            cache=cache_label,
-                            layer=layer_i,
-                            kind="k_pre",
-                            arm="turboquant_mse",
-                            dec_mode="",
-                            budget=float("nan"),
-                            bpe_model=bpe_tq,
-                            bpe_skeptic_deploy=bpe_tq,
-                            rel_fro=rf_tq,
-                            logit=lg_tq,
-                            logit_rope=lg_rope_tq,
-                        ),
-                        dest=tq_rows,
-                    )
 
                 # ---- fp32 / fp16 / int8 decoder-precision arms ---------------
                 for mode in DEC_MODES:
@@ -262,7 +284,16 @@ def main(cfg: Config):
 def _dec_quant_verdict(
     df: pd.DataFrame, tq_df: pd.DataFrame, headline_col: str, cfg: Config
 ) -> dict:
-    tq_curves = _tq_layer_curve(tq_df, headline_col)
+    # Keyed by (cache, layer): a multi-cache invocation must never pool TQ
+    # distortions across caches into one curve (that mixes different
+    # sequences' distortion scales and can even collapse two caches' points
+    # onto the same bpe with different distortions, breaking the log-interp's
+    # monotone-x assumption). _tq_layer_curve groups by layer only, so filter
+    # to one cache's rows before calling it — keeps _k4_common generic for
+    # k4_frontier.py's single-cache caller.
+    tq_curves: dict[str, dict[int, list[tuple[float, float]]]] = {
+        cache: _tq_layer_curve(g, headline_col) for cache, g in tq_df.groupby("cache")
+    }
 
     per_budget: dict[str, dict] = {}
     gate_pass_all = True
@@ -281,7 +312,7 @@ def _dec_quant_verdict(
         extrapolated = False
 
         for (cache, layer), fp16_row in fp16_sub.iterrows():
-            pts = tq_curves.get(int(layer))
+            pts = tq_curves.get(cache, {}).get(int(layer))
             if not pts:
                 continue
             bpe_at = float(fp16_row.bpe_skeptic_deploy)
@@ -311,7 +342,7 @@ def _dec_quant_verdict(
         int8_sub = sub[sub.dec_mode == "int8"].set_index(["cache", "layer"])
         int8_own_wins = []
         for (cache, layer), int8_row in int8_sub.iterrows():
-            pts = tq_curves.get(int(layer))
+            pts = tq_curves.get(cache, {}).get(int(layer))
             if not pts:
                 continue
             tq_dist_own, ex = _log_interp(pts, float(int8_row.bpe_skeptic_deploy))

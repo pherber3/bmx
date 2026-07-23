@@ -129,6 +129,14 @@ charge_v2(S)]/2 − [scale_bits(group)·(1 − C_used/C)]/2` (the second term is
 the payload-v2 correction — group scales aren't stored for zero-bit dirs
 either).
 
+(The `scale_delta` term assumes all `S` entries are quantized, but the
+StreamingQuantizedCache's fp16 recent window means only the quantized prefix
+ever carried a phantom group scale — the true correction is marginally
+smaller, so the formula above subtracts slightly too much. Conservative
+direction: v2 as stated slightly understates K4's corrected bits — ≤0.003
+bits at 4k, vanishing with `S` as the fp16 window's share of the sequence
+shrinks.)
+
 **C̄_used table** (mean over 32 layers, from
 `results/k4_fit_packs/20260713-133628-798d0ef/metrics.parquet`,
 model=llama-3.1-8b-instruct, the run that fit the duel's uniform packs):

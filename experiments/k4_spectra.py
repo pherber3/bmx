@@ -38,7 +38,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.codecs import quantize_cache
+from bmx.cache.codecs import quantize_cache, scale_bits
 from bmx.cache.collect import load_cache, to_matrix
 from bmx.cache.rope import apply_rope
 from bmx.cache.spectral import (
@@ -214,9 +214,20 @@ def main(cfg: Config):
                     bpe_skeptic_deploy = bpe_model + skeptic_charge(
                         C, DEPLOY_S, cfg.tiers, c_used=pack.c_used
                     )
-                    bpe_skeptic_fullc = bpe_model + skeptic_charge(C, S, cfg.tiers)
-                    bpe_skeptic_deploy_fullc = bpe_model + skeptic_charge(
-                        C, DEPLOY_S, cfg.tiers
+                    # bpe_model is payload-v2 (mean(bits) + scale_bits(group)*
+                    # c_used/C); restore the payload-v1 phantom-scale term on
+                    # the dropped (c_used..C) directions before adding the v1
+                    # charge, so bpe_skeptic_fullc is the true pre-2026-07-23
+                    # value, joinable against old parquets.
+                    bpe_skeptic_fullc = (
+                        bpe_model
+                        + scale_bits(cfg.group) * (1 - pack.c_used / C)
+                        + skeptic_charge(C, S, cfg.tiers)
+                    )
+                    bpe_skeptic_deploy_fullc = (
+                        bpe_model
+                        + scale_bits(cfg.group) * (1 - pack.c_used / C)
+                        + skeptic_charge(C, DEPLOY_S, cfg.tiers)
                     )
 
                     lam = pack.lam
@@ -239,6 +250,7 @@ def main(cfg: Config):
                             bpe_skeptic_deploy=bpe_skeptic_deploy,
                             bpe_skeptic_fullc=bpe_skeptic_fullc,
                             bpe_skeptic_deploy_fullc=bpe_skeptic_deploy_fullc,
+                            c_used=float(pack.c_used),
                             rel_fro=rf,
                             logit=lg,
                             logit_rope=lg_rope,
@@ -285,6 +297,7 @@ def main(cfg: Config):
                 bpe_skeptic_deploy=bpe_ref,
                 bpe_skeptic_fullc=bpe_ref,
                 bpe_skeptic_deploy_fullc=bpe_ref,
+                c_used=float("nan"),
                 rel_fro=rf_ref,
                 logit=lg_ref,
                 logit_rope=lg_rope_ref,
