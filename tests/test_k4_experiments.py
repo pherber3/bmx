@@ -81,6 +81,30 @@ def test_k4_frontier_smoke(tmp_path):
     assert "g1_pass" in v and "p3_verdict" in v and "p4_verdict" in v
 
 
+def test_k4_frontier_emits_v2_and_fullc(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_frontier import Config, main
+
+    p = tmp_path / "m.safetensors"
+    _tiny_cache(p, seed=0)
+    cfg = Config(
+        cache_path=str(p),
+        model_label="tiny",
+        budgets=(1.5,),
+        group=16,
+        max_layers=1,
+        out_root=str(tmp_path / "results"),
+    )
+    run_dir = main(cfg)
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    spec = df[(df.arm == "spectral") & (df.fit_mode == "oracle")]
+    assert {"bpe_skeptic_fullc", "bpe_skeptic_deploy_fullc"} <= set(df.columns)
+    # v2 <= v1 always; strict where the allocation dropped dirs.
+    assert (spec.bpe_skeptic <= spec.bpe_skeptic_fullc + 1e-12).all()
+    assert (spec.bpe_skeptic < spec.bpe_skeptic_fullc).any()
+
+
 def test_k4_frontier_figures(tmp_path):
     import pandas as pd
 

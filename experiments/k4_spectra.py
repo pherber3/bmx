@@ -24,7 +24,8 @@ The `lowrank_rtn_channel` reference arm is fit and scored per layer as a
 uniform-codec baseline for the G0 retention ratio; its rows live in the SAME
 metrics.parquet with fit_mode="reference" (weighted=False, budget/spectra
 stats NaN — no spectral pack exists for it; its bpe already counts all
-metadata per-sequence, so bpe_model == bpe_skeptic == bpe_skeptic_deploy).
+metadata per-sequence, so bpe_model == bpe_skeptic == bpe_skeptic_deploy ==
+bpe_skeptic_fullc == bpe_skeptic_deploy_fullc).
 """
 
 from __future__ import annotations
@@ -207,8 +208,14 @@ def main(cfg: Config):
                         k_pre_t,
                         M,
                     )
-                    bpe_skeptic = bpe_model + skeptic_charge(C, S, cfg.tiers)
+                    bpe_skeptic = bpe_model + skeptic_charge(
+                        C, S, cfg.tiers, c_used=pack.c_used
+                    )
                     bpe_skeptic_deploy = bpe_model + skeptic_charge(
+                        C, DEPLOY_S, cfg.tiers, c_used=pack.c_used
+                    )
+                    bpe_skeptic_fullc = bpe_model + skeptic_charge(C, S, cfg.tiers)
+                    bpe_skeptic_deploy_fullc = bpe_model + skeptic_charge(
                         C, DEPLOY_S, cfg.tiers
                     )
 
@@ -230,6 +237,8 @@ def main(cfg: Config):
                             bpe_model=bpe_model,
                             bpe_skeptic=bpe_skeptic,
                             bpe_skeptic_deploy=bpe_skeptic_deploy,
+                            bpe_skeptic_fullc=bpe_skeptic_fullc,
+                            bpe_skeptic_deploy_fullc=bpe_skeptic_deploy_fullc,
                             rel_fro=rf,
                             logit=lg,
                             logit_rope=lg_rope,
@@ -262,7 +271,7 @@ def main(cfg: Config):
         )
         # Reference rows share the full schema: no spectral pack exists, so
         # budget/spectra stats are NaN; lowrank_rtn_channel's bpe already
-        # counts all metadata per-sequence, so all three bpe views coincide.
+        # counts all metadata per-sequence, so all five bpe views coincide.
         emit(
             dict(
                 model=model_label,
@@ -274,6 +283,8 @@ def main(cfg: Config):
                 bpe_model=bpe_ref,
                 bpe_skeptic=bpe_ref,
                 bpe_skeptic_deploy=bpe_ref,
+                bpe_skeptic_fullc=bpe_ref,
+                bpe_skeptic_deploy_fullc=bpe_ref,
                 rel_fro=rf_ref,
                 logit=lg_ref,
                 logit_rope=lg_rope_ref,

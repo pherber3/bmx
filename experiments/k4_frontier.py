@@ -310,8 +310,14 @@ def main(cfg: Config):
                     )
                     M_hat, bpe_model = spectral_quantize(M_pre, pack)
                     rf, lg, lg_rope = score(M_hat, "k_pre")
-                    bpe_skeptic = bpe_model + skeptic_charge(C, S, cfg.tiers)
+                    bpe_skeptic = bpe_model + skeptic_charge(
+                        C, S, cfg.tiers, c_used=pack.c_used
+                    )
                     bpe_skeptic_deploy = bpe_model + skeptic_charge(
+                        C, DEPLOY_S, cfg.tiers, c_used=pack.c_used
+                    )
+                    bpe_skeptic_fullc = bpe_model + skeptic_charge(C, S, cfg.tiers)
+                    bpe_skeptic_deploy_fullc = bpe_model + skeptic_charge(
                         C, DEPLOY_S, cfg.tiers
                     )
                     emit(
@@ -327,6 +333,8 @@ def main(cfg: Config):
                             bpe_model=bpe_model,
                             bpe_skeptic=bpe_skeptic,
                             bpe_skeptic_deploy=bpe_skeptic_deploy,
+                            bpe_skeptic_fullc=bpe_skeptic_fullc,
+                            bpe_skeptic_deploy_fullc=bpe_skeptic_deploy_fullc,
                             rel_fro=rf,
                             logit=lg,
                             logit_rope=lg_rope,
@@ -343,8 +351,16 @@ def main(cfg: Config):
                 )
                 M_hat, bpe_model = spectral_quantize(M_pre, pack)
                 rf, lg, lg_rope = score(M_hat, "k_pre")
-                bpe_skeptic = bpe_model + skeptic_charge(C, S, cfg.tiers)
-                bpe_skeptic_deploy = bpe_model + skeptic_charge(C, DEPLOY_S, cfg.tiers)
+                bpe_skeptic = bpe_model + skeptic_charge(
+                    C, S, cfg.tiers, c_used=pack.c_used
+                )
+                bpe_skeptic_deploy = bpe_model + skeptic_charge(
+                    C, DEPLOY_S, cfg.tiers, c_used=pack.c_used
+                )
+                bpe_skeptic_fullc = bpe_model + skeptic_charge(C, S, cfg.tiers)
+                bpe_skeptic_deploy_fullc = bpe_model + skeptic_charge(
+                    C, DEPLOY_S, cfg.tiers
+                )
                 emit(
                     full_row(
                         layer=layer_i,
@@ -358,6 +374,8 @@ def main(cfg: Config):
                         bpe_model=bpe_model,
                         bpe_skeptic=bpe_skeptic,
                         bpe_skeptic_deploy=bpe_skeptic_deploy,
+                        bpe_skeptic_fullc=bpe_skeptic_fullc,
+                        bpe_skeptic_deploy_fullc=bpe_skeptic_deploy_fullc,
                         rel_fro=rf,
                         logit=lg,
                         logit_rope=lg_rope,
@@ -382,6 +400,8 @@ def main(cfg: Config):
                         bpe_model=bpe,
                         bpe_skeptic=bpe,
                         bpe_skeptic_deploy=bpe,
+                        bpe_skeptic_fullc=bpe,
+                        bpe_skeptic_deploy_fullc=bpe,
                         rel_fro=rf,
                         logit=lg,
                         logit_rope=lg_rope,
@@ -411,6 +431,8 @@ def main(cfg: Config):
                     bpe_model=bpe,
                     bpe_skeptic=bpe,
                     bpe_skeptic_deploy=bpe,
+                    bpe_skeptic_fullc=bpe,
+                    bpe_skeptic_deploy_fullc=bpe,
                     rel_fro=rf,
                     logit=lg,
                     logit_rope=lg_rope,
@@ -439,6 +461,8 @@ def main(cfg: Config):
                     bpe_model=bpe,
                     bpe_skeptic=bpe,
                     bpe_skeptic_deploy=bpe,
+                    bpe_skeptic_fullc=bpe,
+                    bpe_skeptic_deploy_fullc=bpe,
                     rel_fro=rf,
                     logit=lg,
                     logit_rope=lg_rope,
@@ -467,6 +491,8 @@ def main(cfg: Config):
                 bpe_model=bpe,
                 bpe_skeptic=bpe,
                 bpe_skeptic_deploy=bpe,
+                bpe_skeptic_fullc=bpe,
+                bpe_skeptic_deploy_fullc=bpe,
                 rel_fro=rf,
                 logit=lg,
                 logit_rope=lg_rope,
@@ -486,6 +512,8 @@ def main(cfg: Config):
                 bpe_model=bpe,
                 bpe_skeptic=bpe,
                 bpe_skeptic_deploy=bpe,
+                bpe_skeptic_fullc=bpe,
+                bpe_skeptic_deploy_fullc=bpe,
                 rel_fro=rf,
                 logit=lg,
                 logit_rope=lg_rope,
@@ -510,6 +538,8 @@ def main(cfg: Config):
             "bpe_model",
             "bpe_skeptic",
             "bpe_skeptic_deploy",
+            "bpe_skeptic_fullc",
+            "bpe_skeptic_deploy_fullc",
             "rel_fro",
             "logit",
             "logit_rope",
