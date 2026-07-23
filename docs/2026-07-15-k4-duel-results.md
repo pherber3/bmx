@@ -132,7 +132,7 @@ either).
 (The `scale_delta` term assumes all `S` entries are quantized, but the
 StreamingQuantizedCache's fp16 recent window means only the quantized prefix
 ever carried a phantom group scale — the true correction is marginally
-smaller, so the formula above subtracts slightly too much. Conservative
+smaller, so the formula above subtracts slightly too much. Optimistic
 direction: v2 as stated slightly understates K4's corrected bits — ≤0.003
 bits at 4k, vanishing with `S` as the fp16 window's share of the sequence
 shrinks.)
