@@ -35,7 +35,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-from typing import Callable, NamedTuple
 
 import pandas as pd
 import torch
@@ -43,8 +42,6 @@ import tyro
 
 from bmx.artifacts import create_run, write_metrics
 from bmx.cache.codecs import quantize_cache
-from bmx.cache.collect import to_matrix
-from bmx.cache.rope import apply_rope
 from bmx.cache.spectral import (
     int8_decoder_roundtrip,
     load_packs,
@@ -53,6 +50,7 @@ from bmx.cache.spectral import (
 )
 from experiments._k4_common import (
     DEPLOY_S,
+    _layer_ctx,
     _log_interp,
     _score_tail,
     _tq_layer_curve,
@@ -83,58 +81,6 @@ def _dec_variant(dec: torch.Tensor, bits_pc: torch.Tensor, mode: str) -> torch.T
     if mode == "int8":
         return int8_decoder_roundtrip(dec, bits_pc)
     raise AssertionError(f"unknown dec_mode {mode!r}")
-
-
-class _LayerCtx(NamedTuple):
-    """Per-(cache, layer) setup shared by the tq-curve and dec-mode loops."""
-
-    k_pre_t: torch.Tensor  # (h_kv, S, d) fp16, pre-RoPE
-    h_kv: int
-    S: int
-    d: int
-    C: int
-    Q_fp32: torch.Tensor
-    cos_l: torch.Tensor
-    sin_l: torch.Tensor
-    K_post_true: torch.Tensor | None
-    M_pre: torch.Tensor  # (S, C) fp32
-    tail: slice
-
-
-def _layer_ctx(
-    kinds_map: dict[str, torch.Tensor],
-    *,
-    rope_ready: bool,
-    get_cos_sin: Callable[[int], tuple[torch.Tensor, torch.Tensor]],
-) -> _LayerCtx:
-    k_pre_t = kinds_map["k_pre"]  # (h_kv, S, d) fp16, pre-RoPE
-    q_t = kinds_map["q"]  # (h, T, d) fp16
-    h_kv, S, d = k_pre_t.shape
-    Q_fp32 = q_t.float()
-
-    if rope_ready:
-        cos_l, sin_l = get_cos_sin(S)
-    else:
-        cos_l = torch.ones(S, d)
-        sin_l = torch.zeros(S, d)
-    K_post_true = apply_rope(k_pre_t.float(), cos_l, sin_l) if rope_ready else None
-
-    M_pre = to_matrix(k_pre_t)  # (S, C) fp32
-    tail = slice(S // 2, S)
-
-    return _LayerCtx(
-        k_pre_t=k_pre_t,
-        h_kv=h_kv,
-        S=S,
-        d=d,
-        C=h_kv * d,
-        Q_fp32=Q_fp32,
-        cos_l=cos_l,
-        sin_l=sin_l,
-        K_post_true=K_post_true,
-        M_pre=M_pre,
-        tail=tail,
-    )
 
 
 def main(cfg: Config):

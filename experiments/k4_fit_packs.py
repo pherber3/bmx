@@ -34,18 +34,14 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, git_sha, write_metrics
-from bmx.cache.collect import to_matrix
 from bmx.cache.spectral import (
     SpectralBasis,
-    assemble_whitener,
-    fit_spectral_basis,
-    identity_whitener,
     pack_from_basis,
     save_pack_file,
 )
 from experiments._k4_common import (
     SENS_FLOOR,
-    corpus_query_moment,
+    corpus_fit_bases,
     greedy_layer_allocation,
     load_layer_keys,
     setup_rope,
@@ -184,51 +180,18 @@ def main(cfg: Config):
         rope_ready = rope_ready or ready
         get_cos_sins.append(get_cos_sin)
 
-    bases: dict[int, SpectralBasis] = {}
+    fit = corpus_fit_bases(
+        per_cache_layer_keys,
+        get_cos_sins,
+        rope_ready,
+        layers,
+        w_source=cfg.w_source,
+        ridge=cfg.ridge,
+        position_stride=cfg.position_stride,
+    )
+    bases = fit.bases
     rows: list[dict] = []
     model_label = cfg.model_label or "unknown"
-
-    for layer_i in layers:
-        # ---- Σ_k: concat of ALL corpus caches' k_pre matrices -------------
-        h_kv = d = None
-        M_parts = []
-        for lk in per_cache_layer_keys:
-            k_pre_t = lk[layer_i]["k_pre"]
-            this_h_kv, S_c, this_d = k_pre_t.shape
-            if h_kv is None:
-                h_kv, d = this_h_kv, this_d
-            else:
-                assert (this_h_kv, this_d) == (h_kv, d), (
-                    f"corpus cache layer{layer_i}.k_pre shape "
-                    f"{tuple(k_pre_t.shape)} incompatible with (h_kv={h_kv}, d={d})"
-                )
-            M_parts.append(to_matrix(k_pre_t))
-        M_fit = torch.cat(M_parts, dim=0)
-        C = h_kv * d
-
-        # ---- W: pooled query second moment, or identity --------------------
-        if cfg.w_source == "corpus":
-            W_blocks = corpus_query_moment(
-                per_cache_layer_keys,
-                get_cos_sins,
-                rope_ready,
-                layer_i,
-                h_kv,
-                d,
-                cfg.position_stride,
-            )
-            Wh, Wh_inv = assemble_whitener(W_blocks, ridge=cfg.ridge)
-        else:  # "none"
-            Wh, Wh_inv = identity_whitener(C)
-
-        basis = fit_spectral_basis(M_fit, Wh, Wh_inv)
-        bases[layer_i] = basis
-
-        print(
-            f"[layer {layer_i}] (h_kv={h_kv}, d={d}, C={C}, "
-            f"S_fit={M_fit.shape[0]}) basis fit",
-            flush=True,
-        )
 
     # ---- across-layer allocation (needs every layer's basis) --------------
     layer_budgets = None

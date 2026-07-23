@@ -7,14 +7,21 @@ from __future__ import annotations
 
 import math
 import re
+from typing import Callable, NamedTuple
 
 import pandas as pd
 import torch
 
-from bmx.cache.collect import from_matrix, load_cache
+from bmx.cache.collect import from_matrix, load_cache, to_matrix
 from bmx.cache.metrics import logit_distortion, rel_fro
 from bmx.cache.rope import apply_rope
-from bmx.cache.spectral import query_position_moment
+from bmx.cache.spectral import (
+    SpectralBasis,
+    assemble_whitener,
+    fit_spectral_basis,
+    identity_whitener,
+    query_position_moment,
+)
 
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
 DEPLOY_S = 32768
@@ -139,6 +146,75 @@ def corpus_query_moment(
     return W_sum / len(corpus_layer_keys)
 
 
+class CorpusFit(NamedTuple):
+    """One corpus's pooled per-layer fit: basis + pooled fit matrix + whitener."""
+
+    bases: dict[int, SpectralBasis]
+    M_fits: dict[int, torch.Tensor]  # (S_total, C) fp32 — concat of fit caches
+    whiteners: dict[int, tuple[torch.Tensor, torch.Tensor]]  # fp64 (Wh, Wh_inv)
+
+
+def corpus_fit_bases(
+    per_cache_layer_keys: list[dict[int, dict[str, torch.Tensor]]],
+    get_cos_sins: list,
+    rope_ready: bool,
+    layers: list[int],
+    *,
+    w_source: str,
+    ridge: float,
+    position_stride: int,
+) -> CorpusFit:
+    """Corpus-pooled per-layer spectral fit, extracted from k4_fit_packs.main:
+    Σ_k = concat of ALL corpus caches' k_pre matrices; W = pooled corpus query
+    moment ("corpus") or identity ("none"). Byte-identical to the
+    pre-extraction k4_fit_packs flow — pinned by
+    test_k4_fit_packs_default_unchanged."""
+    assert w_source in ("corpus", "none"), f"unknown w_source {w_source!r}"
+    bases: dict[int, SpectralBasis] = {}
+    M_fits: dict[int, torch.Tensor] = {}
+    whiteners: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for layer_i in layers:
+        h_kv = d = None
+        M_parts = []
+        for lk in per_cache_layer_keys:
+            k_pre_t = lk[layer_i]["k_pre"]
+            this_h_kv, _, this_d = k_pre_t.shape
+            if h_kv is None:
+                h_kv, d = this_h_kv, this_d
+            else:
+                assert (this_h_kv, this_d) == (h_kv, d), (
+                    f"corpus cache layer{layer_i}.k_pre shape "
+                    f"{tuple(k_pre_t.shape)} incompatible with (h_kv={h_kv}, d={d})"
+                )
+            M_parts.append(to_matrix(k_pre_t))
+        M_fit = torch.cat(M_parts, dim=0)
+        C = h_kv * d
+
+        if w_source == "corpus":
+            W_blocks = corpus_query_moment(
+                per_cache_layer_keys,
+                get_cos_sins,
+                rope_ready,
+                layer_i,
+                h_kv,
+                d,
+                position_stride,
+            )
+            Wh, Wh_inv = assemble_whitener(W_blocks, ridge=ridge)
+        else:  # "none"
+            Wh, Wh_inv = identity_whitener(C)
+
+        bases[layer_i] = fit_spectral_basis(M_fit, Wh, Wh_inv)
+        M_fits[layer_i] = M_fit
+        whiteners[layer_i] = (Wh, Wh_inv)
+        print(
+            f"[layer {layer_i}] (h_kv={h_kv}, d={d}, C={C}, "
+            f"S_fit={M_fit.shape[0]}) basis fit",
+            flush=True,
+        )
+    return CorpusFit(bases=bases, M_fits=M_fits, whiteners=whiteners)
+
+
 def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_t, M):
     K_hat = from_matrix(M_hat, h_kv)[:, tail, :].float()
     rf = rel_fro(M_hat[tail], M[tail])
@@ -150,6 +226,58 @@ def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_
         lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
         lg_rope = float("nan")
     return rf, lg, lg_rope
+
+
+class _LayerCtx(NamedTuple):
+    """Per-(cache, layer) setup shared by the tq-curve and dec-mode loops."""
+
+    k_pre_t: torch.Tensor  # (h_kv, S, d) fp16, pre-RoPE
+    h_kv: int
+    S: int
+    d: int
+    C: int
+    Q_fp32: torch.Tensor
+    cos_l: torch.Tensor
+    sin_l: torch.Tensor
+    K_post_true: torch.Tensor | None
+    M_pre: torch.Tensor  # (S, C) fp32
+    tail: slice
+
+
+def _layer_ctx(
+    kinds_map: dict[str, torch.Tensor],
+    *,
+    rope_ready: bool,
+    get_cos_sin: Callable[[int], tuple[torch.Tensor, torch.Tensor]],
+) -> _LayerCtx:
+    k_pre_t = kinds_map["k_pre"]  # (h_kv, S, d) fp16, pre-RoPE
+    q_t = kinds_map["q"]  # (h, T, d) fp16
+    h_kv, S, d = k_pre_t.shape
+    Q_fp32 = q_t.float()
+
+    if rope_ready:
+        cos_l, sin_l = get_cos_sin(S)
+    else:
+        cos_l = torch.ones(S, d)
+        sin_l = torch.zeros(S, d)
+    K_post_true = apply_rope(k_pre_t.float(), cos_l, sin_l) if rope_ready else None
+
+    M_pre = to_matrix(k_pre_t)  # (S, C) fp32
+    tail = slice(S // 2, S)
+
+    return _LayerCtx(
+        k_pre_t=k_pre_t,
+        h_kv=h_kv,
+        S=S,
+        d=d,
+        C=h_kv * d,
+        Q_fp32=Q_fp32,
+        cos_l=cos_l,
+        sin_l=sin_l,
+        K_post_true=K_post_true,
+        M_pre=M_pre,
+        tail=tail,
+    )
 
 
 def _tq_layer_curve(

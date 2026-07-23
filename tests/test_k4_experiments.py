@@ -526,3 +526,45 @@ def test_k4_dec_quant_two_caches_keys_tq_curve_per_cache(tmp_path):
     )
     tq_df2 = pd.read_parquet(run_dir2 / "tq_curve.parquet")
     assert not tq_df2.duplicated(subset=["cache", "layer", "bpe_model"]).any()
+
+
+def test_corpus_fit_bases_matches_direct_fit(tmp_path):
+    from bmx.cache.spectral import fit_spectral_basis, identity_whitener
+    from experiments._k4_common import corpus_fit_bases, load_layer_keys, setup_rope
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+    per_cache = [load_layer_keys(str(p)) for p in (p1, p2)]
+    layers = sorted(per_cache[0].keys())
+    get_cos_sins = [setup_rope("", lk, layers)[1] for lk in per_cache]
+
+    fit = corpus_fit_bases(
+        per_cache,
+        get_cos_sins,
+        False,
+        layers,
+        w_source="none",
+        ridge=1e-3,
+        position_stride=8,
+    )
+    M_ref = torch.cat([to_matrix(lk[0]["k_pre"]) for lk in per_cache], dim=0)
+    Ih, Ih_inv = identity_whitener(M_ref.shape[1])
+    ref = fit_spectral_basis(M_ref, Ih, Ih_inv)
+    assert torch.equal(fit.bases[0].enc, ref.enc)
+    assert torch.equal(fit.bases[0].dec, ref.dec)
+    assert torch.equal(fit.M_fits[0], M_ref)
+    assert torch.equal(fit.whiteners[0][0], Ih)
+
+
+def test_layer_ctx_importable_from_k4_common(tmp_path):
+    from experiments._k4_common import _layer_ctx, load_layer_keys
+
+    p = tmp_path / "c.safetensors"
+    _tiny_cache(p, seed=0)
+    lk = load_layer_keys(str(p))
+    ctx = _layer_ctx(lk[0], rope_ready=False, get_cos_sin=lambda S: None)
+    assert ctx.C == ctx.h_kv * ctx.d == 16
+    assert ctx.M_pre.shape == (128, 16)
+    assert ctx.tail == slice(64, 128)
+    assert ctx.K_post_true is None
