@@ -315,3 +315,48 @@ def test_load_eval_tokens_text_field_assert(monkeypatch):
     assert ok.shape == (8,)
     with pytest.raises(AssertionError, match="text_field"):
         ls.load_eval_tokens("gpt2", n_tokens=8, text_field="nope")
+
+
+# ---------------------------------------------------------------------------
+# collect_cache.py corpus passthrough — output naming + corpus-default guard
+# ---------------------------------------------------------------------------
+
+
+def test_collect_cache_out_path_and_corpus_guard():
+    from experiments.collect_cache import Config, _corpus_is_default, _out_path
+
+    default = Config(model_name="gpt2", seq_len=1024)
+    assert _corpus_is_default(default)
+    assert _out_path(default).name == "gpt2_1024.safetensors"
+
+    off = Config(model_name="gpt2", seq_len=1024, token_offset=1024)
+    # pre-change names unchanged: existing wikitext caches stay reusable as-is
+    assert _out_path(off).name == "gpt2_1024_off1024.safetensors"
+
+    code = Config(
+        model_name="gpt2",
+        seq_len=1024,
+        token_offset=1024,
+        dataset_id="bigcode/the-stack-smol",
+        data_dir="data/python",
+        split="train",
+        text_field="content",
+        corpus_label="code",
+    )
+    assert not _corpus_is_default(code)
+    assert _out_path(code).name == "gpt2_1024_code_off1024.safetensors"
+
+    shuf = Config(
+        model_name="gpt2",
+        seq_len=1024,
+        token_offset=1024,
+        shuffle_seed=20260723,
+        corpus_label="shuf",
+    )
+    assert not _corpus_is_default(shuf)
+    assert _out_path(shuf).name == "gpt2_1024_shuf_off1024.safetensors"
+
+    # --out still overrides everything
+    assert _out_path(
+        Config(model_name="gpt2", seq_len=1024, out="x/y.safetensors")
+    ) == Path("x/y.safetensors")
