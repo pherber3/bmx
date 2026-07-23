@@ -2,7 +2,7 @@ import json
 
 import torch
 
-from bmx.cache.collect import save_cache
+from bmx.cache.collect import save_cache, to_matrix
 
 
 def _tiny_cache(path, S=128, C=16, h_kv=2, T=16, seed=0):
@@ -20,6 +20,25 @@ def _tiny_cache(path, S=128, C=16, h_kv=2, T=16, seed=0):
         tensors[f"layer{i}.v"] = torch.randn(h_kv, S, d, generator=g).half()
         tensors[f"layer{i}.q"] = torch.randn(h_kv * 2, T, d, generator=g).half()
     save_cache(tensors, path)
+
+
+def _fit_tiny_pack_file(
+    cache_path, out_path, *, budgets, group, tiers=(0, 2, 3, 4, 5, 6, 8)
+):
+    """Minimal single-cache mirror of k4_fit_packs.py's fit+save flow: builds
+    one SpectralBasis per layer (identity whitener — no RoPE/model needed) and
+    writes a pack file via save_pack_file."""
+    from bmx.cache.spectral import fit_spectral_basis, identity_whitener, save_pack_file
+    from experiments._k4_common import load_layer_keys
+
+    layer_keys = load_layer_keys(str(cache_path))
+    bases = {}
+    for layer_i, kinds_map in layer_keys.items():
+        M_fit = to_matrix(kinds_map["k_pre"])
+        C = M_fit.shape[1]
+        Ih, Ih_inv = identity_whitener(C)
+        bases[layer_i] = fit_spectral_basis(M_fit, Ih, Ih_inv)
+    save_pack_file(out_path, bases, budgets, tiers=tiers, group=group)
 
 
 def test_k4_spectra_smoke(tmp_path):
@@ -390,3 +409,32 @@ def test_k4_charge_curve_smoke(tmp_path):
         - (scale_bits(group) * (1 - c_used / C)) / 2
     )
     assert f"{expected:.2f}" in text
+
+
+def test_k4_dec_quant_smoke(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from experiments.k4_dec_quant import Config, main
+
+    fit, scored = tmp_path / "f.safetensors", tmp_path / "s.safetensors"
+    _tiny_cache(fit, seed=0)
+    _tiny_cache(scored, seed=1)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(
+        fit, packs_path, budgets=(2.5,), group=16
+    )  # helper mirroring k4_fit_packs
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            cache_paths=(str(scored),),
+            model_label="tiny",
+            budgets=(2.5,),
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert set(df.dec_mode) == {"fp32", "fp16", "int8"}
+    v = json.loads((run_dir / "dec_quant_verdict.json").read_text())
+    assert "gate_pass" in v and "rel_degradation_int8" in str(v)

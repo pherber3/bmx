@@ -1,0 +1,18 @@
+{
+  "headline_metric": "logit",
+  "per_budget": {
+    "2.5": {
+      "win_fp32": 8.64709544715088,
+      "win_fp16": 8.645913651059873,
+      "win_int8": 7.20405341712868,
+      "rel_degradation_int8": 0.16676782722141115,
+      "rel_degradation_fp16_vs_fp32": 0.00013666971739012546,
+      "int8_win_at_own_bits": 7.898340870808165,
+      "gate_pass": false,
+      "n_samples": 12,
+      "extrapolated": false
+    }
+  },
+  "gate_pass": false,
+  "fp16_shippability_flag": false
+}

@@ -5,8 +5,10 @@ self-validation, tail scoring, and the across-layer greedy allocator.
 
 from __future__ import annotations
 
+import math
 import re
 
+import pandas as pd
 import torch
 
 from bmx.cache.collect import from_matrix, load_cache
@@ -148,3 +150,40 @@ def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_
         lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
         lg_rope = float("nan")
     return rf, lg, lg_rope
+
+
+def _tq_layer_curve(
+    df: pd.DataFrame, headline_col: str
+) -> dict[int, list[tuple[float, float]]]:
+    """Per-layer turboquant_mse k_pre curve: sorted [(bpe, distortion), ...]."""
+    sub = df[(df.arm == "turboquant_mse") & (df.kind == "k_pre")]
+    curves: dict[int, list[tuple[float, float]]] = {}
+    for layer, g in sub.groupby("layer"):
+        pts = sorted(zip(g.bpe_model.tolist(), g[headline_col].tolist()))
+        curves[int(layer)] = pts
+    return curves
+
+
+def _log_interp(pts: list[tuple[float, float]], x: float) -> tuple[float, bool]:
+    """Interpolate log(y) linearly in x over sorted pts=[(x,y),...].
+    Extrapolates log-linearly from the nearest two points when x is outside
+    the range; returns (y, extrapolated)."""
+    xs = [p[0] for p in pts]
+    ys = [math.log(max(p[1], 1e-300)) for p in pts]
+    if x <= xs[0]:
+        if x == xs[0]:
+            return math.exp(ys[0]), False
+        x0, x1, y0, y1 = xs[0], xs[1], ys[0], ys[1]
+        t = (x - x0) / (x1 - x0)
+        return math.exp(y0 + t * (y1 - y0)), True
+    if x >= xs[-1]:
+        if x == xs[-1]:
+            return math.exp(ys[-1]), False
+        x0, x1, y0, y1 = xs[-2], xs[-1], ys[-2], ys[-1]
+        t = (x - x0) / (x1 - x0)
+        return math.exp(y0 + t * (y1 - y0)), True
+    for i in range(len(xs) - 1):
+        if xs[i] <= x <= xs[i + 1]:
+            t = (x - xs[i]) / (xs[i + 1] - xs[i])
+            return math.exp(ys[i] + t * (ys[i + 1] - ys[i])), False
+    raise AssertionError("unreachable")
