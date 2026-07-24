@@ -395,7 +395,7 @@ done
 
 Expected: 11 new files in `results/cache/` (each ~28 MB, same as the existing gpt2 caches): `gpt2_1024_off5120`, `gpt2_1024_code`, `gpt2_1024_code_off{1024,2048,3072,4096,5120}`, `gpt2_1024_shuf_off{1024,2048,3072,4096}` (all `.safetensors`).
 
-**FALLBACK (binding decision 5):** if `bigcode/the-stack-smol` fails to load or the `text_field` assert fires (field not named `content`), rerun the (b) loop with `--dataset-id codeparrot/codeparrot-clean-valid --dataset-config "" --data-dir "" --split train --text-field content --corpus-label code`, and record which id was used in Task 7's results doc.
+**FALLBACK (binding decision 5):** if `bigcode/the-stack-smol` fails to load or the `text_field` assert fires (field not named `content`), rerun the (b) loop with `--dataset-id codeparrot/codeparrot-clean-valid --dataset-config "" --data-dir "" --split "train[:200]" --text-field content --corpus-label code` (the `train[:200]` prefix form is what the gpt2 run validated — content-identical at these offsets, avoids materializing the 61k-row column), and record which id was used in Task 7's results doc.
 
 - [ ] **Step 6: Sanity-check one cache of each corpus.**
 
@@ -1667,7 +1667,8 @@ Stage `experiments/k4_corpus_transfer.py tests/test_k4_experiments.py`; propose 
 - [ ] **Step 1: Run the harness (local CPU, ~10–20 min for 12 layers × C=768).** From `/d/Projects/bmx` (tyro tuples are space-separated; `--model-name` stays empty — gpt2 has no RoPE, headline = `logit`):
 
 ```bash
-uv run python experiments/k4_corpus_transfer.py \
+# MODULE form required — script form fails on sys.path (ModuleNotFoundError: experiments)
+uv run python -m experiments.k4_corpus_transfer \
   --wiki-fit-paths results/cache/gpt2_1024_off1024.safetensors results/cache/gpt2_1024_off2048.safetensors results/cache/gpt2_1024_off3072.safetensors results/cache/gpt2_1024_off4096.safetensors \
   --code-fit-paths results/cache/gpt2_1024_code_off1024.safetensors results/cache/gpt2_1024_code_off2048.safetensors results/cache/gpt2_1024_code_off3072.safetensors results/cache/gpt2_1024_code_off4096.safetensors \
   --null-fit-paths results/cache/gpt2_1024_shuf_off1024.safetensors results/cache/gpt2_1024_shuf_off2048.safetensors results/cache/gpt2_1024_shuf_off3072.safetensors results/cache/gpt2_1024_shuf_off4096.safetensors \
