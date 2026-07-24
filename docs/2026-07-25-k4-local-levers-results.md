@@ -85,11 +85,16 @@ pattern, now with evidence).** Per-layer certificate
 
 - Ordering: measured T4 < T5 < T6 < blanket at every budget; `ordering_ok =
   true`; zero per-layer sign flips.
-- Magnitude: certificate is a conservative over-estimate ~3–4× throughout
-  (T=5 layer-mean implied 1.35%/1.39% vs measured 0.36%/0.43%; blanket
+- Magnitude: certificate is a conservative over-estimate ~3–4× in the
+  layer-mean (T=5 implied 1.35%/1.39% vs measured 0.36%/0.43%; blanket
   implied 26.4%/30.7% vs measured 8.3%/10.7% — same factor) — consistent
-  with its documented un-modeled second-order terms all sitting on the
-  "over-count" side at these budgets. (The §1 gate numbers 0.50%/0.60% are
+  with its documented un-modeled second-order terms mostly sitting on the
+  "over-count" side at these budgets. [Refined 2026-07-25 while building
+  the figure: conservative for 87/96 cells; layer 2 measures 1.2–2.9× ABOVE
+  its implied value at every tier (all 8 of its rows), with one further
+  marginal excursion on layer 4 (b2.5, T=4, 1.007× — a tie at the noise
+  floor) — ordering still exact there; see
+  `docs/2026-07-25-k4-estimation-levers-results.md` §3.] (The §1 gate numbers 0.50%/0.60% are
   the aggregate-win form 1 − win_t5/win_fp16; the per-layer means here are
   mean-of-ratios — both reported, same verdict.)
 
