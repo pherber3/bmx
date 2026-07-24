@@ -2235,3 +2235,275 @@ def test_k4_jensen_gap_end_to_end_matches_toy_via_diag_cache(tmp_path):
     row = df.iloc[0]
     assert 0.0 < row.r_pred <= 1.0 + 1e-9
     assert math.isfinite(row.log_gap)
+
+
+# ---------------------------------------------------------------------------
+# k4_shrinkage (K4 estimation levers Task 2)
+# ---------------------------------------------------------------------------
+
+
+def test_lw_rows_frame_pin_matches_basis_lam64():
+    """MANDATORY frame-pin test (Task 2 brief): the LW rows passed to
+    shrink_spectrum must be the fit rows projected through the basis's own
+    enc matrix, in fp64 -- rows = M_fit @ enc. Verifies eigvalsh(rows^T rows
+    / n) matches basis.lam64 to 1e-6 relative on a tiny fixture, pinning the
+    W-weighted frame shrink_spectrum's rho must be computed in (Task 1's
+    report: LW rho is NOT invariant to the W-weighting)."""
+    from bmx.cache.spectral import assemble_whitener, fit_spectral_basis
+
+    torch.manual_seed(0)
+    S, h_kv, d = 200, 2, 6
+    C = h_kv * d
+    M_fit = torch.randn(S, C, dtype=torch.float32)
+    W_blocks = torch.randn(h_kv, d, d, dtype=torch.float64)
+    W_blocks = torch.einsum("hij,hkj->hik", W_blocks, W_blocks) + 0.1 * torch.eye(
+        d, dtype=torch.float64
+    )
+    Wh, Wh_inv = assemble_whitener(W_blocks, ridge=1e-3)
+    basis = fit_spectral_basis(M_fit, Wh, Wh_inv)
+
+    rows = M_fit.double() @ basis.enc.double()  # the frame under test
+    n = rows.shape[0]
+    Sigma_rows = rows.mT @ rows / n
+    lam_rows = torch.linalg.eigvalsh(Sigma_rows).flip(0)  # descending
+
+    rel_err = ((lam_rows - basis.lam64).abs() / basis.lam64.clamp_min(1e-12)).max()
+    assert float(rel_err) < 1e-6, f"frame mismatch: rel_err={float(rel_err):.3g}"
+
+
+def test_shrinkage_verdict_gate_both_budgets_and_1_02_factor():
+    """Gate logic on a synthetic frame: PROMOTE iff at BOTH budgets
+    win(lw) >= 1.02*win(plain) AND no matched-budget bpe_v2 regression > 0.02.
+    One budget failing the ratio -> gate_pass False."""
+    from experiments.k4_shrinkage import _shrinkage_verdict
+
+    rows = []
+    for budget in (2.2, 2.5):
+        for arm, win, bpe in (
+            ("plain", 10.0, budget),
+            ("lw", 10.3, budget + 0.01),  # ratio 1.03 >= 1.02, bpe delta ok
+            ("oas", 10.1, budget),
+        ):
+            rows.append(
+                dict(
+                    model="tiny",
+                    cache="c",
+                    layer=0,
+                    arm=arm,
+                    method=arm if arm != "plain" else "",
+                    budget=budget,
+                    n_fit=0,
+                    win=win,
+                    bpe_v2=bpe,
+                    c_used=8.0,
+                    rho=0.1,
+                )
+            )
+    import pandas as pd
+
+    df = pd.DataFrame(rows)
+    v = _shrinkage_verdict(df, budgets=(2.2, 2.5), win_factor=1.02, bpe_guard=0.02)
+    assert v["gate"]["2.2"]["win_ratio"] > 1.02
+    assert v["gate"]["2.5"]["win_ratio"] > 1.02
+    assert v["gate"]["2.2"]["bpe_regression_ok"] is True
+    assert v["gate"]["2.5"]["bpe_regression_ok"] is True
+    assert v["gate_pass"] is True
+
+    # Flip one budget's lw win below the 1.02 factor -> overall gate fails.
+    df2 = df.copy()
+    df2.loc[(df2.arm == "lw") & (df2.budget == 2.5), "win"] = 10.0  # ratio 1.0 < 1.02
+    v2 = _shrinkage_verdict(df2, budgets=(2.2, 2.5), win_factor=1.02, bpe_guard=0.02)
+    assert v2["gate"]["2.2"]["win_ratio"] > 1.02
+    assert v2["gate"]["2.5"]["win_ratio"] <= 1.02
+    assert v2["gate_pass"] is False
+
+
+def test_shrinkage_verdict_bpe_regression_guard():
+    """A budget can pass the win-ratio factor but fail on an oversized
+    matched-budget bpe_v2 regression (lw bpe_v2 > plain bpe_v2 + 0.02) ->
+    gate_pass False for that budget, and overall."""
+    from experiments.k4_shrinkage import _shrinkage_verdict
+    import pandas as pd
+
+    rows = []
+    for budget in (2.2, 2.5):
+        lw_bpe = budget + (0.05 if budget == 2.2 else 0.0)  # regress at 2.2
+        for arm, win, bpe in (
+            ("plain", 10.0, budget),
+            ("lw", 10.5, lw_bpe),  # ratio 1.05, comfortably over factor
+        ):
+            rows.append(
+                dict(
+                    model="tiny",
+                    cache="c",
+                    layer=0,
+                    arm=arm,
+                    method=arm if arm != "plain" else "",
+                    budget=budget,
+                    n_fit=0,
+                    win=win,
+                    bpe_v2=bpe,
+                    c_used=8.0,
+                    rho=0.1,
+                )
+            )
+    df = pd.DataFrame(rows)
+    v = _shrinkage_verdict(df, budgets=(2.2, 2.5), win_factor=1.02, bpe_guard=0.02)
+    assert v["gate"]["2.2"]["bpe_regression_ok"] is False
+    assert v["gate"]["2.2"]["gate_pass"] is False
+    assert v["gate"]["2.5"]["bpe_regression_ok"] is True
+    assert v["gate"]["2.5"]["gate_pass"] is True
+    assert v["gate_pass"] is False  # both-budgets AND
+
+
+def test_shrinkage_verdict_n_scaling_table_shape_and_rho_carried():
+    """n-scaling table: mean win by (arm, n_fit, budget); rho column present
+    per (layer, method, n_fit) in the diagnostics."""
+    from experiments.k4_shrinkage import _shrinkage_verdict
+    import pandas as pd
+
+    rows = []
+    for n_fit in (768, 0):
+        for budget in (2.2, 2.5):
+            for arm, method, rho in (
+                ("plain", "", 0.0),
+                ("lw", "lw", 0.3 if n_fit == 768 else 0.05),
+                ("oas", "oas", 0.25 if n_fit == 768 else 0.04),
+            ):
+                rows.append(
+                    dict(
+                        model="tiny",
+                        cache="c",
+                        layer=0,
+                        arm=arm,
+                        method=method,
+                        budget=budget,
+                        n_fit=n_fit,
+                        win=10.0 + rho,
+                        bpe_v2=budget,
+                        c_used=8.0,
+                        rho=rho,
+                    )
+                )
+    df = pd.DataFrame(rows)
+    v = _shrinkage_verdict(df, budgets=(2.2, 2.5), win_factor=1.02, bpe_guard=0.02)
+    assert "n_scaling" in v
+    # keyed by arm -> n_fit -> budget -> mean win
+    assert set(v["n_scaling"].keys()) >= {"plain", "lw", "oas"}
+    assert set(v["n_scaling"]["lw"].keys()) == {"768", "0"}
+    assert "rho_summary" in v
+    assert "lw" in v["rho_summary"] and "oas" in v["rho_summary"]
+    # rho at n_fit=768 should be reported distinctly from n_fit=0 (full)
+    assert set(v["rho_summary"]["lw"].keys()) == {"768", "0"}
+
+
+def test_k4_shrinkage_smoke(tmp_path):
+    """End-to-end smoke on tiny fixtures: metrics.parquet has the expected
+    arm/method/n_fit/budget columns and shrinkage_verdict.json has the gate
+    + diagnostics keys."""
+    import json
+
+    import pandas as pd
+
+    from experiments.k4_shrinkage import Config, main
+
+    fit_paths = []
+    for i in range(2):
+        p = tmp_path / f"fit{i}.safetensors"
+        _tiny_cache(p, seed=i)
+        fit_paths.append(str(p))
+    heldout_paths = []
+    for i in range(2):
+        p = tmp_path / f"held{i}.safetensors"
+        _tiny_cache(p, seed=100 + i)
+        heldout_paths.append(str(p))
+
+    run_dir = main(
+        Config(
+            fit_cache_paths=tuple(fit_paths),
+            heldout_cache_paths=tuple(heldout_paths),
+            model_label="tiny",
+            budgets=(2.2, 2.5),
+            n_fits=(64, 0),
+            methods=("lw", "oas"),
+            group=16,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    for col in (
+        "model",
+        "cache",
+        "layer",
+        "arm",
+        "method",
+        "budget",
+        "n_fit",
+        "win",
+        "bpe_v2",
+        "c_used",
+        "rho",
+    ):
+        assert col in df.columns, col
+    assert set(df.arm) == {"plain", "lw", "oas"}
+    assert set(df.n_fit) == {64, 0}
+    assert set(df.budget) == {2.2, 2.5}
+    # plain arm carries no shrinkage intensity
+    assert (df[df.arm == "plain"].rho == 0.0).all()
+
+    v = json.loads((run_dir / "shrinkage_verdict.json").read_text())
+    for key in ("gate", "gate_pass", "n_scaling", "rho_summary", "c_used_stability"):
+        assert key in v, key
+
+
+def test_k4_shrinkage_n_fit_zero_matches_standard_fit_path(tmp_path):
+    """n_fit=0 (full) must fit BIT-EXACT the same basis as the standard
+    corpus_fit_bases path (no subsampling applied) -- pinned by comparing
+    the plain-arm pack's bits directly against a corpus_fit_bases +
+    pack_from_basis reference computed independently in this test."""
+    import torch as _torch
+
+    from bmx.cache.spectral import pack_from_basis
+    from experiments._k4_common import corpus_fit_bases, load_layer_keys, setup_rope
+    from experiments.k4_shrinkage import _fit_bases_at_n
+
+    fit_paths = []
+    for i in range(2):
+        p = tmp_path / f"fit{i}.safetensors"
+        _tiny_cache(p, seed=i)
+        fit_paths.append(str(p))
+
+    per_cache = [load_layer_keys(p) for p in fit_paths]
+    layers = sorted(per_cache[0].keys())
+    rope_ready = False
+    get_cos_sins = []
+    for lk in per_cache:
+        ready, gcs = setup_rope("", lk, layers)
+        rope_ready = rope_ready or ready
+        get_cos_sins.append(gcs)
+
+    ref = corpus_fit_bases(
+        per_cache,
+        get_cos_sins,
+        rope_ready,
+        layers,
+        w_source="corpus",
+        ridge=1e-3,
+        position_stride=8,
+    )
+    ref_pack = pack_from_basis(ref.bases[layers[0]], 2.5, group=16)
+
+    fit_n0 = _fit_bases_at_n(
+        per_cache,
+        get_cos_sins,
+        rope_ready,
+        layers,
+        ridge=1e-3,
+        position_stride=8,
+        n_fit=0,
+        seed=0,
+    )
+    test_pack = pack_from_basis(fit_n0[layers[0]][0], 2.5, group=16)
+
+    assert _torch.equal(ref_pack.bits, test_pack.bits)
+    assert _torch.allclose(ref.bases[layers[0]].lam64, fit_n0[layers[0]][0].lam64)
