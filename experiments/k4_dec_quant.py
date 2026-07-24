@@ -116,11 +116,12 @@ def _dec_variant(dec: torch.Tensor, bits_pc: torch.Tensor, mode: str) -> torch.T
 def _mode_c_int8(pack: SpectralPack, mode: str) -> int:
     """Number of used decoder columns int8-stored under `mode` — 0 for
     fp32/fp16, every used column (thr=8) for blanket "int8", and
-    `count(0 < bits <= T)` for "int8_t{T}"."""
+    `count(0 < bits <= T)` for "int8_t{T}" (via `SpectralPack.c_int8`, the
+    shared int8-column count the streaming charge/certificate also use)."""
     if mode in ("fp32", "fp16"):
         return 0
     thr = 8 if mode == "int8" else int(mode[len("int8_t") :])
-    return int(((pack.bits > 0) & (pack.bits <= thr)).sum())
+    return pack.c_int8(thr)
 
 
 def main(cfg: Config):

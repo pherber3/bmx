@@ -186,6 +186,15 @@ class SpectralPack:
         actually read at decode (see skeptic-v2 / payload-v2 above)."""
         return int((self.bits != 0).sum())
 
+    def c_int8(self, tier_threshold: int) -> int:
+        """Number of USED decoder columns int8-eligible at `tier_threshold`:
+        `count(0 < bits <= tier_threshold)` (K4 local-levers Task 1). At the
+        top of the standard tier grid (8) this equals `c_used` (blanket); at
+        or below the smallest used tier it is 0. The single home for the
+        int8-column count `mixed_dec_charge`/`int8_decoder_certificate_tiered`
+        /the streaming charge all price against — see `mixed_dec_charge`."""
+        return int(((self.bits > 0) & (self.bits <= tier_threshold)).sum())
+
 
 @dataclasses.dataclass
 class SpectralBasis:
@@ -766,10 +775,8 @@ def int8_decoder_certificate_tiered(pack: SpectralPack, tier_threshold: int) -> 
     `mixed_dec_charge`/`effective_dec_bits` — see those docstrings for the
     skeptic-v2 arithmetic generalized to a per-column int8/fp16 mix.
     """
-    used = pack.bits != 0
-    gate = used & (pack.bits <= tier_threshold)  # int8-eligible columns
-    c_used = int(used.sum())
-    c_int8 = int(gate.sum())
+    c_used = pack.c_used
+    c_int8 = pack.c_int8(tier_threshold)
 
     dec_gated = int8_decoder_roundtrip(
         pack.dec, pack.bits, tier_threshold=tier_threshold

@@ -231,11 +231,7 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
         mean_c_int8 = (
             0
             if thr is None
-            else sum(
-                int(((layer._pack.bits > 0) & (layer._pack.bits <= thr)).sum())
-                for layer in layers
-            )
-            / len(layers)
+            else sum(layer._pack.c_int8(thr) for layer in layers) / len(layers)
         )
         bpe_k = bpe_k + mixed_dec_charge(
             C, S, last._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
