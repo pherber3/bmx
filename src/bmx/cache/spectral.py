@@ -46,7 +46,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from pathlib import Path
+from typing import Sequence
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -216,6 +218,98 @@ def fit_spectral_basis(
         dec=(Wh_inv @ E).float(),
         lam=lam.float(),
         lam64=lam,
+    )
+
+
+def jensen_gap_report(moments: Sequence[torch.Tensor]) -> dict:
+    """Determinant-Jensen Gate-A anchor (math review 2026-07-24 #6, spec Part
+    2): the population functional behind Gate A's measured corpus-basis
+    retention ceiling.
+
+    `moments`: a sequence of C×C PSD matrices on a FIXED SHARED FRAME (any fp
+    dtype in, fp64 internally) — e.g. per-sequence whitened key moments
+    `T_s = Wh @ Σ_s @ Wh` sharing one whitener `Wh` across the population, so
+    the theorem's "W cancels" argument applies verbatim. This function is
+    otherwise budget-free and knows nothing about RoPE/whitening/allocation —
+    it only consumes matrices.
+
+    Per moment: eigvalsh (fp64), PSD-guard the smallest eigenvalue (allows a
+    small negative slack for fp round-off, asserts otherwise), clamp at a
+    tiny positive floor (counted in `n_clamped`), then
+    `gm(M) = exp(mean(log evals)) = det(M)^{1/C}` — the overflow-safe form of
+    the geometric mean of the spectrum (never forms det(M) directly, which
+    would over/underflow at C ~ hundreds).
+
+    `pooled = mean_s(moments)` (the pooled-fit second moment Σ̄ under the
+    theorem's setup) and:
+
+        gm_pool      = gm(pooled)
+        mean_gm_seq  = mean_s(gm(moments[s]))
+        r_pred       = mean_gm_seq / gm_pool
+        log_gap      = log(gm_pool) - mean_s(log(gm(moments[s])))
+
+    By Minkowski's determinant inequality (det^{1/C} concave on PSD), Jensen
+    gives `r_pred <= 1`. `log_gap` is the SAME comparison in log-space but is
+    NOT `-log(r_pred)` in general (Jensen's gap is different when you take
+    the log before vs after averaging the gm(Σ_s) across sequences) — both
+    are reported deliberately, do not conflate them or "derive" one from the
+    other downstream.
+    """
+    assert len(moments) > 0, "moments must be non-empty"
+    tiny = 1e-300
+    C = None
+    gms: list[float] = []
+    log_gms: list[float] = []
+    n_clamped = 0
+    pooled_sum: torch.Tensor | None = None
+    for i, M in enumerate(moments):
+        M64 = M.double()
+        assert M64.dim() == 2 and M64.shape[0] == M64.shape[1], (
+            f"moments[{i}] must be square 2-D; got {tuple(M.shape)}"
+        )
+        if C is None:
+            C = M64.shape[0]
+        else:
+            assert M64.shape[0] == C, (
+                f"moments[{i}] has size {M64.shape[0]} != moments[0]'s {C} — "
+                "all moments must share one frame"
+            )
+        M64 = 0.5 * (M64 + M64.mT)
+        evals = torch.linalg.eigvalsh(M64)
+        evals_max = float(evals.max())
+        assert float(evals.min()) > -1e-10 * max(evals_max, tiny), (
+            f"moments[{i}] is not PSD (within tolerance): min eigenvalue "
+            f"{float(evals.min())!r}, max {evals_max!r}"
+        )
+        n_clamped += int((evals < tiny).sum())
+        evals = evals.clamp_min(tiny)
+        log_gm = float(evals.log().mean())
+        gms.append(math.exp(log_gm))
+        log_gms.append(log_gm)
+        pooled_sum = M64 if pooled_sum is None else pooled_sum + M64
+
+    pooled = pooled_sum / len(moments)
+    pooled_evals = torch.linalg.eigvalsh(0.5 * (pooled + pooled.mT))
+    pooled_evals_max = float(pooled_evals.max())
+    assert float(pooled_evals.min()) > -1e-10 * max(pooled_evals_max, tiny), (
+        f"pooled moment is not PSD (within tolerance): min eigenvalue "
+        f"{float(pooled_evals.min())!r}, max {pooled_evals_max!r}"
+    )
+    n_clamped += int((pooled_evals < tiny).sum())
+    pooled_evals = pooled_evals.clamp_min(tiny)
+    log_gm_pool = float(pooled_evals.log().mean())
+    gm_pool = math.exp(log_gm_pool)
+
+    mean_gm_seq = float(sum(gms) / len(gms))
+    mean_log_gm_seq = float(sum(log_gms) / len(log_gms))
+
+    return dict(
+        gm_pool=gm_pool,
+        mean_gm_seq=mean_gm_seq,
+        r_pred=mean_gm_seq / gm_pool,
+        log_gap=log_gm_pool - mean_log_gm_seq,
+        n_seq=len(moments),
+        n_clamped=n_clamped,
     )
 
 

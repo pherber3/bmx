@@ -161,6 +161,70 @@ class CorpusFit(NamedTuple):
     whiteners: dict[int, tuple[torch.Tensor, torch.Tensor]]  # fp64 (Wh, Wh_inv)
 
 
+class PerCacheMoments(NamedTuple):
+    """One layer's per-cache raw key matrices + the shared (pooled) whitener,
+    in the exact conventions `corpus_fit_bases` fits packs with."""
+
+    M_parts: list[torch.Tensor]  # per-cache (S_s, C) fp32, to_matrix(k_pre)
+    Wh: torch.Tensor  # fp64 (C, C)
+    Wh_inv: torch.Tensor  # fp64 (C, C)
+    h_kv: int
+    d: int
+
+
+def per_cache_weighted_moments(
+    per_cache_layer_keys: list[dict[int, dict[str, torch.Tensor]]],
+    get_cos_sins: list,
+    rope_ready: bool,
+    layer_i: int,
+    *,
+    w_source: str,
+    ridge: float,
+    position_stride: int,
+    w_rope: str = "frozen",
+) -> PerCacheMoments:
+    """Per-cache k_pre matrices + the pooled-corpus W-weighted whitener for
+    ONE layer, under the IDENTICAL conventions `corpus_fit_bases` fits packs
+    with (same W-weighting, same w_rope default, same shape validation).
+    Hoisted out of `corpus_fit_bases` (K4 local-levers Task 4) so callers that
+    need PER-CACHE second moments (rather than the pooled fit) can build them
+    without duplicating the whitener-assembly logic. Zero numeric change:
+    `corpus_fit_bases` consumes this helper's output — see
+    `test_corpus_fit_bases_hoist_pin`."""
+    assert w_source in ("corpus", "none"), f"unknown w_source {w_source!r}"
+    h_kv = d = None
+    M_parts = []
+    for lk in per_cache_layer_keys:
+        k_pre_t = lk[layer_i]["k_pre"]
+        this_h_kv, _, this_d = k_pre_t.shape
+        if h_kv is None:
+            h_kv, d = this_h_kv, this_d
+        else:
+            assert (this_h_kv, this_d) == (h_kv, d), (
+                f"corpus cache layer{layer_i}.k_pre shape "
+                f"{tuple(k_pre_t.shape)} incompatible with (h_kv={h_kv}, d={d})"
+            )
+        M_parts.append(to_matrix(k_pre_t))
+    C = h_kv * d
+
+    if w_source == "corpus":
+        W_blocks = corpus_query_moment(
+            per_cache_layer_keys,
+            get_cos_sins,
+            rope_ready,
+            layer_i,
+            h_kv,
+            d,
+            position_stride,
+            w_rope=w_rope,
+        )
+        Wh, Wh_inv = assemble_whitener(W_blocks, ridge=ridge)
+    else:  # "none"
+        Wh, Wh_inv = identity_whitener(C)
+
+    return PerCacheMoments(M_parts=M_parts, Wh=Wh, Wh_inv=Wh_inv, h_kv=h_kv, d=d)
+
+
 def corpus_fit_bases(
     per_cache_layer_keys: list[dict[int, dict[str, torch.Tensor]]],
     get_cos_sins: list,
@@ -177,47 +241,28 @@ def corpus_fit_bases(
     moment ("corpus") or identity ("none"). Byte-identical to the
     pre-extraction k4_fit_packs flow — pinned by
     test_k4_fit_packs_default_unchanged."""
-    assert w_source in ("corpus", "none"), f"unknown w_source {w_source!r}"
     bases: dict[int, SpectralBasis] = {}
     M_fits: dict[int, torch.Tensor] = {}
     whiteners: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for layer_i in layers:
-        h_kv = d = None
-        M_parts = []
-        for lk in per_cache_layer_keys:
-            k_pre_t = lk[layer_i]["k_pre"]
-            this_h_kv, _, this_d = k_pre_t.shape
-            if h_kv is None:
-                h_kv, d = this_h_kv, this_d
-            else:
-                assert (this_h_kv, this_d) == (h_kv, d), (
-                    f"corpus cache layer{layer_i}.k_pre shape "
-                    f"{tuple(k_pre_t.shape)} incompatible with (h_kv={h_kv}, d={d})"
-                )
-            M_parts.append(to_matrix(k_pre_t))
-        M_fit = torch.cat(M_parts, dim=0)
-        C = h_kv * d
+        pcm = per_cache_weighted_moments(
+            per_cache_layer_keys,
+            get_cos_sins,
+            rope_ready,
+            layer_i,
+            w_source=w_source,
+            ridge=ridge,
+            position_stride=position_stride,
+            w_rope=w_rope,
+        )
+        M_fit = torch.cat(pcm.M_parts, dim=0)
+        C = pcm.h_kv * pcm.d
 
-        if w_source == "corpus":
-            W_blocks = corpus_query_moment(
-                per_cache_layer_keys,
-                get_cos_sins,
-                rope_ready,
-                layer_i,
-                h_kv,
-                d,
-                position_stride,
-                w_rope=w_rope,
-            )
-            Wh, Wh_inv = assemble_whitener(W_blocks, ridge=ridge)
-        else:  # "none"
-            Wh, Wh_inv = identity_whitener(C)
-
-        bases[layer_i] = fit_spectral_basis(M_fit, Wh, Wh_inv)
+        bases[layer_i] = fit_spectral_basis(M_fit, pcm.Wh, pcm.Wh_inv)
         M_fits[layer_i] = M_fit
-        whiteners[layer_i] = (Wh, Wh_inv)
+        whiteners[layer_i] = (pcm.Wh, pcm.Wh_inv)
         print(
-            f"[layer {layer_i}] (h_kv={h_kv}, d={d}, C={C}, "
+            f"[layer {layer_i}] (h_kv={pcm.h_kv}, d={pcm.d}, C={C}, "
             f"S_fit={M_fit.shape[0]}) basis fit",
             flush=True,
         )

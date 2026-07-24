@@ -7,6 +7,7 @@ from bmx.cache.spectral import (
     assemble_whitener,
     fit_spectral_pack,
     identity_whitener,
+    jensen_gap_report,
     key_second_moment,
     query_position_moment,
     skeptic_charge,
@@ -805,3 +806,102 @@ def test_load_packs_for_spec_tier_gated(tmp_path):
     above_t = (pack.bits > T) & (pack.bits != 0)
     assert above_t.any(), "fixture must have columns above the threshold"
     assert torch.equal(via_tiered[0].dec[:, above_t], pack.dec[:, above_t])
+
+
+# ---------------------------------------------------------------------------
+# jensen_gap_report (K4 local-levers Task 4 — determinant-Jensen Gate-A anchor)
+# ---------------------------------------------------------------------------
+
+
+def _random_psd(C: int, generator: torch.Generator) -> torch.Tensor:
+    A = torch.randn(C, C, generator=generator, dtype=torch.float64)
+    return A @ A.mT + 1e-6 * torch.eye(C, dtype=torch.float64)
+
+
+def test_jensen_gap_identical_moments_r_pred_one():
+    """Identical moments: no heterogeneity, the Jensen gap must vanish
+    exactly (up to fp round-off)."""
+    g = torch.Generator().manual_seed(0)
+    M = _random_psd(12, g)
+    report = jensen_gap_report([M, M.clone(), M.clone()])
+    assert abs(report["r_pred"] - 1.0) < 1e-12
+    assert abs(report["log_gap"]) < 1e-12
+    assert report["n_seq"] == 3
+    assert report["n_clamped"] == 0
+
+
+def test_jensen_gap_random_psd_mixture_minkowski_bound():
+    """A genuinely heterogeneous PSD mixture must satisfy the Minkowski bound
+    r_pred <= 1 (with a tight numerical tolerance, not a loose sanity check)."""
+    g = torch.Generator().manual_seed(1)
+    moments = [_random_psd(10, g) for _ in range(8)]
+    report = jensen_gap_report(moments)
+    assert report["r_pred"] <= 1.0 + 1e-12
+    # A genuinely heterogeneous mixture should show a real (not vanishing) gap.
+    assert report["r_pred"] < 1.0 - 1e-6
+    assert report["log_gap"] > 0.0
+
+
+def test_jensen_gap_two_atom_diagonal_closed_form():
+    """Hand-computable closed form: two diagonal moments diag(a), diag(b).
+    gm(diag(a)) = GM(a) exactly (eigenvalues of a diagonal matrix are its
+    entries), so r_pred = mean(GM(a), GM(b)) / GM((a+b)/2) by direct
+    substitution into the definition — computed independently here via
+    Python floats, not by calling back into the geometric-mean machinery."""
+    import math
+
+    a = torch.tensor([1.0, 4.0, 9.0, 16.0], dtype=torch.float64)
+    b = torch.tensor([2.0, 2.0, 50.0, 0.5], dtype=torch.float64)
+    Ma, Mb = torch.diag(a), torch.diag(b)
+    report = jensen_gap_report([Ma, Mb])
+
+    def gm(vals):
+        return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+    gm_a, gm_b = gm(a.tolist()), gm(b.tolist())
+    pooled = [(ai + bi) / 2 for ai, bi in zip(a.tolist(), b.tolist())]
+    expected_r_pred = ((gm_a + gm_b) / 2) / gm(pooled)
+    expected_log_gap = math.log(gm(pooled)) - (math.log(gm_a) + math.log(gm_b)) / 2
+
+    assert abs(report["r_pred"] - expected_r_pred) < 1e-10
+    assert abs(report["log_gap"] - expected_log_gap) < 1e-10
+    assert abs(report["gm_pool"] - gm(pooled)) < 1e-10
+    assert abs(report["mean_gm_seq"] - (gm_a + gm_b) / 2) < 1e-10
+
+
+def test_jensen_gap_non_psd_input_asserts():
+    """A matrix with a genuinely negative eigenvalue (beyond the PSD-guard's
+    fp-round-off slack) must assert, not silently clamp."""
+    M = torch.diag(torch.tensor([1.0, -1.0, 2.0], dtype=torch.float64))
+    with pytest.raises(AssertionError):
+        jensen_gap_report([M])
+
+
+def test_jensen_gap_clamps_near_zero_eigenvalues_and_counts_them():
+    """A moment with a (numerically) zero eigenvalue is clamped to the tiny
+    floor rather than rejected (it's within the PSD-guard's tolerance), and
+    the clamp is counted in n_clamped -- once per per-sequence pass the zero
+    eigenvalue is seen in, plus once more for the pooled moment (which is
+    itself singular here since the single input moment has a zero eigenvalue
+    exactly on that axis)."""
+    import math
+
+    M = torch.diag(torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 0.0], dtype=torch.float64))
+    report = jensen_gap_report([M])
+    assert report["n_clamped"] == 2
+    # gm must not be NaN/inf: the clamp floor keeps the log finite.
+    assert report["gm_pool"] > 0.0 and math.isfinite(report["gm_pool"])
+
+
+def test_jensen_gap_requires_square_and_matching_shapes():
+    with pytest.raises(AssertionError):
+        jensen_gap_report([torch.eye(3, 4, dtype=torch.float64)])
+    with pytest.raises(AssertionError):
+        jensen_gap_report(
+            [torch.eye(3, dtype=torch.float64), torch.eye(4, dtype=torch.float64)]
+        )
+
+
+def test_jensen_gap_requires_nonempty():
+    with pytest.raises(AssertionError):
+        jensen_gap_report([])

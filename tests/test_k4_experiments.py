@@ -362,6 +362,74 @@ def test_k4_fit_packs_default_unchanged(tmp_path):
         assert torch.equal(t_main[key], t_ref[key]), f"tensor {key} differs"
 
 
+def test_corpus_fit_bases_hoist_pin(tmp_path):
+    """K4 local-levers Task 4 hoist: `per_cache_weighted_moments` factors the
+    per-cache-matrices + whitener assembly out of `corpus_fit_bases`. Pin two
+    things exactly: (1) `corpus_fit_bases`'s bases/M_fits/whiteners are
+    UNCHANGED versus a reference built directly on top of the hoisted helper
+    (round-trips corpus_fit_bases through the same code path it now calls
+    internally -- any accidental reassociation would show up here); (2) the
+    hoisted helper's own contract -- the pooled second moment (mean of
+    to_matrix(k_pre) concatenated across equal-S caches) equals the exact
+    mean of the per-cache second moments (licenses the experiment's Σ̄ = mean_s
+    Σ_s convention)."""
+    from bmx.cache.spectral import fit_spectral_basis, key_second_moment
+    from experiments._k4_common import (
+        corpus_fit_bases,
+        load_layer_keys,
+        per_cache_weighted_moments,
+        setup_rope,
+    )
+
+    p1, p2, p3 = (tmp_path / f"{n}.safetensors" for n in ("a", "b", "c"))
+    for p, seed in ((p1, 0), (p2, 1), (p3, 2)):
+        _tiny_cache(p, seed=seed)  # equal S across caches (S=128 default)
+
+    per_cache = [load_layer_keys(str(p)) for p in (p1, p2, p3)]
+    layers = sorted(per_cache[0].keys())
+    get_cos_sins = [setup_rope("", lk, layers)[1] for lk in per_cache]
+
+    ref = corpus_fit_bases(
+        per_cache,
+        get_cos_sins,
+        rope_ready=False,
+        layers=layers,
+        w_source="corpus",
+        ridge=1e-3,
+        position_stride=8,
+    )
+
+    for layer_i in layers:
+        pcm = per_cache_weighted_moments(
+            per_cache,
+            get_cos_sins,
+            rope_ready=False,
+            layer_i=layer_i,
+            w_source="corpus",
+            ridge=1e-3,
+            position_stride=8,
+        )
+        # (1) corpus_fit_bases's basis == fitting directly on the hoisted
+        # helper's M_parts/whitener (exact tensor equality, not tolerance).
+        M_fit_direct = torch.cat(pcm.M_parts, dim=0)
+        assert torch.equal(M_fit_direct, ref.M_fits[layer_i])
+        basis_direct = fit_spectral_basis(M_fit_direct, pcm.Wh, pcm.Wh_inv)
+        assert torch.equal(basis_direct.enc, ref.bases[layer_i].enc)
+        assert torch.equal(basis_direct.dec, ref.bases[layer_i].dec)
+        assert torch.equal(basis_direct.lam, ref.bases[layer_i].lam)
+        Wh_ref, Wh_inv_ref = ref.whiteners[layer_i]
+        assert torch.equal(pcm.Wh, Wh_ref)
+        assert torch.equal(pcm.Wh_inv, Wh_inv_ref)
+
+        # (2) pooled second moment == exact mean of per-cache second moments
+        # (equal-S caches here, matching the real gpt2_1024 fleet: every
+        # cache_paths entry is a 1024-token window).
+        per_cache_sigmas = [key_second_moment(m) for m in pcm.M_parts]
+        pooled_direct = key_second_moment(M_fit_direct)
+        pooled_mean = sum(per_cache_sigmas) / len(per_cache_sigmas)
+        assert torch.allclose(pooled_direct, pooled_mean, atol=1e-10)
+
+
 def test_k4_fit_packs_tier_counts(tmp_path):
     """Metrics rows gain n_t0,n_t2,n_t3,n_t4,n_t5,n_t6,n_t8 per (layer,
     budget): counts of pack.bits == that tier. Sanity: they sum to C, and
@@ -1828,3 +1896,250 @@ def test_k4_int8_certificate_smoke(tmp_path):
         rescue = tier_sweep_v["per_budget_rescue"][budget_key]
         assert "largest_passing_threshold" in rescue
         assert "charge_saving_fraction_at_S4096" in rescue
+
+
+# ---------------------------------------------------------------------------
+# k4_jensen_gap (K4 local-levers Task 4 — determinant-Jensen Gate-A anchor)
+# ---------------------------------------------------------------------------
+
+
+def _diag_cache(path, diag_mags, *, n_layers=1, h_kv=1, T=8, seed=0):
+    """A cache whose layer-i k_pre matrix has an EXACTLY diagonal, hand-known
+    key second moment: row s has a single nonzero entry `diag_mags[s]` at
+    channel s (S == C == len(diag_mags)), so key_second_moment(to_matrix(k_pre))
+    == diag(diag_mags**2) / S exactly (no cross terms, no sampling noise).
+    h_kv=1 (so C == d == len(diag_mags), identity block layout); q/v are
+    unconstrained random fill (unused by the Jensen-gap path, which only
+    reads k_pre, but load_layer_keys/setup_rope need the other kinds
+    present with consistent shapes)."""
+    g = torch.Generator().manual_seed(seed)
+    S = len(diag_mags)
+    d = S  # C = h_kv * d = d since h_kv=1
+    K = torch.diag(torch.tensor(diag_mags, dtype=torch.float32)).unsqueeze(0)  # (1,S,d)
+    tensors = {}
+    for i in range(n_layers):
+        tensors[f"layer{i}.k_pre"] = K.contiguous().half()
+        tensors[f"layer{i}.k"] = K.contiguous().half()
+        tensors[f"layer{i}.v"] = torch.randn(h_kv, S, d, generator=g).half()
+        tensors[f"layer{i}.q"] = torch.randn(h_kv, T, d, generator=g).half()
+    save_cache(tensors, path)
+
+
+def test_k4_jensen_gap_smoke(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_jensen_gap import Config, main
+
+    p1, p2, p3 = (tmp_path / f"{n}.safetensors" for n in ("a", "b", "c"))
+    for p, seed in ((p1, 0), (p2, 1), (p3, 2)):
+        _tiny_cache(p, seed=seed)
+
+    run_dir = main(
+        Config(
+            cache_paths=(str(p1), str(p2), str(p3)),
+            model_label="tiny",
+            budgets=(2.2, 2.5),
+            n_flat=2,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert {
+        "layer",
+        "gm_pool",
+        "mean_gm_seq",
+        "r_pred",
+        "log_gap",
+        "n_seq",
+        "n_clamped",
+        "r_pred_flat",
+        "flatness_delta",
+        "mixed_r_pred",
+        "within_r_pred",
+        "r_discrete_b2.2",
+        "identity_check_b2.2",
+        "abs_gap_b2.2",
+        "r_discrete_b2.5",
+        "identity_check_b2.5",
+        "abs_gap_b2.5",
+    } <= set(df.columns)
+    assert (df.r_pred <= 1.0 + 1e-9).all()
+    assert (df.n_seq == 3).all()
+    assert df.mixed_r_pred.isna().all()  # no cache_paths_alt given
+
+    verdict = json.loads((run_dir / "jensen_verdict.json").read_text())
+    assert "r_pred" in verdict and "per_budget" in verdict and "match" in verdict
+    assert set(verdict["per_budget"]) == {"2.2", "2.5"}
+    for entry in verdict["per_budget"].values():
+        assert {"r_discrete", "identity_check", "abs_gap", "match"} <= set(entry)
+    assert verdict["flatness"]["n_flat"] == 2
+    assert verdict["mixed_domain"] is None
+
+
+def test_k4_jensen_gap_mixed_domain_diagnostic(tmp_path):
+    """With cache_paths_alt given, mixed_r_pred/within_r_pred populate and the
+    mixed-domain verdict block appears (widening the Jensen gap with
+    heterogeneity is a reported diagnostic, not gated)."""
+    import pandas as pd
+
+    from experiments.k4_jensen_gap import Config, main
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    alt1, alt2 = tmp_path / "alt_a.safetensors", tmp_path / "alt_b.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+    _tiny_cache(alt1, seed=10)
+    _tiny_cache(alt2, seed=11)
+
+    run_dir = main(
+        Config(
+            cache_paths=(str(p1), str(p2)),
+            cache_paths_alt=(str(alt1), str(alt2)),
+            model_label="tiny",
+            budgets=(2.5,),
+            n_flat=1,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert not df.mixed_r_pred.isna().any()
+    assert (df.mixed_r_pred <= 1.0 + 1e-9).all()
+
+    verdict = json.loads((run_dir / "jensen_verdict.json").read_text())
+    assert verdict["mixed_domain"] is not None
+    assert "mixed_r_pred" in verdict["mixed_domain"]
+    assert "within_r_pred" in verdict["mixed_domain"]
+
+
+def test_k4_jensen_gap_verdict_hand_checked_toy(tmp_path):
+    """Hand-checkable 2-layer, C=4 toy: each layer has 2 caches whose k_pre
+    key second moment is EXACTLY diagonal (see _diag_cache) with disjoint
+    hand-picked magnitudes per layer, identity whitener (no model_name given
+    -> no RoPE), w_source='none' isn't wired through Config (jensen_gap
+    always uses corpus W by default) -- so instead this test targets the
+    no-RoPE path where w_source='corpus' with cos=ones/sin=zeros reduces the
+    query moment to a plain pooled outer product; to keep the closed form
+    exact we bypass that by calling the experiment's own arithmetic helpers
+    directly on the EXACT diagonal T_s matrices (jensen_gap_report,
+    allocate_bits_from_variance) and cross-check against independent
+    by-hand Python arithmetic -- the "enumerate the waterfill" pin the task
+    calls for."""
+    from bmx.cache.codecs import allocate_bits_from_variance
+    from bmx.cache.spectral import jensen_gap_report
+    from experiments.k4_jensen_gap import _TIERS, _discrete_readout
+
+    # layer 0: same two diagonal moments as the closed-form spectral.py test.
+    a0 = torch.tensor([1.0, 4.0, 9.0, 16.0], dtype=torch.float64)
+    b0 = torch.tensor([2.0, 2.0, 50.0, 0.5], dtype=torch.float64)
+    # layer 1: a different pair (checks per-layer independence).
+    a1 = torch.tensor([5.0, 5.0, 5.0, 5.0], dtype=torch.float64)
+    b1 = torch.tensor([1.0, 100.0, 1.0, 100.0], dtype=torch.float64)
+
+    layers = {0: [torch.diag(a0), torch.diag(b0)], 1: [torch.diag(a1), torch.diag(b1)]}
+
+    for layer_i, T_list in layers.items():
+        report = jensen_gap_report(T_list)
+
+        def gm(vals):
+            return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+        vecs = [torch.diagonal(T).tolist() for T in T_list]
+        gms = [gm(v) for v in vecs]
+        pooled_diag = [sum(vs) / len(vs) for vs in zip(*vecs)]
+        expected_r_pred = (sum(gms) / len(gms)) / gm(pooled_diag)
+        assert abs(report["r_pred"] - expected_r_pred) < 1e-10, layer_i
+
+        for budget in (2.2, 2.5):
+            disc = _discrete_readout(T_list, budget)
+
+            # By-hand oracle side: each diagonal T_s's eigenvalues ARE its
+            # diagonal entries (any permutation; allocate_bits_from_variance
+            # is permutation-covariant on a 1-D vector, so feed the raw
+            # diagonal directly instead of re-deriving eigh's order).
+            d_oracle_hand = []
+            for T in T_list:
+                lam = torch.diagonal(T).clone()
+                b = allocate_bits_from_variance(lam, budget, _TIERS)
+                d_oracle_hand.append(float((lam * torch.pow(4.0, -b.double())).sum()))
+            mean_oracle_hand = sum(d_oracle_hand) / len(d_oracle_hand)
+            assert abs(disc["mean_d_oracle"] - mean_oracle_hand) < 1e-9, (
+                layer_i,
+                budget,
+            )
+
+            # By-hand pooled side: pooled diag == mean of the per-cache
+            # diagonals (E is a permutation on an already-diagonal matrix
+            # -- eigh may reorder/sign-flip columns, but a permutation-plus-
+            # sign eigenbasis leaves diag(E^T T E) equal to a permutation of
+            # T's own diagonal, and the pooled allocation is computed on the
+            # SAME pooled spectrum either way, so the summed charge matches).
+            pooled_lam_hand = torch.tensor(pooled_diag, dtype=torch.float64)
+            b_bar_hand = allocate_bits_from_variance(pooled_lam_hand, budget, _TIERS)
+            charge_bar_hand = torch.pow(4.0, -b_bar_hand.double())
+            d_pool_hand = [
+                float((torch.diagonal(T) * charge_bar_hand).sum()) for T in T_list
+            ]
+            mean_pool_hand = sum(d_pool_hand) / len(d_pool_hand)
+            assert abs(disc["mean_d_pool"] - mean_pool_hand) < 1e-9, (layer_i, budget)
+
+            expected_r_discrete = mean_oracle_hand / mean_pool_hand
+            assert abs(disc["r_discrete"] - expected_r_discrete) < 1e-9
+
+            C = 4
+            gm_pooled_hand = gm(pooled_diag)
+            expected_identity = mean_pool_hand / (C * gm_pooled_hand * (4.0**-budget))
+            assert abs(disc["identity_check"] - expected_identity) < 1e-9
+
+
+def test_k4_jensen_gap_end_to_end_matches_toy_via_diag_cache(tmp_path):
+    """End-to-end integration: run k4_jensen_gap.main on _diag_cache fixtures
+    (no model_name => identity RoPE tables, w_source='corpus' default with
+    plain-outer-product query moment) and confirm the harness's cache-loading
+    path reproduces the fixture's EXACT known raw per-cache second moments
+    (the moment-convention check), then that the emitted r_pred/log_gap are
+    structurally sane (Minkowski bound, finite) -- the full whitened-moment
+    closed form is exercised by the toy test above, which bypasses cache
+    loading entirely to control the whitener."""
+    import pandas as pd
+
+    from experiments.k4_jensen_gap import Config, main
+
+    a = [1.0, 2.0, 3.0, 4.0]
+    b = [4.0, 3.0, 2.0, 1.0]
+    p1, p2 = tmp_path / "diag_a.safetensors", tmp_path / "diag_b.safetensors"
+    _diag_cache(p1, a, seed=0)
+    _diag_cache(p2, b, seed=1)
+
+    run_dir = main(
+        Config(
+            cache_paths=(str(p1), str(p2)),
+            model_label="toy",
+            budgets=(2.5,),
+            n_flat=1,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert len(df) == 1  # one layer
+
+    S = len(a)
+    Ta = torch.diag(torch.tensor(a, dtype=torch.float64) ** 2) / S
+    Tb = torch.diag(torch.tensor(b, dtype=torch.float64) ** 2) / S
+    # w_source='corpus' with no RoPE (model_name="") gives an all-ones/zeros
+    # cos/sin table, so query_position_moment reduces to the plain pooled
+    # query second moment -- NOT identity in general, so the whitener isn't
+    # trivially I here. Only check the RAW (unwhitened) per-cache second
+    # moments match Ta/Tb exactly (the fixture's own guarantee); the
+    # end-to-end r_pred is cross-checked structurally (<=1, finite) rather
+    # than against a hand-derived whitened closed form.
+    from bmx.cache.spectral import key_second_moment
+    from bmx.cache.collect import to_matrix, load_cache
+
+    ka = load_cache(str(p1))["layer0.k_pre"]
+    kb = load_cache(str(p2))["layer0.k_pre"]
+    assert torch.allclose(key_second_moment(to_matrix(ka)), Ta, atol=1e-6)
+    assert torch.allclose(key_second_moment(to_matrix(kb)), Tb, atol=1e-6)
+
+    row = df.iloc[0]
+    assert 0.0 < row.r_pred <= 1.0 + 1e-9
+    assert math.isfinite(row.log_gap)
