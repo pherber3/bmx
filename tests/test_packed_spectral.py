@@ -441,3 +441,130 @@ def test_packed_bits_per_entry_equals_streaming_dec_quant_int8(tmp_path):
     sm = stream.memory_report(seq_len=300)
     pm = packed.memory_report(seq_len=300)
     assert pm == sm
+
+
+# ---------------------------------------------------------------------------
+# K4 Lloyd payload-quantizer gate, Task 1 (2026-07-25 design):
+# CacheCodecSpec.payload_quant threaded through PackedStreamingCache
+# (write path + chunked-attention read path).
+# ---------------------------------------------------------------------------
+
+
+def test_packed_payload_quant_default_inert(tmp_path):
+    """payload_quant default ('rtn') must reproduce byte-identical bpe AND
+    committed-block bytes vs a spec that omits the field entirely."""
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    k_implicit, v = _k4_specs(path)
+    k_explicit = dataclasses.replace(k_implicit, payload_quant="rtn")
+
+    def _run(k):
+        cache = PackedStreamingCache(model.config, k_spec=k, v_spec=v, recent_window=8)
+        cache.attach(model)
+        with cache:
+            with torch.no_grad():
+                model(ids(seq=300), past_key_values=cache, use_cache=True)
+        return cache
+
+    implicit, explicit = _run(k_implicit), _run(k_explicit)
+    assert implicit.bits_per_entry() == explicit.bits_per_entry()
+    for (kpi, si, ei), (kpe, se, ee) in zip(
+        implicit.layers[0]._k_blocks, explicit.layers[0]._k_blocks
+    ):
+        assert si == se and ei == ee
+        for key, t in kpi.items():
+            assert torch.equal(t, kpe[key]), key
+
+
+def test_packed_payload_quant_lloyd_committed_blocks_bitwise_match_streaming(tmp_path):
+    """BINDING: with payload_quant='lloyd', the packed read-path reconstruction
+    of every committed page (dequant -> RoPE -> cast) must equal streaming's
+    frozen prefix bit-for-bit -- mirrors
+    test_committed_blocks_bitwise_match_streaming but for the lloyd quantizer,
+    proving the read path (_dequant_block's k_quantizer thread) is wired, not
+    just the write path."""
+    from bmx.cache.chunked_attention import _dequant_block
+    from bmx.cache.rope import apply_rope
+    from bmx.cache.streaming import StreamingQuantizedCache
+
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    k, v = _k4_specs(path)
+    k = dataclasses.replace(k, payload_quant="lloyd")
+
+    caches = []
+    for Cls in (StreamingQuantizedCache, PackedStreamingCache):
+        cache = Cls(model.config, k_spec=k, v_spec=v, recent_window=8)
+        cache.attach(model)
+        with cache:
+            with torch.no_grad():
+                model(ids(seq=300), past_key_values=cache, use_cache=True)
+        caches.append(cache)
+    stream, packed = caches
+    assert (
+        stream.bits_per_entry() == packed.bits_per_entry()
+    )  # bpe identical by construction
+    for sl, pl in zip(stream.layers, packed.layers):
+        assert sl._committed_S_q == pl._committed_S_q == 256
+        for (kp, s, e), (_vp, _s, _e) in zip(pl._k_blocks, pl._v_blocks):
+            K = _dequant_block(
+                kp, "spectral", 8, 0, pl._h_kv, pack=pl._pack, k_quantizer="lloyd"
+            )
+            K = apply_rope(K, pl._rope_cos[s:e], pl._rope_sin[s:e]).to(
+                sl._q_prefix_k.dtype
+            )
+            assert torch.equal(K, sl._q_prefix_k[:, s:e, :])
+
+
+def test_packed_payload_quant_lloyd_decode_matches_oracle(tmp_path):
+    """Chunked online-softmax decode (layer.attend, the real call path) must
+    equal naive_dense_attention (the standing oracle) with
+    payload_quant='lloyd', proving k_quantizer is wired through the full
+    chunked_dequant_attention chain (prefill + decode)."""
+    from bmx.cache.chunked_attention import attention_diff, naive_dense_attention
+
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    k, v = _k4_specs(path)
+    k = dataclasses.replace(k, payload_quant="lloyd")
+    cache = PackedStreamingCache(model.config, k_spec=k, v_spec=v, recent_window=8)
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(ids(seq=300), past_key_values=cache, use_cache=True)
+    layer = cache.layers[0]
+    d_head = layer._d_head
+    n_q_groups = model.config.num_attention_heads // layer._h_kv
+    q = torch.randn(model.config.num_attention_heads, 1, d_head)
+    scale = d_head**-0.5
+
+    chunked_out = layer.attend(q, scale)  # real call path, k_quantizer wired internally
+
+    k_tail = layer.keys.squeeze(0)
+    v_tail = layer.values.squeeze(0)
+    oracle_out = naive_dense_attention(
+        q,
+        layer._k_blocks,
+        layer._v_blocks,
+        k_arm=k.arm,
+        v_arm=v.arm,
+        group=k.group,
+        seed=k.seed,
+        k_pre_rope=k.pre_rope,
+        rope_cos=layer._rope_cos,
+        rope_sin=layer._rope_sin,
+        k_tail=k_tail,
+        v_tail=v_tail,
+        n_q_groups=n_q_groups,
+        scale=scale,
+        v_group=v.group,
+        v_seed=v.seed,
+        k_pack=layer._pack,
+        k_tier_cols=layer._tier_cols,
+        k_quantizer="lloyd",
+    )
+    diff = attention_diff(chunked_out, oracle_out)
+    assert diff["max_abs"] < 1e-4, diff

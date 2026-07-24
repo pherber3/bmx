@@ -59,6 +59,20 @@ class CacheCodecSpec:
         ``experiments/k4_dec_quant.py`` (the shippability check for what
         skeptic-v1 charges) and is deliberately not a streaming ``dec_quant``
         value here.
+    payload_quant : str
+        Payload tier codebook for the ``"spectral"`` arm (K4 Lloyd-gate
+        design, 2026-07-25; recipe suffix ``_lq``): ``"rtn"`` (default) is
+        inert -- today's uniform-step (optionally MSE-refined) RTN codebook,
+        threaded to ``spectral.spectral_quantize``/``spectral_quantize_packed``
+        as ``quantizer="rtn"``, byte-identical to every call before this field
+        existed. ``"lloyd"`` swaps the per-tier codebook for the analytic
+        Gaussian Lloyd-Max codebook (``spectral.spectral_quantize``'s
+        ``quantizer="lloyd"``) -- same bits per code, same groupwise fp16
+        scale accounting (bpe is identical by construction; see
+        ``spectral_quantize_packed``'s docstring). Ignored by every non-spectral
+        arm and by the V side (turboquant already ships Lloyd via
+        ``gaussian_codebook`` — this field only ever reaches the K-side
+        spectral quantize calls).
     """
 
     arm: str = "fp16"
@@ -70,3 +84,4 @@ class CacheCodecSpec:
     pack_path: str = ""
     budget: float = 0.0
     dec_quant: str = "fp32"
+    payload_quant: str = "rtn"

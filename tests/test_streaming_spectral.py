@@ -581,3 +581,90 @@ def test_cache_bits_per_entry_int8_tl_uses_materialized_dec_tier_not_a_live_rede
     assert abs(bpe_k - expected_buggy) > 1e-6, (
         "the fix must NOT reproduce the buggy under-charged value"
     )
+
+
+# ---------------------------------------------------------------------------
+# K4 Lloyd payload-quantizer gate, Task 1 (2026-07-25 design):
+# CacheCodecSpec.payload_quant threaded through StreamingQuantizedCache.
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_payload_quant_default_inert(tmp_path):
+    """payload_quant default ('rtn') must reproduce byte-identical bpe AND
+    cache bytes vs a spec that omits the field entirely -- default-inert at
+    the streaming level (brief requirement (e))."""
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+
+    def _run(k_spec):
+        cache = StreamingQuantizedCache(
+            model.config,
+            k_spec=k_spec,
+            v_spec=CacheCodecSpec(arm="fp16"),
+            recent_window=8,
+        )
+        cache.attach(model)
+        with cache:
+            with torch.no_grad():
+                model(ids(seq=150), past_key_values=cache, use_cache=True)
+        return cache
+
+    implicit = _run(
+        CacheCodecSpec(
+            arm="spectral", pre_rope=True, group=8, pack_path=path, budget=2.5
+        )
+    )
+    explicit = _run(
+        CacheCodecSpec(
+            arm="spectral",
+            pre_rope=True,
+            group=8,
+            pack_path=path,
+            budget=2.5,
+            payload_quant="rtn",
+        )
+    )
+    assert implicit.bits_per_entry() == explicit.bits_per_entry()
+    for li, le in zip(implicit.layers, explicit.layers):
+        assert torch.equal(li._q_prefix_k, le._q_prefix_k)
+        assert torch.equal(li._q_prefix_v, le._q_prefix_v)
+
+
+def test_streaming_payload_quant_lloyd_runs_and_bpe_matches_rtn(tmp_path):
+    """payload_quant='lloyd' must run end-to-end through StreamingQuantizedCache
+    and charge the EXACT SAME bpe as 'rtn' (identical bits/scale accounting by
+    construction) while producing a DIFFERENT (non-bit-exact) K reconstruction."""
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+
+    def _run(payload_quant):
+        k_spec = CacheCodecSpec(
+            arm="spectral",
+            pre_rope=True,
+            group=8,
+            pack_path=path,
+            budget=2.5,
+            payload_quant=payload_quant,
+        )
+        cache = StreamingQuantizedCache(
+            model.config,
+            k_spec=k_spec,
+            v_spec=CacheCodecSpec(arm="fp16"),
+            recent_window=8,
+        )
+        cache.attach(model)
+        with cache:
+            with torch.no_grad():
+                model(ids(seq=150), past_key_values=cache, use_cache=True)
+        return cache
+
+    rtn_cache = _run("rtn")
+    lloyd_cache = _run("lloyd")
+    assert rtn_cache.bits_per_entry() == lloyd_cache.bits_per_entry()
+    diverged = any(
+        not torch.equal(lr._q_prefix_k, ll._q_prefix_k)
+        for lr, ll in zip(rtn_cache.layers, lloyd_cache.layers)
+    )
+    assert diverged, "lloyd must reconstruct differently from rtn on real data"

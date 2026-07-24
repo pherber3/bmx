@@ -1553,3 +1553,111 @@ def test_shrink_spectrum_rejects_bad_method_and_missing_rows():
         shrink_spectrum(
             lam, n=10, method="lw", rows=torch.randn(10, 5)
         )  # shape mismatch
+
+
+# ---------------------------------------------------------------------------
+# K4 Lloyd payload-quantizer gate, Task 1 (2026-07-25 design)
+# ---------------------------------------------------------------------------
+
+
+def _tiny_lloyd_pack(C=32, S=128, group=16, budget=2.5, seed=0):
+    from bmx.cache.spectral import (
+        fit_spectral_basis,
+        identity_whitener,
+        pack_from_basis,
+    )
+
+    Wh, Wh_inv = identity_whitener(C)
+    M, _ = _spiked_keys(S=S, C=C, seed=seed)
+    basis = fit_spectral_basis(M, Wh, Wh_inv)
+    pack = pack_from_basis(basis, budget, group=group)
+    return M, pack
+
+
+def test_quantizer_rtn_default_bit_exact_pin():
+    """quantizer='rtn' (the default) must reproduce today's output exactly —
+    both omitting the kwarg and passing it explicitly."""
+    M, pack = _tiny_lloyd_pack()
+    ref, ref_bpe = spectral_quantize(M, pack, mse_scale=True)
+    explicit, explicit_bpe = spectral_quantize(M, pack, mse_scale=True, quantizer="rtn")
+    assert torch.equal(explicit, ref)
+    assert explicit_bpe == ref_bpe
+
+
+def test_quantizer_lloyd_beats_rtn_mse_on_synthetic_gaussian_tier_2_and_3():
+    """Textbook gap (generous floor): on iid Gaussian codes, the analytic
+    Lloyd-Max codebook must beat uniform RTN quantization MSE by >= 20% at
+    tiers 2 and 3."""
+    from bmx.cache.spectral import _lloyd_quantize_packed, _rtn_quantize_for_tier
+
+    g = torch.Generator().manual_seed(11)
+    for bits in (2, 3):
+        x = torch.randn(4096, 64, generator=g)
+        rtn_codes, rtn_scale = _rtn_quantize_for_tier(x, bits, group_size=64)
+        from bmx.quant.rtn import rtn_dequantize_packed
+
+        rtn_hat = rtn_dequantize_packed(rtn_codes, rtn_scale, 64)
+        rtn_mse = float(((x - rtn_hat) ** 2).mean())
+
+        lloyd_codes, lloyd_scale = _lloyd_quantize_packed(x, bits, group_size=64)
+        from bmx.cache.spectral import _lloyd_dequantize_packed
+
+        lloyd_hat = _lloyd_dequantize_packed(lloyd_codes, lloyd_scale, bits, 64)
+        lloyd_mse = float(((x - lloyd_hat) ** 2).mean())
+
+        assert lloyd_mse <= 0.8 * rtn_mse, (
+            f"bits={bits}: lloyd_mse={lloyd_mse} not <= 80% of rtn_mse={rtn_mse}"
+        )
+
+
+def test_quantizer_lloyd_bpe_equals_rtn_bpe_exactly():
+    """Same pack, same tiers, same group-scale accounting -- lloyd must charge
+    IDENTICAL bpe to rtn (never re-derive the accounting expression)."""
+    M, pack = _tiny_lloyd_pack()
+    _, rtn_bpe = spectral_quantize(M, pack, mse_scale=True, quantizer="rtn")
+    _, lloyd_bpe = spectral_quantize(M, pack, mse_scale=True, quantizer="lloyd")
+    assert lloyd_bpe == rtn_bpe
+
+
+def test_quantizer_lloyd_deterministic():
+    M, pack = _tiny_lloyd_pack(seed=5)
+    a, _ = spectral_quantize(M, pack, quantizer="lloyd")
+    b, _ = spectral_quantize(M, pack, quantizer="lloyd")
+    assert torch.equal(a, b)
+
+
+def test_quantizer_invalid_raises():
+    M, pack = _tiny_lloyd_pack()
+    with pytest.raises(AssertionError, match="quantizer"):
+        spectral_quantize(M, pack, quantizer="bogus")
+
+
+@pytest.mark.parametrize("tier", [2, 3, 4])
+def test_lloyd_packed_bitwise_faithful_roundtrip(tier):
+    """quantize -> pack -> unpack -> dequant identity for lloyd codes at
+    tiers 2/3/4 (unsigned level-index containers)."""
+    from bmx.cache.spectral import _pack_tier_codes, _unpack_tier_codes
+
+    g = torch.Generator().manual_seed(tier)
+    n_levels = 2**tier
+    codes = torch.randint(0, n_levels, (7, 128), dtype=torch.int64, generator=g)
+    packed = _pack_tier_codes(codes.to(torch.int8), tier, quantizer="lloyd")
+    assert packed.dtype in (torch.uint8, torch.int8)
+    unpacked = _unpack_tier_codes(packed, tier, 128, quantizer="lloyd")
+    assert torch.equal(unpacked.long(), codes)
+
+
+def test_spectral_quantize_packed_lloyd_bitwise_matches_spectral_quantize():
+    from bmx.cache.spectral import spectral_dequant_packed, spectral_quantize_packed
+
+    M, pack = _tiny_lloyd_pack(C=32, S=128, group=16)
+    ref, ref_bpe = spectral_quantize(M, pack, mse_scale=True, quantizer="lloyd")
+    packed, bpe = spectral_quantize_packed(M, pack, mse_scale=True, quantizer="lloyd")
+    assert bpe == ref_bpe
+    for k, t in packed.items():
+        if k.endswith("_codes"):
+            assert t.dtype in (torch.uint8, torch.int8), (k, t.dtype)
+        else:
+            assert k.endswith("_scale") and t.dtype == torch.float32, (k, t.dtype)
+    M_hat = spectral_dequant_packed(packed, pack, quantizer="lloyd")
+    assert torch.equal(M_hat, ref)

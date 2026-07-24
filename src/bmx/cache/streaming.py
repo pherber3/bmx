@@ -465,7 +465,9 @@ class StreamingQuantizedLayer(DynamicLayer):
                     lam=self._pack.lam.to(k_block_pre.device),
                     bits=self._pack.bits.to(k_block_pre.device),
                 )
-            M_hat, codec_bpe = spectral_quantize(M, self._pack, mse_scale=True)
+            M_hat, codec_bpe = spectral_quantize(
+                M, self._pack, mse_scale=True, quantizer=spec.payload_quant
+            )
             k_hat_pre = from_matrix(M_hat, h)  # (h_kv, block_len, d)
         else:
             # General path (rtn_channel, rtn_token, rotate_rtn_token, turboquant_*).

@@ -503,7 +503,11 @@ class PackedStreamingLayer(DynamicLayer):
                     b: c.to(M.device) for b, c in self._tier_cols.items()
                 }
             packed, bpe = spectral_quantize_packed(
-                M, self._pack, mse_scale=True, cols_by_tier=self._tier_cols
+                M,
+                self._pack,
+                mse_scale=True,
+                cols_by_tier=self._tier_cols,
+                quantizer=spec.payload_quant,
             )
         elif spec.arm == "lowrank_rtn_channel":
             if self._frozen_svd is None:
@@ -1056,6 +1060,7 @@ class PackedStreamingLayer(DynamicLayer):
             attn_mask=attention_mask,
             k_pack=self._pack,
             k_tier_cols=self._tier_cols,
+            k_quantizer=self.k_spec.payload_quant,
         )
 
 

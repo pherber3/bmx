@@ -153,3 +153,33 @@ def test_recipe_dec8tl_suffix():
     # A different budget, to make sure budget parsing survives the new suffix.
     k4, _ = spec_pair("k4_b2.2_dec8tl", pack_path="/p/packs.safetensors")
     assert k4.budget == 2.2 and k4.dec_quant == "int8_tl"
+
+
+def test_recipe_lq_suffix():
+    """K4 Lloyd-gate design (2026-07-25): '_lq' parses to
+    payload_quant='lloyd'. Default (no '_lq') stays payload_quant='rtn'
+    (default-inert, pinned)."""
+    k, v = spec_pair("k4_b2.5", pack_path="/p/packs.safetensors")
+    assert k.payload_quant == "rtn"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    k_lq, _ = spec_pair("k4_b2.5_lq", pack_path="/p/packs.safetensors")
+    assert k_lq.arm == "spectral" and k_lq.budget == 2.5
+    assert k_lq.payload_quant == "lloyd" and k_lq.dec_quant == "fp32"
+
+
+def test_recipe_lq_composes_with_dec8_suffixes_canonical_order():
+    """CANONICAL ORDER (pinned): '_lq' sits BETWEEN the budget and any
+    '_dec8*' suffix -- 'k4_b2.5_lq_dec8tl', not 'k4_b2.5_dec8tl_lq'."""
+    k, v = spec_pair("k4_b2.5_lq_dec8tl", pack_path="/p/packs.safetensors")
+    assert k.arm == "spectral" and k.budget == 2.5
+    assert k.payload_quant == "lloyd" and k.dec_quant == "int8_tl"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    k2, _ = spec_pair("k4_b2.2_lq_dec8t5", pack_path="/p/packs.safetensors")
+    assert (
+        k2.budget == 2.2 and k2.payload_quant == "lloyd" and k2.dec_quant == "int8_t5"
+    )
+
+    k3, _ = spec_pair("k4_b2.5_lq_dec8", pack_path="/p/packs.safetensors")
+    assert k3.payload_quant == "lloyd" and k3.dec_quant == "int8"

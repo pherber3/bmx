@@ -57,6 +57,7 @@ def _dequant_block(
     h_kv,
     pack: SpectralPack | None = None,
     k_tier_cols: dict[int, torch.Tensor] | None = None,
+    k_quantizer: str = "rtn",
 ):
     """packed dict -> (h_kv, blk, d) dense, matching to_matrix layout.
 
@@ -94,6 +95,13 @@ def _dequant_block(
     `.tolist()` is a CUDA->host sync plus up to 7 `.nonzero()` allocations, and this
     fires per committed block, per decode step, per layer. None (the default) keeps
     the standalone-caller behavior: spectral_dequant_packed recomputes it itself.
+
+    k_quantizer: the K spec's `payload_quant` (K4 Lloyd-gate design,
+    2026-07-25) -- must match the `quantizer` the block was packed with
+    (`PackedStreamingLayer._pack_k_block`'s `spectral_quantize_packed` call),
+    since the packed container's signedness convention differs by quantizer
+    (see `spectral._pack_tier_codes`). Default "rtn" reproduces every call
+    before this parameter existed bit-exactly.
     """
     if arm == "spectral":
         assert pack is not None, (
@@ -101,7 +109,9 @@ def _dequant_block(
             "SpectralPack); it is threaded from PackedStreamingLayer._pack via "
             "chunked_dequant_attention's k_pack kwarg."
         )
-        M = spectral_dequant_packed(packed, pack, cols_by_tier=k_tier_cols)
+        M = spectral_dequant_packed(
+            packed, pack, cols_by_tier=k_tier_cols, quantizer=k_quantizer
+        )
         return from_matrix(M, h_kv)
     if (
         arm in ("turboquant_mse", "turboquant_mse_perhead")
@@ -146,6 +156,7 @@ def _dense_kv(
     rope_sin,
     pack=None,
     k_tier_cols=None,
+    k_quantizer="rtn",
 ):
     """Dequant all blocks to one dense (h_kv, S_committed, d), RoPE-at-read for K.
 
@@ -158,11 +169,20 @@ def _dense_kv(
 
     k_tier_cols: forwarded to _dequant_block (see its docstring) — the
     precomputed tier_columns(pack.bits), avoiding a per-block recompute.
+    k_quantizer: forwarded to _dequant_block (K4 Lloyd-gate design) — the K
+    spec's payload_quant; default "rtn" is inert.
     """
     parts = []
     for packed, start, end in blocks:
         B = _dequant_block(
-            packed, arm, group, seed, h_kv, pack=pack, k_tier_cols=k_tier_cols
+            packed,
+            arm,
+            group,
+            seed,
+            h_kv,
+            pack=pack,
+            k_tier_cols=k_tier_cols,
+            k_quantizer=k_quantizer,
         )
         if k_pre_rope:
             B = apply_rope(
@@ -193,6 +213,7 @@ def _assemble_dense_kv(
     dtype,
     k_pack=None,
     k_tier_cols=None,
+    k_quantizer="rtn",
 ):
     """Dequant all blocks + fold the fp16 tail -> dense (h_kv, S, d) K and V in `dtype`.
 
@@ -202,6 +223,8 @@ def _assemble_dense_kv(
 
     k_tier_cols: forwarded to _dense_kv's K side only (V never uses the
     spectral arm) — the precomputed tier_columns(pack.bits).
+    k_quantizer: forwarded to _dense_kv's K side only (K4 Lloyd-gate design) —
+    the K spec's payload_quant; default "rtn" is inert.
     """
     K = _dense_kv(
         k_blocks,
@@ -214,6 +237,7 @@ def _assemble_dense_kv(
         rope_sin,
         k_pack,
         k_tier_cols,
+        k_quantizer,
     )
     V = _dense_kv(v_blocks, v_arm, v_group, v_seed, h_kv, False, None, None)
     if k_tail is not None and k_tail.shape[1] > 0:
@@ -247,6 +271,7 @@ def naive_dense_attention(
     v_seed: int | None = None,
     k_pack: "SpectralPack | None" = None,
     k_tier_cols: dict[int, torch.Tensor] | None = None,
+    k_quantizer: str = "rtn",
 ):
     """ORACLE: dequant everything, single full softmax, GQA-expand. No chunking.
 
@@ -259,6 +284,8 @@ def naive_dense_attention(
     k_tier_cols: precomputed tier_columns(k_pack.bits); forwarded to
     _dequant_block (see its docstring). None recomputes (the oracle is not the
     hot path — this default keeps standalone/test callers unchanged).
+    k_quantizer: the K spec's payload_quant (K4 Lloyd-gate design); default
+    "rtn" is inert.
     """
     _v_group = v_group if v_group is not None else group
     _v_seed = v_seed if v_seed is not None else seed
@@ -282,6 +309,7 @@ def naive_dense_attention(
         dtype=q.dtype,
         k_pack=k_pack,
         k_tier_cols=k_tier_cols,
+        k_quantizer=k_quantizer,
     )
     Kx = K.repeat_interleave(n_q_groups, dim=0)
     Vx = V.repeat_interleave(n_q_groups, dim=0)
@@ -310,6 +338,7 @@ def _prefill_dense_attention(
     attn_mask=None,
     k_pack: "SpectralPack | None" = None,
     k_tier_cols: dict[int, torch.Tensor] | None = None,
+    k_quantizer: str = "rtn",
 ):
     """Prefill (n_q > 1) attention: reconstruct dense K/V once, run flash SDPA.
 
@@ -326,6 +355,8 @@ def _prefill_dense_attention(
 
     k_tier_cols: precomputed tier_columns(k_pack.bits); forwarded to
     _dequant_block via _assemble_dense_kv (see _dequant_block's docstring).
+    k_quantizer: the K spec's payload_quant (K4 Lloyd-gate design); default
+    "rtn" is inert.
     """
     K, V = _assemble_dense_kv(
         k_blocks,
@@ -345,6 +376,7 @@ def _prefill_dense_attention(
         dtype=q.dtype,
         k_pack=k_pack,
         k_tier_cols=k_tier_cols,
+        k_quantizer=k_quantizer,
     )
     Kx = K.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, S, d)
     Vx = V.repeat_interleave(n_q_groups, dim=0)
@@ -385,6 +417,7 @@ def chunked_dequant_attention(
     attn_mask=None,
     k_pack: "SpectralPack | None" = None,
     k_tier_cols: dict[int, torch.Tensor] | None = None,
+    k_quantizer: str = "rtn",
 ):
     """Online-softmax attention over per-block dequantized K/V. GQA-aware.
 
@@ -406,6 +439,9 @@ def chunked_dequant_attention(
     never recomputes it (see _dequant_block's docstring — this is the hot-path fix:
     tier_columns' .tolist() is a per-block CUDA->host sync + up to 7 .nonzero() calls).
     None (the default) preserves standalone-caller behavior exactly.
+    k_quantizer: the K spec's payload_quant (K4 Lloyd-gate design, 2026-07-25) —
+    must match the quantizer the committed blocks were packed with (see
+    _dequant_block's docstring). Default "rtn" is inert.
     """
     n_q_heads, n_q, d = q.shape
     h_kv = n_q_heads // n_q_groups
@@ -436,6 +472,7 @@ def chunked_dequant_attention(
             attn_mask=attn_mask,
             k_pack=k_pack,
             k_tier_cols=k_tier_cols,
+            k_quantizer=k_quantizer,
         )
 
     # Decode (n_q == 1): the single query at the last position attends ALL cached keys
@@ -469,7 +506,14 @@ def chunked_dequant_attention(
         # today's cast-then-rope order verbatim (their parity tests pin it).
         if k_arm == "spectral":
             K_kv = _dequant_block(
-                kpacked, k_arm, group, seed, h_kv, pack=k_pack, k_tier_cols=k_tier_cols
+                kpacked,
+                k_arm,
+                group,
+                seed,
+                h_kv,
+                pack=k_pack,
+                k_tier_cols=k_tier_cols,
+                k_quantizer=k_quantizer,
             )
             K_kv = apply_rope(K_kv, rope_cos[start:end], rope_sin[start:end])
             K_kv = K_kv.to(q.dtype)

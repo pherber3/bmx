@@ -97,6 +97,16 @@ def spec_pair(
         # int("l") and crash. Then "_dec8t{T}" (a superstring-prefix of "_dec8"),
         # then the plain "_dec8" float suffix, since the budget itself may
         # contain no further "_" delimiters.
+        #
+        # CANONICAL SUFFIX ORDER (K4 Lloyd-gate design, 2026-07-25, pinned by
+        # test_recipes.py): "_lq" (payload_quant="lloyd") sits BETWEEN the
+        # budget and any "_dec8*" suffix -- "k4_b2.5_lq_dec8tl", never
+        # "k4_b2.5_dec8tl_lq". The "_dec8*" family is parsed FIRST (unchanged
+        # logic above, matched as a SUFFIX of the whole budget_str -- so it
+        # strips correctly even with "_lq" still embedded, e.g.
+        # "2.5_lq_dec8tl".endswith("_dec8tl") is True), leaving "2.5_lq"
+        # behind; "_lq" is then stripped from what remains, so a lone
+        # "k4_b2.5_lq" (no dec8 suffix) parses too.
         if not pack_path:
             raise ValueError(
                 "k4 arms require --pack-path (a fitted spectral pack file)"
@@ -112,6 +122,10 @@ def spec_pair(
         elif budget_str.endswith("_dec8"):
             dec_quant = "int8"
             budget_str = budget_str[: -len("_dec8")]
+        payload_quant = "rtn"
+        if budget_str.endswith("_lq"):
+            payload_quant = "lloyd"
+            budget_str = budget_str[: -len("_lq")]
         budget = float(budget_str)
         return (
             CacheCodecSpec(
@@ -121,6 +135,7 @@ def spec_pair(
                 pack_path=pack_path,
                 budget=budget,
                 dec_quant=dec_quant,
+                payload_quant=payload_quant,
             ),
             CacheCodecSpec(arm="turboquant_mse", bits=2, seed=seed),
         )

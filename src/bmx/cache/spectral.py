@@ -55,6 +55,7 @@ from safetensors.torch import load_file, save_file
 
 from bmx.cache.codecs import (
     allocate_bits_from_variance,
+    gaussian_codebook,
     scale_bits,
     tier_bits,
 )
@@ -66,6 +67,8 @@ from bmx.cache.triton_dequant_attention import (
     unpack_signed_codes,
 )
 from bmx.quant.rtn import rtn_dequantize_packed, rtn_quantize_packed
+
+QUANTIZERS: tuple[str, ...] = ("rtn", "lloyd")
 
 
 def key_second_moment(M: torch.Tensor) -> torch.Tensor:
@@ -635,29 +638,136 @@ def tier_columns(bits: torch.Tensor) -> dict[int, torch.Tensor]:
     return cols_by_tier
 
 
+def _rtn_quantize_for_tier(
+    W: torch.Tensor, bits: int, group_size: int, *, mse_scale: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Thin name for `rtn_quantize_packed` at the tier-loop call convention
+    (mse_scale defaults True here, matching `spectral_quantize`'s call site) —
+    kept as a distinct symbol so quantizer dispatch in the tier loop reads as
+    `_rtn_quantize_for_tier` vs `_lloyd_quantize_packed`, symmetric names for
+    symmetric roles."""
+    return rtn_quantize_packed(W, bits, group_size, mse_scale=mse_scale)
+
+
+def _lloyd_quantize_packed(
+    W: torch.Tensor, bits: int, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Groupwise quantization against the analytic Gaussian Lloyd-Max
+    codebook (`gaussian_codebook`, already used by the V-side turboquant-mse
+    codec) instead of uniform RTN steps. Mirrors `rtn_quantize_packed`'s
+    signature/shape contract exactly: `(..., d) -> (Q_int, scale (..., n_groups, 1))`,
+    `Q_int` UNSIGNED level indices in `[0, 2**bits-1]` (int8; a member of
+    `[0, 255]`, so int8's unsigned bit pattern via `.to(torch.int8)` — callers
+    reinterpret through `_pack_tier_codes`'s explicit unsigned convention, not
+    a raw dtype read).
+
+    Alternating minimization (assign <-> refit scale), deterministic, fp32,
+    fixed 3 iterations from a group-std scale init (mirrors `_mse_refine_scale`'s
+    pattern for rtn's own MSE-optimal step): per group,
+        codes = bucketize(x / scale, midpoints(codebook))       # assign
+        scale = <x, codebook[codes]> / <codebook[codes], codebook[codes]>  # refit
+    `scale` is clamped away from zero (degenerate all-zero groups) exactly
+    like rtn's `.clamp_min(1e-12)` floor.
+    """
+    *lead, d = W.shape
+    assert d % group_size == 0, f"dim {d} not divisible by group {group_size}"
+    assert bits <= 8, (
+        f"_lloyd_quantize_packed: int8 codes require bits <= 8, got {bits}"
+    )
+    cb = gaussian_codebook(bits).to(device=W.device, dtype=W.dtype)  # (2**bits,) sorted
+    mid = (cb[:-1] + cb[1:]) / 2  # (2**bits - 1,) decision boundaries
+    G = W.reshape(*lead, d // group_size, group_size)
+    scale = G.std(dim=-1, keepdim=True).clamp_min(1e-12)
+    codes = torch.bucketize((G / scale).contiguous(), mid)
+    for _ in range(3):
+        level = cb[codes.long()]
+        num = (G * level).sum(dim=-1, keepdim=True)
+        den = (level * level).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        scale = (num / den).clamp_min(1e-12)
+        codes = torch.bucketize((G / scale).contiguous(), mid)
+    Q_int = codes.to(torch.int8).reshape(W.shape)
+    return Q_int, scale
+
+
+def _lloyd_dequantize_packed(
+    Q_int: torch.Tensor, scale: torch.Tensor, bits: int, group_size: int
+) -> torch.Tensor:
+    """Inverse of `_lloyd_quantize_packed`: (Q_int unsigned level indices,
+    scale) -> dequantized W_hat = scale * codebook[Q_int]."""
+    *lead, d = Q_int.shape
+    cb = gaussian_codebook(bits).to(device=Q_int.device, dtype=scale.dtype)
+    level = cb[Q_int.reshape(*lead, d // group_size, group_size).long()]
+    return (level * scale).reshape(Q_int.shape)
+
+
 _SUBBYTE_TIERS = frozenset({2, 4})  # offset-binary via pack_codes (exact width)
 _NIBBLE_TIERS = frozenset({3})  # signed nibbles via pack_signed_codes (4-bit container)
 
 
-def _pack_tier_codes(Q_int: torch.Tensor, b: int) -> torch.Tensor:
-    """Container policy for one tier's RTN integer codes (reuse-only, no new
+def _pack_tier_codes(
+    Q_int: torch.Tensor, b: int, *, quantizer: str = "rtn"
+) -> torch.Tensor:
+    """Container policy for one tier's integer codes (reuse-only, no new
     bit-twiddling): tiers 2/4 offset to unsigned then `pack_codes` (exact
     width); tier 3 signed nibbles via `pack_signed_codes`; tiers 5/6/8 stored
-    as the int8 container `rtn_quantize_packed` already produced."""
+    as the int8 container `rtn_quantize_packed` already produced.
+
+    `quantizer="rtn"` (default): `Q_int` holds SIGNED codes in
+    `[-2**(b-1), 2**(b-1)-1]` (rtn_quantize_packed's convention) — tiers 2/4
+    offset to unsigned before `pack_codes`; tier 3 (already signed) goes
+    straight into `pack_signed_codes`; tiers 5/6/8 store the signed int8
+    container as-is.
+
+    `quantizer="lloyd"`: `Q_int` holds UNSIGNED Gaussian-codebook level
+    indices in `[0, 2**b-1]` (torch.bucketize's native output range) — the
+    OPPOSITE convention from rtn's signed codes. Tiers 2/4 (`pack_codes`
+    wants unsigned) need NO offset; tier 3 and the raw-int8 tiers 5/6/8 (both
+    signed containers) offset unsigned -> signed by the same `2**(b-1)`
+    constant, in the opposite direction from the rtn tiers-2/4 offset.
+    Exercised at tiers {2,3,4} by `test_lloyd_packed_bitwise_faithful_roundtrip`
+    (unsigned index containers are the K4 Lloyd-gate design's explicit
+    requirement — do NOT silently reuse the signed rtn packer un-adjusted)."""
+    assert quantizer in QUANTIZERS, (
+        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
+    )
+    if quantizer == "rtn":
+        if b in _SUBBYTE_TIERS:
+            return pack_codes(Q_int.to(torch.int16) + 2 ** (b - 1), b)
+        if b in _NIBBLE_TIERS:
+            return pack_signed_codes(Q_int, b)
+        return Q_int  # int8 container (tiers 5, 6, 8)
+    # quantizer == "lloyd": Q_int holds UNSIGNED level indices [0, 2**b-1].
     if b in _SUBBYTE_TIERS:
-        return pack_codes(Q_int.to(torch.int16) + 2 ** (b - 1), b)
+        return pack_codes(Q_int.to(torch.int16), b)
+    signed = (Q_int.to(torch.int16) - 2 ** (b - 1)).to(torch.int8)
     if b in _NIBBLE_TIERS:
-        return pack_signed_codes(Q_int, b)
-    return Q_int  # int8 container (tiers 5, 6, 8)
+        return pack_signed_codes(signed, b)
+    return signed  # int8 container (tiers 5, 6, 8)
 
 
-def _unpack_tier_codes(t: torch.Tensor, b: int, S: int) -> torch.Tensor:
-    """Exact inverse of `_pack_tier_codes`."""
+def _unpack_tier_codes(
+    t: torch.Tensor, b: int, S: int, *, quantizer: str = "rtn"
+) -> torch.Tensor:
+    """Exact inverse of `_pack_tier_codes`. `quantizer="lloyd"` returns
+    UNSIGNED level indices in `[0, 2**b-1]` (int16, wide enough for tier 8's
+    256 levels); `quantizer="rtn"` returns the historical signed int8 codes."""
+    assert quantizer in QUANTIZERS, (
+        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
+    )
+    if quantizer == "rtn":
+        if b in _SUBBYTE_TIERS:
+            return (unpack_codes(t, b, S) - 2 ** (b - 1)).to(torch.int8)
+        if b in _NIBBLE_TIERS:
+            return unpack_signed_codes(t, b, S)
+        return t
+    # quantizer == "lloyd"
     if b in _SUBBYTE_TIERS:
-        return (unpack_codes(t, b, S) - 2 ** (b - 1)).to(torch.int8)
+        return unpack_codes(t, b, S)  # already unsigned [0, 2**b-1], int16
     if b in _NIBBLE_TIERS:
-        return unpack_signed_codes(t, b, S)
-    return t
+        return (unpack_signed_codes(t, b, S).to(torch.int16) + 2 ** (b - 1)).to(
+            torch.int16
+        )
+    return (t.to(torch.int16) + 2 ** (b - 1)).to(torch.int16)
 
 
 def spectral_quantize_packed(
@@ -666,6 +776,7 @@ def spectral_quantize_packed(
     *,
     mse_scale: bool = True,
     cols_by_tier: dict[int, torch.Tensor] | None = None,
+    quantizer: str = "rtn",
 ) -> tuple[dict[str, torch.Tensor], float]:
     """Packed-codec form of `spectral_quantize`: per-tier code containers +
     fp32 group scales instead of a dequantized M_hat. Flat-key dict
@@ -674,7 +785,21 @@ def spectral_quantize_packed(
     Same enc matmul, same per-tier `rtn_quantize_packed` call, same tier
     order as `quantize_by_bits` — `spectral_dequant_packed` is its exact
     inverse (bitwise-equal to `spectral_quantize`'s M_hat by construction).
+
+    `quantizer` (K4 Lloyd-gate design, 2026-07-25): `"rtn"` (default) is the
+    historical uniform-step MSE-refined RTN path, bit-exact with every prior
+    call — `mse_scale` is ignored by `"lloyd"` (the Lloyd assign/refit
+    alternation IS the MSE-optimal-step analogue for a fixed nonuniform
+    codebook; there is no uniform-step choice to make). `"lloyd"` quantizes
+    each tier's codes against the analytic Gaussian Lloyd-Max codebook
+    (`_lloyd_quantize_packed`) instead — same bpe (`spectral_payload_bpe`
+    reads only `pack.bits`/`pack.group`/`pack.c_used`, never the quantizer),
+    same container-choice-per-tier policy, only the per-tier quantize call and
+    the packed container's signedness convention (`_pack_tier_codes`) differ.
     """
+    assert quantizer in QUANTIZERS, (
+        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
+    )
     S, C = M.shape
     assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
     assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"
@@ -683,10 +808,13 @@ def spectral_quantize_packed(
     Y = M @ pack.enc.to(M.dtype)
     packed: dict[str, torch.Tensor] = {}
     for b, cols in cols_by_tier.items():
-        Q_int, scale = rtn_quantize_packed(
-            Y[:, cols].mT, b, pack.group, mse_scale=mse_scale
-        )
-        packed[f"t{b}_codes"] = _pack_tier_codes(Q_int, b)
+        if quantizer == "lloyd":
+            Q_int, scale = _lloyd_quantize_packed(Y[:, cols].mT, b, pack.group)
+        else:
+            Q_int, scale = rtn_quantize_packed(
+                Y[:, cols].mT, b, pack.group, mse_scale=mse_scale
+            )
+        packed[f"t{b}_codes"] = _pack_tier_codes(Q_int, b, quantizer=quantizer)
         packed[f"t{b}_scale"] = scale
     return packed, spectral_payload_bpe(pack)
 
@@ -696,30 +824,52 @@ def spectral_dequant_packed(
     pack: SpectralPack,
     *,
     cols_by_tier: dict[int, torch.Tensor] | None = None,
+    quantizer: str = "rtn",
 ) -> torch.Tensor:
     """Inverse of `spectral_quantize_packed`: fp32 `(S, C)` M_hat, bitwise-equal
-    to `spectral_quantize(M, pack)[0]`."""
+    to `spectral_quantize(M, pack)[0]` (same `quantizer` on both calls — the
+    packed container's signedness convention differs by quantizer, see
+    `_pack_tier_codes`)."""
+    assert quantizer in QUANTIZERS, (
+        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
+    )
     cols_by_tier = cols_by_tier if cols_by_tier is not None else tier_columns(pack.bits)
     first_b = next(iter(cols_by_tier))
     S = packed[f"t{first_b}_scale"].shape[1] * pack.group  # scale is (n_b, S//group, 1)
     C = pack.enc.shape[0]
     Y_hat = torch.zeros(S, C, dtype=pack.dec.dtype, device=pack.dec.device)
     for b, cols in cols_by_tier.items():
-        Q_int = _unpack_tier_codes(packed[f"t{b}_codes"], b, S)
-        Y_hat[:, cols] = rtn_dequantize_packed(
-            Q_int, packed[f"t{b}_scale"], pack.group
-        ).mT
+        Q_int = _unpack_tier_codes(packed[f"t{b}_codes"], b, S, quantizer=quantizer)
+        if quantizer == "lloyd":
+            Y_hat[:, cols] = _lloyd_dequantize_packed(
+                Q_int, packed[f"t{b}_scale"], b, pack.group
+            ).mT
+        else:
+            Y_hat[:, cols] = rtn_dequantize_packed(
+                Q_int, packed[f"t{b}_scale"], pack.group
+            ).mT
     return Y_hat @ pack.dec.mT
 
 
 def spectral_quantize(
-    M: torch.Tensor, pack: SpectralPack, *, mse_scale: bool = True
+    M: torch.Tensor,
+    pack: SpectralPack,
+    *,
+    mse_scale: bool = True,
+    quantizer: str = "rtn",
 ) -> tuple[torch.Tensor, float]:
     """Quantize (S, C) M with a fitted pack. Returns (M_hat, bpe_model).
 
     bpe_model = spectral_payload_bpe(pack) (payload-v2 model-level accounting —
     the pack itself ships with the model). Add skeptic_charge(C, S, tiers) for
-    the per-sequence-charged view.
+    the per-sequence-charged view. bpe is IDENTICAL across `quantizer` values
+    by construction (same bits, same group-scale charge — see
+    `spectral_quantize_packed`'s docstring); only the payload distortion changes.
+
+    `quantizer="rtn"` (default, pinned bit-exact) reproduces every prior call.
+    `quantizer="lloyd"` (K4 Lloyd-gate design, 2026-07-25) swaps the per-tier
+    uniform-RTN codebook for the analytic Gaussian Lloyd-Max codebook — see
+    `spectral_quantize_packed`.
 
     Re-expressed as the composition `spectral_dequant_packed ∘
     spectral_quantize_packed` — bitwise-neutral by construction (`rtn_quantize`
@@ -727,11 +877,16 @@ def spectral_quantize(
     per-tier compose is the same enc/dec matmuls, same order, same
     device/dtype as the direct `quantize_by_bits` path it replaces).
     """
+    assert quantizer in QUANTIZERS, (
+        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
+    )
     S, C = M.shape
     assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
     assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"
-    packed, bpe = spectral_quantize_packed(M, pack, mse_scale=mse_scale)
-    M_hat = spectral_dequant_packed(packed, pack)
+    packed, bpe = spectral_quantize_packed(
+        M, pack, mse_scale=mse_scale, quantizer=quantizer
+    )
+    M_hat = spectral_dequant_packed(packed, pack, quantizer=quantizer)
     return M_hat, bpe
 
 
