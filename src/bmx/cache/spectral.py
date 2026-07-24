@@ -1009,6 +1009,51 @@ def load_packs(path: str | Path, budget: float) -> dict[int, SpectralPack]:
     return packs
 
 
+TIER_THRESHOLD_GRID: tuple[int, ...] = (2, 3, 4, 5, 6, 8)
+
+# Sentinel dec_quant_threshold() returns for "int8_tl": per-layer,
+# certificate-derived thresholds (see per_layer_tier_thresholds) rather than
+# one shared int -- consumers (load_packs_for_spec, cache_bits_per_entry)
+# switch on this value to take the per-layer path.
+PER_LAYER_TIER_SENTINEL = -1
+
+
+def per_layer_tier_thresholds(
+    packs: dict[int, "SpectralPack"], *, bar: float = 0.05
+) -> dict[int, int]:
+    """Certificate-derived per-layer int8 tier threshold (K4 estimation-levers
+    Task 3): for each layer, the largest T in the standard tier grid
+    `TIER_THRESHOLD_GRID` (2, 3, 4, 5, 6, 8) whose
+    `int8_decoder_certificate_tiered(pack, T)["implied_rel_degradation"]`
+    stays at or below `bar`.
+
+    The layer-uniform `int8_t5` threshold binds on the single worst layer at
+    every T (that layer sets the ceiling for every other layer too); this
+    computes the ceiling PER LAYER instead, so layers whose spectrum tolerates
+    int8 further can use a higher T while the worst layer is left at whatever
+    it can actually certify.
+
+    Deterministic and pack-derived only -- no fit, no refit, no new metadata:
+    callers recompute this from the already-loaded pack dict, once.
+
+    Grid is scanned ascending; the returned T is the LAST one that still
+    passes (monotonicity of `implied_rel_degradation` in T is validated
+    empirically, not assumed -- see test_int8_certificate_tiered_endpoints_
+    and_charge's ordering pin), so a layer failing even T=2 gets 0 (no int8
+    for that layer -- fp32-as-loaded/fp16-shipped, same meaning as
+    dec_quant_threshold's None).
+    """
+    thresholds: dict[int, int] = {}
+    for layer_i, pack in packs.items():
+        best = 0
+        for t in TIER_THRESHOLD_GRID:
+            cert = int8_decoder_certificate_tiered(pack, t)
+            if cert["implied_rel_degradation"] <= bar:
+                best = t
+        thresholds[layer_i] = best
+    return thresholds
+
+
 def dec_quant_threshold(dec_quant: str) -> int | None:
     """Parse a `CacheCodecSpec.dec_quant` string to the tier threshold
     `int8_decoder_roundtrip` expects (K4 local-levers Task 1 -- the one
@@ -1020,6 +1065,12 @@ def dec_quant_threshold(dec_quant: str) -> int | None:
                                 today's blanket roundtrip exactly)
         "int8_t{T}" -> T       (2 <= T <= 8; tier-gated -- only columns with
                                 0 < bits <= T are int8-stored)
+        "int8_tl"   -> PER_LAYER_TIER_SENTINEL (-1; K4 estimation-levers
+                                Task 3) -- per-layer certificate-derived
+                                thresholds (per_layer_tier_thresholds), not
+                                one shared int. Consumers switch on the
+                                sentinel explicitly; it is never used as a
+                                real tier_threshold value.
 
     Anything else asserts with a clear message.
     """
@@ -1027,6 +1078,8 @@ def dec_quant_threshold(dec_quant: str) -> int | None:
         return None
     if dec_quant == "int8":
         return 8
+    if dec_quant == "int8_tl":
+        return PER_LAYER_TIER_SENTINEL
     if dec_quant.startswith("int8_t"):
         t_str = dec_quant[len("int8_t") :]
         assert t_str.isdigit(), (
@@ -1038,7 +1091,8 @@ def dec_quant_threshold(dec_quant: str) -> int | None:
         )
         return t
     raise AssertionError(
-        f"dec_quant must be 'fp32', 'int8', or 'int8_t{{T}}' (2<=T<=8); got {dec_quant!r}"
+        f"dec_quant must be 'fp32', 'int8', 'int8_tl', or 'int8_t{{T}}' "
+        f"(2<=T<=8); got {dec_quant!r}"
     )
 
 
@@ -1060,6 +1114,13 @@ def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
     result as before this generalization, pinned by
     test_load_packs_for_spec_matches_load_packs_and_owns_dec_quant).
 
+    `dec_quant="int8_tl"` (K4 estimation-levers Task 3): thr is the
+    PER_LAYER_TIER_SENTINEL, not a real threshold. `per_layer_tier_thresholds`
+    is computed ONCE here from the just-loaded pack dict (deterministic,
+    pack-derived -- no extra state), then each layer is roundtripped at its
+    OWN T_ℓ; a layer whose T_ℓ is 0 (even T=2 fails the certificate bar) is
+    left untouched (no int8 for that layer, same meaning as thr=None).
+
     k_spec: a CacheCodecSpec (arm, pre_rope, pack_path, budget, dec_quant).
     """
     thr = dec_quant_threshold(k_spec.dec_quant)
@@ -1068,7 +1129,22 @@ def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
     assert k_spec.pre_rope, "spectral quantizes pre-RoPE keys; set pre_rope=True"
     assert k_spec.pack_path, "spectral requires pack_path"
     packs = load_packs(k_spec.pack_path, k_spec.budget)
-    if thr is not None:
+    if thr == PER_LAYER_TIER_SENTINEL:
+        t_map = per_layer_tier_thresholds(packs)
+        packs = {
+            i: (
+                pack
+                if t_map[i] == 0
+                else dataclasses.replace(
+                    pack,
+                    dec=int8_decoder_roundtrip(
+                        pack.dec, pack.bits, tier_threshold=t_map[i]
+                    ),
+                )
+            )
+            for i, pack in packs.items()
+        }
+    elif thr is not None:
         # Lever 2 (gated on a later VM quality measurement): roundtrip each
         # layer pack's decoder through the gated int8 roundtrip ONCE, here,
         # at init -- never refit, never re-applied per call.

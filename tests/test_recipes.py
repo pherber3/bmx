@@ -129,3 +129,27 @@ def test_recipe_dec8t_suffix():
     # Other T values.
     k3, _ = spec_pair("k4_b2.2_dec8t4", pack_path="/p/packs.safetensors")
     assert k3.budget == 2.2 and k3.dec_quant == "int8_t4"
+
+
+def test_recipe_dec8tl_suffix():
+    """K4 estimation-levers Task 3: '_dec8tl' parses to dec_quant='int8_tl'
+    (per-layer certificate-derived thresholds), checked as an EXACT suffix
+    BEFORE the digit-parsing '_dec8t{T}' branch -- 'l' is not a digit, so if
+    '_dec8t' were matched first (substring check) the T-parse would try
+    int('l') and crash. '_dec8t5' and plain '_dec8' must still parse
+    unaffected by the new branch."""
+    k, v = spec_pair("k4_b2.5_dec8tl", pack_path="/p/packs.safetensors")
+    assert k.arm == "spectral" and k.budget == 2.5 and k.dec_quant == "int8_tl"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    # '_dec8t5' (digit form) still parses correctly, unaffected.
+    k2, _ = spec_pair("k4_b2.5_dec8t5", pack_path="/p/packs.safetensors")
+    assert k2.dec_quant == "int8_t5"
+
+    # Plain '_dec8' (blanket) still parses to "int8", unaffected.
+    k3, _ = spec_pair("k4_b2.5_dec8", pack_path="/p/packs.safetensors")
+    assert k3.dec_quant == "int8"
+
+    # A different budget, to make sure budget parsing survives the new suffix.
+    k4, _ = spec_pair("k4_b2.2_dec8tl", pack_path="/p/packs.safetensors")
+    assert k4.budget == 2.2 and k4.dec_quant == "int8_tl"

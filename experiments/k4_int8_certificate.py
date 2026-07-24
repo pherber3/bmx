@@ -50,6 +50,7 @@ from bmx.cache.spectral import (
     int8_decoder_certificate_tiered,
     load_packs,
     mixed_dec_charge,
+    per_layer_tier_thresholds,
     skeptic_charge,
 )
 
@@ -270,6 +271,84 @@ def main(cfg: Config):
             "of the FULL blanket-int8 charge saving survives at that T. Same "
             "user-review gate as the blanket certificate above -- this sweep "
             "informs the user's decision, nothing else."
+        ),
+    )
+
+    # ---- per-layer T_ℓ sweep (K4 estimation-levers Task 3) -----------------
+    # per_layer_tier_thresholds(packs, bar=0.05) gives each layer its OWN
+    # certified tier ceiling instead of the layer-uniform T=5 (which binds on
+    # the single worst layer at every T). The analytic question: how much of
+    # uniform T=5's remaining charge-saving gap does per-layer recover, at
+    # S=4096 -- the pre-registered MATERIALITY bar (spec Part 2) is
+    # saving_delta >= 0.3 bits/token/model; below that, "certified but
+    # immaterial" is the expected, honest verdict (recorded here, not shipped
+    # into recipes/docs regardless of quality-bar outcome).
+    per_layer_rows: list[dict] = []
+    per_layer_summary: dict[str, dict] = {}
+    for budget, packs in packs_by_budget.items():
+        t_map = per_layer_tier_thresholds(packs, bar=0.05)
+        saving_delta_by_s: dict[int, float] = {S: 0.0 for S in CHARGE_S_GRID}
+        for layer_i, pack in sorted(packs.items()):
+            T_l = t_map[layer_i]
+            cert_l = int8_decoder_certificate_tiered(pack, T_l) if T_l > 0 else None
+            c_int8_l = pack.c_int8(T_l) if T_l > 0 else 0
+            c_int8_uniform5 = pack.c_int8(5)
+            per_layer_rows.append(
+                dict(
+                    model=model_label,
+                    budget=float(budget),
+                    layer=layer_i,
+                    C=int(pack.enc.shape[0]),
+                    t_layer=T_l,
+                    c_used=int(pack.c_used),
+                    c_int8_t_layer=c_int8_l,
+                    c_int8_uniform_t5=c_int8_uniform5,
+                    implied_rel_degradation_at_t_layer=(
+                        cert_l["implied_rel_degradation"] if cert_l else 0.0
+                    ),
+                )
+            )
+            C_l = int(pack.enc.shape[0])
+            for S in CHARGE_S_GRID:
+                charge_uniform5 = mixed_dec_charge(
+                    C_l, S, pack.tiers, c_used=pack.c_used, c_int8=c_int8_uniform5
+                )
+                charge_t_layer = mixed_dec_charge(
+                    C_l, S, pack.tiers, c_used=pack.c_used, c_int8=c_int8_l
+                )
+                # positive = per-layer cheaper than uniform T=5.
+                saving_delta_by_s[S] += charge_uniform5 - charge_t_layer
+        per_layer_summary[f"{budget:g}"] = dict(
+            t_layer_map={str(k): v for k, v in sorted(t_map.items())},
+            **{f"saving_delta_at_S{S}": saving_delta_by_s[S] for S in CHARGE_S_GRID},
+            materiality_bar_bits_per_token=0.3,
+            materiality_pass_at_S4096=bool(saving_delta_by_s[4096] >= 0.3),
+        )
+        print(
+            f"  [per-layer] b={budget:g} T_ℓ={t_map} "
+            f"saving_delta@4096={saving_delta_by_s[4096]:.4f} "
+            f"(bar=0.3, pass={per_layer_summary[f'{budget:g}']['materiality_pass_at_S4096']})",
+            flush=True,
+        )
+    per_layer_df = pd.DataFrame(per_layer_rows)
+    write_metrics(run, per_layer_df, name="per_layer_tl_sweep")
+
+    verdict["per_layer_tl_sweep"] = dict(
+        bar=0.05,
+        materiality_bar_bits_per_token_at_S4096=0.3,
+        per_budget=per_layer_summary,
+        note=(
+            "Certificate-derived per-layer T_ℓ (per_layer_tier_thresholds, "
+            "same 5% bar as the blanket/tier-sweep certificates above) vs "
+            "the uniform T=5 threshold this repo shipped last cycle. "
+            "saving_delta_at_S{S} = sum_layers [mixed_dec_charge at uniform "
+            "T=5's c_int8 - mixed_dec_charge at T_ℓ's c_int8], bits/token/"
+            "model, positive meaning per-layer is CHEAPER than uniform T=5. "
+            "THE MATERIALITY BAR (pre-registered, spec Part 2): "
+            "saving_delta_at_S4096 >= 0.3 bits/token/model, or per-layer "
+            "does NOT ship regardless of the quality bar -- 'certified but "
+            "immaterial' is a valid, expected verdict, not a failure to "
+            "record honestly."
         ),
     )
 

@@ -809,6 +809,175 @@ def test_load_packs_for_spec_tier_gated(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# per_layer_tier_thresholds / int8_tl (K4 estimation-levers Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _two_layer_packs_distinct_spectra():
+    """Two packs deliberately built so their certificates diverge across the
+    tier grid: layer 0's spikes are far stronger (steeper spectrum decay ->
+    the certificate's added/payload ratio is smaller at any given T, so it
+    should certify a HIGHER T_ℓ) than layer 1's near-flat spectrum (weak
+    spikes barely above noise -> more of the certificate mass sits in the
+    low tiers, so it should certify a LOWER T_ℓ, mirroring the uniform-T=5
+    "layer 1 is the worst layer" finding this task is about)."""
+    C = 32
+    Wh, Wh_inv = identity_whitener(C)
+    strong, _ = _spiked_keys(S=512, C=C, seed=0, spike_std=(80.0, 80.0))
+    weak, _ = _spiked_keys(S=512, C=C, seed=1, spike_std=(3.0, 3.0))
+    pack_strong = fit_spectral_pack(strong, Wh, Wh_inv, budget=2.5, group=8)
+    pack_weak = fit_spectral_pack(weak, Wh, Wh_inv, budget=2.5, group=8)
+    return {0: pack_strong, 1: pack_weak}
+
+
+def test_per_layer_tier_thresholds_each_passes_bar_next_tier_fails_or_max():
+    """Each returned T_ℓ must itself pass the bar; the next grid tier up must
+    either fail the bar or T_ℓ must already be the grid max (8) -- i.e. the
+    returned T really is the LARGEST passing tier, not just A passing tier."""
+    from bmx.cache.spectral import (
+        TIER_THRESHOLD_GRID,
+        int8_decoder_certificate_tiered,
+        per_layer_tier_thresholds,
+    )
+
+    packs = _two_layer_packs_distinct_spectra()
+    bar = 0.05
+    t_map = per_layer_tier_thresholds(packs, bar=bar)
+    assert set(t_map) == set(packs)
+
+    for layer_i, T in t_map.items():
+        pack = packs[layer_i]
+        if T == 0:
+            # Even the smallest grid tier must fail (or the layer has no used
+            # tiers at all -- not the case for this fixture's budget).
+            assert (
+                int8_decoder_certificate_tiered(pack, TIER_THRESHOLD_GRID[0])[
+                    "implied_rel_degradation"
+                ]
+                > bar
+            )
+            continue
+        cert_here = int8_decoder_certificate_tiered(pack, T)
+        assert cert_here["implied_rel_degradation"] <= bar
+        idx = TIER_THRESHOLD_GRID.index(T)
+        if idx + 1 < len(TIER_THRESHOLD_GRID):
+            next_t = TIER_THRESHOLD_GRID[idx + 1]
+            cert_next = int8_decoder_certificate_tiered(pack, next_t)
+            assert cert_next["implied_rel_degradation"] > bar
+
+
+def test_per_layer_tier_thresholds_fixture_forces_different_t_per_layer():
+    """The fixture is deliberately built so the two layers' certified T_ℓ
+    differ -- the case this task exists to handle (uniform T=5 binds on the
+    single worst layer; per-layer should NOT collapse to one shared value)."""
+    from bmx.cache.spectral import per_layer_tier_thresholds
+
+    packs = _two_layer_packs_distinct_spectra()
+    t_map = per_layer_tier_thresholds(packs)
+    assert t_map[0] != t_map[1], f"fixture must force distinct T_ℓ; got {t_map}"
+
+
+def test_per_layer_tier_thresholds_monotone_in_bar():
+    """A larger bar can only relax the certificate, never tighten it: T_ℓ at
+    a larger bar must be pointwise >= T_ℓ at a smaller bar, for every layer."""
+    from bmx.cache.spectral import per_layer_tier_thresholds
+
+    packs = _two_layer_packs_distinct_spectra()
+    tight = per_layer_tier_thresholds(packs, bar=0.01)
+    loose = per_layer_tier_thresholds(packs, bar=0.20)
+    for layer_i in packs:
+        assert loose[layer_i] >= tight[layer_i]
+
+
+def test_per_layer_tier_thresholds_zero_when_even_smallest_tier_fails():
+    """An unreasonably strict bar (effectively zero) must drive every layer's
+    T_ℓ to 0 -- no int8 for that layer -- since no nonzero-tier certificate
+    can be exactly zero on a fixture with real spikes."""
+    from bmx.cache.spectral import per_layer_tier_thresholds
+
+    packs = _two_layer_packs_distinct_spectra()
+    t_map = per_layer_tier_thresholds(packs, bar=0.0)
+    assert all(T == 0 for T in t_map.values())
+
+
+def test_dec_quant_threshold_int8_tl_is_sentinel_and_others_unchanged():
+    """dec_quant_threshold('int8_tl') == PER_LAYER_TIER_SENTINEL (-1); every
+    prior form ('fp32'/'int8'/'int8_t{T}') is byte-for-byte unchanged."""
+    from bmx.cache.spectral import PER_LAYER_TIER_SENTINEL, dec_quant_threshold
+
+    assert PER_LAYER_TIER_SENTINEL == -1
+    assert dec_quant_threshold("int8_tl") == -1
+    assert dec_quant_threshold("fp32") is None
+    assert dec_quant_threshold("int8") == 8
+    assert dec_quant_threshold("int8_t5") == 5
+    assert dec_quant_threshold("int8_t2") == 2
+    assert dec_quant_threshold("int8_t8") == 8
+    with pytest.raises(AssertionError):
+        dec_quant_threshold("int8_t1")
+    with pytest.raises(AssertionError):
+        dec_quant_threshold("int9")
+
+
+def test_load_packs_for_spec_int8_tl_applies_per_layer_thresholds(tmp_path):
+    """dec_quant='int8_tl' materialization: each layer's decoder is
+    roundtripped at ITS OWN T_ℓ (per_layer_tier_thresholds applied to the
+    just-loaded packs), not one shared threshold -- verified against the
+    fixture built to force different T_ℓ per layer, and hand-computed via
+    int8_decoder_roundtrip at each layer's own T_ℓ."""
+    from bmx.cache.spectral import (
+        int8_decoder_roundtrip,
+        load_packs,
+        load_packs_for_spec,
+        per_layer_tier_thresholds,
+        save_pack_file,
+        fit_spectral_basis,
+    )
+    from bmx.cache.specs import CacheCodecSpec
+
+    C = 32
+    Wh, Wh_inv = identity_whitener(C)
+    strong, _ = _spiked_keys(S=512, C=C, seed=0, spike_std=(80.0, 80.0))
+    weak, _ = _spiked_keys(S=512, C=C, seed=1, spike_std=(3.0, 3.0))
+    bases = {
+        0: fit_spectral_basis(strong, Wh, Wh_inv),
+        1: fit_spectral_basis(weak, Wh, Wh_inv),
+    }
+    path = tmp_path / "packs_tl.safetensors"
+    save_pack_file(path, bases, budgets=(2.5,), group=8, meta={"model": "tiny"})
+
+    raw_packs = load_packs(path, 2.5)
+    t_map = per_layer_tier_thresholds(raw_packs)
+    assert t_map[0] != t_map[1], "fixture must force distinct T_ℓ (see module test)"
+
+    tl_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path=str(path),
+        budget=2.5,
+        dec_quant="int8_tl",
+    )
+    via_tl = load_packs_for_spec(tl_spec)
+
+    for layer_i, pack in raw_packs.items():
+        T = t_map[layer_i]
+        if T == 0:
+            assert torch.equal(via_tl[layer_i].dec, pack.dec)
+        else:
+            expected = int8_decoder_roundtrip(pack.dec, pack.bits, tier_threshold=T)
+            assert torch.equal(via_tl[layer_i].dec, expected)
+    # And the two layers' materialized decoders must actually differ in how
+    # they were gated (not both landing on the same threshold by accident).
+    assert not torch.equal(
+        int8_decoder_roundtrip(
+            raw_packs[0].dec, raw_packs[0].bits, tier_threshold=t_map[0]
+        ),
+        int8_decoder_roundtrip(
+            raw_packs[0].dec, raw_packs[0].bits, tier_threshold=t_map[1]
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # jensen_gap_report (K4 local-levers Task 4 — determinant-Jensen Gate-A anchor)
 # ---------------------------------------------------------------------------
 

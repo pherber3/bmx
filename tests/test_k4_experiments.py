@@ -800,6 +800,83 @@ def test_k4_dec_quant_tier_thresholds_run_and_gate_bind_on_t5(tmp_path):
         assert col in cvm.columns
 
 
+def test_k4_dec_quant_int8_tl_mode(tmp_path):
+    """K4 estimation-levers Task 3: dec_tl=True adds the 'int8_tl' dec_mode,
+    reported (rel_degradation_int8_tl) but not the binding gate mode -- the
+    blanket 'int8' (no tier_thresholds set here) stays gate_mode."""
+    import pandas as pd
+
+    from experiments.k4_dec_quant import Config, main
+
+    fit, scored = tmp_path / "f.safetensors", tmp_path / "s.safetensors"
+    _tiny_cache(fit, seed=0)
+    _tiny_cache(scored, seed=1)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            cache_paths=(str(scored),),
+            model_label="tiny",
+            budgets=(2.5,),
+            dec_tl=True,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert set(df.dec_mode) == {"fp32", "fp16", "int8", "int8_tl"}
+    assert df[df.dec_mode == "int8_tl"].bpe_skeptic_deploy.notna().all()
+
+    v = json.loads((run_dir / "dec_quant_verdict.json").read_text())
+    pb = v["per_budget"]["2.5"]
+    assert "rel_degradation_int8_tl" in pb
+    assert "rel_degradation_int8" in pb
+    assert v["gate_mode"] == "int8"  # no tier_thresholds -> blanket still gates
+    assert pb["gate_mode"] == "int8"
+    assert "gate_pass" in v
+
+
+def test_k4_dec_quant_int8_tl_and_tier_thresholds_together(tmp_path):
+    """dec_tl=True combined with tier_thresholds: int8_tl is reported
+    alongside int8_t{T}, and the gate still binds on int8_t5 (dec_tl never
+    changes gate selection)."""
+    import pandas as pd
+
+    from experiments.k4_dec_quant import Config, main
+
+    fit, scored = tmp_path / "f.safetensors", tmp_path / "s.safetensors"
+    _tiny_cache(fit, seed=0)
+    _tiny_cache(scored, seed=1)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            cache_paths=(str(scored),),
+            model_label="tiny",
+            budgets=(2.5,),
+            tier_thresholds=(4, 5, 6),
+            dec_tl=True,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert set(df.dec_mode) == {
+        "fp32",
+        "fp16",
+        "int8",
+        "int8_t4",
+        "int8_t5",
+        "int8_t6",
+        "int8_tl",
+    }
+    v = json.loads((run_dir / "dec_quant_verdict.json").read_text())
+    assert v["gate_mode"] == "int8_t5"
+    pb = v["per_budget"]["2.5"]
+    assert "rel_degradation_int8_tl" in pb
+    assert "rel_degradation_int8_t5" in pb
+
+
 def test_dec_quant_verdict_gate_binds_on_int8_t5_when_present():
     """Synthetic frame: blanket int8 fails 5% but int8_t5 passes -> gate_pass
     True (binding moves off the blanket mode). Then flip so t5 fails ->
@@ -1896,6 +1973,48 @@ def test_k4_int8_certificate_smoke(tmp_path):
         rescue = tier_sweep_v["per_budget_rescue"][budget_key]
         assert "largest_passing_threshold" in rescue
         assert "charge_saving_fraction_at_S4096" in rescue
+
+    # ---- K4 estimation-levers Task 3: per-layer T_ℓ sweep -----------------
+    from bmx.cache.spectral import (
+        load_packs,
+        mixed_dec_charge,
+        per_layer_tier_thresholds,
+    )
+
+    per_layer_df = pd.read_parquet(run_dir / "per_layer_tl_sweep.parquet")
+    assert {
+        "budget",
+        "layer",
+        "C",
+        "t_layer",
+        "c_used",
+        "c_int8_t_layer",
+        "c_int8_uniform_t5",
+        "implied_rel_degradation_at_t_layer",
+    } <= set(per_layer_df.columns)
+    assert (per_layer_df.implied_rel_degradation_at_t_layer <= 0.05 + 1e-9).all()
+
+    pl_v = v["per_layer_tl_sweep"]
+    assert pl_v["materiality_bar_bits_per_token_at_S4096"] == 0.3
+    for budget in (2.0, 2.5):
+        packs = load_packs(str(packs_path), budget)
+        t_map = per_layer_tier_thresholds(packs, bar=0.05)
+        entry = pl_v["per_budget"][f"{budget:g}"]
+        assert entry["t_layer_map"] == {str(k): v for k, v in sorted(t_map.items())}
+
+        expected_delta = 0.0
+        for layer_i, pack in packs.items():
+            T_l = t_map[layer_i]
+            c_int8_l = pack.c_int8(T_l) if T_l > 0 else 0
+            c_int8_5 = pack.c_int8(5)
+            C_l = int(pack.enc.shape[0])
+            expected_delta += mixed_dec_charge(
+                C_l, 4096, pack.tiers, c_used=pack.c_used, c_int8=c_int8_5
+            ) - mixed_dec_charge(
+                C_l, 4096, pack.tiers, c_used=pack.c_used, c_int8=c_int8_l
+            )
+        assert abs(entry["saving_delta_at_S4096"] - expected_delta) < 1e-9
+        assert entry["materiality_pass_at_S4096"] == (expected_delta >= 0.3)
 
 
 # ---------------------------------------------------------------------------

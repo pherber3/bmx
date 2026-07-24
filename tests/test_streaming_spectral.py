@@ -409,3 +409,50 @@ def test_streaming_bpe_int8_t5(tmp_path):
         C, S, cache.layers[-1]._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
     )
     assert abs(bpe_k - expected) < 1e-9
+
+
+def test_streaming_bpe_int8_tl(tmp_path):
+    """K4 estimation-levers Task 3: dec_quant='int8_tl' bpe_k's pack charge
+    equals a hand-computed mixed_dec_charge with PER-LAYER c_int8 at each
+    layer's own certificate-derived T_ℓ (per_layer_tier_thresholds applied
+    to the raw, un-roundtripped packs -- the same map load_packs_for_spec
+    used at materialization), averaged the same way mean_c_used is averaged."""
+    from bmx.cache.spectral import (
+        load_packs,
+        mixed_dec_charge,
+        per_layer_tier_thresholds,
+    )
+
+    path = str(tmp_path / "packs.safetensors")
+    model = tiny_llama()
+    _fit_tiny_packs(model, path, budget=2.5, group=8)
+    k_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        group=8,
+        pack_path=path,
+        budget=2.5,
+        dec_quant="int8_tl",
+    )
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=CacheCodecSpec(arm="fp16"), recent_window=8
+    )
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(ids(seq=150), past_key_values=cache, use_cache=True)
+    bpe_k, _ = cache.bits_per_entry()
+    per_layer = [layer.bpe_k for layer in cache.layers]
+    S = cache.layers[-1].get_seq_length()
+    C = cache.layers[-1]._h_kv * cache.layers[-1]._d_head
+
+    raw_packs = load_packs(path, 2.5)  # un-roundtripped -- the map's input
+    t_map = per_layer_tier_thresholds(raw_packs)
+    mean_c_used = sum(ly._pack.c_used for ly in cache.layers) / len(cache.layers)
+    mean_c_int8 = sum(
+        cache.layers[i]._pack.c_int8(t_map[i]) for i in range(len(cache.layers))
+    ) / len(cache.layers)
+    expected = sum(per_layer) / len(per_layer) + mixed_dec_charge(
+        C, S, cache.layers[-1]._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
+    )
+    assert abs(bpe_k - expected) < 1e-9

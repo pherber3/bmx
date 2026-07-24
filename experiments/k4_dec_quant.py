@@ -64,6 +64,7 @@ from bmx.cache.spectral import (
     int8_decoder_roundtrip,
     load_packs,
     mixed_dec_charge,
+    per_layer_tier_thresholds,
     spectral_quantize,
 )
 from experiments._k4_common import (
@@ -94,32 +95,65 @@ class Config:
     # gates). Non-empty adds int8_t{T} modes for each T and moves the binding
     # gate to int8_t5 (see module docstring).
     tier_thresholds: tuple[int, ...] = ()
+    # K4 estimation-levers Task 3: off (default) = today's behavior byte-exact
+    # (no int8_tl mode). True adds the "int8_tl" mode -- per-layer certificate-
+    # derived thresholds (spectral.per_layer_tier_thresholds), computed ONCE
+    # per (cache, budget) from that budget's loaded packs and applied per
+    # layer. Reported like any other dec mode (rel_degradation_int8_tl); NOT
+    # the binding gate mode -- int8_t5 (or blanket int8) stays the gate when
+    # present, per the pre-registered materiality-bar rule (see spec Part 2).
+    dec_tl: bool = False
 
 
 def _dec_modes(cfg: Config) -> tuple[str, ...]:
-    return DEC_MODES + tuple(f"int8_t{t}" for t in cfg.tier_thresholds)
+    modes = DEC_MODES + tuple(f"int8_t{t}" for t in cfg.tier_thresholds)
+    if cfg.dec_tl:
+        modes = modes + ("int8_tl",)
+    return modes
 
 
-def _dec_variant(dec: torch.Tensor, bits_pc: torch.Tensor, mode: str) -> torch.Tensor:
+def _dec_variant(
+    dec: torch.Tensor,
+    bits_pc: torch.Tensor,
+    mode: str,
+    *,
+    tier_threshold_tl: int | None = None,
+) -> torch.Tensor:
+    """`tier_threshold_tl` is only consulted for mode "int8_tl" -- the
+    caller's per-layer T_ℓ (from `per_layer_tier_thresholds`, looked up once
+    per (cache, budget) and passed in per layer, since this function has no
+    access to the pack dict/layer index by itself). T_ℓ=0 means "no int8 for
+    this layer" -- the fp32-as-loaded decoder, same meaning as `dec` itself."""
     if mode == "fp32":
         return dec
     if mode == "fp16":
         return dec.half().float()
     if mode == "int8":
         return int8_decoder_roundtrip(dec, bits_pc)
+    if mode == "int8_tl":
+        assert tier_threshold_tl is not None, "int8_tl requires tier_threshold_tl"
+        if tier_threshold_tl == 0:
+            return dec
+        return int8_decoder_roundtrip(dec, bits_pc, tier_threshold=tier_threshold_tl)
     if mode.startswith("int8_t"):
         t = int(mode[len("int8_t") :])
         return int8_decoder_roundtrip(dec, bits_pc, tier_threshold=t)
     raise AssertionError(f"unknown dec_mode {mode!r}")
 
 
-def _mode_c_int8(pack: SpectralPack, mode: str) -> int:
+def _mode_c_int8(
+    pack: SpectralPack, mode: str, *, tier_threshold_tl: int | None = None
+) -> int:
     """Number of used decoder columns int8-stored under `mode` — 0 for
     fp32/fp16, every used column (thr=8) for blanket "int8", and
     `count(0 < bits <= T)` for "int8_t{T}" (via `SpectralPack.c_int8`, the
-    shared int8-column count the streaming charge/certificate also use)."""
+    shared int8-column count the streaming charge/certificate also use).
+    "int8_tl" uses the caller-supplied per-layer T_ℓ (see `_dec_variant`)."""
     if mode in ("fp32", "fp16"):
         return 0
+    if mode == "int8_tl":
+        assert tier_threshold_tl is not None, "int8_tl requires tier_threshold_tl"
+        return pack.c_int8(tier_threshold_tl)
     thr = 8 if mode == "int8" else int(mode[len("int8_t") :])
     return pack.c_int8(thr)
 
@@ -208,6 +242,12 @@ def main(cfg: Config):
         for budget in cfg.budgets:
             packs = load_packs(cfg.pack_path, budget)
             packs_by_cache_budget[(cache_label, float(budget))] = packs
+            # K4 estimation-levers Task 3: the per-layer T_ℓ map is pack-
+            # derived and deterministic -- computed ONCE per (cache, budget)
+            # from this budget's loaded packs, then each layer's "int8_tl"
+            # variant below is built at its own T_ℓ. Empty dict when dec_tl
+            # is off (never consulted, keeps the default path inert).
+            t_map = per_layer_tier_thresholds(packs) if cfg.dec_tl else {}
 
             for layer_i in layers:
                 if layer_i not in packs:
@@ -220,10 +260,13 @@ def main(cfg: Config):
                 assert pack.enc.shape == (ctx.C, ctx.C), (
                     f"pack C mismatch at layer {layer_i}: {pack.enc.shape} vs C={ctx.C}"
                 )
+                t_l = t_map.get(layer_i)
 
-                # ---- decoder-precision arms (fp32/fp16/int8 + int8_t{T}) -----
+                # ---- decoder-precision arms (fp32/fp16/int8 + int8_t{T}/int8_tl) --
                 for mode in dec_modes:
-                    dec_variant = _dec_variant(pack.dec, pack.bits, mode)
+                    dec_variant = _dec_variant(
+                        pack.dec, pack.bits, mode, tier_threshold_tl=t_l
+                    )
                     pack_variant = dataclasses.replace(pack, dec=dec_variant)
                     M_hat, bpe_model = spectral_quantize(ctx.M_pre, pack_variant)
                     rf, lg, lg_rope, _lg_causal = _score_tail(
@@ -243,7 +286,7 @@ def main(cfg: Config):
                         DEPLOY_S,
                         pack.tiers,
                         c_used=pack.c_used,
-                        c_int8=_mode_c_int8(pack, mode),
+                        c_int8=_mode_c_int8(pack, mode, tier_threshold_tl=t_l),
                     )
                     emit(
                         dict(
@@ -527,6 +570,14 @@ def _dec_quant_verdict(
             entry[f"win_{m}"] = win_by_mode[m]
             entry[f"rel_degradation_{m}"] = rel_degradation_by_mode[m]
             entry[f"{m}_win_at_own_bits"] = own_bits_wins[m]
+        if cfg.dec_tl:
+            # int8_tl (K4 estimation-levers Task 3): reported like any other
+            # mode, on the same rel_degradation axis -- NEVER the binding
+            # gate mode (gate_mode above is chosen only from tier_thresholds/
+            # blanket, unaffected by dec_tl).
+            entry["win_int8_tl"] = win_by_mode["int8_tl"]
+            entry["rel_degradation_int8_tl"] = rel_degradation_by_mode["int8_tl"]
+            entry["int8_tl_win_at_own_bits"] = own_bits_wins["int8_tl"]
         entry["ordering_ok"] = _ordering_ok(rel_degradation_by_mode)
 
         per_budget[f"{budget:g}"] = entry

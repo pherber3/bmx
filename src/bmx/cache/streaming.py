@@ -49,10 +49,12 @@ from bmx.cache.hf_compat import (
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.spectral import (
+    PER_LAYER_TIER_SENTINEL,
     SpectralPack,
     dec_quant_threshold,
     load_packs_for_spec,
     mixed_dec_charge,
+    per_layer_tier_thresholds,
     spectral_quantize,
 )
 from bmx.decomp.lrs import truncated_svd
@@ -187,7 +189,19 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
     across-layer mean of per-layer charges equals the charge evaluated at
     the means; this is exact for allocated packs too, where each layer's own
     budget gives it a different c_used (range 139-423 zero dirs at b2.5) and
-    a different per-layer tier-column count. `dec_quant="fp32"` (thr=None,
+    a different per-layer tier-column count.
+
+    `dec_quant="int8_tl"` (K4 estimation-levers Task 3): thr is the
+    PER_LAYER_TIER_SENTINEL. `mean_c_int8` is then the mean over layers of
+    `layer._pack.c_int8(t_map[i])` at EACH layer's own certificate-derived
+    threshold, recomputed via `per_layer_tier_thresholds` from the packs
+    (pack-derived and deterministic, so recomputing it here — same map
+    `load_packs_for_spec` used at materialization — needs no extra state;
+    at most 32 layers, cheap per call). `mixed_dec_charge`'s linearity in
+    c_used/c_int8 licenses the mean here exactly as it does for the
+    single-threshold modes.
+
+    `dec_quant="fp32"` (thr=None,
     mean_c_int8=0) and `dec_quant="int8"` (thr=8, blanket) reproduce the
     prior `skeptic_charge(dec_bits=16.0)` / `skeptic_charge(dec_bits=8.0)`
     call sites bit-exactly — `mixed_dec_charge` is endpoint-pinned to
@@ -228,11 +242,19 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
         S = last.get_seq_length()
         C = last._h_kv * last._d_head
         mean_c_used = sum(layer._pack.c_used for layer in layers) / len(layers)
-        mean_c_int8 = (
-            0
-            if thr is None
-            else sum(layer._pack.c_int8(thr) for layer in layers) / len(layers)
-        )
+        if thr == PER_LAYER_TIER_SENTINEL:
+            t_map = per_layer_tier_thresholds(
+                {i: layer._pack for i, layer in enumerate(layers)}
+            )
+            mean_c_int8 = sum(
+                layer._pack.c_int8(t_map[i]) for i, layer in enumerate(layers)
+            ) / len(layers)
+        else:
+            mean_c_int8 = (
+                0
+                if thr is None
+                else sum(layer._pack.c_int8(thr) for layer in layers) / len(layers)
+            )
         bpe_k = bpe_k + mixed_dec_charge(
             C, S, last._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
         )
