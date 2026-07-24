@@ -622,6 +622,88 @@ def test_k4_corpus_transfer_smoke(tmp_path):
         assert cell["label"] in ("insensitive", "domain-sensitive", "as-measured")
         assert cell["min"] <= cell["mean"] <= cell["max"]
     assert isinstance(pb["model_intrinsic_flag"], bool)
+    assert pb["synthesis"] == {}  # no §3b arms provided => empty block
+
+
+def _tiny_corpus_transfer_cfg_synth(tmp_path, budgets=(2.5,)):
+    """Stage-1 tiny cfg + the five §3b synthesis fit arms (2 slices each —
+    matched with the natural corpora's 2 slices, binding decision 1)."""
+    import dataclasses
+
+    cfg = _tiny_corpus_transfer_cfg(tmp_path, budgets=budgets)
+    paths, seed = {}, 100
+    for name in ("sc", "uw", "uc", "bw", "bc"):
+        group = []
+        for j in range(2):
+            p = tmp_path / f"{name}{j}.safetensors"
+            _tiny_cache(p, seed=seed)
+            seed += 1
+            group.append(str(p))
+        paths[name] = tuple(group)
+    return dataclasses.replace(
+        cfg,
+        shufcode_fit_paths=paths["sc"],
+        uniwiki_fit_paths=paths["uw"],
+        unicode_fit_paths=paths["uc"],
+        biwiki_fit_paths=paths["bw"],
+        bicode_fit_paths=paths["bc"],
+    )
+
+
+def test_k4_corpus_transfer_synthesis_smoke(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_corpus_transfer import main
+
+    run_dir = main(_tiny_corpus_transfer_cfg_synth(tmp_path))
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    spec = df[df.arm == "spectral"]
+    synth = ("shufcode", "uniwiki", "unicode", "biwiki", "bicode")
+    assert set(spec.fit_corpus) == {"wiki", "code", "null", *synth}
+    for c in synth:
+        sub = spec[spec.fit_corpus == c]
+        # fit-side-only arms, scored on BOTH eval sides in the same run
+        assert set(sub.eval_corpus) == {"wiki", "code"}
+        assert (sub.w_corpus == c).all() and (sub.alloc_corpus == c).all()
+
+    v = json.loads((run_dir / "corpus_transfer_verdict.json").read_text())
+    pb = v["per_budget"]["2.5"]
+    assert {
+        "uniwiki->wiki",
+        "unicode->code",
+        "biwiki->wiki",
+        "bicode->code",
+        "shufcode->code",
+        "shufcode->wiki",
+    } <= set(pb["D"])
+    rules = pb["synthesis"]["rules"]
+    assert set(rules) == {"wiki", "code"}
+    for eval_c, r in rules.items():
+        assert isinstance(r["recipe_confirmed"], bool)
+        assert isinstance(r["order2_earns_keep"], bool)
+        # pre-registered §3b rules (a)/(b), recomputable from the same JSON
+        assert r["recipe_confirmed"] == (r["D_uni"] < 0.10)
+        assert r["order2_earns_keep"] == ((r["D_uni"] - r["D_bi"]) >= 0.5 * r["D_uni"])
+        assert r["D_shuf"] is not None
+    assert pb["synthesis"]["climb_to_order3"] == all(
+        r["order2_earns_keep"] for r in rules.values()
+    )
+
+
+def test_k4_corpus_transfer_synthesis_guards(tmp_path):
+    import dataclasses
+
+    import pytest
+
+    from experiments.k4_corpus_transfer import main
+
+    cfg = _tiny_corpus_transfer_cfg_synth(tmp_path)
+    # partial provision refuses to run (the order ladder needs all five arms)
+    with pytest.raises(AssertionError, match="all-or-nothing"):
+        main(dataclasses.replace(cfg, bicode_fit_paths=()))
+    # the matched-fit-budget guard extends over the synthesis arms
+    with pytest.raises(AssertionError, match="matched fit"):
+        main(dataclasses.replace(cfg, uniwiki_fit_paths=cfg.uniwiki_fit_paths[:1]))
 
 
 def test_k4_corpus_transfer_matched_fit_budget_guard(tmp_path):

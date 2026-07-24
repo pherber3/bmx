@@ -19,6 +19,16 @@ D < 10% → corpus-insensitive; D > 25% → domain-sensitive; between → report
 as measured. Null-fit ≈ wikitext-fit on the wiki eval side (D < 10%) raises
 model_intrinsic_flag — the stronger "basis is model-intrinsic" claim. All
 gpt2-scale numbers are MECHANISM verdicts only (yellow flag in the JSON).
+
+Synthesis-order addendum (spec §3b): five FIT-SIDE-ONLY arms — shufcode
+(token-permuted code slices), uniwiki/unicode (i.i.d. samples from each fit
+slice's unigram histogram), biwiki/bicode (bigram-Markov samples) — join the
+same matrix at matched budgets. Verdict gains per_budget[b]["synthesis"]
+with the pre-registered order-ladder rules: (a) recipe-confirmed for eval
+side E if D(uni_E->E) < 10%; (b) order-2 earns its keep if
+D(uni_E->E) - D(bi_E->E) >= 0.5 * D(uni_E->E); no higher orders unless (b)
+passes on BOTH sides. uni_* is the recipe estimator, shuf_* its
+without-replacement control.
 """
 
 from __future__ import annotations
@@ -55,6 +65,9 @@ from experiments._k4_common import (
 
 FIT_CORPORA = ("wiki", "code", "null")
 EVAL_CORPORA = ("wiki", "code")
+# §3b synthesis-order fit arms (fit-side only; labels compose as
+# f"uni{eval_side}" / f"bi{eval_side}" in the order-ladder rules).
+SYNTH_FIT_CORPORA = ("shufcode", "uniwiki", "unicode", "biwiki", "bicode")
 # (basis_corpus, alloc_corpus) — scored on the alloc corpus's eval side (H3).
 _HYBRID_CELLS = (("wiki", "code"), ("code", "wiki"))
 # (sigma_corpus, w_corpus) — scored on BOTH eval sides (binding decision 2).
@@ -105,7 +118,8 @@ def _diagnostics(
 
     # Centered refits (Cov(k) instead of E[kkᵀ]), same whitener — H1 probe.
     centered_bases: dict[str, dict[int, object]] = {}
-    for corpus, fit in fits.items():
+    for corpus in sorted({c for p in _PAIRS for c in p}):
+        fit = fits[corpus]
         centered_bases[corpus] = {}
         for layer_i in layers:
             M = fit.M_fits[layer_i]
@@ -241,6 +255,12 @@ class Config:
     null_fit_paths: tuple[str, ...]
     wiki_eval_paths: tuple[str, ...]
     code_eval_paths: tuple[str, ...]
+    # ---- §3b synthesis-order fit arms (fit-side only; all five or none) ----
+    shufcode_fit_paths: tuple[str, ...] = ()
+    uniwiki_fit_paths: tuple[str, ...] = ()
+    unicode_fit_paths: tuple[str, ...] = ()
+    biwiki_fit_paths: tuple[str, ...] = ()
+    bicode_fit_paths: tuple[str, ...] = ()
     model_label: str = ""
     model_name: str = ""  # HF repo id for RoPE; empty => no-RoPE (gpt2), headline=logit
     budgets: tuple[float, ...] = (2.2, 2.5)
@@ -279,6 +299,21 @@ def main(cfg: Config):
         "code": cfg.code_fit_paths,
         "null": cfg.null_fit_paths,
     }
+    synth_paths = {
+        "shufcode": cfg.shufcode_fit_paths,
+        "uniwiki": cfg.uniwiki_fit_paths,
+        "unicode": cfg.unicode_fit_paths,
+        "biwiki": cfg.biwiki_fit_paths,
+        "bicode": cfg.bicode_fit_paths,
+    }
+    n_synth = sum(1 for p in synth_paths.values() if p)
+    assert n_synth in (0, len(synth_paths)), (
+        "§3b synthesis arms are all-or-nothing (the order-ladder rules need "
+        f"all five): got {n_synth}/5 non-empty "
+        f"{ {k: len(v) for k, v in synth_paths.items()} }"
+    )
+    if n_synth:
+        fit_paths.update(synth_paths)
     for name, paths in fit_paths.items():
         assert paths, f"{name}_fit_paths must be non-empty"
     assert cfg.wiki_eval_paths and cfg.code_eval_paths, "eval paths must be non-empty"
@@ -452,8 +487,9 @@ def main(cfg: Config):
                     logit_rope=lg_rope,
                 )
 
-    # ---- plain matrix: fit ∈ FIT_CORPORA × every eval cache ----------------
-    for fit_c in FIT_CORPORA:
+    # ---- plain matrix: fit ∈ fit_paths (natural + present synth) × every
+    #      eval cache ---------------------------------------------------------
+    for fit_c in fit_paths:
         for budget in cfg.budgets:
             for layer_i in layers:
                 pack = pack_from_basis(
@@ -607,11 +643,13 @@ def _transfer_verdict(
         key: _tq_layer_curve(g, headline_col)
         for key, g in tq_df.groupby(["eval_corpus", "cache"])
     }
+    present = set(df.loc[df.arm == "spectral", "fit_corpus"])
+    fit_corpora = [c for c in FIT_CORPORA + SYNTH_FIT_CORPORA if c in present]
 
     per_budget: dict[str, dict] = {}
     for budget in cfg.budgets:
         cells: dict[str, dict] = {}
-        for fit_c in FIT_CORPORA:
+        for fit_c in fit_corpora:
             for eval_c in EVAL_CORPORA:
                 sub = df[
                     (df.arm == "spectral")
@@ -633,7 +671,7 @@ def _transfer_verdict(
             matched = cells.get(f"{eval_c}->{eval_c}")
             if matched is None:
                 continue
-            for fit_c in FIT_CORPORA:
+            for fit_c in fit_corpora:
                 if fit_c == eval_c:
                     continue
                 cross = cells.get(f"{fit_c}->{eval_c}")
@@ -698,6 +736,39 @@ def _transfer_verdict(
                     extrapolated=bool(ex),
                 )
 
+        # §3b synthesis-order rules — gates for the RECIPE claim (spec §3b).
+        synthesis: dict = {}
+        if any(c in fit_corpora for c in SYNTH_FIT_CORPORA):
+            rules: dict[str, dict] = {}
+            for eval_c in EVAL_CORPORA:
+                d_uni = D.get(f"uni{eval_c}->{eval_c}", {}).get("mean")
+                d_bi = D.get(f"bi{eval_c}->{eval_c}", {}).get("mean")
+                if d_uni is None or d_bi is None:
+                    continue
+                shuf_cell = "shufcode->code" if eval_c == "code" else "null->wiki"
+                rules[eval_c] = dict(
+                    D_uni=d_uni,
+                    D_bi=d_bi,
+                    D_shuf=D.get(shuf_cell, {}).get("mean"),
+                    # rule (a): the sampled-unigram recipe transfers on E
+                    recipe_confirmed=bool(d_uni < 0.10),
+                    # rule (b): bigram closes >= half the unigram gap on E
+                    order2_earns_keep=bool((d_uni - d_bi) >= 0.5 * d_uni),
+                )
+            synthesis = dict(
+                rules=rules,
+                climb_to_order3=bool(
+                    rules and all(r["order2_earns_keep"] for r in rules.values())
+                ),
+                note=(
+                    "§3b pre-registered gates for the traffic-histogram RECIPE "
+                    "claim: uni_* is the recipe estimator, shuf_* its "
+                    "without-replacement control (D_shuf for wiki = the Stage-1 "
+                    "null->wiki cell); no higher orders unless order2_earns_keep "
+                    "on BOTH eval sides"
+                ),
+            )
+
         null_wiki = D.get("null->wiki", {}).get("mean")
         per_budget[f"{budget:g}"] = dict(
             cells=cells,
@@ -705,6 +776,7 @@ def _transfer_verdict(
             model_intrinsic_flag=bool(null_wiki is not None and null_wiki < 0.10),
             hybrid=hybrid,
             wcross=wcross,
+            synthesis=synthesis,
         )
 
     return dict(
