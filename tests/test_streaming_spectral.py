@@ -23,7 +23,7 @@ from bmx.cache.spectral import (
 )
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.streaming import StreamingQuantizedCache
-from tests.factories import ids, tiny_llama
+from tests.factories import ids, tiny_llama, tiny_qwen3
 
 
 def _fit_tiny_packs(model, path, budget=2.5, group=8):
@@ -42,10 +42,11 @@ def _fit_tiny_packs(model, path, budget=2.5, group=8):
     return bases
 
 
-def test_streaming_spectral_matches_reference(tmp_path):
+@pytest.mark.parametrize("factory", [tiny_llama, tiny_qwen3], ids=["llama", "qwen3"])
+def test_streaming_spectral_matches_reference(tmp_path, factory):
     """Streamed spectral quantization must equal offline spectral_quantize on the
     committed blocks (write-once parity — the K3 invariant)."""
-    model = tiny_llama()
+    model = factory()
     path = str(tmp_path / "packs.safetensors")
     _fit_tiny_packs(model, path)
     k_spec = CacheCodecSpec(
@@ -71,8 +72,9 @@ def test_streaming_spectral_matches_reference(tmp_path):
     assert 2.0 < bpe_k < 16.0  # payload + scale + pack charge at tiny S
 
 
-def test_streaming_spectral_requires_pre_rope(tmp_path):
-    model = tiny_llama()
+@pytest.mark.parametrize("factory", [tiny_llama, tiny_qwen3], ids=["llama", "qwen3"])
+def test_streaming_spectral_requires_pre_rope(tmp_path, factory):
+    model = factory()
     path = str(tmp_path / "packs.safetensors")
     _fit_tiny_packs(model, path)
     with pytest.raises(AssertionError, match="pre_rope"):
@@ -83,7 +85,10 @@ def test_streaming_spectral_requires_pre_rope(tmp_path):
         )
 
 
-def test_streaming_spectral_committed_block_matches_offline_and_frozen(tmp_path):
+@pytest.mark.parametrize("factory", [tiny_llama, tiny_qwen3], ids=["llama", "qwen3"])
+def test_streaming_spectral_committed_block_matches_offline_and_frozen(
+    tmp_path, factory
+):
     """Strongest available parity invariant (mirrors
     test_streaming_cache.test_each_token_quantized_once): reach into
     cache.layers[i]._q_prefix_k after a flush and check it is BYTE-IDENTICAL
@@ -95,7 +100,7 @@ def test_streaming_spectral_committed_block_matches_offline_and_frozen(tmp_path)
     from bmx.cache.rope import apply_rope, rope_cos_sin
     from bmx.cache.spectral import load_packs
 
-    model = tiny_llama()
+    model = factory()
     path = str(tmp_path / "packs.safetensors")
     _fit_tiny_packs(model, path, budget=2.5, group=8)
     k_spec = CacheCodecSpec(

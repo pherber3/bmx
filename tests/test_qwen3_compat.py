@@ -130,3 +130,103 @@ def test_packed_attach_hooks_k_norm_qwen3():
         assert len(sa.k_proj._forward_hooks) == 0
     finally:
         cache.detach()
+
+
+def test_streaming_k2b_qwen3():
+    """The proven k2b arm streams through a Qwen3 module tree: attach() hooks
+    fire, pages flush, bpe accounting is real (<16). Mirror the fixture pattern
+    of tests/test_streaming_cache.py::test_k2b_pre_rope_streams_token_by_token
+    (seq=150, recent_window=8 — read it first, copy its invariant exactly)."""
+    from bmx.cache.recipes import spec_pair
+    from bmx.cache.streaming import StreamingQuantizedCache
+
+    model = tiny_qwen3()
+    k_spec, v_spec = spec_pair("k2b", rank=4, group=8)
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(ids(seq=150), past_key_values=cache, use_cache=True)
+    bpe_k, bpe_v = cache.bits_per_entry()
+    assert bpe_k < 16.0 and bpe_v < 16.0  # at least one page actually flushed
+
+
+def test_generate_k4_qwen3(tmp_path):
+    """k4_b2.5 end-to-end (attach + hooks + spectral flush + greedy decode) on
+    Qwen3 — the exact recipe the VM probe runs."""
+    from bmx.cache.generate import generate_through_cache
+    from bmx.cache.recipes import spec_pair
+    from tests.test_streaming_spectral import _fit_tiny_packs
+
+    model = tiny_qwen3()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)  # budget=2.5, group=8
+
+    class _StubTok:
+        eos_token_id = None
+
+        def decode(self, t, skip_special_tokens=True):
+            return " ".join(map(str, t.tolist() if hasattr(t, "tolist") else t))
+
+    k_spec, v_spec = spec_pair("k4_b2.5", group=8, pack_path=path)
+    out = generate_through_cache(
+        model,
+        _StubTok(),
+        ids(seq=150),
+        n_prefill=128,
+        k_spec=k_spec,
+        v_spec=v_spec,
+        max_new_tokens=4,
+    )
+    assert isinstance(out, str) and out
+
+
+def test_generate_stops_on_any_eos_in_list():
+    """Qwen3's generation_config.eos_token_id is a LIST ([151645, 151643] on
+    the real model) — the decode loop must stop on ANY member. Pinned here on
+    tiny_qwen3 because Llama-3.1's list was the only case ever exercised.
+    Verified stop semantics (generate.py:105-113): the EOS token IS appended
+    to new_ids before the break, so the stub-decoded output has length 1 when
+    the first decode token is an eos member."""
+    from bmx.cache.generate import generate_through_cache
+    from bmx.cache.specs import CacheCodecSpec
+
+    class _StubTok:
+        eos_token_id = None
+
+        def decode(self, t, skip_special_tokens=True):
+            return " ".join(map(str, t.tolist() if hasattr(t, "tolist") else t))
+
+    model = tiny_qwen3()
+    fp16 = CacheCodecSpec(arm="fp16")
+    prompt = ids(seq=24)
+    # Probe: which token does greedy decode emit SECOND? (the first decode
+    # token is emitted before the loop's eos check ever runs — generate.py:103)
+    out = generate_through_cache(
+        model,
+        _StubTok(),
+        prompt,
+        n_prefill=12,
+        k_spec=fp16,
+        v_spec=fp16,
+        max_new_tokens=4,
+        strip=False,
+    )
+    toks = out.split()
+    assert len(toks) == 4  # no eos configured => full budget
+    second = int(toks[1])
+    # Re-run with an eos LIST containing that token (plus a never-emitted one):
+    model.generation_config.eos_token_id = [96, second]
+    out2 = generate_through_cache(
+        model,
+        _StubTok(),
+        prompt,
+        n_prefill=12,
+        k_spec=fp16,
+        v_spec=fp16,
+        max_new_tokens=4,
+        strip=False,
+    )
+    assert len(out2.split()) == 2  # stopped ON the second token, immediately
