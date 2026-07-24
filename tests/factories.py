@@ -6,7 +6,14 @@ in eval mode.
 """
 
 import torch
-from transformers import GPT2Config, GPT2LMHeadModel, LlamaConfig, LlamaForCausalLM
+from transformers import (
+    GPT2Config,
+    GPT2LMHeadModel,
+    LlamaConfig,
+    LlamaForCausalLM,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+)
 
 
 def tiny_gpt2():
@@ -47,6 +54,27 @@ def tiny_llama_d32():
     )
     torch.manual_seed(1)
     return LlamaForCausalLM(cfg).eval()
+
+
+def tiny_qwen3():
+    """Tiny Qwen3 mirroring tiny_llama's geometry — the second-model-family
+    fixture. Llama-style layer tree (model.model.layers[i].self_attn) PLUS
+    Qwen3's per-head q_norm/k_norm between projection and RoPE (qk-norm is
+    unconditional in Qwen3, so this factory exercises the k_norm capture path
+    by construction). head_dim=8 must be explicit: Qwen3Config's default is
+    128, decoupled from hidden_size // num_attention_heads."""
+    cfg = Qwen3Config(
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        hidden_size=32,
+        intermediate_size=64,
+        vocab_size=97,
+        head_dim=8,
+        max_position_embeddings=512,  # exceed the 128-token PAGE flush threshold
+    )
+    torch.manual_seed(3)
+    return Qwen3ForCausalLM(cfg).eval()
 
 
 def ids(vocab=97, seq=12, seed=42):
