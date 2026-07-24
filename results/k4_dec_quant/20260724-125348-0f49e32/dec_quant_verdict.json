@@ -1,0 +1,52 @@
+{
+  "headline_metric": "logit",
+  "gate_mode": "int8_t5",
+  "per_budget": {
+    "2.2": {
+      "win_fp32": 9.159771077154925,
+      "win_fp16": 9.158614025205337,
+      "win_int8": 7.925118153683329,
+      "rel_degradation_int8": 0.13468149963818932,
+      "rel_degradation_fp16_vs_fp32": 0.00012631887192837699,
+      "int8_win_at_own_bits": 8.632352281839816,
+      "gate_pass": true,
+      "gate_mode": "int8_t5",
+      "n_samples": 12,
+      "extrapolated": false,
+      "win_int8_t4": 9.13473056502048,
+      "rel_degradation_int8_t4": 0.00260775922198786,
+      "int8_t4_win_at_own_bits": 9.774248876369759,
+      "win_int8_t5": 9.112586210965127,
+      "rel_degradation_int8_t5": 0.0050256309648530895,
+      "int8_t5_win_at_own_bits": 9.845406628481514,
+      "win_int8_t6": 9.07709989772219,
+      "rel_degradation_int8_t6": 0.00890026888990103,
+      "int8_t6_win_at_own_bits": 9.860904428032423,
+      "ordering_ok": true
+    },
+    "2.5": {
+      "win_fp32": 8.64709544715088,
+      "win_fp16": 8.645913651059873,
+      "win_int8": 7.20405341712868,
+      "rel_degradation_int8": 0.16676782722141115,
+      "rel_degradation_fp16_vs_fp32": 0.00013666971739012546,
+      "int8_win_at_own_bits": 7.898340870808165,
+      "gate_pass": true,
+      "gate_mode": "int8_t5",
+      "n_samples": 12,
+      "extrapolated": false,
+      "win_int8_t4": 8.62426980136836,
+      "rel_degradation_int8_t4": 0.0025033617689276255,
+      "int8_t4_win_at_own_bits": 9.234390220056271,
+      "win_int8_t5": 8.59424852877116,
+      "rel_degradation_int8_t5": 0.005975669475068002,
+      "int8_t5_win_at_own_bits": 9.316088463758192,
+      "win_int8_t6": 8.548334278158334,
+      "rel_degradation_int8_t6": 0.011286184067958671,
+      "int8_t6_win_at_own_bits": 9.338974643031891,
+      "ordering_ok": true
+    }
+  },
+  "gate_pass": true,
+  "fp16_shippability_flag": false
+}

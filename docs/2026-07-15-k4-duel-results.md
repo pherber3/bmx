@@ -198,6 +198,21 @@ gate) it moves to ~5.2k, clearing the <8k target. The k3v2 crossover moves
 from ~61.8k (v1) to ~42.5k (v2) to ~21.4k (v2-int8). No quality number in
 §2 or §4 changed — this section is an accounting correction only.
 
+**Supersession (2026-07-24).** The `skeptic-v2-int8` column above assumed a
+BLANKET int8 decoder (8 bits for every used column). That variant was
+subsequently REJECTED by its own offline certificate (implied rel_deg up to
+54%, `docs/2026-07-24-k4-math-actions-results.md` §C) and by measurement
+(13.5%/16.7% vs the 5% gate); the certified+measured replacement is the
+tier-gated decoder (int8 only for columns with bits ≤ 5 — measured rel_deg
+0.50%/0.60%, PROMOTED). Under the certified mix (`mixed_dec_charge`,
+gpt2-measured frac_int8 band [0.893, 0.916] applied to the Llama C_used as
+a labeled estimate), the crossovers become: k4_b2.5 vs tq_b3 **~5.6k–5.7k**
+(< 8k target still cleared); vs tq_k3v2 **~23.1k–23.6k**. The blanket
+column stays above as the historical record. Exact Llama per-tier counts
+(collapsing the band to a point) ride the rotated-W refit — the fit-pack
+schema now records them. Full record:
+`docs/2026-07-25-k4-local-levers-results.md` §§1–2.
+
 ## 4. NIAH (real-text PG-essay, 4k–32k × 5 depths, recall_full /10)
 
 | arm | 4k | 8k | 16k | 32k | 64k | mean |

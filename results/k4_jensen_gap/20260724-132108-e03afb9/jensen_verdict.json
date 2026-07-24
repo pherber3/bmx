@@ -1,0 +1,29 @@
+{
+  "r_pred": 0.3652568954646782,
+  "per_budget": {
+    "2.2": {
+      "r_discrete": 0.7315150054938733,
+      "identity_check": 7.587001614094402,
+      "abs_gap": 0.36625811002919506,
+      "match": false
+    },
+    "2.5": {
+      "r_discrete": 0.7691761882947555,
+      "identity_check": 10.501003169289328,
+      "abs_gap": 0.4039192928300773,
+      "match": false
+    }
+  },
+  "match": false,
+  "flatness": {
+    "n_flat": 3,
+    "r_pred_at_n_flat": 0.40511725260556847,
+    "r_pred_at_all": 0.3652568954646782,
+    "delta": 0.03986035714089018
+  },
+  "mixed_domain": {
+    "mixed_r_pred": 0.23403796930205623,
+    "within_r_pred": 0.3652568954646782
+  },
+  "n_layers": 12
+}

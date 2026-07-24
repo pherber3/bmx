@@ -1,0 +1,30 @@
+{
+  "cache_paths": [
+    "results/cache/gpt2_1024.safetensors",
+    "results/cache/gpt2_1024_off1024.safetensors",
+    "results/cache/gpt2_1024_off2048.safetensors",
+    "results/cache/gpt2_1024_off3072.safetensors",
+    "results/cache/gpt2_1024_off4096.safetensors",
+    "results/cache/gpt2_1024_off5120.safetensors"
+  ],
+  "cache_paths_alt": [
+    "results/cache/gpt2_1024_code.safetensors",
+    "results/cache/gpt2_1024_code_off1024.safetensors",
+    "results/cache/gpt2_1024_code_off2048.safetensors",
+    "results/cache/gpt2_1024_code_off3072.safetensors",
+    "results/cache/gpt2_1024_code_off4096.safetensors",
+    "results/cache/gpt2_1024_code_off5120.safetensors"
+  ],
+  "model_label": "gpt2",
+  "model_name": "",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "w_source": "corpus",
+  "ridge": 0.001,
+  "position_stride": 8,
+  "n_flat": 3,
+  "seed": 0,
+  "out_root": ""
+}
