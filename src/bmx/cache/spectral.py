@@ -48,11 +48,17 @@ from safetensors.torch import load_file, save_file
 
 from bmx.cache.codecs import (
     allocate_bits_from_variance,
-    quantize_by_bits,
     scale_bits,
     tier_bits,
 )
 from bmx.cache.rope import _rotate_half
+from bmx.cache.triton_dequant_attention import (
+    pack_codes,
+    pack_signed_codes,
+    unpack_codes,
+    unpack_signed_codes,
+)
+from bmx.quant.rtn import rtn_dequantize_packed, rtn_quantize_packed
 
 
 def key_second_moment(M: torch.Tensor) -> torch.Tensor:
@@ -270,6 +276,100 @@ def spectral_payload_v1_bpe(pack: SpectralPack) -> float:
     return float(pack.bits.float().mean().item()) + scale_bits(pack.group)
 
 
+def tier_columns(bits: torch.Tensor) -> dict[int, torch.Tensor]:
+    """Ascending column indices per nonzero tier, `sorted(set(bits.tolist()))`
+    exactly as `quantize_by_bits` iterates — byte-for-byte the same loop.
+
+    This IS the sort-by-tier permutation: scattering into these columns at
+    dequant is its inverse. `spectral_quantize_packed`/`spectral_dequant_packed`
+    take this as an optional precomputed arg because the read path calls it
+    per committed page per decode step per layer; the layer computes it once.
+    """
+    cols_by_tier: dict[int, torch.Tensor] = {}
+    for b in sorted(set(int(x) for x in bits.tolist())):
+        if b == 0:
+            continue
+        cols_by_tier[b] = (bits == b).nonzero(as_tuple=True)[0]
+    return cols_by_tier
+
+
+_SUBBYTE_TIERS = frozenset({2, 4})  # offset-binary via pack_codes (exact width)
+_NIBBLE_TIERS = frozenset({3})  # signed nibbles via pack_signed_codes (4-bit container)
+
+
+def _pack_tier_codes(Q_int: torch.Tensor, b: int) -> torch.Tensor:
+    """Container policy for one tier's RTN integer codes (reuse-only, no new
+    bit-twiddling): tiers 2/4 offset to unsigned then `pack_codes` (exact
+    width); tier 3 signed nibbles via `pack_signed_codes`; tiers 5/6/8 stored
+    as the int8 container `rtn_quantize_packed` already produced."""
+    if b in _SUBBYTE_TIERS:
+        return pack_codes(Q_int.to(torch.int16) + 2 ** (b - 1), b)
+    if b in _NIBBLE_TIERS:
+        return pack_signed_codes(Q_int, b)
+    return Q_int  # int8 container (tiers 5, 6, 8)
+
+
+def _unpack_tier_codes(t: torch.Tensor, b: int, S: int) -> torch.Tensor:
+    """Exact inverse of `_pack_tier_codes`."""
+    if b in _SUBBYTE_TIERS:
+        return (unpack_codes(t, b, S) - 2 ** (b - 1)).to(torch.int8)
+    if b in _NIBBLE_TIERS:
+        return unpack_signed_codes(t, b, S)
+    return t
+
+
+def spectral_quantize_packed(
+    M: torch.Tensor,
+    pack: SpectralPack,
+    *,
+    mse_scale: bool = True,
+    cols_by_tier: dict[int, torch.Tensor] | None = None,
+) -> tuple[dict[str, torch.Tensor], float]:
+    """Packed-codec form of `spectral_quantize`: per-tier code containers +
+    fp32 group scales instead of a dequantized M_hat. Flat-key dict
+    `{f"t{b}_codes": container, f"t{b}_scale": fp32 (n_b, S//group, 1)}`.
+
+    Same enc matmul, same per-tier `rtn_quantize_packed` call, same tier
+    order as `quantize_by_bits` — `spectral_dequant_packed` is its exact
+    inverse (bitwise-equal to `spectral_quantize`'s M_hat by construction).
+    """
+    S, C = M.shape
+    assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
+    assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"
+    cols_by_tier = cols_by_tier if cols_by_tier is not None else tier_columns(pack.bits)
+    assert cols_by_tier, "pack allocates zero bits everywhere; nothing to store"
+    Y = M @ pack.enc.to(M.dtype)
+    packed: dict[str, torch.Tensor] = {}
+    for b, cols in cols_by_tier.items():
+        Q_int, scale = rtn_quantize_packed(
+            Y[:, cols].mT, b, pack.group, mse_scale=mse_scale
+        )
+        packed[f"t{b}_codes"] = _pack_tier_codes(Q_int, b)
+        packed[f"t{b}_scale"] = scale
+    return packed, spectral_payload_bpe(pack)
+
+
+def spectral_dequant_packed(
+    packed: dict[str, torch.Tensor],
+    pack: SpectralPack,
+    *,
+    cols_by_tier: dict[int, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Inverse of `spectral_quantize_packed`: fp32 `(S, C)` M_hat, bitwise-equal
+    to `spectral_quantize(M, pack)[0]`."""
+    cols_by_tier = cols_by_tier if cols_by_tier is not None else tier_columns(pack.bits)
+    first_b = next(iter(cols_by_tier))
+    S = packed[f"t{first_b}_scale"].shape[1] * pack.group  # scale is (n_b, S//group, 1)
+    C = pack.enc.shape[0]
+    Y_hat = torch.zeros(S, C, dtype=pack.dec.dtype, device=pack.dec.device)
+    for b, cols in cols_by_tier.items():
+        Q_int = _unpack_tier_codes(packed[f"t{b}_codes"], b, S)
+        Y_hat[:, cols] = rtn_dequantize_packed(
+            Q_int, packed[f"t{b}_scale"], pack.group
+        ).mT
+    return Y_hat @ pack.dec.mT
+
+
 def spectral_quantize(
     M: torch.Tensor, pack: SpectralPack, *, mse_scale: bool = True
 ) -> tuple[torch.Tensor, float]:
@@ -278,14 +378,18 @@ def spectral_quantize(
     bpe_model = spectral_payload_bpe(pack) (payload-v2 model-level accounting —
     the pack itself ships with the model). Add skeptic_charge(C, S, tiers) for
     the per-sequence-charged view.
+
+    Re-expressed as the composition `spectral_dequant_packed ∘
+    spectral_quantize_packed` — bitwise-neutral by construction (`rtn_quantize`
+    is literally `rtn_dequantize_packed(rtn_quantize_packed(...))`, so the
+    per-tier compose is the same enc/dec matmuls, same order, same
+    device/dtype as the direct `quantize_by_bits` path it replaces).
     """
     S, C = M.shape
     assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
     assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"
-    Y = M @ pack.enc.to(M.dtype)
-    Y_hat = quantize_by_bits(Y, pack.bits, pack.group, mse_scale=mse_scale)
-    M_hat = Y_hat @ pack.dec.mT.to(M.dtype)
-    bpe = spectral_payload_bpe(pack)
+    packed, bpe = spectral_quantize_packed(M, pack, mse_scale=mse_scale)
+    M_hat = spectral_dequant_packed(packed, pack)
     return M_hat, bpe
 
 

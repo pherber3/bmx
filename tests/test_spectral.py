@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from bmx.cache.codecs import scale_bits, tier_bits
@@ -344,3 +345,42 @@ def test_basis_alloc_moment_matches_projection_variance():
     assert lam.dtype == torch.float64 and lam.shape == (8,)
     assert torch.allclose(lam, ref, rtol=1e-10, atol=1e-12)
     assert (lam >= 0).all()
+
+
+@pytest.mark.parametrize("b", [2, 3, 4, 5, 6, 8])
+def test_tier_container_roundtrip(b):
+    from bmx.cache.spectral import _pack_tier_codes, _unpack_tier_codes
+
+    qmax = 2 ** (b - 1) - 1
+    codes = torch.randint(-qmax - 1, qmax + 1, (7, 128), dtype=torch.int8)
+    packed = _pack_tier_codes(codes, b)
+    assert packed.dtype in (torch.uint8, torch.int8)
+    assert torch.equal(_unpack_tier_codes(packed, b, 128), codes)
+
+
+def test_spectral_packed_bitwise_matches_spectral_quantize():
+    from bmx.cache.spectral import (
+        fit_spectral_basis,
+        identity_whitener,
+        pack_from_basis,
+        spectral_dequant_packed,
+        spectral_quantize,
+        spectral_quantize_packed,
+    )
+
+    C, S = 32, 128
+    Wh, Wh_inv = identity_whitener(C)
+    M, _ = _spiked_keys(S=S, C=C, seed=0)
+    basis = fit_spectral_basis(M, Wh, Wh_inv)
+    pack = pack_from_basis(basis, 2.5, group=16)
+    ref, ref_bpe = spectral_quantize(M, pack, mse_scale=True)
+    packed, bpe = spectral_quantize_packed(M, pack, mse_scale=True)
+    assert bpe == ref_bpe
+    # Container discipline (the T4 pin at codec level): codes uint8/int8, scales fp32.
+    for k, t in packed.items():
+        if k.endswith("_codes"):
+            assert t.dtype in (torch.uint8, torch.int8), (k, t.dtype)
+        else:
+            assert k.endswith("_scale") and t.dtype == torch.float32, (k, t.dtype)
+    M_hat = spectral_dequant_packed(packed, pack)
+    assert torch.equal(M_hat, ref)  # BITWISE — the codec-level parity anchor
