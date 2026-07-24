@@ -296,3 +296,89 @@ ONLY if H3 confirms here and there. **H3 did NOT confirm here** (hybrid
 recovery 0.42–0.57 < 0.9 at both budgets) — per the plan's stated
 condition, the LongBench-code probe cell is gated off pending the Llama
 replication's own H3 result; do not run it speculatively.
+
+## 8. Stage 2 — synthesis order (§3b addendum; run `20260723-220816-9d11538`, git SHA `9d11538`)
+
+Motivation: Stage 1 measured D(shuf_wiki→wiki) ≈ 9.4% — the unigram token
+histogram carries ~91% of the matched-fit win for English. Stage 2 asks
+whether the literal deployment recipe (SAMPLE a calibration stream from a
+traffic token histogram) works, on both domains, and whether order 2 buys
+anything (spec §3b). Five fit-side arms at matched budgets (4 × 1024 tokens,
+offsets 1024/2048/3072/4096; per-slice statistics; seed 20260723 for both
+shuffle and synthesis, generator seeded `20260723 + offset`); code source =
+the Stage-1 codeparrot fallback (identity with Stage-1 code windows). FULL
+matrix rerun — all Stage-1 and Stage-2 cells share this run-id; Stage-1 D
+cells reproduced against run `20260723-190823-8dced47` to < 1e-9 (Step-2
+check), so §§1–7 above stand unchanged.
+
+**YELLOW FLAG:** gpt2 scale = mechanism verdict only (corpus-W retention
+~0.47–0.52, `docs/2026-07-15-k4-duel-results.md`); Llama fit-side
+replication pre-registered.
+
+### 8.1 Synthesis-arm win matrix (win_mean, b2.2 / b2.5; gpt2 — see yellow flag)
+
+| fit arm \ eval | wiki-held | code-held |
+|---|---|---|
+| shuf_code | 5.270 / 4.985 | 15.411 / 14.033 |
+| uni_wiki | 8.623 / 8.113 | 7.636 / 7.287 |
+| uni_code | 5.085 / 4.810 | 15.019 / 13.635 |
+| bi_wiki | 9.619 / 9.075 | 7.132 / 6.822 |
+| bi_code | 5.260 / 4.958 | 16.934 / 15.351 |
+
+(Reference matched cells, §1: wiki→wiki 9.736/9.207, code→code 17.488/15.876.)
+
+### 8.2 Matched-side D + order-ladder rules (§3b; gpt2 — see yellow flag)
+
+| eval side | D_shuf (control) | D_uni (recipe) | D_bi | rule (a) D_uni<10% | rule (b) gap-closed ≥ ½ |
+|---|---|---|---|---|---|
+| wiki | 0.094 (Stage-1 null→wiki) | 0.112 / 0.116 (b2.2/b2.5) | 0.009 / 0.012 | fail | pass |
+| code | 0.116 / 0.114 (shufcode→code) | 0.140 / 0.140 (b2.2/b2.5) | 0.030 / 0.032 | fail | pass |
+
+climb_to_order3: true (rule b on BOTH sides — the ladder is climbed
+one measured rung at a time; no higher orders otherwise).
+
+The shuf-vs-uni gap isolates with-vs-without replacement at matched order-1
+statistics: on wiki, D_uni (0.112–0.116) sits 1.8–2.3 points above D_shuf
+(0.094) — sampling WITH replacement from the fit-slice histogram loses a
+small but consistent slice of win relative to a straight without-replacement
+permutation of the same tokens, at matched order-1 marginal statistics. On
+code the gap is similar in size (0.023–0.026 points, D_uni 0.140 vs D_shuf
+0.114–0.116) despite code's D_shuf already sitting above wiki's — the
+with-replacement sampling-noise cost is roughly constant in absolute D
+across both domains, not a code-specific problem.
+
+### 8.3 Recipe verdict (delete the branch the numbers kill, per rule per side)
+
+**(a) killed branch:** the sampled-unigram recipe fails for both wiki and
+code — D(uni→E) is 0.112–0.116 (wiki) and 0.140 (code), both ≥ 10% at both
+budgets, vs the shuf control at 0.094 (wiki) and 0.114–0.116 (code): shuf
+passes (< 10%, "insensitive"/"as-measured" band) where uni fails on wiki,
+and both sit in the same "as-measured" (10–25%) band on code but uni is
+still further from the 10% line than shuf — so the loss is the
+with-replacement sampling noise / multiset drift on top of the order
+statistics, not the order-1 marginal itself. The histogram recipe does not
+transfer at the literal-sampling level (order 1) on either side at gpt2
+mechanism scale; per-domain NATURAL calibration text remains the fallback
+UNLESS the bigram-order recipe below closes enough of the gap to serve as
+the floor instead (it does — see the earns-keep branch next).
+
+**(b) earns-keep branch:** order 2 closes 90.0–91.6% of the unigram gap on
+wiki and 77.3–78.3% on code (≥ ½ bar on both sides) — the bigram chain is
+the recipe floor there; order 3 is licensed for the ladder
+(`climb_to_order3: true`, both budgets) since rule (b) passes on both eval
+sides, not just one.
+
+### 8.4 VM rider
+
+If rule (a) confirms here, the pre-registered Llama A1/A2 replication
+carries the five synthesis arms (exact flags in
+`docs/superpowers/plans/2026-07-23-k4-synthesis-order.md`, VM NOTE). Rule
+(a) did NOT confirm here on either side (§8.3) — the literal
+sampled-unigram recipe is killed at gpt2 mechanism scale, so the histogram-
+only privacy claim (ship histograms, not texts) is not licensed by this
+result. Order 2 (bigram) earns its keep on both sides instead and licenses
+climbing to order 3 (`climb_to_order3: true`); the pre-registered VM rider's
+CONDITION was rule (a), not rule (b), so the synthesis arms do not
+automatically ride the Llama A1/A2 replication under this outcome — a
+bigram-recipe-specific VM extension would need its own pre-registration
+before running on Llama.
