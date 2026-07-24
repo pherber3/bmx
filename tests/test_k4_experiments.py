@@ -1120,3 +1120,104 @@ def test_plot_k4_paper_smoke(tmp_path):
     main(cfg)
     pdf_after = (out_dir / "k4_bits_vs_context.pdf").read_bytes()
     assert pdf_before == pdf_after
+
+
+def test_k4_charge_alloc_smoke(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from experiments.k4_charge_alloc import Config, main
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    scored = tmp_path / "s.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+    _tiny_cache(scored, seed=2)
+    cfg = Config(
+        corpus_cache_paths=(str(p1), str(p2)),
+        cache_paths=(str(scored),),
+        model_label="tiny",
+        plain_budgets=(1.5, 2.0, 2.5, 3.0),
+        ca_budgets=(2.0,),
+        s_refs=(256, 1024),  # tiny C=16: s = 16/16 + 16*16/256 = 2.0 at 256
+        eval_s=(256, 1024, 4096),
+        group=16,
+        out_root=str(tmp_path / "results"),
+    )
+    run_dir = main(cfg)
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert set(df.arm) == {"plain", "charge_aware"}
+    assert set(df[df.arm == "charge_aware"].s_ref) == {256, 1024}
+    assert (df[df.arm == "plain"].s_ref == -1).all()  # sentinel, like bits==-1
+
+    diag = pd.read_parquet(run_dir / "diagnostics.parquet")
+    assert {"c_used", "mean_bits"} <= set(diag.columns)
+    assert any(c.startswith("n_t") for c in diag.columns)  # tier histogram
+
+    fr = pd.read_parquet(run_dir / "frontier.parquet")
+    assert set(fr.s_eval) == {256, 1024, 4096}
+
+    v = json.loads((run_dir / "charge_alloc_verdict.json").read_text())
+    assert "a_gate_pass" in v and "honest_negative" in v and "rule" in v
+    e = v["per_point"]["b2_s256"]
+    for key in (
+        "win_ca",
+        "win_plain_at_matched_bpe",
+        "win_not_worse",
+        "bpe_ca",
+        "bpe_plain_at_matched_win",
+        "bits_saved_k_side",
+        "bits_saved_blended",
+    ):
+        assert key in e, key
+    # c_used diagnostic: charge-aware at the harshest s_ref uses no more
+    # directions than plain at the same budget (per-layer means).
+    cu_ca = diag[(diag.arm == "charge_aware") & (diag.s_ref == 256)].c_used.mean()
+    cu_pl = diag[(diag.arm == "plain") & (diag.budget == 2.0)].c_used.mean()
+    assert cu_ca <= cu_pl
+
+
+def test_k4_charge_alloc_verdict_arithmetic(tmp_path):
+    """Belt-and-braces regression pin (idiom of test_k4_charge_curve_smoke):
+    recompute one verdict entry's bpe_ca from the metrics rows + skeptic_charge
+    and assert the JSON carries exactly that number; bits_saved_blended must
+    be exactly half of bits_saved_k_side."""
+    import json
+
+    import pandas as pd
+
+    from bmx.cache.spectral import skeptic_charge
+    from experiments.k4_charge_alloc import Config, main
+
+    p1 = tmp_path / "a.safetensors"
+    scored = tmp_path / "s.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(scored, seed=2)
+    cfg = Config(
+        corpus_cache_paths=(str(p1),),
+        cache_paths=(str(scored),),
+        model_label="tiny",
+        plain_budgets=(1.5, 2.0, 2.5, 3.0),
+        ca_budgets=(2.0,),
+        s_refs=(256,),
+        eval_s=(256,),
+        group=16,
+        out_root=str(tmp_path / "results"),
+    )
+    run_dir = main(cfg)
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    v = json.loads((run_dir / "charge_alloc_verdict.json").read_text())
+    e = v["per_point"]["b2_s256"]
+    sub = df[(df.arm == "charge_aware") & (df.s_ref == 256)]
+    expected_bpe = (
+        sub.bpe_model
+        + sub.apply(
+            lambda r: skeptic_charge(
+                int(r.C), 256, tuple(cfg.tiers), c_used=float(r.c_used)
+            ),
+            axis=1,
+        )
+    ).mean()
+    assert abs(e["bpe_ca"] - float(expected_bpe)) < 1e-9
+    assert abs(e["bits_saved_blended"] - 0.5 * e["bits_saved_k_side"]) < 1e-12
