@@ -467,6 +467,92 @@ def basis_alloc_moment(basis: SpectralBasis, M_alloc: torch.Tensor) -> torch.Ten
     return torch.einsum("ci,cd,di->i", enc64, Sigma, enc64).clamp_min(0.0)
 
 
+def shrink_spectrum(
+    lam64: torch.Tensor,
+    *,
+    n: int,
+    method: str,
+    rows: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Eigenvalue shrinkage for the waterfill ALLOCATION INPUT (K4
+    estimation-levers Part 1, finding #7). Consumed via
+    `pack_from_basis(lam_alloc=shrink_spectrum(...)[0])`; changes no basis,
+    no stored lam, no accounting expression.
+
+    Sample eigenvalues at deployment aspect ratios (gamma = C/n ~ 0.1-0.75)
+    are spread vs the population spectrum (top biased up, bulk/tail biased
+    down). Both estimators below are a monotone affine map of the SAME
+    spectrum toward its own mean -- same eigenvectors, same basis:
+
+        lambda'_i = (1 - rho) * lambda_hat_i + rho * mu_hat,  mu_hat = mean(lambda_hat)
+
+    Returns (shrunk fp64 spectrum, same shape/order as lam64; rho in [0, 1]).
+
+    method="lw": Ledoit-Wolf (2004) linear shrinkage. Requires `rows`, the
+    (n, C) fp matrix the sample moment Sigma_hat = rows^T @ rows / n was
+    built from (index-aligned columns with lam64's directions -- callers
+    typically pass the eigenbasis-projected rows). Intensity:
+
+        d^2   = ||Sigma_hat - mu_hat*I||_F^2 = sum_i (lambda_hat_i - mu_hat)^2
+        bbar2 = min(d^2, (1/n^2) * sum_t ||x_t x_t^T - Sigma_hat||_F^2)
+        rho   = bbar2 / d^2                                   (in [0, 1] by the min)
+
+    The b-bar^2 sum is computed WITHOUT materializing per-row outer
+    products, via the trace identity (verified against the naive
+    double-loop form in tests/test_spectral.py):
+
+        ||x_t x_t^T - Sigma_hat||_F^2 = ||x_t||^4 - 2*x_t^T Sigma_hat x_t + ||Sigma_hat||_F^2
+        sum_t x_t^T Sigma_hat x_t     = tr(Sigma_hat * sum_t x_t x_t^T) = n * tr(Sigma_hat^2)
+        => sum_t ||x_t x_t^T - Sigma_hat||_F^2 = sum_t ||x_t||^4 - n * tr(Sigma_hat^2)
+
+    method="oas": Oracle-Approximating Shrinkage (Chen, Wiesel, Eldar &
+    Hero 2010), closed form from (lam64, n) alone -- no rows needed:
+
+        rho = min(1, [(1 - 2/C)*tr(Sigma_hat^2) + tr(Sigma_hat)^2]
+                     / [(n + 1 - 2/C)*(tr(Sigma_hat^2) - tr(Sigma_hat)^2/C)])
+
+    with tr(Sigma_hat) = sum(lambda_hat), tr(Sigma_hat^2) = sum(lambda_hat^2).
+    The denominator is <= 0 exactly when Sigma_hat is already proportional
+    to I (rank-1 spectrum spread == 0); guarded to rho = 1 (already at
+    target) rather than dividing.
+
+    Edge semantics: shrinkage LIFTS zero/clamped eigenvalues toward mu_hat
+    -- intended, since the tail bias is downward (sample tail eigenvalues
+    are the most under-estimated by the top/tail spreading effect).
+    """
+    assert method in ("lw", "oas"), f"method must be 'lw' or 'oas'; got {method!r}"
+    assert lam64.dtype == torch.float64, f"lam64 must be fp64; got {lam64.dtype}"
+    C = lam64.shape[0]
+    mu = lam64.mean()
+    d2 = float(((lam64 - mu) ** 2).sum())
+
+    if method == "lw":
+        assert rows is not None, "method='lw' requires rows (the (n, C) fit matrix)"
+        assert rows.shape == (n, C), f"rows shape {tuple(rows.shape)} != (n={n}, C={C})"
+        rows64 = rows.double()
+        Sigma = rows64.mT @ rows64 / n
+        trace_sigma_sq = float(
+            (Sigma * Sigma).sum()
+        )  # tr(Sigma^2) == ||Sigma||_F^2 (symmetric)
+        norm4_sum = float((rows64.pow(2).sum(dim=1) ** 2).sum())
+        num_sum = norm4_sum - n * trace_sigma_sq  # sum_t ||x_t x_t^T - Sigma||_F^2
+        bbar2 = min(d2, num_sum / (n**2))
+        rho = 1.0 if d2 == 0.0 else bbar2 / d2
+    else:
+        trace_sigma = float(lam64.sum())
+        trace_sigma_sq = float((lam64**2).sum())
+        num = (1.0 - 2.0 / C) * trace_sigma_sq + trace_sigma**2
+        den = (n + 1.0 - 2.0 / C) * (trace_sigma_sq - trace_sigma**2 / C)
+        rho = 1.0 if den <= 0.0 else min(1.0, num / den)
+
+    assert 0.0 <= rho <= 1.0, f"rho out of [0, 1]: {rho}"
+    shrunk = (1.0 - rho) * lam64 + rho * mu
+    assert (shrunk[lam64 > 0] > 0).all(), (
+        "shrinkage must preserve positivity where input > 0"
+    )
+    return shrunk, float(rho)
+
+
 def fit_spectral_pack(
     M_fit: torch.Tensor,
     Wh: torch.Tensor,

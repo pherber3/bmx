@@ -1002,3 +1002,236 @@ def test_jensen_gap_debiasing_equal_n_algebraic_identity():
     assert abs(report["r_pred_debiased"] - expected_r_pred_debiased) < 1e-9
     assert abs(report["bias_factor_seq"] - math.exp(b_seq)) < 1e-9
     assert abs(report["bias_factor_pool"] - math.exp(b_pool)) < 1e-9
+
+
+def _wishart_rows(
+    pop_spectrum: torch.Tensor, n: int, generator: torch.Generator
+) -> torch.Tensor:
+    """n iid rows ~ N(0, diag(pop_spectrum)), fp64."""
+    C = pop_spectrum.shape[0]
+    z = torch.randn(n, C, generator=generator, dtype=torch.float64)
+    return z * pop_spectrum.sqrt().unsqueeze(0)
+
+
+def test_shrink_spectrum_lw_reduces_mse_to_population():
+    """Wishart recovery: population = known decaying diag spectrum, n=64
+    Gaussian rows, C=32 (gamma=0.5, a real small-sample regime). Averaged
+    over 20 seeded trials, LW-shrunk spectrum has strictly smaller MSE to
+    the population spectrum than the raw sample spectrum."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C, n, trials = 32, 64, 20
+    pop = torch.logspace(2, -2, C, dtype=torch.float64)
+    raw_mse_total, lw_mse_total = 0.0, 0.0
+    for trial in range(trials):
+        g = torch.Generator().manual_seed(1000 + trial)
+        rows = _wishart_rows(pop, n, g)
+        Sigma = rows.mT @ rows / n
+        lam_raw = torch.linalg.eigvalsh(
+            Sigma
+        )  # ascending, matches population sort order
+        lam_shrunk, rho = shrink_spectrum(lam_raw, n=n, method="lw", rows=rows)
+        assert 0.0 <= rho <= 1.0
+        pop_sorted = pop.sort().values
+        raw_mse_total += float(((lam_raw - pop_sorted) ** 2).mean())
+        lw_mse_total += float(((lam_shrunk - pop_sorted) ** 2).mean())
+    assert lw_mse_total < raw_mse_total, (
+        f"LW mean MSE {lw_mse_total / trials:.6g} must beat raw {raw_mse_total / trials:.6g}"
+    )
+
+
+def test_shrink_spectrum_oas_reduces_mse_to_population():
+    """Same Wishart-recovery property for OAS (spectrum-only, no rows)."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C, n, trials = 32, 64, 20
+    pop = torch.logspace(2, -2, C, dtype=torch.float64)
+    raw_mse_total, oas_mse_total = 0.0, 0.0
+    for trial in range(trials):
+        g = torch.Generator().manual_seed(2000 + trial)
+        rows = _wishart_rows(pop, n, g)
+        Sigma = rows.mT @ rows / n
+        lam_raw = torch.linalg.eigvalsh(Sigma)
+        lam_shrunk, rho = shrink_spectrum(lam_raw, n=n, method="oas")
+        assert 0.0 <= rho <= 1.0
+        pop_sorted = pop.sort().values
+        raw_mse_total += float(((lam_raw - pop_sorted) ** 2).mean())
+        oas_mse_total += float(((lam_shrunk - pop_sorted) ** 2).mean())
+    assert oas_mse_total < raw_mse_total, (
+        f"OAS mean MSE {oas_mse_total / trials:.6g} must beat raw {raw_mse_total / trials:.6g}"
+    )
+
+
+def test_shrink_spectrum_large_n_rho_small_and_shrunk_near_raw():
+    """n = 200*C: the estimate is precise, both methods must report a small
+    intensity. "Near raw" is checked via the exact affine map (not a
+    tolerance-based allclose): the spectrum spans 4 decades here, so even a
+    tiny rho produces a large RELATIVE shift on the smallest eigenvalues
+    (they get pulled toward mu_hat, which is order-of-magnitude larger) --
+    that is correct shrinkage behavior, not a bug. The exact-formula check
+    is scale-independent and pins the map itself."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C = 16
+    n = 200 * C
+    pop = torch.logspace(2, -2, C, dtype=torch.float64)
+    g = torch.Generator().manual_seed(3)
+    rows = _wishart_rows(pop, n, g)
+    Sigma = rows.mT @ rows / n
+    lam_raw = torch.linalg.eigvalsh(Sigma)
+    mu = lam_raw.mean()
+
+    lam_lw, rho_lw = shrink_spectrum(lam_raw, n=n, method="lw", rows=rows)
+    assert rho_lw < 0.05
+    assert torch.allclose(lam_lw, (1.0 - rho_lw) * lam_raw + rho_lw * mu, rtol=1e-9)
+
+    lam_oas, rho_oas = shrink_spectrum(lam_raw, n=n, method="oas")
+    assert rho_oas < 0.05
+    assert torch.allclose(lam_oas, (1.0 - rho_oas) * lam_raw + rho_oas * mu, rtol=1e-9)
+
+
+def test_shrink_spectrum_rho_monotone_in_gamma():
+    """Same population spectrum, matched-seed sampling: shrinkage intensity
+    rho must be LARGER at small n (near-degenerate, big gamma=C/n) than at
+    large n, for both LW and OAS. Monotone-in-gamma sanity, not a fixed
+    numeric bound."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C = 16
+    pop = torch.logspace(2, -2, C, dtype=torch.float64)
+
+    g_small = torch.Generator().manual_seed(4)
+    rows_small = _wishart_rows(pop, 48, g_small)
+    Sigma_small = rows_small.mT @ rows_small / 48
+    lam_small = torch.linalg.eigvalsh(Sigma_small)
+
+    g_large = torch.Generator().manual_seed(4)
+    rows_large = _wishart_rows(pop, 2048, g_large)
+    Sigma_large = rows_large.mT @ rows_large / 2048
+    lam_large = torch.linalg.eigvalsh(Sigma_large)
+
+    _, rho_lw_small = shrink_spectrum(lam_small, n=48, method="lw", rows=rows_small)
+    _, rho_lw_large = shrink_spectrum(lam_large, n=2048, method="lw", rows=rows_large)
+    assert rho_lw_small > rho_lw_large
+
+    _, rho_oas_small = shrink_spectrum(lam_small, n=48, method="oas")
+    _, rho_oas_large = shrink_spectrum(lam_large, n=2048, method="oas")
+    assert rho_oas_small > rho_oas_large
+
+
+def test_shrink_spectrum_lw_trace_trick_matches_naive_double_loop():
+    """Pins the algebra: the trace-trick LW numerator must equal the naive
+    per-row-outer-product double loop, on a tiny case (C=8, n=16), to 1e-10.
+    Both derivations are computed independently here (not by calling
+    shrink_spectrum's internals), then checked against the same rho it
+    returns."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C, n = 8, 16
+    g = torch.Generator().manual_seed(5)
+    rows = torch.randn(n, C, generator=g, dtype=torch.float64)
+    Sigma = rows.mT @ rows / n
+    lam = torch.linalg.eigvalsh(Sigma)
+    mu = lam.mean()
+
+    d2 = float(((lam - mu) ** 2).sum())
+
+    # Naive double loop: sum_t || x_t x_t^T - Sigma ||_F^2 / n^2.
+    naive_sum = 0.0
+    for t in range(n):
+        x_t = rows[t]
+        outer = torch.outer(x_t, x_t)
+        naive_sum += float(((outer - Sigma) ** 2).sum())
+    naive_bbar2 = min(d2, naive_sum / (n**2))
+    naive_rho = naive_bbar2 / d2
+
+    # Trace-trick form, independently re-derived here (not shrink_spectrum's code):
+    # sum_t ||x_t x_t^T - Sigma||_F^2 = sum_t ||x_t||^4 - n*tr(Sigma^2).
+    norm4_sum = float((rows.pow(2).sum(dim=1) ** 2).sum())
+    trace_sq = float((Sigma * Sigma).sum())  # tr(Sigma^2) == ||Sigma||_F^2 (symmetric)
+    trace_sum = norm4_sum - n * trace_sq
+    trace_bbar2 = min(d2, trace_sum / (n**2))
+    trace_rho = trace_bbar2 / d2
+
+    assert abs(trace_sum - naive_sum) < 1e-10 * max(1.0, abs(naive_sum))
+    assert abs(trace_rho - naive_rho) < 1e-10
+
+    _, rho = shrink_spectrum(lam, n=n, method="lw", rows=rows)
+    assert abs(rho - naive_rho) < 1e-10
+
+
+def test_shrink_spectrum_order_and_positivity_preserved():
+    """The shrink map is affine per-entry toward mu: order (sortedness) and
+    positivity of the input spectrum are preserved in the output."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C, n = 12, 40
+    g = torch.Generator().manual_seed(6)
+    rows = torch.randn(n, C, generator=g, dtype=torch.float64)
+    Sigma = rows.mT @ rows / n
+    lam = torch.linalg.eigvalsh(Sigma)  # ascending, all > 0 a.s.
+    assert (lam > 0).all()
+
+    lam_lw, _ = shrink_spectrum(lam, n=n, method="lw", rows=rows)
+    assert (lam_lw[1:] >= lam_lw[:-1] - 1e-12).all(), "order must be preserved"
+    assert (lam_lw > 0).all(), "positivity must be preserved"
+
+    lam_oas, _ = shrink_spectrum(lam, n=n, method="oas")
+    assert (lam_oas[1:] >= lam_oas[:-1] - 1e-12).all()
+    assert (lam_oas > 0).all()
+
+
+def test_shrink_spectrum_preserves_mean():
+    """The affine shrink map lambda' = (1-rho)*lambda + rho*mu preserves the
+    mean of the spectrum exactly, for any rho in [0, 1] (mean of a constant
+    shift toward the mean is a no-op on the mean)."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C, n = 20, 30
+    g = torch.Generator().manual_seed(7)
+    rows = torch.randn(n, C, generator=g, dtype=torch.float64)
+    Sigma = rows.mT @ rows / n
+    lam = torch.linalg.eigvalsh(Sigma)
+
+    lam_lw, _ = shrink_spectrum(lam, n=n, method="lw", rows=rows)
+    assert abs(float(lam_lw.mean()) - float(lam.mean())) < 1e-12
+
+    lam_oas, _ = shrink_spectrum(lam, n=n, method="oas")
+    assert abs(float(lam_oas.mean()) - float(lam.mean())) < 1e-12
+
+
+def test_shrink_spectrum_zero_d2_forces_rho_one():
+    """Degenerate case: Sigma already proportional to I (d^2 == 0) forces
+    rho = 1 exactly (already at target; also guards a 0/0 division)."""
+    from bmx.cache.spectral import shrink_spectrum
+
+    C = 8
+    lam = torch.full((C,), 3.0, dtype=torch.float64)
+    # Construct rows (n=C) whose sample covariance rows^T @ rows / n is
+    # exactly 3*I: a diagonal design with entries sqrt(3*C).
+    rows = torch.zeros(C, C, dtype=torch.float64)
+    rows[range(C), range(C)] = (3.0 * C) ** 0.5
+    Sigma_check = rows.mT @ rows / C
+    assert torch.allclose(Sigma_check, 3.0 * torch.eye(C, dtype=torch.float64))
+
+    lam_lw, rho_lw = shrink_spectrum(lam, n=C, method="lw", rows=rows)
+    assert rho_lw == 1.0
+    assert torch.allclose(lam_lw, lam)
+
+    lam_oas, rho_oas = shrink_spectrum(lam, n=100, method="oas")
+    assert rho_oas == 1.0
+    assert torch.allclose(lam_oas, lam)
+
+
+def test_shrink_spectrum_rejects_bad_method_and_missing_rows():
+    from bmx.cache.spectral import shrink_spectrum
+
+    lam = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+    with pytest.raises(AssertionError):
+        shrink_spectrum(lam, n=10, method="bogus")
+    with pytest.raises(AssertionError):
+        shrink_spectrum(lam, n=10, method="lw")  # rows required
+    with pytest.raises(AssertionError):
+        shrink_spectrum(
+            lam, n=10, method="lw", rows=torch.randn(10, 5)
+        )  # shape mismatch
