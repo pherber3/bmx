@@ -825,3 +825,16 @@ def test_k4_corpus_transfer_overlap_row_pinned_to_dec(tmp_path):
         f"overlap.parquet wiki-code layer={layer_i} rank={r}: {got} != "
         f"dec-derived expected {expected}"
     )
+
+    # Power check: the enc-derived alternative must differ meaningfully from
+    # the dec-derived expected value (measured gap ~0.021 on this fixture), or
+    # a future fixture change could silently defang this pin against the
+    # dec->enc mutant at the actual _diagnostics call sites.
+    Q_a_enc = orthogonalize(fit_wiki.bases[layer_i].enc[:, :r].double())
+    Q_b_enc = orthogonalize(fit_code.bases[layer_i].enc[:, :r].double())
+    svals_enc = torch.linalg.svdvals(Q_a_enc.mT @ Q_b_enc)
+    enc_val = float((svals_enc**2).mean())
+    assert abs(enc_val - expected) > 0.005, (
+        f"enc-derived value {enc_val} too close to dec-derived expected "
+        f"{expected} -- fixture doesn't discriminate the dec->enc mutant"
+    )

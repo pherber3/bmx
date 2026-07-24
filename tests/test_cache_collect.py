@@ -422,6 +422,57 @@ def test_load_eval_tokens_does_not_touch_rows_past_needed_prefix(monkeypatch):
     assert got.shape == (8,)
 
 
+class _FakeHFDataset:
+    """A fake mimicking the real HF Dataset access pattern: len(ds) is cheap
+    metadata, column_names is cheap metadata, and the text column is only
+    reachable via .select(range(k))[text_field] — no whole-column getitem.
+    Records the max row index any .select call ever requested, so the test
+    can assert the production code only ever asks for a row-bounded prefix,
+    not len(ds) rows."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.column_names = ["text"]
+        self.max_selected = -1
+
+    def __len__(self):
+        return len(self._rows)
+
+    def select(self, indices):
+        indices = list(indices)
+        if indices:
+            self.max_selected = max(self.max_selected, max(indices))
+        return {"text": [self._rows[i] for i in indices]}
+
+
+def test_load_eval_tokens_select_bounded_to_needed_prefix(monkeypatch):
+    """With a real-Dataset-shaped fake (.select-based access, no whole-column
+    getitem), the max row index ever passed to .select must stay far below
+    len(ds) for a small n_tokens request — proving the row-bounded .select
+    path is actually used, not just tolerated."""
+    import bmx.eval.layer_swap as ls
+
+    n_rows = 10_000
+    ds = _FakeHFDataset(
+        [f"row {i:05d} padded to forty characters!!" for i in range(n_rows)]
+    )
+    monkeypatch.setattr("datasets.load_dataset", lambda *a, **k: ds, raising=False)
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda *a, **k: _char_proportional_tokenizer(),
+    )
+
+    got = ls.load_eval_tokens("gpt2", n_tokens=8, token_offset=0)
+    assert got.shape == (8,)
+    assert ds.max_selected >= 0, "select() was never called"
+    # need_chars = 8*16=128 over 40-char rows needs ~4 rows; generous headroom
+    # well short of the full 10,000-row column.
+    assert ds.max_selected < 50, (
+        f"max_selected={ds.max_selected} materialized far more rows than the "
+        "needed prefix"
+    )
+
+
 def test_load_eval_tokens_capped_accumulation_matches_full_join(monkeypatch):
     """~10 short rows, sufficient margin on the first pass: capped
     accumulation must equal the old full-join result exactly."""
@@ -508,3 +559,29 @@ def test_collect_cache_out_path_and_corpus_guard():
     assert _out_path(
         Config(model_name="gpt2", seq_len=1024, out="x/y.safetensors")
     ) == Path("x/y.safetensors")
+
+
+def test_collect_cache_main_guard_raises_before_model_load(monkeypatch):
+    """Non-default corpus knobs without --corpus-label must raise
+    AssertionError, and must do so BEFORE any model load. Monkeypatch the
+    model loader to fail loudly if called, so the test pins the ordering
+    (guard-then-load), not just the guard's existence."""
+    from experiments.collect_cache import Config, main
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("model loader was called — guard did not fire first")
+
+    monkeypatch.setattr(
+        "transformers.AutoModelForCausalLM.from_pretrained", _fail_if_called
+    )
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", _fail_if_called)
+    monkeypatch.setattr("datasets.load_dataset", _fail_if_called, raising=False)
+
+    cfg = Config(
+        model_name="gpt2",
+        seq_len=1024,
+        dataset_id="bigcode/the-stack-smol",
+        corpus_label="",  # missing on purpose: dataset_id is non-default
+    )
+    with pytest.raises(AssertionError, match="corpus-label"):
+        main(cfg)

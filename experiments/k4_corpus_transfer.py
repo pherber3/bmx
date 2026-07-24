@@ -63,6 +63,10 @@ _WCROSS_CELLS = (("wiki", "code"), ("code", "wiki"))
 _PAIRS = (("wiki", "code"), ("wiki", "null"), ("code", "null"))
 
 
+def _cache_label(path: str) -> str:
+    return path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
 def _rank_overlap(dec_a: torch.Tensor, dec_b: torch.Tensor, r: int) -> float:
     """Mean squared principal cosine between the top-r reconstruction
     subspaces span(dec[:, :r]) of two fits, in [0, 1]."""
@@ -78,8 +82,6 @@ def _proxy_distortion(lam64: torch.Tensor, bits: torch.Tensor) -> float:
 def _diagnostics(
     fits: dict[str, CorpusFit], layers: list[int], cfg: Config
 ) -> pd.DataFrame:
-    from bmx.cache.spectral import fit_spectral_basis
-
     rows: list[dict] = []
 
     def emit(**kw):
@@ -327,7 +329,7 @@ def main(cfg: Config):
     any_rope_ready = False
     for eval_c, paths in eval_paths.items():
         for path in paths:
-            label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            label = _cache_label(path)
             layer_keys = load_layer_keys(path)
             assert sorted(layer_keys.keys()) == layers, (
                 f"eval cache {label} layer set mismatch"
@@ -462,7 +464,7 @@ def main(cfg: Config):
                 )
                 for eval_c, paths in eval_paths.items():
                     for path in paths:
-                        label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                        label = _cache_label(path)
                         score_pack(
                             pack,
                             eval_c,
@@ -490,7 +492,7 @@ def main(cfg: Config):
                     lam_alloc=lam_alloc,
                 )
                 for path in eval_paths[alloc_c]:
-                    label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                    label = _cache_label(path)
                     score_pack(
                         pack,
                         alloc_c,
@@ -514,7 +516,7 @@ def main(cfg: Config):
                 )
                 for eval_c, paths in eval_paths.items():
                     for path in paths:
-                        label = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                        label = _cache_label(path)
                         score_pack(
                             pack,
                             eval_c,
