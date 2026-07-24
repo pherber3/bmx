@@ -59,18 +59,27 @@ def _next_capacity(need: int, have: int) -> int:
     return cap
 
 
-# Process-shared growing RoPE tables, keyed by (device, rope-relevant config params).
-# Every PackedStreamingLayer of every cache on the same model config reads the SAME
-# fp16 (max_S, d) cos/sin pair — previously each of the 32 layers grew its own copy
-# (memory-ledger probe 2026-07-06: ~0.5 GiB duplicated per cache at 32k). Two configs
-# with identical rope params colliding is harmless: the tables are identical by
-# construction (rope_cos_sin derives them from exactly these params).
+# Process-shared growing RoPE tables, keyed by (device, dtype, rope-relevant config
+# params). Every PackedStreamingLayer of every cache on the same model config +
+# dtype reads the SAME (max_S, d) cos/sin pair — previously each of the 32 layers
+# grew its own copy (memory-ledger probe 2026-07-06: ~0.5 GiB duplicated per cache
+# at 32k). Two configs with identical rope params colliding is harmless: the tables
+# are identical by construction (rope_cos_sin derives them from exactly these
+# params). dtype joins the key (not just fp16): spectral layers request fp32
+# (self._rope_dtype) because committed-block BITWISE parity with streaming's
+# frozen prefix is only reachable if the packed read replays streaming's exact
+# fp32-RoPE-then-fp16-cast op order (fp16 tables, or rope-after-fp16-cast, both
+# break it) — everything else keeps fp16 (byte-identical behavior, unchanged
+# policy). Cost: one shared fp32 pair per process, ~134 MB at 128k (vs 67 MB
+# fp16) — still the shared design that killed the 0.5 GiB/cache duplication, and
+# only paid when a spectral cache exists.
 _ROPE_SHARED: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-def _rope_key(config, device: torch.device) -> tuple:
+def _rope_key(config, device: torch.device, dtype: torch.dtype) -> tuple:
     return (
         str(device),
+        str(dtype),
         float(getattr(config, "rope_theta", 10000.0)),
         int(getattr(config, "head_dim", 0) or 0),
         int(getattr(config, "hidden_size", 0)),
@@ -80,17 +89,21 @@ def _rope_key(config, device: torch.device) -> tuple:
 
 
 def _shared_rope(
-    config, upto: int, device: torch.device
+    config, upto: int, device: torch.device, dtype: torch.dtype = torch.float16
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return shared fp16 cos/sin tables covering positions [0, upto), growing once."""
-    key = _rope_key(config, device)
+    """Return shared cos/sin tables (in `dtype`) covering positions [0, upto).
+
+    Grows once per (device, dtype, config) key. Default fp16 (the cache compute
+    dtype, unchanged policy); spectral layers pass dtype=torch.float32.
+    """
+    key = _rope_key(config, device, dtype)
     cos, sin = _ROPE_SHARED.get(key, (None, None))
     covered = 0 if cos is None else cos.shape[0]
     if upto > covered:
         nc, ns = rope_cos_sin(config, upto - covered, start=covered, device=device)
-        # Cast once at grow-time to the cache compute dtype (fp16), so the decode
-        # loop doesn't re-cast the slice every block (unchanged policy).
-        nc, ns = nc.to(torch.float16), ns.to(torch.float16)
+        # Cast once at grow-time to `dtype`, so the decode loop doesn't re-cast
+        # the slice every block (unchanged policy).
+        nc, ns = nc.to(dtype), ns.to(dtype)
         cos = nc if cos is None else torch.cat([cos, nc], dim=0)
         sin = ns if sin is None else torch.cat([sin, ns], dim=0)
         _ROPE_SHARED[key] = (cos, sin)
@@ -327,6 +340,11 @@ class PackedStreamingLayer(DynamicLayer):
         self._tier_cols: dict[int, torch.Tensor] | None = (
             tier_columns(pack.bits) if pack is not None else None
         )
+        # RoPE table dtype for this layer's shared table (_shared_rope's dtype-in-
+        # key design): spectral K requests fp32 (committed-block bitwise parity —
+        # see _shared_rope's module-level comment); every other arm keeps fp16
+        # (byte-identical behavior, unchanged policy).
+        self._rope_dtype = torch.float32 if pack is not None else torch.float16
         # W5-2: pack the k2b stacked V indices 4-codes/byte (uint8) instead of
         # int16. Flag-gated, default OFF everywhere -- flips only on GH200
         # oracle evidence (see triton_dequant_attention.build_kv_stacked_k2b /
@@ -426,15 +444,17 @@ class PackedStreamingLayer(DynamicLayer):
     def _extend_rope(self, new_committed: int, device: torch.device) -> None:
         """Point this layer at the process-shared RoPE table covering [0, new_committed).
 
-        The tables are identical for every layer (same config, same positions), and
-        were previously grown PER LAYER — ~0.5 GiB of duplicated fp16 tables per
-        32-layer cache at 32k ctx, ~2.1 GiB at 128k (memory-ledger probe,
-        2026-07-06). One shared grower per (device, rope-params) now serves all
-        layers of all caches on the same model config; layers rebind on every call
-        because a grow reallocates (torch.cat) the shared tensors.
+        The tables are identical for every layer of the same dtype (same config,
+        same positions), and were previously grown PER LAYER — ~0.5 GiB of
+        duplicated fp16 tables per 32-layer cache at 32k ctx, ~2.1 GiB at 128k
+        (memory-ledger probe, 2026-07-06). One shared grower per (device, dtype,
+        rope-params) now serves all layers of all caches on the same model config
+        + dtype; layers rebind on every call because a grow reallocates
+        (torch.cat) the shared tensors. dtype is self._rope_dtype (fp32 for
+        spectral, fp16 otherwise — see its init-time comment).
         """
         self._rope_cos, self._rope_sin = _shared_rope(
-            self.model_config, new_committed, device
+            self.model_config, new_committed, device, dtype=self._rope_dtype
         )
 
     def _pack_k_block(
@@ -943,14 +963,25 @@ class PackedStreamingLayer(DynamicLayer):
             # fused decode kernels — other arms (e.g. turboquant_mse full-C) land
             # here BY DESIGN. Warn once so a benchmark can't silently attribute
             # this cost to the Triton path (2026-07-04 desk review, finding F0).
-            warnings.warn(
-                f"PackedStreamingCache decode falling back to chunked dequant on "
-                f"CUDA for arms K={self.k_spec.arm!r}/V={self.v_spec.arm!r} — no "
-                f"fused kernel covers this pair; expect ~30-70x slower decode than "
-                f"StreamingQuantizedCache. Use use_packed only with rtn_token or "
-                f"k2b_ph arms, or accept the cost knowingly.",
-                stacklevel=2,
-            )
+            # Split the message so benchmarks can't misattribute cost: spectral
+            # decode ALWAYS runs chunked (Phase A resident-memory path, no fused
+            # spectral kernel exists) — that is by design, not a misrouted arm.
+            if self.k_spec.arm == "spectral":
+                warnings.warn(
+                    "PackedStreamingCache spectral decode runs the CHUNKED path "
+                    "BY DESIGN (Phase A resident-memory path, no fused spectral "
+                    "kernel); expect chunked-class decode latency.",
+                    stacklevel=2,
+                )
+            else:
+                warnings.warn(
+                    f"PackedStreamingCache decode falling back to chunked dequant on "
+                    f"CUDA for arms K={self.k_spec.arm!r}/V={self.v_spec.arm!r} — no "
+                    f"fused kernel covers this pair; expect ~30-70x slower decode than "
+                    f"StreamingQuantizedCache. Use use_packed only with rtn_token or "
+                    f"k2b_ph arms, or accept the cost knowingly.",
+                    stacklevel=2,
+                )
         return chunked_dequant_attention(
             q,
             self._k_blocks,
@@ -970,6 +1001,7 @@ class PackedStreamingLayer(DynamicLayer):
             v_group=self.v_spec.group,
             v_seed=self.v_spec.seed,
             attn_mask=attention_mask,
+            k_pack=self._pack,
         )
 
 

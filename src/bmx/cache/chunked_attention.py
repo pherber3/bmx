@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from bmx.cache.codecs import dequant_packed
 from bmx.cache.collect import from_matrix
 from bmx.cache.rope import apply_rope
+from bmx.cache.spectral import SpectralPack, spectral_dequant_packed
 from bmx.cache.triton_dequant_attention import block_k_res, block_v_indices
 
 
@@ -48,7 +49,7 @@ def attention_diff(a: torch.Tensor, b: torch.Tensor) -> dict:
     }
 
 
-def _dequant_block(packed, arm, group, seed, h_kv):
+def _dequant_block(packed, arm, group, seed, h_kv, pack: SpectralPack | None = None):
     """packed dict -> (h_kv, blk, d) dense, matching to_matrix layout.
 
     W5-2 pack_v interaction: a k2b V block dict that has been re-pointed under
@@ -58,7 +59,11 @@ def _dequant_block(packed, arm, group, seed, h_kv):
     (codecs.py) is arm-generic and always reads "indices" by key, so route
     through block_v_indices here (the one place that knows both
     representations) to transiently materialize int16 indices before handing
-    the dict to dequant_packed -- codecs.py itself is untouched.
+    the dict to dequant_packed -- codecs.py itself is untouched. This container
+    discipline applies to both "turboquant_mse" and "turboquant_mse_perhead" --
+    the spectral K write path (_pack_v_block) sub-byte-packs V's "indices"
+    whenever K is spectral, regardless of which turboquant_mse* arm V uses.
+    Transient only -- never stored back onto packed (the block_v_indices contract).
 
     W5-3 pack_k interaction: same pattern, K side. A lowrank_rtn_channel K block
     dict re-pointed under pack_k=True (_repoint_k2b_blocks) no longer holds
@@ -67,16 +72,36 @@ def _dequant_block(packed, arm, group, seed, h_kv):
     residual bit-width, stashed at repoint time since -- unlike V's turboquant
     dict -- the lowrank_rtn_channel dict has no native "bits" key to read).
     Route through block_k_res to transiently materialize int8 codes.
+
+    arm == "spectral": dequant via spectral_dequant_packed (Task 1), the
+    corpus-fit-pack inverse of PackedStreamingLayer._pack_k_block's
+    spectral_quantize_packed. Returns fp32 (spectral_dequant_packed's native
+    output dtype) -- RoPE-at-read (chunked_dequant_attention's decode-loop
+    order branch) needs fp32 K for committed-block bitwise parity with
+    streaming's fp32-RoPE-then-fp16-cast order; callers that need fp16 cast
+    explicitly after RoPE, not here.
     """
+    if arm == "spectral":
+        assert pack is not None, (
+            "_dequant_block(arm='spectral', ...) requires pack= (the corpus-fit "
+            "SpectralPack); it is threaded from PackedStreamingLayer._pack via "
+            "chunked_dequant_attention's k_pack kwarg."
+        )
+        M = spectral_dequant_packed(packed, pack)
+        return from_matrix(M, h_kv)
     if (
-        arm == "turboquant_mse_perhead"
+        arm in ("turboquant_mse", "turboquant_mse_perhead")
         and "indices" not in packed
         and "indices_packed" in packed
     ):
         vbits = packed["bits"]
         per_byte = 8 // vbits
         C = packed["indices_packed"].shape[-1] * per_byte
-        packed = {**packed, "indices": block_v_indices(packed, vbits, C)}
+        packed = {
+            **packed,
+            "indices": block_v_indices(packed, vbits, C),
+            "norms": packed["norms"].float(),
+        }
     if (
         arm == "lowrank_rtn_channel"
         and "res_Q_int" not in packed
@@ -96,11 +121,21 @@ def _dequant_block(packed, arm, group, seed, h_kv):
     return from_matrix(M, h_kv)
 
 
-def _dense_kv(blocks, arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin):
-    """Dequant all blocks to one dense (h_kv, S_committed, d), RoPE-at-read for K."""
+def _dense_kv(
+    blocks, arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin, pack=None
+):
+    """Dequant all blocks to one dense (h_kv, S_committed, d), RoPE-at-read for K.
+
+    arm == "spectral" dequants fp32 (via pack) and RoPE tables are already fp32
+    (chunked_dequant_attention's is_prefill path passes fp32 tables for a
+    spectral K arm — see _shared_rope's dtype-in-key design), so
+    `rope_cos[start:end].to(B.dtype)` is a no-op cast there — fp32-RoPE-then-
+    later-fp16-cast (by _assemble_dense_kv's final `.to(dtype)`), matching
+    streaming's exact op order without a branch.
+    """
     parts = []
     for packed, start, end in blocks:
-        B = _dequant_block(packed, arm, group, seed, h_kv)
+        B = _dequant_block(packed, arm, group, seed, h_kv, pack=pack)
         if k_pre_rope:
             B = apply_rope(
                 B,
@@ -128,6 +163,7 @@ def _assemble_dense_kv(
     k_tail,
     v_tail,
     dtype,
+    k_pack=None,
 ):
     """Dequant all blocks + fold the fp16 tail -> dense (h_kv, S, d) K and V in `dtype`.
 
@@ -135,7 +171,9 @@ def _assemble_dense_kv(
     cast-then-cat vs cat-then-cast are value-identical; this helper standardizes
     on casting each piece before concatenation.
     """
-    K = _dense_kv(k_blocks, k_arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin)
+    K = _dense_kv(
+        k_blocks, k_arm, group, seed, h_kv, k_pre_rope, rope_cos, rope_sin, k_pack
+    )
     V = _dense_kv(v_blocks, v_arm, v_group, v_seed, h_kv, False, None, None)
     if k_tail is not None and k_tail.shape[1] > 0:
         kt = k_tail.to(dtype)
@@ -166,6 +204,7 @@ def naive_dense_attention(
     scale,
     v_group: int | None = None,
     v_seed: int | None = None,
+    k_pack: "SpectralPack | None" = None,
 ):
     """ORACLE: dequant everything, single full softmax, GQA-expand. No chunking.
 
@@ -174,6 +213,7 @@ def naive_dense_attention(
     v_group / v_seed: allow K and V to use different quantization params
     (k2b oracle tests use K=lowrank_rtn_channel and V=turboquant_mse with
     different seeds). Default to group / seed.
+    k_pack: the corpus-fit SpectralPack, required when k_arm == "spectral".
     """
     _v_group = v_group if v_group is not None else group
     _v_seed = v_seed if v_seed is not None else seed
@@ -195,6 +235,7 @@ def naive_dense_attention(
         k_tail=k_tail,
         v_tail=v_tail,
         dtype=q.dtype,
+        k_pack=k_pack,
     )
     Kx = K.repeat_interleave(n_q_groups, dim=0)
     Vx = V.repeat_interleave(n_q_groups, dim=0)
@@ -221,6 +262,7 @@ def _prefill_dense_attention(
     v_group,
     v_seed,
     attn_mask=None,
+    k_pack: "SpectralPack | None" = None,
 ):
     """Prefill (n_q > 1) attention: reconstruct dense K/V once, run flash SDPA.
 
@@ -251,6 +293,7 @@ def _prefill_dense_attention(
         k_tail=k_tail,
         v_tail=v_tail,
         dtype=q.dtype,
+        k_pack=k_pack,
     )
     Kx = K.repeat_interleave(n_q_groups, dim=0)  # (n_q_heads, S, d)
     Vx = V.repeat_interleave(n_q_groups, dim=0)
@@ -289,6 +332,7 @@ def chunked_dequant_attention(
     v_group: int | None = None,
     v_seed: int | None = None,
     attn_mask=None,
+    k_pack: "SpectralPack | None" = None,
 ):
     """Online-softmax attention over per-block dequantized K/V. GQA-aware.
 
@@ -303,6 +347,8 @@ def chunked_dequant_attention(
     attn_mask: the model's 4D causal mask, forwarded to the prefill SDPA path.
     v_group / v_seed: dequant params for V blocks; default to group / seed when
     not provided (allows K and V to use different packed formats).
+    k_pack: the corpus-fit SpectralPack, required when k_arm == "spectral" (both
+    the decode online-softmax loop and the prefill dense path need it).
     """
     n_q_heads, n_q, d = q.shape
     h_kv = n_q_heads // n_q_groups
@@ -331,6 +377,7 @@ def chunked_dequant_attention(
             v_group=_v_group,
             v_seed=_v_seed,
             attn_mask=attn_mask,
+            k_pack=k_pack,
         )
 
     # Decode (n_q == 1): the single query at the last position attends ALL cached keys
@@ -358,9 +405,18 @@ def chunked_dequant_attention(
         m = m_new
 
     for (kpacked, start, end), (vpacked, _vs, _ve) in zip(k_blocks, v_blocks):
-        K_kv = _dequant_block(kpacked, k_arm, group, seed, h_kv).to(q.dtype)
-        if k_pre_rope:
+        # Spectral K: fp32-RoPE-then-fp16-cast, matching streaming's exact op
+        # order (streaming.py:324-339 — fp32 tables, RoPE in fp32, THEN cast) —
+        # required for committed-block BITWISE parity. k2b/other arms keep
+        # today's cast-then-rope order verbatim (their parity tests pin it).
+        if k_arm == "spectral":
+            K_kv = _dequant_block(kpacked, k_arm, group, seed, h_kv, pack=k_pack)
             K_kv = apply_rope(K_kv, rope_cos[start:end], rope_sin[start:end])
+            K_kv = K_kv.to(q.dtype)
+        else:
+            K_kv = _dequant_block(kpacked, k_arm, group, seed, h_kv).to(q.dtype)
+            if k_pre_rope:
+                K_kv = apply_rope(K_kv, rope_cos[start:end], rope_sin[start:end])
         V_kv = _dequant_block(vpacked, v_arm, _v_group, _v_seed, h_kv).to(q.dtype)
         attend(K_kv, V_kv)
 
