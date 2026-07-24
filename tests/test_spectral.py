@@ -461,3 +461,56 @@ def test_spectral_packed_bitwise_matches_spectral_quantize():
             assert k.endswith("_scale") and t.dtype == torch.float32, (k, t.dtype)
     M_hat = spectral_dequant_packed(packed, pack)
     assert torch.equal(M_hat, ref)  # BITWISE — the codec-level parity anchor
+
+
+def test_pack_from_basis_s_ref_default_inert():
+    """s_ref=None / g_table=None reproduce today's allocation bit-exactly
+    (the default-inert pin idiom), on both pack_from_basis and
+    fit_spectral_pack."""
+    from bmx.cache.spectral import fit_spectral_basis, pack_from_basis
+
+    M, _ = _spiked_keys(S=256, C=64, seed=3)
+    Wh, Wh_inv = identity_whitener(64)
+    basis = fit_spectral_basis(M, Wh, Wh_inv)
+    default = pack_from_basis(basis, 2.5)
+    explicit = pack_from_basis(basis, 2.5, s_ref=None, g_table=None)
+    assert torch.equal(default.bits, explicit.bits)
+    p1 = fit_spectral_pack(M, Wh, Wh_inv, 2.5)
+    p2 = fit_spectral_pack(M, Wh, Wh_inv, 2.5, s_ref=None, g_table=None)
+    assert torch.equal(p1.bits, p2.bits)
+
+
+def test_pack_from_basis_s_ref_hand_case():
+    """Hand-computable charge-aware allocation (math review #2 mechanism).
+    lam=(256,16,1,1e-8), tiers (0,2,4), group=16, C=4, s_ref=64 =>
+    s = 16/16 + 16*4/64 = 2.0. At budget 3.0 (mean TOTAL charge):
+      (4,4,0,0): charge (6+6)/4 = 3.0, D ~ 2.06  <- Lagrangian pick
+      (4,4,2,0): charge 4.0 -- infeasible
+    Plain at budget 3.0 (mean payload bits) opens THREE directions
+    (4,4,4,0). Charge-aware closes the marginal direction: c_used 2 vs 3 --
+    the 0<->2 boundary movement the math doc predicts."""
+    from bmx.cache.spectral import SpectralBasis, pack_from_basis
+
+    lam64 = torch.tensor([256.0, 16.0, 1.0, 1e-8], dtype=torch.float64)
+    eye = torch.eye(4, dtype=torch.float32)
+    basis = SpectralBasis(enc=eye, dec=eye.clone(), lam=lam64.float(), lam64=lam64)
+    ca = pack_from_basis(basis, 3.0, tiers=(0, 2, 4), group=16, s_ref=64)
+    plain = pack_from_basis(basis, 3.0, tiers=(0, 2, 4), group=16)
+    assert torch.equal(ca.bits, torch.tensor([4, 4, 0, 0], dtype=torch.int64))
+    assert torch.equal(plain.bits, torch.tensor([4, 4, 4, 0], dtype=torch.int64))
+    assert ca.c_used == 2 and plain.c_used == 3
+
+
+def test_s_ref_c_used_monotone():
+    """Diagnostic invariant the A-gate pre-registers: c_used decreases as the
+    deployment context shortens (bigger per-direction charge)."""
+    from bmx.cache.spectral import fit_spectral_basis, pack_from_basis
+
+    M, _ = _spiked_keys(S=512, C=64, seed=6)
+    Wh, Wh_inv = identity_whitener(64)
+    basis = fit_spectral_basis(M, Wh, Wh_inv)
+    c_none = pack_from_basis(basis, 2.5, group=16).c_used
+    c_8k = pack_from_basis(basis, 2.5, group=16, s_ref=8192).c_used
+    c_1k = pack_from_basis(basis, 2.5, group=16, s_ref=1024).c_used
+    assert c_1k <= c_8k <= c_none
+    assert c_1k < c_none, "fixture must actually exercise the charge"

@@ -197,6 +197,8 @@ def pack_from_basis(
     tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8),
     group: int = 64,
     lam_alloc: torch.Tensor | None = None,
+    s_ref: int | None = None,
+    g_table: tuple[float, ...] | None = None,
 ) -> SpectralPack:
     """Allocate bits for one budget against an already-fit SpectralBasis.
 
@@ -205,13 +207,44 @@ def pack_from_basis(
     allocation adapts": basis from corpus A, per-direction variances measured
     on corpus B via basis_alloc_moment). Default None reproduces the prior
     behavior bit-exactly (allocates on basis.lam64).
+
+    s_ref (charge-aware allocation, math review 2026-07-24 #2): when set, the
+    allocator prices every used direction's TRUE storage cost under the
+    reported accounting -- per-direction fixed charge
+    s = 16/group + 16*C/s_ref (fp16 decoder column + group-scale share) --
+    via the exact Lagrangian enumeration
+    b_i = argmin_{b in T} lam_i*g(b) + kappa_L*(b + s*1[b>0]).
+    budget then bounds the mean per-direction TOTAL charge
+    (1/C)*sum_i (b_i + s*1[b_i>0]) = payload-v2 bpe + 16*c_used/s_ref
+    = skeptic-v2 bpe@s_ref - tier_bits(tiers, s_ref). This is an ALLOCATION
+    change only: the bpe accounting expressions stay frozen; c_used simply
+    becomes smaller. g_table (finding #4) swaps 4^{-b} for measured per-tier
+    ratios (Lagrangian selection, fixed charge 0 unless s_ref is also set).
+    Defaults (None, None) reproduce the prior behavior bit-exactly.
     """
     assert 1 not in tiers, "symmetric RTN is undefined at 1 bit (qmax=0)"
     alloc_input = basis.lam64 if lam_alloc is None else lam_alloc
     assert alloc_input.shape == basis.lam64.shape, (
         f"lam_alloc shape {tuple(alloc_input.shape)} != {tuple(basis.lam64.shape)}"
     )
-    bits = allocate_bits_from_variance(alloc_input, budget, tiers)
+    if s_ref is not None or g_table is not None:
+        fixed = 0.0
+        if s_ref is not None:
+            assert s_ref > 0, f"s_ref must be positive; got {s_ref}"
+            C = basis.enc.shape[0]
+            # math review #2: s = 16/group + dec_bits*C/S_ref, dec_bits=16
+            # (fp16 decoder; the A-gate never invokes the int8 lever).
+            fixed = scale_bits(group) + 16.0 * C / float(s_ref)
+        bits = allocate_bits_from_variance(
+            alloc_input,
+            budget,
+            tiers,
+            selection="lagrange",
+            g_table=g_table,
+            fixed_charge=fixed,
+        )
+    else:
+        bits = allocate_bits_from_variance(alloc_input, budget, tiers)
     return SpectralPack(
         enc=basis.enc,
         dec=basis.dec,
@@ -240,10 +273,17 @@ def fit_spectral_pack(
     *,
     tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8),
     group: int = 64,
+    s_ref: int | None = None,
+    g_table: tuple[float, ...] | None = None,
 ) -> SpectralPack:
     """Fit basis + allocation on M_fit (the calibration matrix). fp64 internally."""
     return pack_from_basis(
-        fit_spectral_basis(M_fit, Wh, Wh_inv), budget, tiers=tiers, group=group
+        fit_spectral_basis(M_fit, Wh, Wh_inv),
+        budget,
+        tiers=tiers,
+        group=group,
+        s_ref=s_ref,
+        g_table=g_table,
     )
 
 
