@@ -43,6 +43,7 @@ from bmx.cache.collect import from_matrix, reshape_heads, to_matrix
 from bmx.cache.hf_compat import (
     model_config_n_layers,
     resolve_decoder_layers,
+    resolve_qk_capture_modules,
     resolve_text_config,
 )
 from bmx.cache.rope import apply_rope, rope_cos_sin
@@ -234,8 +235,9 @@ class StreamingQuantizedLayer(DynamicLayer):
     def stash_pre_rope(self, out: torch.Tensor):
         """Called by the cache's k_proj hook: append a captured pre-RoPE block.
 
-        out: (1, T, h_kv*d) -> reshaped to (h_kv, T, d) fp16, concatenated
-        across calls to accumulate the full sequence.
+        out: (1, T, h_kv*d) (k_proj) or (1, T, h_kv, d) (k_norm) -> reshaped
+        to (h_kv, T, d) fp16, concatenated across calls to accumulate the
+        full sequence.
         """
         block = reshape_heads(out, self._h_kv, self._d_head)  # (h_kv, T, d)
         self._k_pre = (
@@ -625,7 +627,8 @@ class StreamingQuantizedCache(Cache):
             def k_hook(module, inp, out, i=i):
                 self.layers[i].stash_pre_rope(out)
 
-            self._handles.append(mlayer.self_attn.k_proj.register_forward_hook(k_hook))
+            _, k_mod = resolve_qk_capture_modules(mlayer.self_attn)
+            self._handles.append(k_mod.register_forward_hook(k_hook))
         return self
 
     def detach(self) -> "StreamingQuantizedCache":

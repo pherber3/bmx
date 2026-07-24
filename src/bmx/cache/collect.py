@@ -32,7 +32,11 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
-from bmx.cache.hf_compat import resolve_decoder_layers, resolve_text_config
+from bmx.cache.hf_compat import (
+    resolve_decoder_layers,
+    resolve_qk_capture_modules,
+    resolve_text_config,
+)
 
 
 def to_matrix(kv: torch.Tensor) -> torch.Tensor:
@@ -59,7 +63,9 @@ def _get_kv_layer(past_key_values, i: int):
 
 
 def reshape_heads(out: torch.Tensor, n_head: int, d: int) -> torch.Tensor:
-    """(1, S, n_head*d) projection output -> (n_head, S, d), fp16 contiguous."""
+    """(1, S, n_head*d) or (1, S, n_head, d) projection/norm output ->
+    (n_head, S, d), fp16 contiguous. The two input shapes are numel-equal, so
+    one reshape covers both (Qwen3's q_norm/k_norm emit the 4-D headed form)."""
     S = out.shape[1]
     heads = out.reshape(1, S, n_head, d).permute(0, 2, 1, 3).squeeze(0)
     return heads.contiguous().to(torch.float16)
@@ -85,7 +91,8 @@ def _register_gpt2_hooks(model, store: dict, n_q_keep: int):
 
 
 def _register_qkproj_hooks(model, store: dict, n_q_keep: int):
-    """Hooks on q_proj/k_proj (Llama-family); returns (handles, n_layer)."""
+    """Hooks on the pre-RoPE q/k capture modules ({q,k}_proj on Llama-family,
+    {q,k}_norm on Qwen3-style qk-norm attention); returns (handles, n_layer)."""
     cfg = resolve_text_config(model.config)  # unwrap multimodal text_config
     h = cfg.num_attention_heads
     h_kv = getattr(cfg, "num_key_value_heads", h)
@@ -102,8 +109,9 @@ def _register_qkproj_hooks(model, store: dict, n_q_keep: int):
         def k_hook(module, inp, out, i=i):
             store[f"layer{i}.k_pre"] = reshape_heads(out, h_kv, d)
 
-        handles.append(layer.self_attn.q_proj.register_forward_hook(q_hook))
-        handles.append(layer.self_attn.k_proj.register_forward_hook(k_hook))
+        q_mod, k_mod = resolve_qk_capture_modules(layer.self_attn)
+        handles.append(q_mod.register_forward_hook(q_hook))
+        handles.append(k_mod.register_forward_hook(k_hook))
     return handles, len(layers)
 
 

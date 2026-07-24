@@ -55,3 +55,22 @@ def resolve_decoder_layers(model):
 def model_config_n_layers(model) -> int:
     """Number of transformer layers in model (structural probe, not model_type)."""
     return len(resolve_decoder_layers(model))
+
+
+def resolve_qk_capture_modules(self_attn):
+    """(q_module, k_module) whose forward OUTPUT is the pre-RoPE query/key.
+
+    Llama-family attention is {q,k}_proj -> reshape heads -> RoPE, so the
+    projection output IS the pre-RoPE tensor. Qwen3/Gemma3-style attention
+    inserts a per-head RMSNorm between projection and RoPE
+    (k_proj -> view(b, S, h, d) -> k_norm -> RoPE): capturing at k_proj there
+    breaks the k == RoPE(k_pre) identity every rope-at-read consumer relies
+    on, and q_proj output is not the query attention actually uses (W-moment
+    statistics must see the q_norm output). Probe structurally: prefer
+    {q,k}_norm when both are present, else the plain projections. The norm
+    modules emit the already-headed (b, S, h, d) shape; collect.reshape_heads
+    covers both layouts with one numel-equal reshape.
+    """
+    if hasattr(self_attn, "q_norm") and hasattr(self_attn, "k_norm"):
+        return self_attn.q_norm, self_attn.k_norm
+    return self_attn.q_proj, self_attn.k_proj

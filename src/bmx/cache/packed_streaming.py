@@ -30,6 +30,7 @@ from bmx.cache.collect import reshape_heads, to_matrix
 from bmx.cache.hf_compat import (
     model_config_n_layers,
     resolve_decoder_layers,
+    resolve_qk_capture_modules,
     resolve_text_config,
 )
 from bmx.cache.rope import rope_cos_sin
@@ -989,9 +990,8 @@ class PackedStreamingCache(Cache):
                 def k_hook(module, inp, out, i=i):
                     self.layers[i].stash_pre_rope(out)
 
-                self._handles.append(
-                    mlayer.self_attn.k_proj.register_forward_hook(k_hook)
-                )
+                _, k_mod = resolve_qk_capture_modules(mlayer.self_attn)
+                self._handles.append(k_mod.register_forward_hook(k_hook))
         return self
 
     def detach(self) -> "PackedStreamingCache":
