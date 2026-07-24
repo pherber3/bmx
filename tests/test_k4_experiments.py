@@ -1354,3 +1354,34 @@ def test_k4_int8_certificate_smoke(tmp_path):
         abs(v["margin_factor"] - 0.05 / max(v["max_implied_rel_degradation"], 1e-300))
         < 1e-6 * v["margin_factor"]
     )
+
+    # ---- 6b: tier-gated rescue sweep ------------------------------------
+    sweep_df = pd.read_parquet(run_dir / "tier_sweep.parquet")
+    assert {
+        "budget",
+        "tier_threshold",
+        "c_used_total",
+        "c_int8_total",
+        "frac_int8",
+        "max_implied_rel_degradation",
+        "effective_dec_bits",
+        "charge_saving_at_S4096",
+        "charge_saving_at_S16384",
+        "charge_saving_at_S65536",
+    } <= set(sweep_df.columns)
+    assert set(sweep_df.tier_threshold) == {2, 3, 4, 5, 6}
+    assert (sweep_df.frac_int8 >= 0).all() and (sweep_df.frac_int8 <= 1).all()
+    # frac_int8 and charge_saving must be non-decreasing in tier_threshold
+    # per budget (a higher T can only int8-cover more columns, never fewer).
+    for budget in (2.0, 2.5):
+        sub = sweep_df[sweep_df.budget == budget].sort_values("tier_threshold")
+        assert sub.frac_int8.is_monotonic_increasing
+        assert sub.charge_saving_at_S4096.is_monotonic_increasing
+        assert sub.effective_dec_bits.is_monotonic_decreasing
+
+    tier_sweep_v = v["tier_sweep"]
+    assert tier_sweep_v["tier_thresholds"] == [2, 3, 4, 5, 6]
+    for budget_key in ("2", "2.5"):
+        rescue = tier_sweep_v["per_budget_rescue"][budget_key]
+        assert "largest_passing_threshold" in rescue
+        assert "charge_saving_fraction_at_S4096" in rescue

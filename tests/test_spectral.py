@@ -647,3 +647,61 @@ def test_int8_certificate_dropped_columns_and_determinism():
     dec_mut[:, pack.bits == 0] = torch.randn_like(dec_mut[:, pack.bits == 0])
     c2 = int8_decoder_certificate(_dc.replace(pack, dec=dec_mut))
     assert c1 == c2 == int8_decoder_certificate(pack)
+
+
+def test_int8_certificate_tiered_endpoints_and_charge():
+    """K4 math-actions 6b: int8_decoder_certificate_tiered's two boundary
+    cases, plus mixed_dec_charge/effective_dec_bits pinned against
+    skeptic_charge at both endpoints of the int8 coverage fraction.
+
+    tier_threshold >= max(pack.bits) must reproduce the blanket certificate
+    bit-for-bit (nothing gets zeroed -- same ddec, same projection).
+    tier_threshold below every used tier must give added == 0.0 exactly
+    (every used column zeroed before the enc^T ddec projection)."""
+    from bmx.cache.spectral import (
+        effective_dec_bits,
+        fit_spectral_pack,
+        int8_decoder_certificate,
+        int8_decoder_certificate_tiered,
+        mixed_dec_charge,
+        skeptic_charge,
+    )
+
+    C, S = 16, 200
+    scales = torch.linspace(0.2, 5.0, C, dtype=torch.float64)
+    Wh, Wh_inv = torch.diag(scales), torch.diag(1.0 / scales)
+    g = torch.Generator().manual_seed(0)
+    M = torch.randn(S, C, generator=g)
+    pack = fit_spectral_pack(M, Wh, Wh_inv, 2.5, tiers=(0, 2, 3, 4, 5, 6, 8), group=8)
+    used_tiers = sorted(set(int(b) for b in pack.bits.tolist() if b != 0))
+    assert len(used_tiers) >= 2  # fixture must span more than one used tier
+
+    blanket = int8_decoder_certificate(pack)
+
+    # T = max(bits): reproduces the blanket certificate exactly.
+    top = int8_decoder_certificate_tiered(pack, max(used_tiers))
+    assert top["c_int8"] == top["c_used"] == pack.c_used
+    assert top["frac_int8"] == 1.0
+    for key in ("added", "payload", "noise_to_signal", "implied_rel_degradation"):
+        assert abs(top[key] - blanket[key]) < 1e-12 * max(abs(blanket[key]), 1e-12)
+
+    # T below the lowest used tier: zero added distortion, zero int8 coverage.
+    bottom = int8_decoder_certificate_tiered(pack, used_tiers[0] - 1)
+    assert bottom["added"] == 0.0
+    assert bottom["c_int8"] == 0
+    assert bottom["frac_int8"] == 0.0
+    assert bottom["noise_to_signal"] == 0.0
+    assert bottom["implied_rel_degradation"] == 0.0
+    assert bottom["payload"] == blanket["payload"]  # payload never depends on ddec
+
+    # mixed_dec_charge/effective_dec_bits pinned at both coverage endpoints.
+    S_ref = 4096
+    cu = pack.c_used
+    sc_fp16 = skeptic_charge(C, S_ref, pack.tiers, c_used=cu, dec_bits=16.0)
+    sc_int8 = skeptic_charge(C, S_ref, pack.tiers, c_used=cu, dec_bits=8.0)
+    mc_none = mixed_dec_charge(C, S_ref, pack.tiers, c_used=cu, c_int8=0)
+    mc_all = mixed_dec_charge(C, S_ref, pack.tiers, c_used=cu, c_int8=cu)
+    assert abs(mc_none - sc_fp16) < 1e-15
+    assert abs(mc_all - sc_int8) < 1e-15
+    assert effective_dec_bits(C, cu, 0) == 16.0
+    assert abs(effective_dec_bits(C, cu, cu) - (8.0 + 16.0 / C)) < 1e-12

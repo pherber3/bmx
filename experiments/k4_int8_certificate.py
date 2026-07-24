@@ -8,6 +8,31 @@ pre-registered VM gate axis (rel_degradation_int8 < 5%). The verdict JSON
 carries max_implied_rel_degradation, the margin factor to the 5% line, and
 the binding review condition: THE USER REVIEWS THESE NUMBERS BEFORE VM TASK 8
 IS RELEASED — the VM task stays queued until explicit release.
+
+Micro-task 6b (tier-gated rescue sweep, pure analysis, no codec change): the
+blanket certificate above int8-stores EVERY used decoder column and can fail
+the 5% gate — but the failure is driven by high-tier (6/8-bit) columns whose
+payload is geometrically tiny (payload_i = lam_i*4^-b_i) while the int8 noise
+floor added_i is roughly flat across tiers. "Is int8 dead, or just
+misapplied?" For each `tier_thresholds` entry T, this sweep int8-stores ONLY
+columns with `bits_i <= T` (columns with `bits_i > T` stay fp16 -> zero added
+error on those columns) via `int8_decoder_certificate_tiered` — pure
+post-processing of the existing per-layer ddec, zero codec change.
+
+Accounting (skeptic-v2-int8 arithmetic, generalized to a per-column mix, NOT
+a new mode — see `mixed_dec_charge`'s docstring in spectral.py for the exact
+per-column terms): for each (budget, threshold), summed over every layer's
+decoder resident in the cache,
+
+    charge_saving_at_S = sum_layers [ skeptic_charge(dec_bits=16, S)
+                                       - mixed_dec_charge(c_int8_layer, S) ]
+
+is the total per-sequence bits/token saved relative to an all-fp16 decoder,
+evaluated at S in {4096, 16384, 65536} (the deployment-length grid this repo
+reports skeptic charges at). `effective_dec_bits` is the c_used-weighted mix
+bit rate of the gated decoder (16.0 = no int8 coverage survives the gate;
+8 + 16/C = full blanket int8 coverage), aggregated across layers via total
+c_used/c_int8 counts (S-independent, matching effective_dec_bits's contract).
 """
 
 from __future__ import annotations
@@ -19,13 +44,23 @@ import pandas as pd
 import tyro
 
 from bmx.artifacts import create_run, git_sha, write_metrics
-from bmx.cache.spectral import int8_decoder_certificate, load_packs
+from bmx.cache.spectral import (
+    effective_dec_bits,
+    int8_decoder_certificate,
+    int8_decoder_certificate_tiered,
+    load_packs,
+    mixed_dec_charge,
+    skeptic_charge,
+)
+
+CHARGE_S_GRID = (4096, 16384, 65536)
 
 
 @dataclasses.dataclass
 class Config:
     pack_path: str
     budgets: tuple[float, ...] = (2.2, 2.5)
+    tier_thresholds: tuple[int, ...] = (2, 3, 4, 5, 6)
     model_label: str = ""
     out_root: str = ""
 
@@ -36,14 +71,19 @@ def main(cfg: Config):
         if cfg.out_root
         else create_run("k4_int8_certificate", cfg)
     )
+    model_label = cfg.model_label or "unknown"
+
+    # ---- blanket per-(budget, layer) certificate table (unchanged) --------
     rows: list[dict] = []
+    packs_by_budget: dict[float, dict[int, object]] = {}
     for budget in cfg.budgets:
         packs = load_packs(cfg.pack_path, budget)
+        packs_by_budget[budget] = packs
         for layer_i, pack in sorted(packs.items()):
             cert = int8_decoder_certificate(pack)
             rows.append(
                 dict(
-                    model=cfg.model_label or "unknown",
+                    model=model_label,
                     budget=float(budget),
                     layer=layer_i,
                     c_used=int(pack.c_used),
@@ -76,6 +116,161 @@ def main(cfg: Config):
         ),
         git_sha=git_sha(),
     )
+
+    # ---- tier-gated rescue sweep (6b) --------------------------------------
+    # Per-(budget, threshold, layer) detail table (full transparency).
+    sweep_layer_rows: list[dict] = []
+    for budget, packs in packs_by_budget.items():
+        for layer_i, pack in sorted(packs.items()):
+            for T in cfg.tier_thresholds:
+                tiered = int8_decoder_certificate_tiered(pack, T)
+                sweep_layer_rows.append(
+                    dict(
+                        model=model_label,
+                        budget=float(budget),
+                        layer=layer_i,
+                        C=int(pack.enc.shape[0]),
+                        **tiered,
+                    )
+                )
+    sweep_layer_df = pd.DataFrame(sweep_layer_rows)
+    write_metrics(run, sweep_layer_df, name="tier_sweep_layers")
+
+    # Per-(budget, threshold) aggregate: worst-case implied_rel_degradation
+    # across layers (the binding number, same convention as the blanket
+    # verdict's max), total int8 coverage, effective_dec_bits, and the
+    # charge saving summed over every layer's decoder at each S in the grid.
+    sweep_rows: list[dict] = []
+    for budget, packs in packs_by_budget.items():
+        for T in cfg.tier_thresholds:
+            layer_certs = {
+                layer_i: int8_decoder_certificate_tiered(pack, T)
+                for layer_i, pack in packs.items()
+            }
+            c_used_total = sum(c["c_used"] for c in layer_certs.values())
+            c_int8_total = sum(c["c_int8"] for c in layer_certs.values())
+            worst_impl = max(c["implied_rel_degradation"] for c in layer_certs.values())
+            worst_n2s = max(c["noise_to_signal"] for c in layer_certs.values())
+
+            # effective_dec_bits requires a single C; assert layer uniformity
+            # (true for every pack file this repo has fit so far) rather than
+            # silently mixing per-layer channel counts into one number.
+            Cs = {int(pack.enc.shape[0]) for pack in packs.values()}
+            assert len(Cs) == 1, f"non-uniform per-layer C not supported: {Cs}"
+            C = next(iter(Cs))
+            eff_bits = effective_dec_bits(C, c_used_total, c_int8_total)
+
+            row = dict(
+                model=model_label,
+                budget=float(budget),
+                tier_threshold=T,
+                c_used_total=c_used_total,
+                c_int8_total=c_int8_total,
+                frac_int8=c_int8_total / c_used_total if c_used_total > 0 else 0.0,
+                max_implied_rel_degradation=worst_impl,
+                max_noise_to_signal=worst_n2s,
+                effective_dec_bits=eff_bits,
+            )
+            for S in CHARGE_S_GRID:
+                saving = sum(
+                    skeptic_charge(
+                        int(pack.enc.shape[0]),
+                        S,
+                        pack.tiers,
+                        c_used=pack.c_used,
+                        dec_bits=16.0,
+                    )
+                    - mixed_dec_charge(
+                        int(pack.enc.shape[0]),
+                        S,
+                        pack.tiers,
+                        c_used=pack.c_used,
+                        c_int8=layer_certs[layer_i]["c_int8"],
+                    )
+                    for layer_i, pack in packs.items()
+                )
+                row[f"charge_saving_at_S{S}"] = saving
+            sweep_rows.append(row)
+            print(
+                f"  [sweep] b={budget:g} T={T} frac_int8={row['frac_int8']:.3f} "
+                f"max_implied_rel_degradation={worst_impl:.4f} "
+                f"eff_dec_bits={eff_bits:.3f} "
+                f"saving@4096={row['charge_saving_at_S4096']:.4f}",
+                flush=True,
+            )
+    sweep_df = pd.DataFrame(sweep_rows)
+    write_metrics(run, sweep_df, name="tier_sweep")
+
+    # Full-int8 charge saving reference (T = max tier, i.e. the blanket
+    # int8 decoder) at the same S grid, per budget — "how much of the
+    # original int8 charge saving survives" needs this denominator.
+    full_int8_saving: dict[str, dict[str, float]] = {}
+    for budget, packs in packs_by_budget.items():
+        entry = {}
+        for S in CHARGE_S_GRID:
+            entry[f"S{S}"] = sum(
+                skeptic_charge(
+                    int(pack.enc.shape[0]),
+                    S,
+                    pack.tiers,
+                    c_used=pack.c_used,
+                    dec_bits=16.0,
+                )
+                - skeptic_charge(
+                    int(pack.enc.shape[0]),
+                    S,
+                    pack.tiers,
+                    c_used=pack.c_used,
+                    dec_bits=8.0,
+                )
+                for pack in packs.values()
+            )
+        full_int8_saving[f"{budget:g}"] = entry
+
+    # Largest threshold clearing the 5% gate, per budget (the interesting
+    # readout): scan tier_thresholds ascending, keep the last one whose
+    # aggregate max_implied_rel_degradation is still under the line.
+    per_budget_rescue: dict[str, dict] = {}
+    for budget in cfg.budgets:
+        b_rows = [r for r in sweep_rows if r["budget"] == float(budget)]
+        b_rows.sort(key=lambda r: r["tier_threshold"])
+        passing = [r for r in b_rows if r["max_implied_rel_degradation"] < 0.05]
+        best = max(passing, key=lambda r: r["tier_threshold"]) if passing else None
+        per_budget_rescue[f"{budget:g}"] = dict(
+            largest_passing_threshold=(best["tier_threshold"] if best else None),
+            rel_degradation_at_that_threshold=(
+                best["max_implied_rel_degradation"] if best else None
+            ),
+            margin_to_gate=(
+                0.05 - best["max_implied_rel_degradation"] if best else None
+            ),
+            frac_int8_at_that_threshold=(best["frac_int8"] if best else None),
+            charge_saving_fraction_at_S4096=(
+                best["charge_saving_at_S4096"]
+                / max(full_int8_saving[f"{budget:g}"]["S4096"], 1e-300)
+                if best
+                else 0.0
+            ),
+            any_threshold_passes=bool(passing),
+        )
+
+    verdict["tier_sweep"] = dict(
+        tier_thresholds=list(cfg.tier_thresholds),
+        charge_s_grid=list(CHARGE_S_GRID),
+        full_int8_charge_saving=full_int8_saving,
+        per_budget_rescue=per_budget_rescue,
+        note=(
+            "Rescue sweep: int8-store only columns with bits<=T, fp16 for "
+            "the rest (pure post-processing of the existing certificate, no "
+            "codec change). largest_passing_threshold is the biggest T whose "
+            "aggregate (max-over-layers) implied_rel_degradation stays under "
+            "the 5% VM gate line; charge_saving_fraction_at_S4096 is how much "
+            "of the FULL blanket-int8 charge saving survives at that T. Same "
+            "user-review gate as the blanket certificate above -- this sweep "
+            "informs the user's decision, nothing else."
+        ),
+    )
+
     (run / "certificate_verdict.json").write_text(json.dumps(verdict, indent=2))
     print("\n" + "=" * 88)
     print("INT8 DECODER CERTIFICATE — user reviews before VM Task 8 is released")

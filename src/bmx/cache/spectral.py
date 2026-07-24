@@ -553,6 +553,91 @@ def int8_decoder_certificate(pack: SpectralPack) -> dict[str, float]:
     )
 
 
+def int8_decoder_certificate_tiered(pack: SpectralPack, tier_threshold: int) -> dict:
+    """Tier-gated rescue of `int8_decoder_certificate` (K4 math-actions 6b):
+    "is int8 dead or just misapplied?" The blanket certificate int8-stores
+    EVERY used decoder column; this asks what happens if only the low-tier
+    columns (`0 < bits_i <= tier_threshold`) are int8-stored and the rest
+    stay fp16.
+
+    Pure post-processing of the existing `ddec = dec_int8 - dec`: columns
+    with `bits_i > tier_threshold` are zeroed in `ddec` BEFORE the same
+    `enc^T ddec` projection the blanket certificate uses (those columns stay
+    fp16 -> zero added error; no codec change, no new roundtrip). `added`,
+    `payload`, `noise_to_signal`, `implied_rel_degradation` are exactly
+    `int8_decoder_certificate`'s expressions restricted to the gated ddec —
+    at `tier_threshold >= max(pack.bits)` this reproduces the blanket
+    certificate bit-for-bit (nothing gets zeroed); at
+    `tier_threshold < min(used tier)` `added == 0.0` exactly (everything
+    gets zeroed).
+
+    Mixed-decoder accounting (`c_used`/`c_int8` below) is priced separately by
+    `mixed_dec_charge`/`effective_dec_bits` — see those docstrings for the
+    skeptic-v2 arithmetic generalized to a per-column int8/fp16 mix.
+    """
+    used = pack.bits != 0
+    gate = used & (pack.bits <= tier_threshold)  # int8-eligible columns
+    c_used = int(used.sum())
+    c_int8 = int(gate.sum())
+
+    ddec_full = int8_decoder_roundtrip(pack.dec, pack.bits).double() - pack.dec.double()
+    ddec = ddec_full * gate.to(ddec_full.dtype)  # zero columns above threshold
+    proj = pack.enc.double().mT @ ddec
+    lam = pack.lam.double().clamp_min(0.0)
+    added = float((lam * (proj**2).sum(dim=0)).sum())
+    payload = float((lam * torch.pow(4.0, -pack.bits.double())).sum())
+
+    return dict(
+        tier_threshold=int(tier_threshold),
+        c_used=c_used,
+        c_int8=c_int8,
+        frac_int8=c_int8 / c_used if c_used > 0 else 0.0,
+        added=added,
+        payload=payload,
+        noise_to_signal=added / max(payload, 1e-300),
+        implied_rel_degradation=added / max(payload + added, 1e-300),
+    )
+
+
+def mixed_dec_charge(
+    C: int, S: int, tiers: tuple[int, ...], *, c_used: int, c_int8: int
+) -> float:
+    """Per-sequence decoder+tier-map charge (skeptic-v2 arithmetic) when only
+    `c_int8` of the `c_used` used columns are int8-stored and the remaining
+    `c_used - c_int8` stay fp16 -- the same skeptic-v2-int8 per-column terms
+    (`8·c/S` entry cost + `16·c/(S·C)` amortized fp16 scale), split across
+    the int8 and fp16 subsets and summed:
+
+        dec_charge(S) = [8·c_int8/S + 16·c_int8/(S·C)]  (int8 cols + scales)
+                      + 16·(c_used - c_int8)/S            (fp16 cols, no scale)
+                      + tier_bits(tiers, S)
+
+    Reduces to `skeptic_charge(dec_bits=16.0)` at `c_int8=0` and to
+    `skeptic_charge(dec_bits=8.0)` at `c_int8=c_used`
+    (checked by `test_mixed_dec_charge_endpoints_match_skeptic_charge`).
+    """
+    assert 0 <= c_int8 <= c_used <= C, (
+        f"need 0<=c_int8<=c_used<=C; got {c_int8},{c_used},{C}"
+    )
+    int8_term = 8.0 * c_int8 / S + 16.0 * c_int8 / (S * C)
+    fp16_term = 16.0 * (c_used - c_int8) / S
+    return int8_term + fp16_term + tier_bits(tiers, S)
+
+
+def effective_dec_bits(C: int, c_used: int, c_int8: int) -> float:
+    """The c_used-weighted mix bit rate implied by `mixed_dec_charge`'s
+    decoder-column terms alone (excludes tier_bits, which is S-amortized
+    metadata, not a per-column decoder rate): 16.0 bits/column for the fp16
+    columns, `8 + 16/C` bits/column for the int8 ones (entry + amortized
+    per-column scale, matching skeptic_charge's `dec_bits=8.0` convention of
+    folding the scale into an equivalent per-entry rate). Independent of S.
+    """
+    if c_used == 0:
+        return 16.0
+    int8_rate = 8.0 + 16.0 / C
+    return (c_int8 * int8_rate + (c_used - c_int8) * 16.0) / c_used
+
+
 def save_pack_file(
     path: str | Path,
     bases: dict[int, SpectralBasis],
