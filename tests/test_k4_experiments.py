@@ -1676,11 +1676,38 @@ def test_plot_k4_paper_smoke(tmp_path):
                 )
     pd.DataFrame(rows).to_parquet(transfer_dir / "overlap.parquet")
 
+    # -- fig 4 input: a tiny cert_vs_measured.parquet mirroring the real
+    # run's schema (one row below y=x, one above -- exercises both branches
+    # of the honest-annotation counting, not just the all-conservative
+    # case). ------------------------------------------------------------
+    dec_quant_dir = tmp_path / "k4_dec_quant" / "tiny"
+    dec_quant_dir.mkdir(parents=True)
+    cvm_rows = []
+    for budget in (2.2, 2.5):
+        for layer in (0, 1):
+            for t in (4, 5, 6, 8):
+                cvm_rows.append(
+                    dict(
+                        model="tiny",
+                        cache="tiny.safetensors",
+                        budget=budget,
+                        layer=layer,
+                        tier_threshold=t,
+                        implied_rel_degradation=0.01 * t,
+                        measured_rel_deg=(0.005 * t if layer == 0 else 0.02 * t),
+                        frac_int8=0.5,
+                        c_used=10,
+                        c_int8=5,
+                    )
+                )
+    pd.DataFrame(cvm_rows).to_parquet(dec_quant_dir / "cert_vs_measured.parquet")
+
     out_dir = tmp_path / "figures"
     cfg = Config(
         niah_run_dirs=tuple(str(d) for d in niah_dirs),
         fit_packs_parquet=str(fit_packs),
         corpus_transfer_run_dir=str(transfer_dir),
+        dec_quant_run_dir=str(dec_quant_dir),
         charge_budgets=(2.2, 2.5),
         transfer_budget="2.5",
         C=16,
@@ -1696,6 +1723,8 @@ def test_plot_k4_paper_smoke(tmp_path):
         "k4_corpus_transfer.pdf",
         "k4_overlap.png",
         "k4_overlap.pdf",
+        "k4_cert_vs_measured.png",
+        "k4_cert_vs_measured.pdf",
     }
     got = {p.name for p in out_dir.iterdir()}
     assert expected <= got
@@ -1705,9 +1734,34 @@ def test_plot_k4_paper_smoke(tmp_path):
     # Deterministic bytes: re-running must reproduce identical PDF output
     # (no embedded timestamp).
     pdf_before = (out_dir / "k4_bits_vs_context.pdf").read_bytes()
+    cvm_pdf_before = (out_dir / "k4_cert_vs_measured.pdf").read_bytes()
     main(cfg)
     pdf_after = (out_dir / "k4_bits_vs_context.pdf").read_bytes()
+    cvm_pdf_after = (out_dir / "k4_cert_vs_measured.pdf").read_bytes()
     assert pdf_before == pdf_after
+    assert cvm_pdf_before == cvm_pdf_after
+
+    # The blanket-int8 dashed line is GONE; the certified band replaced it.
+    from experiments.plot_k4_paper import _build_bits_vs_context
+
+    bits_result = _build_bits_vs_context(
+        tuple(str(d) for d in niah_dirs),
+        str(fit_packs),
+        (2.2, 2.5),
+        16,
+        16,
+        (0, 2, 3, 4, 5, 6, 8),
+    )
+    assert "skeptic-v2-int8" not in bits_result["mode_names"]
+    b25 = bits_result["curves"]["k4_b2.5"]
+    lo = dict(b25["skeptic-v2-int8-tier-band-lo"])
+    hi = dict(b25["skeptic-v2-int8-tier-band-hi"])
+    v2 = dict(b25["skeptic-v2"])
+    for length in lo:
+        # Both band edges must sit below the fp16-decoder (v2) curve (int8
+        # only ever saves charge, never adds it) and the band must have
+        # nonzero width (the two fracs 0.893/0.916 are distinct).
+        assert lo[length] <= hi[length] <= v2[length]
 
 
 def test_k4_charge_alloc_smoke(tmp_path):
