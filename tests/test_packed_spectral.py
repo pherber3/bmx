@@ -168,7 +168,9 @@ def test_packed_spectral_decode_matches_oracle(tmp_path):
         q, layer._k_blocks, layer._v_blocks, k_pack=layer._pack, **common
     )
     drift = attention_diff(fast, oracle)
-    assert drift["max_abs"] < 1e-2, drift
+    # Measured drift is 1.5-3.1e-5 (online-softmax reassembly, ~1 fp16 ULP);
+    # 1e-3 keeps ~30x headroom while actually policing the path.
+    assert drift["max_abs"] < 1e-3, drift
 
 
 def test_packed_spectral_generate_matches_streaming(tmp_path):
