@@ -290,6 +290,7 @@ def main(cfg: Config):
         saving_delta_by_s: dict[int, float] = {S: 0.0 for S in CHARGE_S_GRID}
         for layer_i, pack in sorted(packs.items()):
             T_l = t_map[layer_i]
+            C_l = int(pack.enc.shape[0])
             cert_l = int8_decoder_certificate_tiered(pack, T_l) if T_l > 0 else None
             c_int8_l = pack.c_int8(T_l) if T_l > 0 else 0
             c_int8_uniform5 = pack.c_int8(5)
@@ -298,7 +299,7 @@ def main(cfg: Config):
                     model=model_label,
                     budget=float(budget),
                     layer=layer_i,
-                    C=int(pack.enc.shape[0]),
+                    C=C_l,
                     t_layer=T_l,
                     c_used=int(pack.c_used),
                     c_int8_t_layer=c_int8_l,
@@ -308,7 +309,6 @@ def main(cfg: Config):
                     ),
                 )
             )
-            C_l = int(pack.enc.shape[0])
             for S in CHARGE_S_GRID:
                 charge_uniform5 = mixed_dec_charge(
                     C_l, S, pack.tiers, c_used=pack.c_used, c_int8=c_int8_uniform5

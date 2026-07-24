@@ -182,6 +182,14 @@ def main(cfg: Config):
         T_list, n_rows, _Wh, _Wh_inv = _whitened_moments(
             layer_keys_list, get_cos_sins, rope_ready, layer_i, cfg
         )
+        # The discrete readout pools per-cache moments UNWEIGHTED while the
+        # debias treats the pool's sample size as sum(n_rows) (concatenation
+        # semantics) — the two agree only for equal per-cache row counts.
+        # Fail fast rather than silently disagree on a future unequal fleet.
+        assert len(set(n_rows)) == 1, (
+            f"per-cache row counts must be equal (unweighted pooled mean vs "
+            f"sum-n debias semantics); got {sorted(set(n_rows))}"
+        )
 
         report_all = jensen_gap_report(T_list, n_rows=n_rows)
         report_flat = jensen_gap_report(

@@ -37,7 +37,7 @@ class CacheCodecSpec:
     dec_quant : str
         Decoder storage precision for the ``"spectral"`` arm (Lever 2; K4
         local-levers Task 1 collapses this to one tier threshold parsed by
-        ``spectral.dec_quant_threshold``). Three forms:
+        ``spectral.dec_quant_threshold``). Four forms:
         ``"fp32"`` (default) is inert -- today's byte-identical compute path;
         threshold None, no int8 storage.
         ``"int8"`` roundtrips EVERY used decoder column through int8 once at
@@ -48,8 +48,14 @@ class CacheCodecSpec:
         ``"int8_t{T}"`` (e.g. ``"int8_t5"``, 2 <= T <= 8) tier-gates: only
         columns whose allocated bits satisfy ``0 < bits <= T`` are
         int8-roundtripped; used columns above T stay fp32-as-loaded (fp16
-        cost in the accounting). Ignored by every other arm. A fourth mode,
-        fp16 (``dec.half().float()``), exists only as a measurement arm in
+        cost in the accounting).
+        ``"int8_tl"`` (recipe suffix ``_dec8tl``) derives a PER-LAYER
+        threshold at materialization from each layer pack's own certificate
+        (``spectral.per_layer_tier_thresholds``, 5% bar); the applied
+        threshold is recorded on ``SpectralPack.dec_tier`` and the accounting
+        reads that record (never re-derives — see the 2026-07-24 map-drift
+        fix). Ignored by every other arm. A fifth mode, fp16
+        (``dec.half().float()``), exists only as a measurement arm in
         ``experiments/k4_dec_quant.py`` (the shippability check for what
         skeptic-v1 charges) and is deliberately not a streaming ``dec_quant``
         value here.

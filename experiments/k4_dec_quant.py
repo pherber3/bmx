@@ -60,6 +60,7 @@ from bmx.artifacts import create_run, write_metrics
 from bmx.cache.codecs import quantize_cache
 from bmx.cache.spectral import (
     SpectralPack,
+    dec_quant_threshold,
     int8_decoder_certificate_tiered,
     int8_decoder_roundtrip,
     load_packs,
@@ -128,17 +129,16 @@ def _dec_variant(
         return dec
     if mode == "fp16":
         return dec.half().float()
-    if mode == "int8":
-        return int8_decoder_roundtrip(dec, bits_pc)
     if mode == "int8_tl":
         assert tier_threshold_tl is not None, "int8_tl requires tier_threshold_tl"
         if tier_threshold_tl == 0:
             return dec
         return int8_decoder_roundtrip(dec, bits_pc, tier_threshold=tier_threshold_tl)
-    if mode.startswith("int8_t"):
-        t = int(mode[len("int8_t") :])
-        return int8_decoder_roundtrip(dec, bits_pc, tier_threshold=t)
-    raise AssertionError(f"unknown dec_mode {mode!r}")
+    # "int8" (blanket == T8, pinned) and "int8_t{T}" both parse through the
+    # shared validated parser — no hand-rolled suffix split here.
+    return int8_decoder_roundtrip(
+        dec, bits_pc, tier_threshold=dec_quant_threshold(mode)
+    )
 
 
 def _mode_c_int8(
@@ -154,8 +154,7 @@ def _mode_c_int8(
     if mode == "int8_tl":
         assert tier_threshold_tl is not None, "int8_tl requires tier_threshold_tl"
         return pack.c_int8(tier_threshold_tl)
-    thr = 8 if mode == "int8" else int(mode[len("int8_t") :])
-    return pack.c_int8(thr)
+    return pack.c_int8(dec_quant_threshold(mode))
 
 
 def main(cfg: Config):
@@ -189,8 +188,11 @@ def main(cfg: Config):
             flush=True,
         )
 
-    for cache_path in cfg.cache_paths:
-        cache_label = cache_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    cache_labels = [
+        cache_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        for cache_path in cfg.cache_paths
+    ]
+    for cache_path, cache_label in zip(cfg.cache_paths, cache_labels):
         layer_keys = load_layer_keys(cache_path)
         layers = sorted(layer_keys.keys())
         rope_ready, get_cos_sin = setup_rope(cfg.model_name, layer_keys, layers)
@@ -336,10 +338,6 @@ def main(cfg: Config):
     tq_curves = {
         cache: _tq_layer_curve(g, headline_col) for cache, g in tq_df.groupby("cache")
     }
-    cache_labels = [
-        cache_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        for cache_path in cfg.cache_paths
-    ]
     cvm_rows: list[dict] = []
     for budget in cfg.budgets:
         packs_by_cache = {
@@ -386,6 +384,9 @@ def _per_layer_wins(
     decoder-precision damage — see module docstring's win definition).
     Returns (wins[mode][(cache, layer)] -> win, extrapolated)."""
     fp16_sub = sub[sub.dec_mode == "fp16"].set_index(["cache", "layer"])
+    # One indexed frame per mode up front — the inner loop below does O(1)
+    # lookups instead of re-scanning the full frame per (cache, layer, mode).
+    by_mode = {m: sub[sub.dec_mode == m].set_index(["cache", "layer"]) for m in modes}
     wins: dict[str, dict[tuple[str, int], float]] = {m: {} for m in modes}
     extrapolated = False
 
@@ -397,12 +398,10 @@ def _per_layer_wins(
         tq_dist, ex = _log_interp(pts, bpe_at)
         extrapolated = extrapolated or ex
         for mode in modes:
-            row = sub[
-                (sub.cache == cache) & (sub.layer == layer) & (sub.dec_mode == mode)
-            ]
-            if row.empty:
+            mode_sub = by_mode[mode]
+            if (cache, layer) not in mode_sub.index:
                 continue
-            dist = max(float(row[headline_col].iloc[0]), 1e-300)
+            dist = max(float(mode_sub.loc[(cache, layer), headline_col]), 1e-300)
             wins[mode][(cache, layer)] = tq_dist / dist
 
     return wins, extrapolated

@@ -78,6 +78,25 @@ def _load_niah_rows(run_dirs: tuple[str, ...]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _corrected(
+    measured: float,
+    C: int,
+    S: int,
+    tiers: tuple[int, ...],
+    group: int,
+    c_used: float,
+    charge: float,
+) -> float:
+    """The shared corrected() blend: subtract the K-side decoder-charge delta
+    (v1 minus the caller's corrected charge, /2 for the K-V blend) and the
+    unused-column scale share, from the measured blended bits. Both public
+    variants below differ ONLY in how `charge` is computed."""
+    charge_v1 = skeptic_charge(C, S, tiers)
+    decoder_delta = (charge_v1 - charge) / 2.0
+    scale_delta = (scale_bits(group) * (1 - c_used / C)) / 2.0
+    return measured - decoder_delta - scale_delta
+
+
 def _corrected_bits(
     measured: float,
     C: int,
@@ -87,11 +106,8 @@ def _corrected_bits(
     c_used: float,
     dec_bits: float,
 ) -> float:
-    charge_v1 = skeptic_charge(C, S, tiers)
-    charge_v2 = skeptic_charge(C, S, tiers, c_used=c_used, dec_bits=dec_bits)
-    decoder_delta = (charge_v1 - charge_v2) / 2.0
-    scale_delta = (scale_bits(group) * (1 - c_used / C)) / 2.0
-    return measured - decoder_delta - scale_delta
+    charge = skeptic_charge(C, S, tiers, c_used=c_used, dec_bits=dec_bits)
+    return _corrected(measured, C, S, tiers, group, c_used, charge)
 
 
 def _corrected_bits_mixed(
@@ -103,19 +119,14 @@ def _corrected_bits_mixed(
     c_used: float,
     frac: float,
 ) -> float:
-    """Same corrected() blend as `_corrected_bits` (same /2 K-V blend factor,
-    same scale_bits term), but the decoder charge routes through
-    `mixed_dec_charge(c_int8=frac*c_used)` instead of
-    `skeptic_charge(dec_bits=db)` — the tier-gated honest replacement for the
-    blanket int8 column (see module docstring / §3b of the local-levers
-    design doc). Endpoint-pinned: frac=0.0 == dec_bits=16.0 (skeptic-v2),
-    frac=1.0 == dec_bits=8.0 (skeptic-v2-int8) EXACTLY, since
+    """The tier-gated honest replacement for the blanket int8 column: decoder
+    charge routes through `mixed_dec_charge(c_int8=frac*c_used)` instead of
+    `skeptic_charge(dec_bits=db)` (see module docstring / §3b of the
+    local-levers design doc). Endpoint-pinned: frac=0.0 == dec_bits=16.0
+    (skeptic-v2), frac=1.0 == dec_bits=8.0 (skeptic-v2-int8) EXACTLY, since
     mixed_dec_charge reduces to skeptic_charge at c_int8 in {0, c_used}."""
-    charge_v1 = skeptic_charge(C, S, tiers)
-    charge_mixed = mixed_dec_charge(C, S, tiers, c_used=c_used, c_int8=frac * c_used)
-    decoder_delta = (charge_v1 - charge_mixed) / 2.0
-    scale_delta = (scale_bits(group) * (1 - c_used / C)) / 2.0
-    return measured - decoder_delta - scale_delta
+    charge = mixed_dec_charge(C, S, tiers, c_used=c_used, c_int8=frac * c_used)
+    return _corrected(measured, C, S, tiers, group, c_used, charge)
 
 
 def _mode_label(dec_bits: float) -> str:

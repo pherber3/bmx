@@ -2186,13 +2186,16 @@ def test_k4_jensen_gap_smoke(tmp_path):
 
 
 def test_k4_jensen_gap_debiasing_uses_real_row_counts_not_hardcoded(tmp_path):
-    """Two caches with DIFFERENT sequence lengths (S): the harness must read
-    each cache's own row count off the data (per_cache_weighted_moments'
-    M_parts) rather than assuming a fixed S like 1024 -- verified by checking
-    bias_factor_seq against the closed-form Bartlett/digamma correction
-    computed independently in the test from the ACTUAL S values, and
-    confirming a hardcoded-1024 assumption would give a visibly different
-    (wrong) number here."""
+    """Two caches at S=96 (equal, but != any hardcoded default like 1024):
+    the harness must read each cache's row count off the data
+    (per_cache_weighted_moments' M_parts) rather than assuming a fixed S --
+    verified by checking bias_factor_seq against the closed-form
+    Bartlett/digamma correction computed independently in the test from the
+    ACTUAL S, and confirming a hardcoded-1024 assumption would give a
+    visibly different (wrong) number. Equal lengths are REQUIRED: the
+    experiment fail-fasts on unequal per-cache row counts (unweighted
+    pooled-mean vs sum-n debias semantics only agree when n_s are equal --
+    see the assert in k4_jensen_gap.main)."""
     import math
 
     import pandas as pd
@@ -2201,7 +2204,7 @@ def test_k4_jensen_gap_debiasing_uses_real_row_counts_not_hardcoded(tmp_path):
 
     p_small, p_large = tmp_path / "small.safetensors", tmp_path / "large.safetensors"
     _tiny_cache(p_small, S=96, C=16, h_kv=2, T=16, seed=0)
-    _tiny_cache(p_large, S=192, C=16, h_kv=2, T=16, seed=1)
+    _tiny_cache(p_large, S=96, C=16, h_kv=2, T=16, seed=1)
 
     run_dir = main(
         Config(
@@ -2221,9 +2224,9 @@ def test_k4_jensen_gap_debiasing_uses_real_row_counts_not_hardcoded(tmp_path):
         psi = torch.special.digamma((n - idx + 1) / 2.0)
         return float((psi + math.log(2.0 / n)).mean())
 
-    # Real per-cache n_rows are 96 and 192 (read off the fixture's own S);
-    # bias_factor_seq is exp(mean_s(b_s)) over those two REAL values.
-    b_seq_expected = math.exp((b(96) + b(192)) / 2.0)
+    # Real per-cache n_rows are 96 (read off the fixture's own S);
+    # bias_factor_seq is exp(mean_s(b_s)) over the REAL value.
+    b_seq_expected = math.exp(b(96))
     # A hardcoded-1024 bug would instead give exp(b(1024)) for BOTH caches.
     b_seq_wrong_if_hardcoded = math.exp(b(1024))
 

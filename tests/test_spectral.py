@@ -980,15 +980,11 @@ def test_load_packs_for_spec_int8_tl_applies_per_layer_thresholds(tmp_path):
 
 
 def _spiked_matrix(S, C, seed, spike_std):
-    """Minimal spiked-key generator with an explicit (S, C, seed, spike_std)
-    signature (unlike _spiked_keys, whose spike_std is a fixed pair) --
-    needed to hunt a certificate BOUNDARY case below."""
-    g = torch.Generator().manual_seed(seed)
-    raw = torch.randn(C, 2, generator=g)
-    dirs, _ = torch.linalg.qr(raw)
-    z = torch.randn(S, 2, generator=g) * torch.tensor([spike_std, spike_std])
-    noise = torch.randn(S, C, generator=g)
-    return z @ dirs.mT + noise
+    """Scalar-spike_std convenience over `_spiked_keys` — draw-for-draw
+    identical to `_spiked_keys(S, C, seed, spike_std=(x, x))[0]` (same
+    generator order: raw -> qr -> z -> noise). Kept as the named fixture the
+    certificate-boundary tests below were grid-searched against."""
+    return _spiked_keys(S=S, C=C, seed=seed, spike_std=(spike_std, spike_std))[0]
 
 
 def _pristine_vs_postroundtrip_divergent_packs():
