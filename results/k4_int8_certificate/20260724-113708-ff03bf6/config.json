@@ -1,0 +1,16 @@
+{
+  "pack_path": "results/cache/k4_packs_gpt2.safetensors",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "tier_thresholds": [
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "model_label": "gpt2",
+  "out_root": ""
+}

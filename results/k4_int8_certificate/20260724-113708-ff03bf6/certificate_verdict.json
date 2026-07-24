@@ -1,0 +1,60 @@
+{
+  "pack_path": "results/cache/k4_packs_gpt2.safetensors",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "max_noise_to_signal": 1.1752972938639092,
+  "max_implied_rel_degradation": 0.5402927209899973,
+  "vm_gate_line": 0.05,
+  "margin_factor": 0.09254242757219319,
+  "certificate_far_inside_gate": false,
+  "user_review_required_before_vm_task8_release": true,
+  "note": "These numbers are an offline certificate for user review. VM Task 8's gate measurement stays queued until the user explicitly releases it; this certificate does not replace it.",
+  "git_sha": "ff03bf6",
+  "tier_sweep": {
+    "tier_thresholds": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "charge_s_grid": [
+      4096,
+      16384,
+      65536
+    ],
+    "full_int8_charge_saving": {
+      "2.2": {
+        "S4096": 11.912256876627604,
+        "S16384": 2.978064219156901,
+        "S65536": 0.7445160547892252
+      },
+      "2.5": {
+        "S4096": 12.825887044270834,
+        "S16384": 3.2064717610677085,
+        "S65536": 0.8016179402669271
+      }
+    },
+    "per_budget_rescue": {
+      "2.2": {
+        "largest_passing_threshold": 5,
+        "rel_degradation_at_that_threshold": 0.021148315486014518,
+        "margin_to_gate": 0.028851684513985485,
+        "frac_int8_at_that_threshold": 0.916107931316435,
+        "charge_saving_fraction_at_S4096": 0.9161079313164351,
+        "any_threshold_passes": true
+      },
+      "2.5": {
+        "largest_passing_threshold": 5,
+        "rel_degradation_at_that_threshold": 0.021011224530834174,
+        "margin_to_gate": 0.02898877546916583,
+        "frac_int8_at_that_threshold": 0.8929222357229648,
+        "charge_saving_fraction_at_S4096": 0.8929222357229646,
+        "any_threshold_passes": true
+      }
+    },
+    "note": "Rescue sweep: int8-store only columns with bits<=T, fp16 for the rest (pure post-processing of the existing certificate, no codec change). largest_passing_threshold is the biggest T whose aggregate (max-over-layers) implied_rel_degradation stays under the 5% VM gate line; charge_saving_fraction_at_S4096 is how much of the FULL blanket-int8 charge saving survives at that T. Same user-review gate as the blanket certificate above -- this sweep informs the user's decision, nothing else."
+  }
+}
