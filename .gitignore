@@ -16,3 +16,13 @@ results/cache/
 /LongBench/
 # superpowers SDD scratch — session scaffolding, not project artefacts
 .superpowers/
+# run debris classes (2026-07-25 results-tree curation): in-flight partials,
+# VM stdout logs, and local scratch never carry doc-cited numbers
+results/**/partial/
+results/logs/
+results/overnight_logs/
+scratchpad/
+/*.pdf
+# attic: uncited superseded/iteration run dirs swept out of the active tree
+# (bytes preserved on disk; doc-cited runs are always committed, never attic'd)
+results/attic/

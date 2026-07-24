@@ -1,5 +1,8 @@
 # K2 — water-filling per-channel bit allocation on key residuals (2026-06-21)
 
+> **[2026-07-25 traceability note]** The `results/k2_waterfill/2026-06-21*` run dirs this doc cites were never committed and no longer exist on any machine (predates the results-commit discipline; verified against full git history 2026-07-25). The numbers in this doc are the only surviving record of those runs. The K2 conclusions here were independently superseded/confirmed by the later K2b-K3-K4 chain, whose artifacts are committed.
+
+
 Kill-or-confirm for the spec `docs/superpowers/specs/2026-06-21-waterfill-channel-allocation-design.md`.
 One question: at matched total bpe, does reverse-water-filling per-channel bits on
 the **post-low-rank key residual** beat uniform-per-channel RTN, scored on logit

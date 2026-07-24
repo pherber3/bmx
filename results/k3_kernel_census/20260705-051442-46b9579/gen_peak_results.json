@@ -1,0 +1,44 @@
+[
+  {
+    "length": 32768,
+    "arm": "fp16",
+    "packed": false,
+    "peak_gib": 23.74,
+    "oom": false
+  },
+  {
+    "length": 32768,
+    "arm": "k2b",
+    "packed": true,
+    "peak_gib": 24.0,
+    "oom": false
+  },
+  {
+    "length": 65536,
+    "arm": "fp16",
+    "packed": false,
+    "peak_gib": 38.49,
+    "oom": false
+  },
+  {
+    "length": 65536,
+    "arm": "k2b",
+    "packed": true,
+    "peak_gib": 39.01,
+    "oom": false
+  },
+  {
+    "length": 131072,
+    "arm": "fp16",
+    "packed": false,
+    "peak_gib": 86.0,
+    "oom": false
+  },
+  {
+    "length": 131072,
+    "arm": "k2b",
+    "packed": true,
+    "peak_gib": 87.03,
+    "oom": false
+  }
+]

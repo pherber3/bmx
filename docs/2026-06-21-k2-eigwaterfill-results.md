@@ -1,5 +1,8 @@
 # K2 — eigenbasis (KLT) water-filling on key residuals (2026-06-21)
 
+> **[2026-07-25 traceability note]** The `results/k2_waterfill/2026-06-21*` run dirs this doc cites were never committed and no longer exist on any machine (predates the results-commit discipline; verified against full git history 2026-07-25). The numbers in this doc are the only surviving record of those runs. The K2 conclusions here were independently superseded/confirmed by the later K2b-K3-K4 chain, whose artifacts are committed.
+
+
 Revival test for the negative in `docs/2026-06-21-k2-waterfill-results.md` (per-
 **channel** water-fill KILLED, uniform won 32/32). Cover–Thomas reverse water-
 filling is optimal over **eigen-directions**, not raw channels, so this rotates the
