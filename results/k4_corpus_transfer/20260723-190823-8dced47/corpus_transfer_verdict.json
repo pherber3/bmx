@@ -1,0 +1,229 @@
+{
+  "headline_metric": "logit",
+  "verdict_rule": "D<0.10 insensitive; D>0.25 domain-sensitive; else as-measured",
+  "gpt2_yellow_flag": "gpt2 scale = mechanism verdict only (corpus-W retention ~0.47-0.52, docs/2026-07-15-k4-duel-results.md); Llama fit-side replication pre-registered before any paper claim",
+  "per_budget": {
+    "2.2": {
+      "cells": {
+        "wiki->wiki": {
+          "win_per_cache": {
+            "gpt2_1024.safetensors": 9.159771077154925,
+            "gpt2_1024_off5120.safetensors": 10.31222311691222
+          },
+          "win_mean": 9.735997097033572,
+          "extrapolated": false
+        },
+        "wiki->code": {
+          "win_per_cache": {
+            "gpt2_1024_code.safetensors": 7.079189261949073,
+            "gpt2_1024_code_off5120.safetensors": 7.2513015411550406
+          },
+          "win_mean": 7.165245401552056,
+          "extrapolated": false
+        },
+        "code->wiki": {
+          "win_per_cache": {
+            "gpt2_1024.safetensors": 5.41590764640706,
+            "gpt2_1024_off5120.safetensors": 5.1323074677793405
+          },
+          "win_mean": 5.274107557093201,
+          "extrapolated": false
+        },
+        "code->code": {
+          "win_per_cache": {
+            "gpt2_1024_code.safetensors": 15.396805224866652,
+            "gpt2_1024_code_off5120.safetensors": 19.578652735887353
+          },
+          "win_mean": 17.487728980377003,
+          "extrapolated": false
+        },
+        "null->wiki": {
+          "win_per_cache": {
+            "gpt2_1024.safetensors": 8.461981804650206,
+            "gpt2_1024_off5120.safetensors": 9.163615401733447
+          },
+          "win_mean": 8.812798603191826,
+          "extrapolated": false
+        },
+        "null->code": {
+          "win_per_cache": {
+            "gpt2_1024_code.safetensors": 7.248841213365125,
+            "gpt2_1024_code_off5120.safetensors": 7.50149966657889
+          },
+          "win_mean": 7.375170439972008,
+          "extrapolated": false
+        }
+      },
+      "D": {
+        "code->wiki": {
+          "mean": 0.4555186336821994,
+          "min": 0.4087289299276603,
+          "max": 0.5023083374367385,
+          "label": "domain-sensitive"
+        },
+        "null->wiki": {
+          "mean": 0.09378145233182628,
+          "min": 0.07617977203000759,
+          "max": 0.11138313263364497,
+          "label": "insensitive"
+        },
+        "wiki->code": {
+          "mean": 0.5849246266564607,
+          "min": 0.5402170022573378,
+          "max": 0.6296322510555835,
+          "label": "domain-sensitive"
+        },
+        "null->code": {
+          "mean": 0.5730257390807005,
+          "min": 0.5291983559253017,
+          "max": 0.6168531222360993,
+          "label": "domain-sensitive"
+        }
+      },
+      "model_intrinsic_flag": true,
+      "hybrid": {
+        "basis_wiki_alloc_code": {
+          "win_mean": 7.432675453191209,
+          "recovery": 0.42502233775074055,
+          "h3_pass": false,
+          "extrapolated": false
+        },
+        "basis_code_alloc_wiki": {
+          "win_mean": 5.514385385093512,
+          "recovery": 0.566391436864096,
+          "h3_pass": false,
+          "extrapolated": false
+        }
+      },
+      "wcross": {
+        "sigma_wiki_W_code->wiki": {
+          "win_mean": 7.74014282033924,
+          "extrapolated": false
+        },
+        "sigma_wiki_W_code->code": {
+          "win_mean": 10.864223582904254,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->wiki": {
+          "win_mean": 6.914978417552375,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->code": {
+          "win_mean": 12.332395964067437,
+          "extrapolated": false
+        }
+      }
+    },
+    "2.5": {
+      "cells": {
+        "wiki->wiki": {
+          "win_per_cache": {
+            "gpt2_1024.safetensors": 8.64709544715088,
+            "gpt2_1024_off5120.safetensors": 9.767551383014132
+          },
+          "win_mean": 9.207323415082506,
+          "extrapolated": false
+        },
+        "wiki->code": {
+          "win_per_cache": {
+            "gpt2_1024_code.safetensors": 6.763713292996401,
+            "gpt2_1024_code_off5120.safetensors": 6.9079102390849
+          },
+          "win_mean": 6.83581176604065,
+          "extrapolated": false
+        },
+        "code->wiki": {
+          "win_per_cache": {
+            "gpt2_1024.safetensors": 5.119061881946478,
+            "gpt2_1024_off5120.safetensors": 4.863786647069417
+          },
+          "win_mean": 4.991424264507947,
+          "extrapolated": false
+        },
+        "code->code": {
+          "win_per_cache": {
+            "gpt2_1024_code.safetensors": 14.07264015544529,
+            "gpt2_1024_code_off5120.safetensors": 17.679512361684612
+          },
+          "win_mean": 15.87607625856495,
+          "extrapolated": false
+        },
+        "null->wiki": {
+          "win_per_cache": {
+            "gpt2_1024.safetensors": 8.008102204783027,
+            "gpt2_1024_off5120.safetensors": 8.661151847637832
+          },
+          "win_mean": 8.33462702621043,
+          "extrapolated": false
+        },
+        "null->code": {
+          "win_per_cache": {
+            "gpt2_1024_code.safetensors": 7.025434793430673,
+            "gpt2_1024_code_off5120.safetensors": 7.185366604103453
+          },
+          "win_mean": 7.105400698767063,
+          "extrapolated": false
+        }
+      },
+      "D": {
+        "code->wiki": {
+          "mean": 0.45502431405186683,
+          "min": 0.4080021536441869,
+          "max": 0.5020464744595468,
+          "label": "domain-sensitive"
+        },
+        "null->wiki": {
+          "mean": 0.09358491636021465,
+          "min": 0.07389686470714207,
+          "max": 0.11327296801328723,
+          "label": "insensitive"
+        },
+        "wiki->code": {
+          "mean": 0.564320860646184,
+          "min": 0.5193714030711403,
+          "max": 0.6092703182212277,
+          "label": "domain-sensitive"
+        },
+        "null->code": {
+          "mean": 0.5471750794776629,
+          "min": 0.5007735069021686,
+          "max": 0.5935766520531572,
+          "label": "domain-sensitive"
+        }
+      },
+      "model_intrinsic_flag": true,
+      "hybrid": {
+        "basis_wiki_alloc_code": {
+          "win_mean": 7.110421772408425,
+          "recovery": 0.44787022036206453,
+          "h3_pass": false,
+          "extrapolated": false
+        },
+        "basis_code_alloc_wiki": {
+          "win_mean": 5.268347787964523,
+          "recovery": 0.5721910212618847,
+          "h3_pass": false,
+          "extrapolated": false
+        }
+      },
+      "wcross": {
+        "sigma_wiki_W_code->wiki": {
+          "win_mean": 7.331359470831256,
+          "extrapolated": false
+        },
+        "sigma_wiki_W_code->code": {
+          "win_mean": 10.203463628210494,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->wiki": {
+          "win_mean": 6.54083867726163,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->code": {
+          "win_mean": 11.368922501778592,
+          "extrapolated": false
+        }
+      }
+    }
+  }
+}
