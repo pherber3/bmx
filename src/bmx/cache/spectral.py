@@ -179,6 +179,20 @@ class SpectralPack:
     group: int
     tiers: tuple[int, ...]
     budget: float
+    # RUNTIME-ONLY (never persisted by save_pack_file/load_packs -- the pack
+    # FILE format is unchanged; this is set by load_packs_for_spec at
+    # materialization only): the tier threshold this pack's `dec` was
+    # ACTUALLY int8-roundtripped at, or None if `dec` is still fp-stored.
+    # Ground truth for accounting -- see `cache_bits_per_entry`, which must
+    # read this rather than re-derive a threshold from the (possibly already
+    # roundtripped) pack, since int8_decoder_roundtrip is near-idempotent:
+    # re-running the certificate on an already-int8-stored decoder sees
+    # ddec ~= 0 and can silently pass a HIGHER tier than the pristine
+    # certificate would have allowed (K4 estimation-levers Task 3 fix wave --
+    # this was a real bug in the "int8_tl" streaming path: recomputing
+    # per_layer_tier_thresholds from the post-roundtrip packs drifted from
+    # the map materialization actually applied, under-charging bpe).
+    dec_tier: int | None = None
 
     @property
     def c_used(self) -> int:
@@ -1112,14 +1126,19 @@ def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
     which keeps every other pack field (enc, lam, bits, tiers, ...)
     untouched. `dec_quant="int8"` parses to threshold 8 (blanket -- the same
     result as before this generalization, pinned by
-    test_load_packs_for_spec_matches_load_packs_and_owns_dec_quant).
+    test_load_packs_for_spec_matches_load_packs_and_owns_dec_quant). Every
+    roundtripped pack's `dec_tier` is set to the threshold ACTUALLY applied
+    to it (the ground truth `cache_bits_per_entry` reads back — see
+    `SpectralPack.dec_tier`'s docstring for why re-deriving a threshold from
+    an already-roundtripped decoder is unsafe).
 
     `dec_quant="int8_tl"` (K4 estimation-levers Task 3): thr is the
     PER_LAYER_TIER_SENTINEL, not a real threshold. `per_layer_tier_thresholds`
-    is computed ONCE here from the just-loaded pack dict (deterministic,
-    pack-derived -- no extra state), then each layer is roundtripped at its
-    OWN T_ℓ; a layer whose T_ℓ is 0 (even T=2 fails the certificate bar) is
-    left untouched (no int8 for that layer, same meaning as thr=None).
+    is computed ONCE here from the just-loaded PRISTINE pack dict
+    (deterministic, pack-derived -- no extra state), then each layer is
+    roundtripped at its OWN T_ℓ with `dec_tier` set to that same T_ℓ; a layer
+    whose T_ℓ is 0 (even T=2 fails the certificate bar) is left untouched (no
+    int8 for that layer, `dec_tier` stays None -- same meaning as thr=None).
 
     k_spec: a CacheCodecSpec (arm, pre_rope, pack_path, budget, dec_quant).
     """
@@ -1130,6 +1149,12 @@ def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
     assert k_spec.pack_path, "spectral requires pack_path"
     packs = load_packs(k_spec.pack_path, k_spec.budget)
     if thr == PER_LAYER_TIER_SENTINEL:
+        # per_layer_tier_thresholds MUST see the pristine (just-loaded, never
+        # roundtripped) packs -- int8_decoder_roundtrip is near-idempotent,
+        # so deriving the map from an already-roundtripped decoder would
+        # silently certify a higher (wrong) tier. This is the ONLY place the
+        # map is ever computed; every other consumer (streaming accounting)
+        # reads the per-layer dec_tier this loop stamps, never re-derives.
         t_map = per_layer_tier_thresholds(packs)
         packs = {
             i: (
@@ -1140,6 +1165,7 @@ def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
                     dec=int8_decoder_roundtrip(
                         pack.dec, pack.bits, tier_threshold=t_map[i]
                     ),
+                    dec_tier=t_map[i],
                 )
             )
             for i, pack in packs.items()
@@ -1152,6 +1178,7 @@ def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
             i: dataclasses.replace(
                 pack,
                 dec=int8_decoder_roundtrip(pack.dec, pack.bits, tier_threshold=thr),
+                dec_tier=thr,
             )
             for i, pack in packs.items()
         }

@@ -415,8 +415,14 @@ def test_streaming_bpe_int8_tl(tmp_path):
     """K4 estimation-levers Task 3: dec_quant='int8_tl' bpe_k's pack charge
     equals a hand-computed mixed_dec_charge with PER-LAYER c_int8 at each
     layer's own certificate-derived T_ℓ (per_layer_tier_thresholds applied
-    to the raw, un-roundtripped packs -- the same map load_packs_for_spec
-    used at materialization), averaged the same way mean_c_used is averaged."""
+    to a FRESH pristine reload -- an independent oracle from whatever
+    load_packs_for_spec/cache_bits_per_entry actually did internally),
+    averaged the same way mean_c_used is averaged. Also pins each live
+    layer's SpectralPack.dec_tier against that same fresh map (fix-wave
+    regression: dec_tier is what cache_bits_per_entry actually reads --
+    see test_cache_bits_per_entry_int8_tl_uses_materialized_dec_tier_not_
+    a_live_rederivation below for the fixture that actually EXERCISES the
+    pristine-vs-post-roundtrip divergence this pins against in principle)."""
     from bmx.cache.spectral import (
         load_packs,
         mixed_dec_charge,
@@ -446,8 +452,15 @@ def test_streaming_bpe_int8_tl(tmp_path):
     S = cache.layers[-1].get_seq_length()
     C = cache.layers[-1]._h_kv * cache.layers[-1]._d_head
 
-    raw_packs = load_packs(path, 2.5)  # un-roundtripped -- the map's input
+    raw_packs = load_packs(path, 2.5)  # FRESH pristine reload -- independent oracle
     t_map = per_layer_tier_thresholds(raw_packs)
+    # dec_tier pin: each live layer's pack must carry the PRISTINE map's
+    # value, not something re-derived from its own (possibly roundtripped)
+    # live decoder.
+    for i, layer in enumerate(cache.layers):
+        expected_tier = t_map[i] if t_map[i] != 0 else None
+        assert layer._pack.dec_tier == expected_tier, (i, layer._pack.dec_tier, t_map)
+
     mean_c_used = sum(ly._pack.c_used for ly in cache.layers) / len(cache.layers)
     mean_c_int8 = sum(
         cache.layers[i]._pack.c_int8(t_map[i]) for i in range(len(cache.layers))
@@ -456,3 +469,115 @@ def test_streaming_bpe_int8_tl(tmp_path):
         C, S, cache.layers[-1]._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
     )
     assert abs(bpe_k - expected) < 1e-9
+
+
+def test_cache_bits_per_entry_int8_tl_uses_materialized_dec_tier_not_a_live_rederivation():
+    """K4 estimation-levers Task 3 FIX WAVE (P1 bug, confirmed on real gpt2
+    packs): cache_bits_per_entry must charge using each layer's
+    SpectralPack.dec_tier (set once, from the PRISTINE packs, by
+    load_packs_for_spec) -- NOT by re-deriving per_layer_tier_thresholds from
+    the live (already int8-roundtripped) packs. int8_decoder_roundtrip is
+    near-idempotent, so a live re-derivation can silently pass a HIGHER tier
+    than the pristine decoder certified, under-charging bpe.
+
+    This test exercises the actual divergent case directly against
+    cache_bits_per_entry (bypassing the model/forward-pass plumbing, which
+    the tiny_llama fixture's C=16 packs are too well-behaved to hit): a
+    boundary pack pair where the buggy re-derivation would have produced
+    dec_tier=8 for layer 0 (pristine certifies only 6). Minimal stand-in
+    layer objects expose exactly the attributes cache_bits_per_entry reads
+    (bpe_k/bpe_v/_committed_S_q/get_seq_length()/_h_kv/_d_head/_pack)."""
+    import dataclasses
+
+    from bmx.cache.spectral import (
+        fit_spectral_pack,
+        identity_whitener,
+        int8_decoder_roundtrip,
+        mixed_dec_charge,
+        per_layer_tier_thresholds,
+    )
+    from bmx.cache.streaming import cache_bits_per_entry
+
+    def _spiked(S, C, seed, spike_std):
+        g = torch.Generator().manual_seed(seed)
+        raw = torch.randn(C, 2, generator=g)
+        dirs, _ = torch.linalg.qr(raw)
+        z = torch.randn(S, 2, generator=g) * torch.tensor([spike_std, spike_std])
+        noise = torch.randn(S, C, generator=g)
+        return z @ dirs.mT + noise
+
+    C = 64
+    Wh, Wh_inv = identity_whitener(C)
+    M0 = _spiked(300, C, seed=4, spike_std=40.0)  # the boundary layer
+    M1 = _spiked(300, C, seed=1, spike_std=10.0)  # control layer
+    pack0 = fit_spectral_pack(M0, Wh, Wh_inv, budget=2.5, group=8)
+    pack1 = fit_spectral_pack(M1, Wh, Wh_inv, budget=2.5, group=8)
+    pristine = {0: pack0, 1: pack1}
+    t_map = per_layer_tier_thresholds(pristine)
+    assert t_map == {0: 6, 1: 8}, "boundary fixture drifted; re-tune spike/seed"
+
+    # Materialize the way load_packs_for_spec now does: roundtrip each layer
+    # at ITS OWN pristine T_ℓ, stamping dec_tier to match.
+    materialized = {
+        i: dataclasses.replace(
+            pack,
+            dec=int8_decoder_roundtrip(pack.dec, pack.bits, tier_threshold=t_map[i]),
+            dec_tier=t_map[i],
+        )
+        for i, pack in pristine.items()
+    }
+
+    class _StubLayer:
+        def __init__(self, pack):
+            self._pack = pack
+            self.bpe_k = 3.0  # arbitrary fixed payload bpe -- charge is additive
+            self.bpe_v = 2.0
+            self._committed_S_q = 128  # > 0 so the spectral charge is applied
+            self._h_kv = 1
+            self._d_head = C
+
+        def get_seq_length(self):
+            return 4096
+
+    layers = [_StubLayer(materialized[0]), _StubLayer(materialized[1])]
+    k_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path="unused",
+        budget=2.5,
+        dec_quant="int8_tl",
+    )
+    bpe_k, bpe_v = cache_bits_per_entry(layers, k_spec)
+
+    # Correct expectation: dec_tier-driven charge, i.e. layer 0 at T=6.
+    S, C_ = 4096, C
+    mean_c_used = sum(ly._pack.c_used for ly in layers) / len(layers)
+    mean_c_int8_correct = sum(
+        ly._pack.c_int8(ly._pack.dec_tier) for ly in layers
+    ) / len(layers)
+    expected_correct = 3.0 + mixed_dec_charge(
+        C_, S, layers[-1]._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8_correct
+    )
+    assert abs(bpe_k - expected_correct) < 1e-9
+
+    # The BUG's expectation: re-deriving the map from the LIVE (already
+    # roundtripped) packs would have wrongly promoted layer 0 to T=8,
+    # producing a strictly SMALLER (under-charged) mean_c_int8-driven charge
+    # unless c_int8(6) == c_int8(8) for layer 0 (ruled out by the fixture --
+    # the whole point of the boundary case is that the two differ).
+    buggy_t_map = per_layer_tier_thresholds(
+        {i: ly._pack for i, ly in enumerate(layers)}
+    )
+    assert buggy_t_map[0] == 8  # confirms the LIVE re-derivation IS wrong here
+    assert pack0.c_int8(6) != pack0.c_int8(8), (
+        "fixture must have a real column-count gap between T=6 and T=8"
+    )
+    mean_c_int8_buggy = sum(
+        ly._pack.c_int8(buggy_t_map[i]) for i, ly in enumerate(layers)
+    ) / len(layers)
+    expected_buggy = 3.0 + mixed_dec_charge(
+        C_, S, layers[-1]._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8_buggy
+    )
+    assert abs(bpe_k - expected_buggy) > 1e-6, (
+        "the fix must NOT reproduce the buggy under-charged value"
+    )

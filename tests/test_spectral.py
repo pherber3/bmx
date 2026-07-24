@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 import torch
 
@@ -975,6 +977,157 @@ def test_load_packs_for_spec_int8_tl_applies_per_layer_thresholds(tmp_path):
             raw_packs[0].dec, raw_packs[0].bits, tier_threshold=t_map[1]
         ),
     )
+
+
+def _spiked_matrix(S, C, seed, spike_std):
+    """Minimal spiked-key generator with an explicit (S, C, seed, spike_std)
+    signature (unlike _spiked_keys, whose spike_std is a fixed pair) --
+    needed to hunt a certificate BOUNDARY case below."""
+    g = torch.Generator().manual_seed(seed)
+    raw = torch.randn(C, 2, generator=g)
+    dirs, _ = torch.linalg.qr(raw)
+    z = torch.randn(S, 2, generator=g) * torch.tensor([spike_std, spike_std])
+    noise = torch.randn(S, C, generator=g)
+    return z @ dirs.mT + noise
+
+
+def _pristine_vs_postroundtrip_divergent_packs():
+    """A REAL boundary case (2026-07-24 fix-wave regression fixture, found by
+    grid search over C/budget/spike/seed): layer 0's PRISTINE certificate at
+    T=8 sits at implied_rel_degradation ~5.01% (just OVER the 5% bar, so
+    per_layer_tier_thresholds certifies T=6 for it) -- but re-running the
+    SAME certificate on layer 0's decoder AFTER it has been int8-roundtripped
+    at T=6 gives ~4.93% at T=8 (just UNDER the bar), because
+    int8_decoder_roundtrip is near-idempotent (re-roundtripping an
+    already-int8-stored column perturbs it negligibly further, shrinking
+    ddec and hence the certificate's `added` term). A naive re-derivation of
+    per_layer_tier_thresholds from the POST-roundtrip pack would silently
+    promote layer 0 from T=6 to T=8 -- exactly the bug this fix wave closes.
+    Layer 1 is an unrelated well-behaved control (T=8 either way, sanity
+    check that the fixture isn't accidentally forcing divergence everywhere).
+    """
+    C = 64
+    Wh, Wh_inv = identity_whitener(C)
+    M0 = _spiked_matrix(300, C, seed=4, spike_std=40.0)  # the boundary layer
+    M1 = _spiked_matrix(300, C, seed=1, spike_std=10.0)  # control layer
+    pack0 = fit_spectral_pack(M0, Wh, Wh_inv, budget=2.5, group=8)
+    pack1 = fit_spectral_pack(M1, Wh, Wh_inv, budget=2.5, group=8)
+    return {0: pack0, 1: pack1}
+
+
+def test_pristine_vs_postroundtrip_certificate_diverges_fixture_sanity():
+    """Sanity-pin the fixture itself (independent of any load_packs_for_spec
+    code path): pristine layer 0 certifies T=6; re-deriving the map from a
+    pack ALREADY roundtripped at T=6 wrongly promotes it to T=8. If this
+    test ever fails, the fixture stopped exhibiting the boundary case and
+    the regression tests below would silently stop covering the bug."""
+    from bmx.cache.spectral import (
+        int8_decoder_roundtrip,
+        per_layer_tier_thresholds,
+    )
+
+    packs = _pristine_vs_postroundtrip_divergent_packs()
+    t_map_pristine = per_layer_tier_thresholds(packs)
+    assert t_map_pristine[0] == 6, t_map_pristine
+    assert t_map_pristine[1] == 8, t_map_pristine
+
+    pack0 = packs[0]
+    rt_dec = int8_decoder_roundtrip(pack0.dec, pack0.bits, tier_threshold=6)
+    rt_pack0 = dataclasses.replace(pack0, dec=rt_dec)
+    t_map_post = per_layer_tier_thresholds({0: rt_pack0, 1: packs[1]})
+    assert t_map_post[0] == 8, (
+        f"fixture must exhibit the near-idempotency divergence; got {t_map_post}"
+    )
+    assert t_map_post[0] != t_map_pristine[0]
+
+
+def test_load_packs_for_spec_int8_tl_sets_dec_tier_from_pristine_map(tmp_path):
+    """K4 estimation-levers Task 3 fix wave (P1 bug): dec_quant='int8_tl'
+    materialization must set each layer's SpectralPack.dec_tier to the
+    PRISTINE per_layer_tier_thresholds value -- on the boundary fixture,
+    layer 0's dec_tier must be 6, never 8 (the value a re-derivation from the
+    already-roundtripped decoder would wrongly produce). Also pins dec_tier
+    for 'int8' (8 on every layer) and 'fp32' (None on every layer)."""
+    from bmx.cache.spectral import (
+        fit_spectral_basis,
+        int8_decoder_roundtrip,
+        load_packs_for_spec,
+        per_layer_tier_thresholds,
+        save_pack_file,
+    )
+    from bmx.cache.specs import CacheCodecSpec
+
+    C = 64
+    Wh, Wh_inv = identity_whitener(C)
+    M0 = _spiked_matrix(300, C, seed=4, spike_std=40.0)
+    M1 = _spiked_matrix(300, C, seed=1, spike_std=10.0)
+    bases = {
+        0: fit_spectral_basis(M0, Wh, Wh_inv),
+        1: fit_spectral_basis(M1, Wh, Wh_inv),
+    }
+    path = tmp_path / "boundary_packs.safetensors"
+    save_pack_file(path, bases, budgets=(2.5,), group=8, meta={"model": "boundary"})
+
+    from bmx.cache.spectral import load_packs
+
+    pristine = load_packs(path, 2.5)
+    t_map = per_layer_tier_thresholds(pristine)
+    assert t_map == {0: 6, 1: 8}, "boundary fixture drifted; re-tune spike/seed"
+
+    tl_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path=str(path),
+        budget=2.5,
+        dec_quant="int8_tl",
+    )
+    via_tl = load_packs_for_spec(tl_spec)
+    assert via_tl[0].dec_tier == 6  # NOT 8 -- the bug this test guards against
+    assert via_tl[1].dec_tier == 8
+    # And the materialized decoder itself must match the PRISTINE-T6 roundtrip,
+    # not a T8 roundtrip (dec_tier is not just a label -- it must agree with
+    # what was actually written into .dec).
+    expected_dec0 = int8_decoder_roundtrip(
+        pristine[0].dec, pristine[0].bits, tier_threshold=6
+    )
+    assert torch.equal(via_tl[0].dec, expected_dec0)
+
+    # 'int8' (blanket): dec_tier == 8 on every layer.
+    blanket_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path=str(path),
+        budget=2.5,
+        dec_quant="int8",
+    )
+    via_blanket = load_packs_for_spec(blanket_spec)
+    assert via_blanket[0].dec_tier == 8 and via_blanket[1].dec_tier == 8
+
+    # 'int8_t5' (single shared threshold): dec_tier == 5 on every layer.
+    t5_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path=str(path),
+        budget=2.5,
+        dec_quant="int8_t5",
+    )
+    via_t5 = load_packs_for_spec(t5_spec)
+    assert via_t5[0].dec_tier == 5 and via_t5[1].dec_tier == 5
+
+    # 'fp32': dec_tier is None on every layer (no roundtrip at all).
+    fp32_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path=str(path),
+        budget=2.5,
+        dec_quant="fp32",
+    )
+    via_fp32 = load_packs_for_spec(fp32_spec)
+    assert via_fp32[0].dec_tier is None and via_fp32[1].dec_tier is None
+
+    # And a freshly-loaded pack (never through load_packs_for_spec) also
+    # defaults to dec_tier=None -- pristine packs are never "secretly" int8.
+    assert pristine[0].dec_tier is None and pristine[1].dec_tier is None
 
 
 # ---------------------------------------------------------------------------

@@ -49,12 +49,9 @@ from bmx.cache.hf_compat import (
 from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.spectral import (
-    PER_LAYER_TIER_SENTINEL,
     SpectralPack,
-    dec_quant_threshold,
     load_packs_for_spec,
     mixed_dec_charge,
-    per_layer_tier_thresholds,
     spectral_quantize,
 )
 from bmx.decomp.lrs import truncated_svd
@@ -182,27 +179,33 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
 
     where mean_c_used = mean over layers of layer._pack.c_used (the number
     of decoder columns actually carrying nonzero bits — see
-    SpectralPack.c_used) and mean_c_int8 = mean over layers of each layer's
-    count of columns with `0 < bits <= thr` (`thr =
-    dec_quant_threshold(k_spec.dec_quant)`; 0 when thr is None — no int8
-    storage). `mixed_dec_charge` is linear in both c_used and c_int8, so the
-    across-layer mean of per-layer charges equals the charge evaluated at
-    the means; this is exact for allocated packs too, where each layer's own
-    budget gives it a different c_used (range 139-423 zero dirs at b2.5) and
-    a different per-layer tier-column count.
+    SpectralPack.c_used) and mean_c_int8 = mean over layers of
+    `layer._pack.c_int8(layer._pack.dec_tier)` (0 when `dec_tier` is None —
+    no int8 storage). `mixed_dec_charge` is linear in both c_used and c_int8,
+    so the across-layer mean of per-layer charges equals the charge
+    evaluated at the means; this is exact for allocated packs too, where
+    each layer's own budget gives it a different c_used (range 139-423 zero
+    dirs at b2.5) and a different per-layer tier-column count.
 
-    `dec_quant="int8_tl"` (K4 estimation-levers Task 3): thr is the
-    PER_LAYER_TIER_SENTINEL. `mean_c_int8` is then the mean over layers of
-    `layer._pack.c_int8(t_map[i])` at EACH layer's own certificate-derived
-    threshold, recomputed via `per_layer_tier_thresholds` from the packs
-    (pack-derived and deterministic, so recomputing it here — same map
-    `load_packs_for_spec` used at materialization — needs no extra state;
-    at most 32 layers, cheap per call). `mixed_dec_charge`'s linearity in
-    c_used/c_int8 licenses the mean here exactly as it does for the
-    single-threshold modes.
+    `SpectralPack.dec_tier` (K4 estimation-levers Task 3 fix wave) is the
+    single source of truth for "what threshold was this layer's decoder
+    ACTUALLY roundtripped at": `load_packs_for_spec` stamps it at
+    materialization (per-layer for `dec_quant="int8_tl"`, one shared value
+    for blanket/`int8_t{T}`, None for `fp32`). This function reads it back
+    rather than re-deriving anything from `k_spec.dec_quant` — deriving a
+    threshold (or, worse, a `per_layer_tier_thresholds` map) from the LIVE
+    packs here would be reading `int8_decoder_certificate_tiered` off an
+    already-int8-roundtripped decoder, which is a real, previously-shipped
+    bug: `int8_decoder_roundtrip` is near-idempotent (re-roundtripping an
+    already-int8-stored column perturbs it negligibly further), so the
+    certificate sees `ddec ~= 0` and can pass a HIGHER tier than the
+    pristine decoder actually certified — silently drifting from the map
+    materialization used and under-charging bpe. `dec_tier` closes this by
+    recording materialization's decision once, at the only point pristine
+    packs are ever in hand.
 
-    `dec_quant="fp32"` (thr=None,
-    mean_c_int8=0) and `dec_quant="int8"` (thr=8, blanket) reproduce the
+    `dec_quant="fp32"` (dec_tier=None,
+    mean_c_int8=0) and `dec_quant="int8"` (dec_tier=8, blanket) reproduce the
     prior `skeptic_charge(dec_bits=16.0)` / `skeptic_charge(dec_bits=8.0)`
     call sites bit-exactly — `mixed_dec_charge` is endpoint-pinned to
     `skeptic_charge` at `c_int8 ∈ {0, c_used}`
@@ -238,23 +241,19 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
     # in (c_used, c_int8) (see spectral.mixed_dec_charge) makes that equal
     # to averaging per-layer charged values.
     if k_spec.arm == "spectral" and last._committed_S_q > 0:
-        thr = dec_quant_threshold(k_spec.dec_quant)
         S = last.get_seq_length()
         C = last._h_kv * last._d_head
         mean_c_used = sum(layer._pack.c_used for layer in layers) / len(layers)
-        if thr == PER_LAYER_TIER_SENTINEL:
-            t_map = per_layer_tier_thresholds(
-                {i: layer._pack for i, layer in enumerate(layers)}
-            )
-            mean_c_int8 = sum(
-                layer._pack.c_int8(t_map[i]) for i, layer in enumerate(layers)
-            ) / len(layers)
-        else:
-            mean_c_int8 = (
-                0
-                if thr is None
-                else sum(layer._pack.c_int8(thr) for layer in layers) / len(layers)
-            )
+        # dec_tier is the ground truth stamped by load_packs_for_spec at
+        # materialization -- never re-derived here (see this function's
+        # docstring for why re-deriving from the live, possibly already
+        # int8-roundtripped packs is unsafe). None -> no int8 for that layer.
+        mean_c_int8 = sum(
+            0
+            if layer._pack.dec_tier is None
+            else layer._pack.c_int8(layer._pack.dec_tier)
+            for layer in layers
+        ) / len(layers)
         bpe_k = bpe_k + mixed_dec_charge(
             C, S, last._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
         )
