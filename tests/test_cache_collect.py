@@ -235,9 +235,13 @@ def test_load_eval_tokens_offset(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _patch_eval_tokens_io(monkeypatch):
+def _patch_eval_tokens_io(monkeypatch, period=None):
     """Fake tokenizer (arange ids) + fake dataset with 'text' and 'content'
     columns, so no download happens and byte-identity is checkable.
+
+    `period` makes the fake stream periodic (`arange % period`), so windows at
+    offsets that are multiples of the period have IDENTICAL contents — this
+    isolates the generator-seed composition from window-content differences.
 
     Returns a recorder list of (args, kwargs) for every load_dataset call, so
     tests can pin WHICH dataset/config/split the defaults fetch (the arange
@@ -250,8 +254,10 @@ def _patch_eval_tokens_io(monkeypatch):
         def __call__(self, text, return_tensors, truncation, max_length):
             import torch
 
-            ids = torch.arange(max_length).unsqueeze(0)
-            return type("E", (), {"input_ids": ids})()
+            ids = torch.arange(max_length)
+            if period is not None:
+                ids = ids % period
+            return type("E", (), {"input_ids": ids.unsqueeze(0)})()
 
     def _fake_load_dataset(*a, **k):
         calls.append((a, k))
@@ -676,6 +682,38 @@ def test_load_eval_tokens_synth_wiring(monkeypatch):
     # window — the arange window has 16 distinct tokens, so a permutation
     # would preserve the multiset exactly
     assert not torch.equal(uni1.sort().values, nat.sort().values)
+
+
+def test_load_eval_tokens_per_slice_seed_offset(monkeypatch):
+    """Pin the per-slice generator-seed composition `seed + token_offset` for
+    BOTH the shuffle null and the synth arms: distinct slices must get
+    distinct permutations/samples even when the windows' CONTENTS are
+    identical. Period-8 fake stream => the offset-0 and offset-8 windows
+    match, so any output difference can ONLY come from the offset entering
+    the seed. (bigram shares the same composed-seed call site in
+    load_eval_tokens, so the unigram pin covers it.)"""
+    import bmx.eval.layer_swap as ls
+
+    _patch_eval_tokens_io(monkeypatch, period=8)
+    nat0 = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=0)
+    nat8 = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=8)
+    assert torch.equal(nat0, nat8)  # fixture premise: identical window contents
+
+    shuf0, shuf8 = (
+        ls.load_eval_tokens(
+            "gpt2", n_tokens=16, token_offset=off, shuffle_seed=20260723
+        )
+        for off in (0, 8)
+    )
+    assert not torch.equal(shuf0, shuf8)  # token_offset entered the seed
+
+    uni0, uni8 = (
+        ls.load_eval_tokens(
+            "gpt2", n_tokens=16, token_offset=off, synth="unigram", synth_seed=20260723
+        )
+        for off in (0, 8)
+    )
+    assert not torch.equal(uni0, uni8)  # token_offset entered the seed
 
 
 def test_load_eval_tokens_synth_validation(monkeypatch):

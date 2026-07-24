@@ -50,6 +50,10 @@ class Config:
     corpus_label: str = ""  # REQUIRED when any corpus knob above is non-default
 
 
+# Deliberately duplicates the Config defaults above: this tuple pins the
+# canonical wikitext-cache identity INDEPENDENTLY, so a drifted Config default
+# trips the corpus-label guard (fail-loud) instead of silently writing a
+# different corpus into wikitext-named cache files. Don't DRY it away.
 _WIKI_DEFAULTS = (
     "Salesforce/wikitext",
     "wikitext-2-raw-v1",

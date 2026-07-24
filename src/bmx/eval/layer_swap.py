@@ -180,17 +180,16 @@ def synth_stream(window: torch.Tensor, mode: str, seed: int) -> torch.Tensor:
     succ: dict[int, list[int]] = {}
     for c, nx in zip(window[:-1].tolist(), window[1:].tolist()):
         succ.setdefault(c, []).append(nx)
-    succ_t = {c: torch.tensor(v, dtype=window.dtype) for c, v in succ.items()}
     out = torch.empty(n, dtype=window.dtype)
     cur = int(uni(1).item())
     out[0] = cur
     for t in range(1, n):
-        choices = succ_t.get(cur)
+        choices = succ.get(cur)
         if choices is None:  # context never observed with a successor
             cur = int(uni(1).item())
         else:
-            j = int(torch.randint(0, choices.numel(), (1,), generator=g).item())
-            cur = int(choices[j])
+            j = int(torch.randint(0, len(choices), (1,), generator=g).item())
+            cur = choices[j]
         out[t] = cur
     return out
 

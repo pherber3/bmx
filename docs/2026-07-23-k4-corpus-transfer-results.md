@@ -338,11 +338,11 @@ climb_to_order3: true (rule b on BOTH sides — the ladder is climbed
 one measured rung at a time; no higher orders otherwise).
 
 The shuf-vs-uni gap isolates with-vs-without replacement at matched order-1
-statistics: on wiki, D_uni (0.112–0.116) sits 1.8–2.3 points above D_shuf
+statistics: on wiki, D_uni (0.112–0.116) sits 1.8–2.2 points above D_shuf
 (0.094) — sampling WITH replacement from the fit-slice histogram loses a
 small but consistent slice of win relative to a straight without-replacement
 permutation of the same tokens, at matched order-1 marginal statistics. On
-code the gap is similar in size (0.023–0.026 points, D_uni 0.140 vs D_shuf
+code the gap is similar in size (2.4–2.6 points, D_uni 0.140 vs D_shuf
 0.114–0.116) despite code's D_shuf already sitting above wiki's — the
 with-replacement sampling-noise cost is roughly constant in absolute D
 across both domains, not a code-specific problem.
