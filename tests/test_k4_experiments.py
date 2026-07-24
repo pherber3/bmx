@@ -1258,3 +1258,59 @@ def test_k4_w_rope_ab_smoke(tmp_path):
     # tiny fixture has no RoPE (model_name="") => the null: delta ~ 0.
     for e in v["per_budget"].values():
         assert abs(e["rel_win_delta"]) < 1e-6
+
+
+def test_k4_g_table_smoke(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from bmx.cache.codecs import _tier_g
+    from experiments.k4_g_table import Config, main
+
+    fit = tmp_path / "f.safetensors"
+    _tiny_cache(fit, seed=0)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            corpus_cache_paths=(str(fit),),
+            model_label="tiny",
+            group=16,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    g = json.loads((run_dir / "g_table.json").read_text())
+    tiers = tuple(g["tiers"])
+    table = tuple(g["g_table"])
+    assert tiers == (0, 2, 3, 4, 5, 6, 8)
+    assert table[0] == 1.0  # g(0) exact
+    assert all(a > b for a, b in zip(table, table[1:]))  # strictly decreasing
+    # The table must be directly consumable by the allocator's validator.
+    tiers_t = torch.tensor([float(t) for t in tiers], dtype=torch.float64)
+    _tier_g(tiers_t, table)  # raises if not grid-convex
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert {"layer", "tier", "g_hat", "p10", "p90", "n_dirs"} <= set(df.columns)
+
+
+def test_k4_g_table_deterministic(tmp_path):
+    import json
+
+    from experiments.k4_g_table import Config, main
+
+    fit = tmp_path / "f.safetensors"
+    _tiny_cache(fit, seed=0)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+    cfg = dict(
+        pack_path=str(packs_path),
+        corpus_cache_paths=(str(fit),),
+        model_label="tiny",
+        group=16,
+    )
+    r1 = main(Config(**cfg, out_root=str(tmp_path / "r1")))
+    r2 = main(Config(**cfg, out_root=str(tmp_path / "r2")))
+    g1 = json.loads((r1 / "g_table.json").read_text())["g_table"]
+    g2 = json.loads((r2 / "g_table.json").read_text())["g_table"]
+    assert g1 == g2
