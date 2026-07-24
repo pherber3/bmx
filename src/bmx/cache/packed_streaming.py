@@ -45,7 +45,11 @@ from bmx.cache.spectral import (
     spectral_quantize_packed,
     tier_columns,
 )
-from bmx.cache.streaming import compute_flush_schedule
+from bmx.cache.streaming import (
+    cache_bits_per_entry,
+    compute_flush_schedule,
+    kv_memory_report,
+)
 from bmx.decomp.lrs import truncated_svd
 
 _ATTN_NAME = "chunked_dequant"
@@ -366,6 +370,18 @@ class PackedStreamingLayer(DynamicLayer):
         # pruning — these two quantities are always equal.
         self._committed_S_q: int = 0
 
+        # Honest bpe accounting (mirrors StreamingQuantizedLayer exactly): total
+        # quantized bits accumulated at flush time from the codec bpe returned by
+        # _pack_k_block/_pack_v_block, one page at a time (Task 2 signature change
+        # — quantize_packed's bpe was discarded before). Blended bpe_k/bpe_v is
+        # recomputed in update() from these counts + the fp16 tail, using
+        # streaming's exact blend formula — see cache_bits_per_entry's docstring
+        # for the shared cross-cache derivation.
+        self._quant_bits_k: float = 0.0
+        self._quant_bits_v: float = 0.0
+        self.bpe_k = float("nan")
+        self.bpe_v = float("nan")
+
         # Packed block lists: list of (packed_dict, start, end).
         self._k_blocks: list[tuple[dict, int, int]] = []
         self._v_blocks: list[tuple[dict, int, int]] = []
@@ -585,10 +601,25 @@ class PackedStreamingLayer(DynamicLayer):
         # factors. (Reuses compute_flush_schedule with g=PAGE.)
         new_S_q = compute_flush_schedule(S, W, self._page)
 
+        if new_S_q <= self._committed_S_q:
+            # No new block to flush this step — recompute blended bpe from the
+            # accumulated counts + the (now longer) fp16 tail (mirrors
+            # StreamingQuantizedLayer.update's no-flush branch exactly).
+            total_entries = S * self._h_kv * self._d_head
+            if total_entries > 0:
+                tail_len = S - self._committed_S_q
+                self.bpe_k = (
+                    self._quant_bits_k + tail_len * self._h_kv * self._d_head * 16.0
+                ) / total_entries
+                self.bpe_v = (
+                    self._quant_bits_v + tail_len * self._h_kv * self._d_head * 16.0
+                ) / total_entries
+
         if new_S_q > self._committed_S_q:
             commit_start = self._committed_S_q
             commit_end = new_S_q
             committed_len = commit_end - commit_start  # multiple of PAGE
+            page_entries = self._page * self._h_kv * self._d_head
 
             # Emit uniform PAGE-sized blocks across [commit_start, commit_end). Each
             # page is packed independently (its own codec metadata / lowrank factor).
@@ -608,14 +639,16 @@ class PackedStreamingLayer(DynamicLayer):
                     local_start = block_start - self._k_pre_offset
                     local_end = block_end - self._k_pre_offset
                     k_block_pre = self._k_pre[:, local_start:local_end, :].float()
-                    kpacked, _ = self._pack_k_block(k_block_pre, block_start, block_end)
+                    kpacked, codec_bpe_k = self._pack_k_block(
+                        k_block_pre, block_start, block_end
+                    )
                 else:
                     # Post-RoPE: page is pristine fp16 in the slab until now.
                     k_block_fp32 = keys.squeeze(0)[
                         ..., slab_off : slab_off + block_len, :
                     ].float()
                     M = to_matrix(k_block_fp32)
-                    kpacked, _ = quantize_packed(
+                    kpacked, codec_bpe_k = quantize_packed(
                         self.k_spec.arm,
                         M,
                         bits=self.k_spec.bits,
@@ -628,10 +661,18 @@ class PackedStreamingLayer(DynamicLayer):
                 v_block_fp32 = values.squeeze(0)[
                     ..., slab_off : slab_off + block_len, :
                 ].float()
-                vpacked, _ = self._pack_v_block(v_block_fp32)
+                vpacked, codec_bpe_v = self._pack_v_block(v_block_fp32)
 
                 self._k_blocks.append((kpacked, block_start, block_end))
                 self._v_blocks.append((vpacked, block_start, block_end))
+
+                # Honest bpe accounting: each page is its own codec call here (no
+                # super-block batching on the packed write path), so accumulating
+                # per page with THIS page's own codec bpe matches streaming's
+                # per-page loop granularity exactly (streaming's batched-flush
+                # spans collapse to the same float sum — see _flush_batchable).
+                self._quant_bits_k += codec_bpe_k * page_entries
+                self._quant_bits_v += codec_bpe_v * page_entries
 
                 # Incremental uniform_blk/blk_len update (F3): the only mutation site
                 # for _k_blocks is this append (pages are committed once, never
@@ -665,6 +706,20 @@ class PackedStreamingLayer(DynamicLayer):
             # attend()/get_seq_length() recover total length as _committed_S_q + slab len.
             keys = keys[..., block_len:, :].contiguous()
             values = values[..., block_len:, :].contiguous()
+
+            # --- Blended bpe: quantized prefix costs codec_bpe; fp16 tail costs 16 ---
+            # tail_len is self.keys.shape[2] post-prune (== keys.shape[2] here,
+            # since `keys` above IS the just-pruned tail) — S was captured before
+            # pruning as the total (committed + tail) sequence length, matching
+            # StreamingQuantizedLayer.update's S/tail_len exactly.
+            tail_len = keys.shape[2]
+            total_entries = S * self._h_kv * self._d_head
+            self.bpe_k = (
+                self._quant_bits_k + tail_len * self._h_kv * self._d_head * 16.0
+            ) / total_entries
+            self.bpe_v = (
+                self._quant_bits_v + tail_len * self._h_kv * self._d_head * 16.0
+            ) / total_entries
 
         # Store pruned (or full, if no flush this step) slab.
         self.keys = keys
@@ -1108,6 +1163,22 @@ class PackedStreamingCache(Cache):
             return None
         assert i in self._packs, f"spectral pack file missing layer {i}"
         return self._packs[i]
+
+    def bits_per_entry(self):
+        """(bpe_k, bpe_v) — blended payload bpe averaged across layers.
+
+        Thin wrapper over the shared `cache_bits_per_entry` (streaming.py) —
+        same accounting as StreamingQuantizedCache.bits_per_entry on the same
+        schedule (this cache's PackedStreamingLayer accumulates _quant_bits_k/
+        _quant_bits_v and blended bpe_k/bpe_v identically at flush time)."""
+        return cache_bits_per_entry(self.layers, self.k_spec)
+
+    def memory_report(self, seq_len: int) -> dict:
+        """Honest KV footprint: dense fp16 baseline vs packed (bpe-derived) bytes.
+
+        Thin wrapper over the shared `kv_memory_report` (streaming.py)."""
+        bpe_k, bpe_v = self.bits_per_entry()
+        return kv_memory_report(self.model_config, bpe_k, bpe_v, seq_len)
 
     def attach(self, model) -> "PackedStreamingCache":
         """Register the chunked-dequant attention fn and pre-RoPE capture hooks.

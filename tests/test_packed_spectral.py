@@ -7,6 +7,8 @@ only the write path: pack loading at cache init, the guard move to
 construction time, and container discipline on committed pages.
 """
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -290,3 +292,42 @@ def test_packed_spectral_dec_quant_int8_matches_streaming(tmp_path):
     packed_pack = packed._packs[0]
     assert torch.equal(stream_pack.dec, packed_pack.dec)
     assert stream_pack.dec.dtype == packed_pack.dec.dtype
+
+
+def test_packed_bits_per_entry_equals_streaming(tmp_path):
+    """Same schedule, same codec calls per page => identical honest accounting,
+    including the per-sequence skeptic pack charge. Also un-NaNs the census."""
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    stream, packed = _run_pair(model, path, seq=300)
+    assert packed.bits_per_entry() == stream.bits_per_entry()
+    sm = stream.memory_report(seq_len=300)
+    pm = packed.memory_report(seq_len=300)
+    assert pm == sm  # same bpe in => same honest bytes out
+
+
+def test_packed_bits_per_entry_equals_streaming_dec_quant_int8(tmp_path):
+    """Same equality pin, but with dec_quant='int8' — exercises the
+    _dec_bits=8.0 skeptic-v2-int8 charge path on both caches."""
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    k, v = _k4_specs(path)
+    k = dataclasses.replace(k, dec_quant="int8")
+
+    from bmx.cache.streaming import StreamingQuantizedCache
+
+    caches = []
+    for Cls in (StreamingQuantizedCache, PackedStreamingCache):
+        cache = Cls(model.config, k_spec=k, v_spec=v, recent_window=8)
+        cache.attach(model)
+        with cache:
+            with torch.no_grad():
+                model(ids(seq=300), past_key_values=cache, use_cache=True)
+        caches.append(cache)
+    stream, packed = caches
+    assert packed.bits_per_entry() == stream.bits_per_entry()
+    sm = stream.memory_report(seq_len=300)
+    pm = packed.memory_report(seq_len=300)
+    assert pm == sm
