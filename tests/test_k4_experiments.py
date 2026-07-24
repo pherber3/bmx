@@ -2691,3 +2691,301 @@ def test_k4_shrinkage_n_fit_zero_matches_standard_fit_path(tmp_path):
 
     assert _torch.equal(ref_pack.bits, test_pack.bits)
     assert _torch.allclose(ref.bases[layers[0]].lam64, fit_n0[layers[0]][0].lam64)
+
+
+# ---------------------------------------------------------------------------
+# K4 Lloyd payload-quantizer gate (Task 2): g_table quantizer arm + gate
+# ---------------------------------------------------------------------------
+
+
+def test_k4_g_table_rtn_default_byte_identical_to_prior(tmp_path):
+    """Pin: quantizer='rtn' (default) reproduces the pre-existing g_table
+    output byte-identically -- the additive columns (quantizer,
+    analytic_gaussian, sampling_limited) must not perturb g_hat/p10/p90/table."""
+    import pandas as pd
+
+    from experiments.k4_g_table import Config, main
+
+    fit = tmp_path / "f.safetensors"
+    _tiny_cache(fit, seed=0)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+
+    cfg_kwargs = dict(
+        pack_path=str(packs_path),
+        corpus_cache_paths=(str(fit),),
+        model_label="tiny",
+        group=16,
+    )
+    run_old = main(Config(**cfg_kwargs, out_root=str(tmp_path / "old")))
+    run_new = main(
+        Config(**cfg_kwargs, quantizer="rtn", out_root=str(tmp_path / "new"))
+    )
+    g_old = json.loads((run_old / "g_table.json").read_text())
+    g_new = json.loads((run_new / "g_table.json").read_text())
+    assert g_old["g_table"] == g_new["g_table"]
+    assert g_old["tiers"] == g_new["tiers"]
+
+    df_old = pd.read_parquet(run_old / "metrics.parquet")
+    df_new = pd.read_parquet(run_new / "metrics.parquet")
+    shared_cols = ["model", "layer", "tier", "g_hat", "p10", "p90", "n_dirs"]
+    pd.testing.assert_frame_equal(
+        df_old[shared_cols].reset_index(drop=True),
+        df_new[shared_cols].reset_index(drop=True),
+    )
+    # New additive columns present.
+    assert "quantizer" in df_new.columns
+    assert "analytic_gaussian" in df_new.columns
+    assert "sampling_limited" in df_new.columns
+    assert (df_new["quantizer"] == "rtn").all()
+
+
+def test_k4_g_table_quantizer_lloyd_arm_runs_and_flags_sampling_limited(tmp_path):
+    """quantizer='lloyd' measures ghat under the Lloyd-Max codebook (same
+    calibration pipeline); analytic_gaussian is the deterministic
+    Gaussian-Lloyd reference per tier; sampling_limited flags measured <
+    analytic (impossible for a real quantizer on a truly-Gaussian source --
+    signals undersampled tail bins)."""
+    import pandas as pd
+
+    from experiments.k4_g_table import Config, main
+
+    fit = tmp_path / "f.safetensors"
+    _tiny_cache(fit, seed=0)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            corpus_cache_paths=(str(fit),),
+            model_label="tiny",
+            group=16,
+            quantizer="lloyd",
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert (df["quantizer"] == "lloyd").all()
+    assert (df["analytic_gaussian"] > 0).all()
+    assert df["sampling_limited"].dtype == bool
+    # sampling_limited is EXACTLY measured < analytic, tier-for-tier.
+    assert ((df["sampling_limited"]) == (df["g_hat"] < df["analytic_gaussian"])).all()
+
+
+def test_k4_g_table_analytic_gaussian_deterministic_and_cached_per_tier(tmp_path):
+    """The analytic reference is a closed, deterministic computation per tier
+    (fixed seed, n>=2e6, fp64) -- identical across independent runs and
+    identical across layers/caches for the SAME tier."""
+    import pandas as pd
+
+    from experiments.k4_g_table import Config, main
+
+    fit = tmp_path / "f.safetensors"
+    _tiny_cache(fit, seed=0)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+    cfg_kwargs = dict(
+        pack_path=str(packs_path),
+        corpus_cache_paths=(str(fit),),
+        model_label="tiny",
+        group=16,
+        quantizer="lloyd",
+    )
+    r1 = main(Config(**cfg_kwargs, out_root=str(tmp_path / "r1")))
+    r2 = main(Config(**cfg_kwargs, out_root=str(tmp_path / "r2")))
+    df1 = pd.read_parquet(r1 / "metrics.parquet")
+    df2 = pd.read_parquet(r2 / "metrics.parquet")
+    assert (
+        df1.set_index("tier")["analytic_gaussian"]
+        == df2.set_index("tier")["analytic_gaussian"]
+    ).all()
+    # Same tier, different layers -> same analytic reference value.
+    per_tier = df1.groupby("tier")["analytic_gaussian"].nunique()
+    assert (per_tier == 1).all()
+
+
+def test_lloyd_gate_verdict_1_02_both_budgets_and_convexity():
+    """Verdict logic on a synthetic frame: gate_pass iff win_ratio >= 1.02 at
+    BOTH budgets AND the measured lloyd g_table is grid-convex."""
+    import pandas as pd
+
+    from experiments.k4_lloyd_gate import _lloyd_verdict
+
+    rows = []
+    for budget in (2.2, 2.5):
+        for arm, win in (("rtn", 10.0), ("lloyd", 10.3)):  # ratio 1.03
+            rows.append(
+                dict(
+                    cache="c",
+                    layer=0,
+                    budget=budget,
+                    arm=arm,
+                    win=win,
+                    bpe_model=budget,
+                )
+            )
+    df = pd.DataFrame(rows)
+    tiers = (0, 2, 3, 4, 5, 6, 8)
+    g_rtn = (1.0, 0.16997, 0.05033, 0.013198, 0.0030774, 0.00073008, 4.3638e-05)
+    # A convex Lloyd table strictly better than rtn at every nonzero tier
+    # (theory says roughly 1.2-1.4x reduction; scaled by 0.75 at nonzero
+    # tiers only -- g(0) stays exactly 1.0, the drop-boundary requirement --
+    # which preserves strict-decrease and grid-convexity of the rtn table).
+    g_lloyd = (1.0,) + tuple(g * 0.75 for g in g_rtn[1:])
+
+    v = _lloyd_verdict(
+        df, budgets=(2.2, 2.5), tiers=tiers, g_table_rtn=g_rtn, g_table_lloyd=g_lloyd
+    )
+    assert v["per_budget"]["2.2"]["win_ratio"] > 1.02
+    assert v["per_budget"]["2.5"]["win_ratio"] > 1.02
+    assert v["convex"] is True
+    assert v["gate_pass"] is True
+
+    # Flip one budget below the 1.02 factor -> gate fails even though convex.
+    df2 = df.copy()
+    df2.loc[(df2.arm == "lloyd") & (df2.budget == 2.5), "win"] = 10.0  # ratio 1.0
+    v2 = _lloyd_verdict(
+        df2, budgets=(2.2, 2.5), tiers=tiers, g_table_rtn=g_rtn, g_table_lloyd=g_lloyd
+    )
+    assert v2["per_budget"]["2.2"]["win_ratio"] > 1.02
+    assert v2["per_budget"]["2.5"]["win_ratio"] <= 1.02
+    assert v2["gate_pass"] is False
+
+
+def test_lloyd_gate_verdict_nonconvex_g_table_fails_gate():
+    """Even if both budgets clear the 1.02 win-ratio bar, a non-grid-convex
+    measured Lloyd g_table must fail the gate (the allocator-validity
+    requirement is an AND, not reported-only)."""
+    import pandas as pd
+
+    from experiments.k4_lloyd_gate import _lloyd_verdict
+
+    rows = []
+    for budget in (2.2, 2.5):
+        for arm, win in (("rtn", 10.0), ("lloyd", 10.5)):  # ratio 1.05, clears
+            rows.append(
+                dict(
+                    cache="c",
+                    layer=0,
+                    budget=budget,
+                    arm=arm,
+                    win=win,
+                    bpe_model=budget,
+                )
+            )
+    df = pd.DataFrame(rows)
+    tiers = (0, 2, 3, 4, 5, 6, 8)
+    g_rtn = (1.0, 0.16997, 0.05033, 0.013198, 0.0030774, 0.00073008, 4.3638e-05)
+    # Non-grid-convex: still strictly decreasing in g, but the per-bit
+    # marginal gains dip flat across tiers 3-5 then rise again (violates
+    # strict-decrease of marginals -- the optimality lemma's condition).
+    g_lloyd_bad = (1.0, 0.17, 0.10, 0.095, 0.09, 0.02, 0.001)
+
+    v = _lloyd_verdict(
+        df,
+        budgets=(2.2, 2.5),
+        tiers=tiers,
+        g_table_rtn=g_rtn,
+        g_table_lloyd=g_lloyd_bad,
+    )
+    assert v["per_budget"]["2.2"]["win_ratio"] >= 1.02
+    assert v["per_budget"]["2.5"]["win_ratio"] >= 1.02
+    assert v["convex"] is False
+    assert v["gate_pass"] is False  # convexity is an AND, not reported-only
+
+
+def test_lloyd_gate_bpe_identity_assert_fires_on_doctored_frame():
+    """bpe_model must be identical across the rtn/lloyd arms per (cache,
+    layer, budget) -- identical by construction (spectral_quantize's bpe
+    accounting reads only pack.bits/group/c_used, never the quantizer). A
+    doctored frame with mismatched bpe must raise."""
+    import pandas as pd
+
+    from experiments.k4_lloyd_gate import _assert_bpe_identical
+
+    rows = [
+        dict(cache="c", layer=0, budget=2.2, arm="rtn", bpe_model=2.2),
+        dict(cache="c", layer=0, budget=2.2, arm="lloyd", bpe_model=2.2),
+    ]
+    _assert_bpe_identical(pd.DataFrame(rows))  # no raise: identical bpe
+
+    rows_bad = [
+        dict(cache="c", layer=0, budget=2.2, arm="rtn", bpe_model=2.2),
+        dict(cache="c", layer=0, budget=2.2, arm="lloyd", bpe_model=2.35),
+    ]
+    try:
+        _assert_bpe_identical(pd.DataFrame(rows_bad))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised, "doctored mismatched bpe must raise AssertionError"
+
+
+def test_lloyd_gate_certificate_arithmetic_hand_checked():
+    """Offline certificate: per pack, predicted relative payload-distortion
+    reduction = sum_i lam_i*(ghat_rtn(b_i) - ghat_lloyd(b_i)) /
+    sum_i lam_i*ghat_rtn(b_i), evaluated over the pack's OWN allocated bits
+    b_i (a synthetic 4-direction pack: hand-computed reference)."""
+    import torch
+
+    from experiments.k4_lloyd_gate import _predicted_reduction
+
+    tiers = (0, 2, 4)
+    g_rtn = {0: 1.0, 2: 0.17, 4: 0.013}
+    g_lloyd = {0: 1.0, 2: 0.12, 4: 0.009}
+    # 4 directions: bits = [0, 2, 2, 4], lam = [1.0, 2.0, 3.0, 4.0]
+    bits = torch.tensor([0, 2, 2, 4], dtype=torch.int64)
+    lam = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+
+    num = 0.0
+    den = 0.0
+    for b_i, lam_i in zip(bits.tolist(), lam.tolist()):
+        num += lam_i * (g_rtn[b_i] - g_lloyd[b_i])
+        den += lam_i * g_rtn[b_i]
+    expected = num / den
+
+    got = _predicted_reduction(
+        bits=bits,
+        lam=lam,
+        tiers=tiers,
+        g_table_rtn=(g_rtn[0], g_rtn[2], g_rtn[4]),
+        g_table_lloyd=(g_lloyd[0], g_lloyd[2], g_lloyd[4]),
+    )
+    assert abs(got - expected) < 1e-12
+
+
+def test_k4_lloyd_gate_smoke(tmp_path):
+    """End-to-end smoke on tiny fixtures: both arms run, bpe identical per
+    (cache, layer, budget), lloyd_verdict.json has the required keys."""
+    import pandas as pd
+
+    from experiments.k4_lloyd_gate import Config, main
+
+    fit, scored = tmp_path / "f.safetensors", tmp_path / "s.safetensors"
+    _tiny_cache(fit, seed=0)
+    _tiny_cache(scored, seed=1)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.2, 2.5), group=16)
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            cache_paths=(str(scored),),
+            model_label="tiny",
+            budgets=(2.2, 2.5),
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert set(df.arm) == {"rtn", "lloyd"}
+    # bpe identical per (cache, layer, budget) across arms.
+    piv = df.pivot_table(
+        index=["cache", "layer", "budget"], columns="arm", values="bpe_model"
+    )
+    assert (piv["rtn"] - piv["lloyd"]).abs().max() < 1e-9
+
+    v = json.loads((run_dir / "lloyd_verdict.json").read_text())
+    for key in ("per_budget", "convex", "gate_pass", "certificate"):
+        assert key in v, key
+    for budget_key, entry in v["per_budget"].items():
+        assert {"win_rtn", "win_lloyd", "win_ratio", "gate_pass"} <= set(entry)

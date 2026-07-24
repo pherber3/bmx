@@ -16,11 +16,32 @@ The emitted table plugs into `k4_charge_alloc --g-table ...` (and any
 `pack_from_basis(g_table=...)` call); `_tier_g` validates grid-convexity at
 consumption time — this script also validates at emission time and fails
 loudly if the measurement violates the optimality lemma's conditions.
+
+K4 Lloyd-gate design (2026-07-25, `docs/superpowers/specs/2026-07-25-k4-lloyd-
+gate-design.md`): `Config.quantizer` ("rtn" default, bit-exact-pinned |
+"lloyd") threads through the SAME calibration pipeline above -- the per-tier
+quantize call swaps from `rtn_quantize` (uniform step, mse_scale=True) to the
+analytic Gaussian Lloyd-Max codebook alternating-minimization quantizer
+(mirroring `spectral._lloyd_quantize_packed`'s assign/refit pattern, applied
+here to the UNPACKED (dequantized) form since this script measures distortion
+directly, not containers). Every row gains a `quantizer` column and an
+`analytic_gaussian` column: the CLOSED, deterministic Gaussian-Lloyd
+reference distortion for that tier (quantize a large fixed-seed N(0,1) sample
+against `gaussian_codebook(bits)` and report its MSE -- unit-variance source,
+so the MSE IS the relative distortion, directly comparable to g_hat). A row
+is `sampling_limited=True` when `g_hat < analytic_gaussian`: impossible for a
+real quantizer against the Gaussian-OPTIMAL reference when the source is
+truly Gaussian, so it flags undersampled tail bins (expected at the high
+tiers, per the design doc's prior finding at tiers 6/8 for rtn). Both new
+columns are ADDITIVE -- `quantizer="rtn"` (default) reproduces every
+pre-existing column byte-identically (pinned by
+`test_k4_g_table_rtn_default_byte_identical_to_prior`).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 
 import pandas as pd
@@ -28,11 +49,62 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, git_sha, write_metrics
-from bmx.cache.codecs import _tier_g
+from bmx.cache.codecs import _tier_g, gaussian_codebook
 from bmx.cache.collect import to_matrix
-from bmx.cache.spectral import load_packs
+from bmx.cache.spectral import QUANTIZERS, load_packs
 from bmx.quant.rtn import rtn_quantize
 from experiments._k4_common import load_layer_keys
+
+# The analytic-reference sample: fixed seed, n >= 2e6, fp64 standard normal --
+# deterministic and cached per (bits, seed) so repeated tiers/layers/caches
+# within (and across) a run never re-draw or re-quantize it.
+_ANALYTIC_N_SAMPLES = 2_000_000
+_ANALYTIC_SEED = 0
+
+
+@functools.lru_cache(maxsize=16)
+def _analytic_gaussian_distortion(bits: int) -> float:
+    """Closed reference: MSE of quantizing a large fixed-seed N(0,1) fp64
+    sample against the analytic Gaussian Lloyd-Max codebook for `bits`. The
+    source has unit variance, so this MSE already equals a RELATIVE
+    distortion -- directly comparable to g_hat (which normalizes by the
+    empirical per-direction energy). Deterministic; cached per tier."""
+    g = torch.Generator().manual_seed(_ANALYTIC_SEED)
+    x = torch.randn(_ANALYTIC_N_SAMPLES, generator=g, dtype=torch.float64)
+    cb = gaussian_codebook(bits).double()  # (2**bits,) sorted, unit-variance-fit
+    mid = (cb[:-1] + cb[1:]) / 2
+    idx = torch.bucketize(x, mid)
+    x_hat = cb[idx]
+    return float(((x - x_hat) ** 2).mean())
+
+
+def _lloyd_quantize_unpacked(
+    Y: torch.Tensor, bits: int, group_size: int
+) -> torch.Tensor:
+    """Groupwise dequantized reconstruction of Y against the analytic
+    Gaussian Lloyd-Max codebook -- the unpacked-form twin of
+    `spectral._lloyd_quantize_packed`/`_lloyd_dequantize_packed` (this script
+    measures distortion directly on the dequantized reconstruction, never
+    stores containers, so there is no packed-format concern). SAME
+    alternating-minimization (assign <-> refit scale), deterministic, fp32,
+    3 iterations from a group-std init -- mirrors `rtn_quantize`'s call
+    convention exactly: `(..., d) -> (..., d)` dequantized values.
+    """
+    *lead, d = Y.shape
+    assert d % group_size == 0, f"dim {d} not divisible by group {group_size}"
+    cb = gaussian_codebook(bits).to(device=Y.device, dtype=Y.dtype)
+    mid = (cb[:-1] + cb[1:]) / 2
+    G = Y.reshape(*lead, d // group_size, group_size)
+    scale = G.std(dim=-1, keepdim=True).clamp_min(1e-12)
+    codes = torch.bucketize((G / scale).contiguous(), mid)
+    for _ in range(3):
+        level = cb[codes.long()]
+        num = (G * level).sum(dim=-1, keepdim=True)
+        den = (level * level).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        scale = (num / den).clamp_min(1e-12)
+        codes = torch.bucketize((G / scale).contiguous(), mid)
+    level = cb[codes.long()]
+    return (level * scale).reshape(Y.shape)
 
 
 @dataclasses.dataclass
@@ -45,10 +117,18 @@ class Config:
     group: int = 64
     energy_floor: float = 1e-12
     out_root: str = ""
+    # K4 Lloyd-gate design: "rtn" (default, bit-exact-pinned) reproduces the
+    # historical calibration pipeline exactly. "lloyd" swaps the per-tier
+    # quantizer for the analytic Gaussian Lloyd-Max codebook -- same
+    # pipeline, same pooling, same grid-convexity validation.
+    quantizer: str = "rtn"
 
 
 def main(cfg: Config):
     assert cfg.corpus_cache_paths
+    assert cfg.quantizer in QUANTIZERS, (
+        f"quantizer must be one of {QUANTIZERS}; got {cfg.quantizer!r}"
+    )
     run = (
         create_run("k4_g_table", cfg, root=cfg.out_root)
         if cfg.out_root
@@ -73,20 +153,30 @@ def main(cfg: Config):
         for t in cfg.tiers:
             if t == 0:
                 continue
-            Y_hat = rtn_quantize(
-                Y[:, keep].float().mT, t, cfg.group, mse_scale=True
-            ).mT.double()
+            if cfg.quantizer == "lloyd":
+                Y_hat = _lloyd_quantize_unpacked(
+                    Y[:, keep].float().mT, t, cfg.group
+                ).mT.double()
+            else:
+                Y_hat = rtn_quantize(
+                    Y[:, keep].float().mT, t, cfg.group, mse_scale=True
+                ).mT.double()
             r = ((Y[:, keep] - Y_hat) ** 2).mean(dim=0) / energy[keep]
             pooled[t].append(r)
+            g_hat_t = float(r.mean())
+            analytic_t = _analytic_gaussian_distortion(t)
             rows.append(
                 dict(
                     model=cfg.model_label or "unknown",
                     layer=layer_i,
                     tier=t,
-                    g_hat=float(r.mean()),
+                    g_hat=g_hat_t,
                     p10=float(r.quantile(0.10)),
                     p90=float(r.quantile(0.90)),
                     n_dirs=int(keep.sum()),
+                    quantizer=cfg.quantizer,
+                    analytic_gaussian=analytic_t,
+                    sampling_limited=bool(g_hat_t < analytic_t),
                 )
             )
 
@@ -104,9 +194,14 @@ def main(cfg: Config):
     tiers_t = torch.tensor([float(t) for t in cfg.tiers], dtype=torch.float64)
     _tier_g(tiers_t, tuple(table))
 
+    analytic_gaussian_table = [
+        1.0 if t == 0 else _analytic_gaussian_distortion(t) for t in cfg.tiers
+    ]
     out = dict(
         tiers=list(cfg.tiers),
         g_table=table,
+        quantizer=cfg.quantizer,
+        analytic_gaussian_table=analytic_gaussian_table,
         n_rows=n_rows_total,
         spread_p10_p90_by_tier=spread,
         git_sha=git_sha(),
