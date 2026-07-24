@@ -87,6 +87,43 @@ the full-fit matched cell.
 - Cross-corpus retention: Gate-A retention machinery pointed across corpora
   (A-basis quality evaluated under B's covariance).
 
+## 3b. Synthesis-order addendum (added 2026-07-23, after the Stage-1 verdict)
+
+Stage 1 measured D(shuffled-wiki→wiki) ≈ 9.4%: the unigram token histogram
+carries ~91% of the matched-fit win for English. Two loose ends make the
+"synthesize a calibration stream from traffic token counts" recipe deployable
+or kill it, and they discriminate synthesis ORDER (the user's n-gram
+question — noting the speculative-decoding analogy is inexact: drafting
+consumes the conditional P(next|ctx) where order is everything, packs consume
+the stationary second moment E[kk^T] where the Stage-1 null shows order is
+second-order):
+
+- **shuf_code** — token-level permutation of the CODE fit slices (same seed
+  scheme as the wiki null): D(shuf_code→code) tests the unigram recipe on the
+  domain that matters. Stage 1's unigram evidence is wiki-only.
+- **uni_wiki / uni_code** — streams SAMPLED i.i.d. (seeded) from each corpus's
+  fit-slice token histogram: the literal deployment recipe at order 1
+  (permutation = sampling without replacement; sampling with replacement is
+  what a traffic histogram supports).
+- **bi_wiki / bi_code** — streams sampled from a bigram Markov chain estimated
+  on the fit slices (add-nothing smoothing; unseen contexts back off to the
+  unigram histogram; seeded): the deployment recipe at order 2.
+
+All are FIT-SIDE ONLY (nothing is evaluated on synthetic text), matched token
+budgets (binding decision 1), evaluated in the SAME matrix run against
+wiki-held and code-held.
+
+**Pre-registered synthesis-order rules:** for each eval side E ∈ {wiki, code}
+with matched cell win W_E and unigram-family cell win W_uni (use the sampled
+`uni_*` arm as the recipe's estimator; `shuf_*` is its
+without-replacement control): (a) **recipe-confirmed for E** if
+D(uni_E→E) < 10%; (b) **order-2 earns its keep** if
+[D(uni_E→E) − D(bi_E→E)] ≥ ½·D(uni_E→E) — bigram closes at least half the
+unigram gap; otherwise unigram is the final recipe and order is dead at 2nd
+order too (report the privacy note: histograms, not texts). No higher orders
+unless (b) passes at BOTH eval sides — the ladder is climbed one measured
+rung at a time.
+
 ## 4. Pre-registered verdict rules
 
 - Primary: relative cross-fit degradation `D = 1 − win(fit≠eval)/win(fit=eval)`
