@@ -589,7 +589,7 @@ class StreamingQuantizedCache(Cache):
         return self._packs[i]
 
     def attach(self, model) -> "StreamingQuantizedCache":
-        """Register k_proj hooks so each layer captures its pre-RoPE keys.
+        """Register pre-RoPE capture hooks (resolved QK-capture modules).
 
         Call before prefill when k_spec.pre_rope. Hooks fire on every forward
         including each decode step. No-op when k_spec.pre_rope is False.
@@ -633,7 +633,7 @@ class StreamingQuantizedCache(Cache):
         return self
 
     def detach(self) -> "StreamingQuantizedCache":
-        """Remove all registered k_proj hooks."""
+        """Remove all registered capture hooks."""
         for h in self._handles:
             h.remove()
         self._handles = []

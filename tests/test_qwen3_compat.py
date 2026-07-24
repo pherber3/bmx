@@ -13,6 +13,15 @@ from bmx.cache.hf_compat import (
 from tests.factories import ids, tiny_qwen3
 
 
+class _StubTok:
+    """Minimal tokenizer for generate_through_cache: ids in, space-joined out."""
+
+    eos_token_id = None
+
+    def decode(self, t, skip_special_tokens=True):
+        return " ".join(map(str, t.tolist() if hasattr(t, "tolist") else t))
+
+
 def test_hf_compat_resolves_qwen3():
     m = tiny_qwen3()
     assert model_config_n_layers(m) == 2
@@ -164,12 +173,6 @@ def test_generate_k4_qwen3(tmp_path):
     path = str(tmp_path / "packs.safetensors")
     _fit_tiny_packs(model, path)  # budget=2.5, group=8
 
-    class _StubTok:
-        eos_token_id = None
-
-        def decode(self, t, skip_special_tokens=True):
-            return " ".join(map(str, t.tolist() if hasattr(t, "tolist") else t))
-
     k_spec, v_spec = spec_pair("k4_b2.5", group=8, pack_path=path)
     out = generate_through_cache(
         model,
@@ -192,12 +195,6 @@ def test_generate_stops_on_any_eos_in_list():
     the first decode token is an eos member."""
     from bmx.cache.generate import generate_through_cache
     from bmx.cache.specs import CacheCodecSpec
-
-    class _StubTok:
-        eos_token_id = None
-
-        def decode(self, t, skip_special_tokens=True):
-            return " ".join(map(str, t.tolist() if hasattr(t, "tolist") else t))
 
     model = tiny_qwen3()
     fp16 = CacheCodecSpec(arm="fp16")

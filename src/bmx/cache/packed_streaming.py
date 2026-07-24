@@ -384,9 +384,10 @@ class PackedStreamingLayer(DynamicLayer):
         self._page = max(self._g, (128 // self._g) * self._g) if self._g > 1 else 128
 
     def stash_pre_rope(self, out: torch.Tensor) -> None:
-        """Called by the k_proj hook: append captured pre-RoPE keys.
+        """Called by the cache's QK-capture hook: append captured pre-RoPE keys.
 
-        out: (1, S, h_kv*d) -> reshaped to (h_kv, S, d) fp16, concatenated.
+        out: (1, S, h_kv*d) (k_proj) or (1, S, h_kv, d) (k_norm) -> reshaped
+        to (h_kv, S, d) fp16, concatenated.
         """
         block = reshape_heads(out, self._h_kv, self._d_head)  # (h_kv, S, d)
         self._k_pre = (
@@ -955,7 +956,7 @@ class PackedStreamingCache(Cache):
         self._model = None
 
     def attach(self, model) -> "PackedStreamingCache":
-        """Register the chunked-dequant attention fn and k_proj hooks.
+        """Register the chunked-dequant attention fn and pre-RoPE capture hooks.
 
         Sets model.config._attn_implementation = "chunked_dequant" so HF routes
         every attention call to chunked_attention_forward, which reads packed state
