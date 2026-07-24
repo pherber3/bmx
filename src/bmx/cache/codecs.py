@@ -231,11 +231,7 @@ def allocate_bits_from_variance(
     tiers_t = torch.tensor(sorted(tiers), dtype=torch.float64, device=var.device)
 
     assert selection in ("round", "lagrange"), f"unknown selection {selection!r}"
-    if selection == "round":
-        assert g_table is None and fixed_charge == 0.0, (
-            "g_table/fixed_charge require selection='lagrange'"
-        )
-    else:
+    if selection == "lagrange":
         g_t = _tier_g(tiers_t, g_table)
         lo = math.log(float(var.min().item()) * _LN4 * 1e-6)
         hi = math.log(float(var.max().item()) * _LN4 * 1e6)
@@ -253,6 +249,11 @@ def allocate_bits_from_variance(
             else:
                 lo = mid
         return best.to(torch.int64)
+
+    # ---- selection == "round": the byte-exact-pinned original path --------
+    assert g_table is None and fixed_charge == 0.0, (
+        "g_table/fixed_charge require selection='lagrange'"
+    )
 
     def rounded_mean(kappa: float) -> tuple[torch.Tensor, float]:
         b_cont = (0.5 * torch.log2(var / kappa)).clamp_min(0.0)

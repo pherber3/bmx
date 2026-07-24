@@ -140,6 +140,7 @@ def main(cfg: Config):
                     c_ready,
                     ctx.k_pre_t,
                     ctx.M_pre,
+                    with_causal=True,
                 )
                 tq_rows.append(
                     dict(
@@ -177,6 +178,7 @@ def main(cfg: Config):
                         c_ready,
                         ctx.k_pre_t,
                         ctx.M_pre,
+                        with_causal=True,
                     )
                     bpe_deploy = bpe_model + skeptic_charge(
                         ctx.C, DEPLOY_S, tuple(cfg.tiers), c_used=pack.c_used
@@ -297,25 +299,42 @@ def main(cfg: Config):
             )
         third_instrument_verdict = "no_rope_null_control"
 
+    # The top-level decision derives from the CAUSAL instrument only — the
+    # frozen-instrument (logit_rope) readout is retained below as the
+    # circularity record, never as a decision source (MA task-4 adjudication;
+    # docs/2026-07-24-k4-math-actions-results.md §B).
+    causal_decision, causal_refit = {
+        "rotated_preferred_causal": ("rotated_form_required", True),
+        "frozen_preferred_causal": ("frozen_form_retained", False),
+        "neutral_causal": ("scoped_negligible", False),
+        "mixed_causal": ("mixed_undecided", True),
+        "no_rope_null_control": ("no_rope_null", False),
+    }[third_instrument_verdict]
+
     verdict = dict(
         headline_metric=headline,
-        rule=(
-            "Pre-registered (spec 2026-07-24 SB): |rel_win_delta| < 2% at "
-            "both budgets -> scoped_negligible (frozen-rotation approximation "
-            "measured-negligible at this scale; Llama spot-check queued); "
-            ">= 2% -> rotated_form_required (paper uses rotated numbers; "
-            "Llama refit REQUIRED on the rental). Sign-flip footnote enters "
-            "the methods section either way. NOTE (task-4 third instrument):"
-            " logit_rope/win_frozen/win_rotated above are CIRCULAR — logit_rope"
-            " leaves Q un-rotated, which is exactly the same frozen quadratic"
-            " form W is fit to match, so this A/B could not distinguish"
-            " frozen from rotated on independent grounds. The deciding"
-            " readout is `causal` below (logit_distortion_causal, the true"
-            " masked per-position causal logit error)."
+        decision=causal_decision,
+        llama_refit_required=causal_refit,
+        frozen_instrument_record=dict(
+            note=(
+                "CIRCULAR — logit_rope leaves Q un-rotated, which is exactly "
+                "the frozen quadratic form W is fit to match, so this A/B "
+                "could not distinguish frozen from rotated on independent "
+                "grounds (MA task-4 adjudication). Retained as the record of "
+                "the pre-registered spec-2026-07-24 §B rule; SUPERSEDED by "
+                "`causal` for every decision field."
+            ),
+            rule=(
+                "Pre-registered (spec 2026-07-24 SB): |rel_win_delta| < 2% at "
+                "both budgets -> scoped_negligible; >= 2% -> "
+                "rotated_form_required. Sign-flip footnote enters the methods "
+                "section either way."
+            ),
+            per_budget=per_budget,
+            decision_circular="scoped_negligible"
+            if scoped
+            else "rotated_form_required",
         ),
-        per_budget=per_budget,
-        decision="scoped_negligible" if scoped else "rotated_form_required",
-        llama_refit_required=not scoped,
         causal=dict(
             metric="logit_distortion_causal (forward-RoPE Q at true absolute "
             "position, masked to causal s<=t pairs, over the FULL sequence)",

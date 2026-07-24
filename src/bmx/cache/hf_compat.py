@@ -80,4 +80,17 @@ def resolve_qk_capture_modules(self_attn):
     )
     if has_q:
         return self_attn.q_norm, self_attn.k_norm
+    # Fail loud on families whose pre-RoPE per-head norm lives under a
+    # DIFFERENT attribute name (transformers 5.11 zoo: lfm2/phi/persimmon/
+    # stablelm use {q,k}_layernorm; llama4 a shared qk_norm) — falling
+    # through to the projections there would capture un-normed keys with no
+    # error, the exact bug class this dispatch exists to kill. These attrs
+    # only exist when the norm is enabled, so supported norm-less configs of
+    # the same families still take the projection path below.
+    for alt in ("q_layernorm", "k_layernorm", "qk_norm"):
+        assert not hasattr(self_attn, alt), (
+            f"attention has unsupported pre-RoPE norm '{alt}'; hooking the "
+            "projections would capture un-normed keys silently — extend "
+            "resolve_qk_capture_modules for this family"
+        )
     return self_attn.q_proj, self_attn.k_proj

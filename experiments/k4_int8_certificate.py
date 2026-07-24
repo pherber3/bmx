@@ -176,15 +176,9 @@ def main(cfg: Config):
             )
             for S in CHARGE_S_GRID:
                 saving = sum(
-                    skeptic_charge(
-                        int(pack.enc.shape[0]),
-                        S,
-                        pack.tiers,
-                        c_used=pack.c_used,
-                        dec_bits=16.0,
-                    )
+                    skeptic_charge(C, S, pack.tiers, c_used=pack.c_used, dec_bits=16.0)
                     - mixed_dec_charge(
-                        int(pack.enc.shape[0]),
+                        C,
                         S,
                         pack.tiers,
                         c_used=pack.c_used,

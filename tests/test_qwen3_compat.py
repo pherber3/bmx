@@ -227,3 +227,39 @@ def test_generate_stops_on_any_eos_in_list():
         strip=False,
     )
     assert len(out2.split()) == 2  # stopped ON the second token, immediately
+
+
+def test_qwen3_decoupled_head_dim_capture():
+    """head_dim decoupled from hidden_size // num_attention_heads (real Qwen3:
+    128 vs 80 on 4B) — tiny_qwen3's geometry has them EQUAL (8 == 32//4), so
+    a hypothetical hidden//heads bug would slip through that fixture. This
+    config makes them differ (6 != 32//4) and pins that capture geometry
+    follows head_dim end-to-end: captured k_pre has d == head_dim and the
+    k == RoPE(k_pre) identity holds."""
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    from bmx.cache.collect import collect_cache
+    from bmx.cache.rope import apply_rope, rope_cos_sin
+
+    cfg = Qwen3Config(
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        hidden_size=32,
+        intermediate_size=64,
+        vocab_size=97,
+        head_dim=6,  # != 32 // 4 — the decoupled path
+        max_position_embeddings=512,
+    )
+    torch.manual_seed(5)
+    model = Qwen3ForCausalLM(cfg).eval()
+
+    cache = collect_cache(model, ids(seq=16), n_q_keep=4)
+    k_pre = cache["layer0.k_pre"]
+    k_post = cache["layer0.k"]
+    assert k_pre.shape == (2, 16, 6), k_pre.shape  # (h_kv, S, head_dim=6)
+
+    cos, sin = rope_cos_sin(model.config, 16)
+    k_re = apply_rope(k_pre.float(), cos, sin)
+    rel = (k_re - k_post.float()).norm() / k_post.float().norm()
+    assert rel < 1e-2, f"k == RoPE(k_pre) identity broken at decoupled head_dim: {rel}"

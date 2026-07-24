@@ -254,10 +254,9 @@ def logit_distortion_causal(
     mask = s_positions.view(1, -1) <= q_positions.view(-1, 1)  # (T, S) bool
     mask = mask.view(1, T, S)  # broadcast over heads
 
-    diff = torch.where(mask, logits_approx - logits_ref, torch.zeros_like(logits_ref))
-    ref = torch.where(mask, logits_ref, torch.zeros_like(logits_ref))
-
-    per_head_err = diff.flatten(1).norm(dim=-1) / ref.flatten(1).norm(dim=-1).clamp_min(
-        1e-12
-    )
-    return per_head_err.mean().item()
+    # Masking both inputs first makes the difference equal the masked
+    # difference elementwise, so the module's shared per-head reduction
+    # applies unchanged (identical arithmetic, incl. the 1e-12 clamp).
+    approx_m = torch.where(mask, logits_approx, torch.zeros_like(logits_approx))
+    ref_m = torch.where(mask, logits_ref, torch.zeros_like(logits_ref))
+    return _frobenius_rel_error(approx_m, ref_m).mean().item()

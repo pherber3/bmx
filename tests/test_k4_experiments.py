@@ -1893,12 +1893,20 @@ def test_k4_w_rope_ab_smoke(tmp_path):
     assert set(ov["rank"]) == {4, 8}
     assert ((ov.value >= -1e-9) & (ov.value <= 1 + 1e-9)).all()
     v = json.loads((run_dir / "w_rope_verdict.json").read_text())
-    assert set(v["per_budget"]) == {"2", "2.5"}
-    for e in v["per_budget"].values():
+    # Circular (frozen-instrument) readout lives ONLY under the demoted
+    # record key; the top-level decision derives from the causal instrument.
+    rec = v["frozen_instrument_record"]
+    assert set(rec["per_budget"]) == {"2", "2.5"}
+    for e in rec["per_budget"].values():
         assert {"win_frozen", "win_rotated", "rel_win_delta"} <= set(e)
-    assert v["decision"] in ("scoped_negligible", "rotated_form_required")
-    # tiny fixture has no RoPE (model_name="") => the null: delta ~ 0.
-    for e in v["per_budget"].values():
+    assert rec["decision_circular"] in ("scoped_negligible", "rotated_form_required")
+    # tiny fixture has no RoPE (model_name="") => the causal instrument is
+    # the null control and the top-level decision reflects that, not the
+    # circular rule.
+    assert v["causal"]["third_instrument_verdict"] == "no_rope_null_control"
+    assert v["decision"] == "no_rope_null"
+    assert v["llama_refit_required"] is False
+    for e in rec["per_budget"].values():
         assert abs(e["rel_win_delta"]) < 1e-6
 
 

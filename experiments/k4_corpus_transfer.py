@@ -757,8 +757,14 @@ def _transfer_verdict(
                 )
             synthesis = dict(
                 rules=rules,
+                # "on BOTH eval sides" (note below) is binding: a missing D
+                # cell drops that side out of `rules` above, so require full
+                # coverage — a single-side pass must never license order-3
+                # (2026-07-25 sweep: latent robustness gap, never fired in
+                # the shipped pipeline where both cells always exist).
                 climb_to_order3=bool(
-                    rules and all(r["order2_earns_keep"] for r in rules.values())
+                    len(rules) == len(EVAL_CORPORA)
+                    and all(r["order2_earns_keep"] for r in rules.values())
                 ),
                 note=(
                     "§3b pre-registered gates for the traffic-histogram RECIPE "

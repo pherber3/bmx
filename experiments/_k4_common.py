@@ -269,8 +269,27 @@ def corpus_fit_bases(
     return CorpusFit(bases=bases, M_fits=M_fits, whiteners=whiteners)
 
 
-def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_t, M):
+def _score_tail(
+    M_hat,
+    h_kv,
+    tail,
+    K_post_true,
+    Q,
+    cos,
+    sin,
+    rope_ready,
+    k_true_t,
+    M,
+    *,
+    with_causal: bool = False,
+):
     """Returns (rel_fro, logit, logit_rope, logit_causal).
+
+    `with_causal` (default False): `logit_causal` is a full-sequence masked
+    (h, T, S) matmul — the ONE experiment that consumes it (k4_w_rope_ab, the
+    instrument it was built for) opts in; every other caller discards the
+    fourth value, so the default skips the compute and returns NaN there
+    (2026-07-25 sweep: 11 of 13 call sites paid for a discarded column).
 
     logit_causal is the THIRD INSTRUMENT (math review #3(b), task-4
     prescription): true causal per-position logit error, additive alongside
@@ -298,11 +317,14 @@ def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_
         K_hat_rope_full = apply_rope(K_hat_full, cos, sin)
         K_hat_rope = K_hat_rope_full[:, tail, :]
         lg_rope = logit_distortion(K_post_true[:, tail], K_hat_rope, Q)
-        T = Q.shape[1]
-        S = K_post_true.shape[1]
-        lg_causal = logit_distortion_causal(
-            K_post_true, K_hat_rope_full, Q, cos, sin, q_start=S - T
-        )
+        if with_causal:
+            T = Q.shape[1]
+            S = K_post_true.shape[1]
+            lg_causal = logit_distortion_causal(
+                K_post_true, K_hat_rope_full, Q, cos, sin, q_start=S - T
+            )
+        else:
+            lg_causal = float("nan")
     else:
         lg_rope = float("nan")
         lg_causal = float("nan")
