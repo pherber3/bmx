@@ -690,3 +690,47 @@ def test_load_eval_tokens_synth_validation(monkeypatch):
         ls.load_eval_tokens(
             "gpt2", n_tokens=8, synth="unigram", synth_seed=0, shuffle_seed=0
         )
+
+
+def test_collect_cache_synth_labels_and_guard():
+    from experiments.collect_cache import Config, _corpus_is_default, _out_path
+
+    uni = Config(
+        model_name="gpt2",
+        seq_len=1024,
+        token_offset=1024,
+        synth="unigram",
+        synth_seed=20260723,
+        corpus_label="uniwiki",
+    )
+    assert not _corpus_is_default(uni)
+    assert _out_path(uni).name == "gpt2_1024_uniwiki_off1024.safetensors"
+
+    bicode = Config(
+        model_name="gpt2",
+        seq_len=1024,
+        token_offset=2048,
+        dataset_id="codeparrot/codeparrot-clean-valid",
+        dataset_config="",
+        split="train[:200]",
+        text_field="content",
+        synth="bigram",
+        synth_seed=20260723,
+        corpus_label="bicode",
+    )
+    assert not _corpus_is_default(bicode)
+    assert _out_path(bicode).name == "gpt2_1024_bicode_off2048.safetensors"
+
+    shufcode = Config(
+        model_name="gpt2",
+        seq_len=1024,
+        token_offset=1024,
+        dataset_id="codeparrot/codeparrot-clean-valid",
+        dataset_config="",
+        split="train[:200]",
+        text_field="content",
+        shuffle_seed=20260723,
+        corpus_label="shufcode",
+    )
+    assert not _corpus_is_default(shufcode)
+    assert _out_path(shufcode).name == "gpt2_1024_shufcode_off1024.safetensors"

@@ -8,6 +8,8 @@ Usage
     uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024 \
         --token-offset 1024 --dataset-id bigcode/the-stack-smol --data-dir data/python \
         --split train --text-field content --corpus-label code
+    uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024 \
+        --token-offset 1024 --synth unigram --synth-seed 20260723 --corpus-label uniwiki
 
 --token-offset shifts the wikitext slice so distinct offsets act as distinct
 documents (calibration corpora for the corpus-vs-heldout transfer test).
@@ -43,10 +45,21 @@ class Config:
     split: str = "test"
     text_field: str = "text"
     shuffle_seed: int = -1  # >=0 => seeded post-slice token shuffle (null corpus)
+    synth: str = ""  # "" | "unigram" | "bigram" — §3b sampled synthetic stream
+    synth_seed: int = -1  # required >=0 when synth set; recorded seed: 20260723
     corpus_label: str = ""  # REQUIRED when any corpus knob above is non-default
 
 
-_WIKI_DEFAULTS = ("Salesforce/wikitext", "wikitext-2-raw-v1", "", "test", "text", -1)
+_WIKI_DEFAULTS = (
+    "Salesforce/wikitext",
+    "wikitext-2-raw-v1",
+    "",
+    "test",
+    "text",
+    -1,
+    "",
+    -1,
+)
 
 
 def _corpus_is_default(cfg: Config) -> bool:
@@ -57,6 +70,8 @@ def _corpus_is_default(cfg: Config) -> bool:
         cfg.split,
         cfg.text_field,
         cfg.shuffle_seed,
+        cfg.synth,
+        cfg.synth_seed,
     ) == _WIKI_DEFAULTS
 
 
@@ -101,6 +116,8 @@ def main(cfg: Config) -> None:
         split=cfg.split,
         text_field=cfg.text_field,
         shuffle_seed=cfg.shuffle_seed,
+        synth=cfg.synth,
+        synth_seed=cfg.synth_seed,
     )
     input_ids = tokens.unsqueeze(0)  # (1, S)
 
