@@ -233,7 +233,7 @@ class StreamingQuantizedLayer(DynamicLayer):
         self._rope_sin: torch.Tensor | None = None
 
     def stash_pre_rope(self, out: torch.Tensor):
-        """Called by the cache's k_proj hook: append a captured pre-RoPE block.
+        """Called by the cache's QK-capture hook: append a captured pre-RoPE block.
 
         out: (1, T, h_kv*d) (k_proj) or (1, T, h_kv, d) (k_norm) -> reshaped
         to (h_kv, T, d) fp16, concatenated across calls to accumulate the
@@ -618,7 +618,8 @@ class StreamingQuantizedCache(Cache):
         ):
             raise ValueError(
                 f"unsupported architecture {model.config.model_type!r} for pre-RoPE "
-                "streaming: attach() hooks self_attn.k_proj (Llama-family); GPT-2-style "
+                "streaming: attach() hooks the resolved QK-capture modules (Llama k_proj / "
+                "Qwen3 k_norm); GPT-2-style "
                 "fused c_attn is not supported"
             )
 

@@ -71,6 +71,13 @@ def resolve_qk_capture_modules(self_attn):
     modules emit the already-headed (b, S, h, d) shape; collect.reshape_heads
     covers both layouts with one numel-equal reshape.
     """
-    if hasattr(self_attn, "q_norm") and hasattr(self_attn, "k_norm"):
+    has_q, has_k = hasattr(self_attn, "q_norm"), hasattr(self_attn, "k_norm")
+    # Half-normed attention would make the fallthrough capture un-normed keys
+    # silently — fail loud instead (no known architecture does this today).
+    assert has_q == has_k, (
+        f"attention has {'q_norm' if has_q else 'k_norm'} but not its twin; "
+        "capture point ambiguous — extend resolve_qk_capture_modules"
+    )
+    if has_q:
         return self_attn.q_norm, self_attn.k_norm
     return self_attn.q_proj, self_attn.k_proj
