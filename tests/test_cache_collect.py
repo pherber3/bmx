@@ -585,3 +585,108 @@ def test_collect_cache_main_guard_raises_before_model_load(monkeypatch):
     )
     with pytest.raises(AssertionError, match="corpus-label"):
         main(cfg)
+
+
+# ---------------------------------------------------------------------------
+# §3b synthesis sampler — synth_stream + load_eval_tokens synth passthrough
+# (spec: docs/superpowers/specs/2026-07-23-k4-corpus-transfer-design.md §3b)
+# ---------------------------------------------------------------------------
+
+
+def test_synth_stream_unigram_marginal():
+    from bmx.eval.layer_swap import synth_stream
+
+    g = torch.Generator().manual_seed(7)
+    window = torch.randint(0, 8, (16384,), generator=g)
+    s1 = synth_stream(window, "unigram", seed=123)
+    s2 = synth_stream(window, "unigram", seed=123)
+    s3 = synth_stream(window, "unigram", seed=124)
+    assert torch.equal(s1, s2)  # deterministic under the seed
+    assert not torch.equal(s1, s3)  # the seed actually enters
+    assert s1.shape == window.shape and s1.dtype == window.dtype
+    # support: sampled WITH replacement from the window itself
+    assert set(s1.tolist()) <= set(window.tolist())
+    # unigram marginal preserved within tolerance (empirical L1 vs source)
+    src = torch.bincount(window, minlength=8).float() / window.numel()
+    smp = torch.bincount(s1, minlength=8).float() / s1.numel()
+    assert float((src - smp).abs().sum()) < 0.05
+
+
+def test_synth_stream_bigram_transitions():
+    from bmx.eval.layer_swap import synth_stream
+
+    # Deterministic 3-cycle: every observed transition is t -> (t+1) % 3, and
+    # every token appears as a context, so the sampled chain must follow the
+    # cycle exactly after the first token.
+    window = torch.tensor([0, 1, 2] * 512, dtype=torch.int64)
+    out = synth_stream(window, "bigram", seed=5)
+    assert out.shape == window.shape and out.dtype == window.dtype
+    assert torch.equal(out[1:], (out[:-1] + 1) % 3)
+    assert torch.equal(out, synth_stream(window, "bigram", seed=5))
+
+    # Branching chain: from 0 the source goes to 1 three times per rep and to
+    # 2 once (P = 0.75 / 0.25); 1 and 2 always return to 0. The sampled
+    # conditional frequencies must match the source transition counts.
+    window = torch.tensor(([0, 1] * 3 + [0, 2]) * 512, dtype=torch.int64)
+    out = synth_stream(window, "bigram", seed=11)
+    prev, nxt = out[:-1], out[1:]
+    frac1 = float((nxt[prev == 0] == 1).float().mean())
+    assert abs(frac1 - 0.75) < 0.05
+    assert (nxt[prev == 1] == 0).all()
+    assert (nxt[prev == 2] == 0).all()
+
+
+def test_synth_stream_bigram_unseen_context_backoff():
+    from bmx.eval.layer_swap import synth_stream
+
+    # window [5, 9]: succ = {5: [9]}; 9 has NO observed successor. Find a seed
+    # whose first (unigram) draw is 9 — the very next step must take the
+    # unigram-backoff branch without crashing and stay in the window's support.
+    w = torch.tensor([5, 9], dtype=torch.int64)
+    hit = None
+    for s in range(50):
+        o = synth_stream(w, "bigram", seed=s)
+        if o[0].item() == 9:
+            hit = o
+            break
+    assert hit is not None, "no seed in 0..49 started at the successorless token"
+    assert hit.shape == (2,) and hit[1].item() in (5, 9)
+
+
+def test_load_eval_tokens_synth_wiring(monkeypatch):
+    import bmx.eval.layer_swap as ls
+
+    _patch_eval_tokens_io(monkeypatch)
+    nat = ls.load_eval_tokens("gpt2", n_tokens=16, token_offset=8)
+    uni1 = ls.load_eval_tokens(
+        "gpt2", n_tokens=16, token_offset=8, synth="unigram", synth_seed=20260723
+    )
+    uni2 = ls.load_eval_tokens(
+        "gpt2", n_tokens=16, token_offset=8, synth="unigram", synth_seed=20260723
+    )
+    bi = ls.load_eval_tokens(
+        "gpt2", n_tokens=16, token_offset=8, synth="bigram", synth_seed=20260723
+    )
+    assert torch.equal(uni1, uni2)  # deterministic under the recorded seed
+    assert uni1.shape == bi.shape == nat.shape == (16,)
+    # sampled from the window at THIS offset: support subset of the natural slice
+    assert set(uni1.tolist()) <= set(nat.tolist())
+    assert set(bi.tolist()) <= set(nat.tolist())
+    # WITH replacement (unlike the shuffle null): not a permutation of the
+    # window — the arange window has 16 distinct tokens, so a permutation
+    # would preserve the multiset exactly
+    assert not torch.equal(uni1.sort().values, nat.sort().values)
+
+
+def test_load_eval_tokens_synth_validation(monkeypatch):
+    import bmx.eval.layer_swap as ls
+
+    _patch_eval_tokens_io(monkeypatch)
+    with pytest.raises(AssertionError, match="synth mode"):
+        ls.load_eval_tokens("gpt2", n_tokens=8, synth="trigram", synth_seed=0)
+    with pytest.raises(AssertionError, match="synth_seed"):
+        ls.load_eval_tokens("gpt2", n_tokens=8, synth="unigram")
+    with pytest.raises(AssertionError, match="mutually exclusive"):
+        ls.load_eval_tokens(
+            "gpt2", n_tokens=8, synth="unigram", synth_seed=0, shuffle_seed=0
+        )

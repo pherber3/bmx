@@ -56,6 +56,8 @@ def load_eval_tokens(
     split: str = "test",
     text_field: str = "text",
     shuffle_seed: int = -1,
+    synth: str = "",
+    synth_seed: int = -1,
 ) -> torch.Tensor:
     """Tokenize a corpus slice for eval/calibration. Defaults reproduce the
     original wikitext-test path byte-identically.
@@ -67,7 +69,18 @@ def load_eval_tokens(
     multiset as the natural slice at this offset); the generator is seeded
     `shuffle_seed + token_offset` so distinct slices get distinct — but fully
     recorded — permutations.
+
+    `synth` ∈ {"unigram", "bigram"} replaces the RETURNED natural slice with a
+    same-length stream sampled from that slice's own n-gram statistics (spec
+    §3b — the traffic-histogram calibration recipe at orders 1 and 2); the
+    generator is seeded `synth_seed + token_offset` (same per-slice scheme as
+    shuffle). Mutually exclusive with shuffle_seed.
     """
+    assert synth in ("", "unigram", "bigram"), f"unknown synth mode {synth!r}"
+    assert not synth or synth_seed >= 0, "synth requires synth_seed >= 0"
+    assert not (synth and shuffle_seed >= 0), (
+        "synth and shuffle_seed are mutually exclusive (distinct §3b arms)"
+    )
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
@@ -135,6 +148,50 @@ def load_eval_tokens(
     if shuffle_seed >= 0:
         g = torch.Generator().manual_seed(shuffle_seed + token_offset)
         out = out[torch.randperm(out.numel(), generator=g)]
+    if synth:
+        out = synth_stream(out, synth, synth_seed + token_offset)
+    return out
+
+
+def synth_stream(window: torch.Tensor, mode: str, seed: int) -> torch.Tensor:
+    """Sample a same-length synthetic token stream from `window`'s own n-gram
+    statistics (spec §3b: the 'synthesize calibration text from traffic token
+    counts' recipe, orders 1 and 2).
+
+    "unigram": i.i.d. WITH replacement from the window's empirical histogram
+    (uniform position draws — each token's probability is count/N; contrast
+    the shuffle null, which is sampling WITHOUT replacement).
+    "bigram": Markov chain with empirical conditionals estimated on the
+    window (add-nothing smoothing — a successor is drawn uniformly from the
+    multiset of tokens observed after the current context); the first token
+    and any context with no observed successor back off to the unigram
+    histogram. Deterministic in `seed`; output shape/dtype match `window`.
+    """
+    assert window.ndim == 1 and window.numel() > 0, "window must be 1-D, non-empty"
+    assert mode in ("unigram", "bigram"), f"unknown synth mode {mode!r}"
+    n = window.numel()
+    g = torch.Generator().manual_seed(seed)
+
+    def uni(k: int) -> torch.Tensor:
+        return window[torch.randint(0, n, (k,), generator=g)]
+
+    if mode == "unigram":
+        return uni(n)
+    succ: dict[int, list[int]] = {}
+    for c, nx in zip(window[:-1].tolist(), window[1:].tolist()):
+        succ.setdefault(c, []).append(nx)
+    succ_t = {c: torch.tensor(v, dtype=window.dtype) for c, v in succ.items()}
+    out = torch.empty(n, dtype=window.dtype)
+    cur = int(uni(1).item())
+    out[0] = cur
+    for t in range(1, n):
+        choices = succ_t.get(cur)
+        if choices is None:  # context never observed with a successor
+            cur = int(uni(1).item())
+        else:
+            j = int(torch.randint(0, choices.numel(), (1,), generator=g).item())
+            cur = int(choices[j])
+        out[t] = cur
     return out
 
 
