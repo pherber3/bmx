@@ -697,3 +697,131 @@ def test_k4_corpus_transfer_diagnostics(tmp_path):
     # nothing is evaluated UNDER the null's covariance (fit-side only)
     assert all(not p.endswith("->null") for p in x.pair)
     assert (x.value > 0).all()
+
+
+def test_rank_overlap_pinned_to_dec_not_enc():
+    """Reviewer mutant (Task 6): swapping dec->enc inside _rank_overlap is NOT
+    caught by any prior assertion — self-overlap stays 1.0 and values stay in
+    [0, 1] under the mutant. Pin the function's output against an expected
+    value computed independently, in-test, straight from `dec`, and prove the
+    test can discriminate the enc-derived alternative (power check).
+
+    Non-trivial (non-multiple-of-identity) diagonal whitener: distinct
+    per-channel scales make enc = Wh@E and dec = Wh_inv@E span genuinely
+    different subspaces (Wh != c*Wh_inv for any scalar c), unlike the
+    identity_whitener used by most other tiny fixtures in this file where
+    enc == dec and the mutant would be invisible.
+    """
+    from bmx.cache.spectral import fit_spectral_basis
+    from bmx.quant.hadamard import orthogonalize
+    from experiments.k4_corpus_transfer import _rank_overlap
+
+    C, S = 16, 200
+    scales = torch.linspace(0.2, 5.0, C, dtype=torch.float64)
+    Wh = torch.diag(scales)
+    Wh_inv = torch.diag(1.0 / scales)
+
+    def make_basis(seed):
+        g = torch.Generator().manual_seed(seed)
+        M = torch.randn(S, C, generator=g, dtype=torch.float32)
+        return fit_spectral_basis(M, Wh, Wh_inv)
+
+    basis_a = make_basis(1)
+    basis_b = make_basis(2)
+
+    for r in (4, 8):
+        # Expected value transcribed independently from _rank_overlap's own
+        # reduction (mean of squared singular values of Q_a.T @ Q_b), applied
+        # by hand to `dec` — no call into _rank_overlap or subspace_overlap.
+        Q_a = orthogonalize(basis_a.dec[:, :r].double())
+        Q_b = orthogonalize(basis_b.dec[:, :r].double())
+        svals = torch.linalg.svdvals(Q_a.mT @ Q_b)
+        expected = float((svals**2).mean())
+
+        got = _rank_overlap(basis_a.dec, basis_b.dec, r)
+        assert abs(got - expected) < 1e-9, (
+            f"r={r}: _rank_overlap={got} != dec-derived expected={expected}"
+        )
+
+        # Power check: the enc-derived alternative must differ meaningfully
+        # from the dec-derived expected value, or a dec->enc mutant would
+        # slip through this fixture too.
+        Q_a_enc = orthogonalize(basis_a.enc[:, :r].double())
+        Q_b_enc = orthogonalize(basis_b.enc[:, :r].double())
+        svals_enc = torch.linalg.svdvals(Q_a_enc.mT @ Q_b_enc)
+        enc_val = float((svals_enc**2).mean())
+        assert abs(enc_val - expected) > 0.02, (
+            f"r={r}: enc-derived value {enc_val} too close to dec-derived "
+            f"expected {expected} -- fixture doesn't discriminate the mutant"
+        )
+
+    # Cheap ground-truth pin (self-overlap must be exactly 1 at any rank).
+    for r in (4, 8):
+        assert abs(_rank_overlap(basis_a.dec, basis_a.dec, r) - 1.0) < 1e-9
+
+
+def test_k4_corpus_transfer_overlap_row_pinned_to_dec(tmp_path):
+    """Closes the reviewer's actual mutant surface: `_rank_overlap` itself is
+    attribute-agnostic (it takes raw tensors), so the real dec->enc mutation
+    site is the two call sites in `_diagnostics` that read `.dec` off
+    `fits[a].bases[layer_i]` / `fits[b].bases[layer_i]`. Neither
+    test_k4_corpus_transfer_diagnostics (range/monotonicity only) nor a
+    unit-level pin on `_rank_overlap` in isolation exercises those call
+    sites. Recompute the expected value independently — via the SAME fit
+    path `main()` uses (`_load_side` + `corpus_fit_bases`) — straight from
+    `.dec`, and pin it against the actual emitted overlap.parquet row.
+    """
+    from experiments._k4_common import corpus_fit_bases
+    from experiments.k4_corpus_transfer import _load_side, main
+    from bmx.quant.hadamard import orthogonalize
+
+    cfg = _tiny_corpus_transfer_cfg(tmp_path)
+    run_dir = main(cfg)
+
+    import pandas as pd
+
+    ov = pd.read_parquet(run_dir / "overlap.parquet")
+    o = ov[(ov.kind == "overlap") & (~ov.centered)]
+
+    # Independently reproduce fits["wiki"] / fits["code"] the same way main()
+    # does (corpus_fit_bases with w_source="corpus", matching cfg.ridge /
+    # position_stride) -- a non-identity whitener assembled from the tiny
+    # cache's own query moments, so dec != enc here too.
+    per_cache_w, gcs_w, rope_w, layers = _load_side(cfg.wiki_fit_paths, cfg.model_name)
+    per_cache_c, gcs_c, rope_c, layers_c = _load_side(
+        cfg.code_fit_paths, cfg.model_name
+    )
+    assert layers == layers_c
+    fit_wiki = corpus_fit_bases(
+        per_cache_w,
+        gcs_w,
+        rope_w,
+        layers,
+        w_source="corpus",
+        ridge=cfg.ridge,
+        position_stride=cfg.position_stride,
+    )
+    fit_code = corpus_fit_bases(
+        per_cache_c,
+        gcs_c,
+        rope_c,
+        layers,
+        w_source="corpus",
+        ridge=cfg.ridge,
+        position_stride=cfg.position_stride,
+    )
+
+    layer_i = layers[0]
+    r = 4
+    Q_a = orthogonalize(fit_wiki.bases[layer_i].dec[:, :r].double())
+    Q_b = orthogonalize(fit_code.bases[layer_i].dec[:, :r].double())
+    svals = torch.linalg.svdvals(Q_a.mT @ Q_b)
+    expected = float((svals**2).mean())
+
+    row = o[(o.pair == "wiki-code") & (o.layer == layer_i) & (o["rank"] == r)]
+    assert len(row) == 1, f"expected exactly one matching row, got {len(row)}"
+    got = float(row.value.iloc[0])
+    assert abs(got - expected) < 1e-6, (
+        f"overlap.parquet wiki-code layer={layer_i} rank={r}: {got} != "
+        f"dec-derived expected {expected}"
+    )
