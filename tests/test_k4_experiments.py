@@ -1962,18 +1962,107 @@ def test_k4_jensen_gap_smoke(tmp_path):
         "r_discrete_b2.5",
         "identity_check_b2.5",
         "abs_gap_b2.5",
+        "r_pred_debiased",
+        "bias_factor_seq",
+        "bias_factor_pool",
+        "r_pred_flat_debiased",
+        "flatness_delta_debiased",
+        "mixed_r_pred_debiased",
+        "within_r_pred_debiased",
+        "abs_gap_debiased_b2.2",
+        "abs_gap_debiased_b2.5",
     } <= set(df.columns)
     assert (df.r_pred <= 1.0 + 1e-9).all()
     assert (df.n_seq == 3).all()
     assert df.mixed_r_pred.isna().all()  # no cache_paths_alt given
+    assert df.mixed_r_pred_debiased.isna().all()
+    assert (df.bias_factor_seq > 0).all() and (df.bias_factor_pool > 0).all()
 
     verdict = json.loads((run_dir / "jensen_verdict.json").read_text())
     assert "r_pred" in verdict and "per_budget" in verdict and "match" in verdict
     assert set(verdict["per_budget"]) == {"2.2", "2.5"}
     for entry in verdict["per_budget"].values():
-        assert {"r_discrete", "identity_check", "abs_gap", "match"} <= set(entry)
+        assert {
+            "r_discrete",
+            "identity_check",
+            "abs_gap",
+            "match",
+            "abs_gap_debiased",
+            "match_debiased",
+        } <= set(entry)
     assert verdict["flatness"]["n_flat"] == 2
+    assert {
+        "r_pred_at_n_flat_debiased",
+        "r_pred_at_all_debiased",
+        "delta_debiased",
+    } <= set(verdict["flatness"])
     assert verdict["mixed_domain"] is None
+
+    # Wishart debiasing block: pre-registered raw `match` stays the primary
+    # readout; the debiased comparison is explicitly labeled post-hoc.
+    wd = verdict["wishart_debiasing"]
+    assert wd["post_hoc"] is True
+    assert "r_pred_debiased" in wd and "match_debiased" in wd
+    assert wd["bias_factor_seq"] > 0 and wd["bias_factor_pool"] > 0
+    # Bias factor magnitude sanity: this fixture's n_rows (S=128) comfortably
+    # exceeds C (16), so bias factors sit in (0, 1] (small-sample gm
+    # underestimation shrinks toward 1 as n/C grows, never overshoots past 1
+    # for n >= C -- the Wishart mean is a downward-biased estimator here).
+    assert 0.0 < wd["bias_factor_seq"] <= 1.0 + 1e-9
+    assert 0.0 < wd["bias_factor_pool"] <= 1.0 + 1e-9
+
+
+def test_k4_jensen_gap_debiasing_uses_real_row_counts_not_hardcoded(tmp_path):
+    """Two caches with DIFFERENT sequence lengths (S): the harness must read
+    each cache's own row count off the data (per_cache_weighted_moments'
+    M_parts) rather than assuming a fixed S like 1024 -- verified by checking
+    bias_factor_seq against the closed-form Bartlett/digamma correction
+    computed independently in the test from the ACTUAL S values, and
+    confirming a hardcoded-1024 assumption would give a visibly different
+    (wrong) number here."""
+    import math
+
+    import pandas as pd
+
+    from experiments.k4_jensen_gap import Config, main
+
+    p_small, p_large = tmp_path / "small.safetensors", tmp_path / "large.safetensors"
+    _tiny_cache(p_small, S=96, C=16, h_kv=2, T=16, seed=0)
+    _tiny_cache(p_large, S=192, C=16, h_kv=2, T=16, seed=1)
+
+    run_dir = main(
+        Config(
+            cache_paths=(str(p_small), str(p_large)),
+            model_label="tiny",
+            budgets=(2.5,),
+            n_flat=1,
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+
+    C = 16
+
+    def b(n):
+        idx = torch.arange(1, C + 1, dtype=torch.float64)
+        psi = torch.special.digamma((n - idx + 1) / 2.0)
+        return float((psi + math.log(2.0 / n)).mean())
+
+    # Real per-cache n_rows are 96 and 192 (read off the fixture's own S);
+    # bias_factor_seq is exp(mean_s(b_s)) over those two REAL values.
+    b_seq_expected = math.exp((b(96) + b(192)) / 2.0)
+    # A hardcoded-1024 bug would instead give exp(b(1024)) for BOTH caches.
+    b_seq_wrong_if_hardcoded = math.exp(b(1024))
+
+    for row_val in df.bias_factor_seq.tolist():
+        assert abs(row_val - b_seq_expected) < 1e-6, (
+            row_val,
+            b_seq_expected,
+        )
+        assert abs(row_val - b_seq_wrong_if_hardcoded) > 1e-3, (
+            "bias_factor_seq matches the hardcoded-1024 value -- "
+            "n_rows is not being read from the actual cache data"
+        )
 
 
 def test_k4_jensen_gap_mixed_domain_diagnostic(tmp_path):
@@ -2004,11 +2093,14 @@ def test_k4_jensen_gap_mixed_domain_diagnostic(tmp_path):
     df = pd.read_parquet(run_dir / "metrics.parquet")
     assert not df.mixed_r_pred.isna().any()
     assert (df.mixed_r_pred <= 1.0 + 1e-9).all()
+    assert not df.mixed_r_pred_debiased.isna().any()
 
     verdict = json.loads((run_dir / "jensen_verdict.json").read_text())
     assert verdict["mixed_domain"] is not None
     assert "mixed_r_pred" in verdict["mixed_domain"]
     assert "within_r_pred" in verdict["mixed_domain"]
+    assert "mixed_r_pred_debiased" in verdict["mixed_domain"]
+    assert "within_r_pred_debiased" in verdict["mixed_domain"]
 
 
 def test_k4_jensen_gap_verdict_hand_checked_toy(tmp_path):

@@ -221,7 +221,27 @@ def fit_spectral_basis(
     )
 
 
-def jensen_gap_report(moments: Sequence[torch.Tensor]) -> dict:
+def _wishart_logdet_bias(n: int, C: int) -> float:
+    """Bartlett/Wishart closed-form bias of E[log det(S)] relative to
+    log det(Σ) for a sample covariance S = X^T X / n from n iid Gaussian
+    rows in C dims (n >= C required — the standard non-degenerate Wishart
+    regime): per-dim bias term
+
+        b(n, C) = (1/C) * sum_{i=1..C} [psi((n-i+1)/2) + log(2/n)]
+
+    via `torch.special.digamma` (no scipy dependency). E[gm(S)] ~
+    gm(Sigma)*exp(b(n,C)) to first order (see `jensen_gap_report`'s n_rows
+    docstring for the exact/first-order scope caveat).
+    """
+    assert n >= C, f"Wishart log-det bias requires n >= C; got n={n}, C={C}"
+    idx = torch.arange(1, C + 1, dtype=torch.float64)
+    psi = torch.special.digamma((n - idx + 1) / 2.0)
+    return float((psi + math.log(2.0 / n)).mean())
+
+
+def jensen_gap_report(
+    moments: Sequence[torch.Tensor], *, n_rows: Sequence[int] | None = None
+) -> dict:
     """Determinant-Jensen Gate-A anchor (math review 2026-07-24 #6, spec Part
     2): the population functional behind Gate A's measured corpus-basis
     retention ceiling.
@@ -254,8 +274,45 @@ def jensen_gap_report(moments: Sequence[torch.Tensor]) -> dict:
     the log before vs after averaging the gm(Σ_s) across sequences) — both
     are reported deliberately, do not conflate them or "derive" one from the
     other downstream.
+
+    `n_rows` (Wishart log-det debiasing, follow-up to the original anchor):
+    None (default) reproduces the exact prior output bit-for-bit — no new
+    keys added. When given (one int per moment: the token-row count that
+    sample moment was ESTIMATED from — e.g. the sequence length S the
+    per-cache Σ_s came from), a raw sample gm(Σ_s) is a BIASED estimate of
+    the true population gm at finite n/C — `gm(Σ̄)` (pooled over many more
+    effective rows) is far less biased than any single `gm(Σ_s)`, so `r_pred`
+    itself is contaminated by an asymmetric small-sample bias, not just the
+    "real" Jensen gap. `_wishart_logdet_bias(n, C)` gives the closed-form
+    Bartlett/digamma correction to `E[log det(S)]`; this function applies it
+    per moment (`b_s = _wishart_logdet_bias(n_rows[s], C)`) and once to the
+    pool (`b_pool = _wishart_logdet_bias(sum(n_rows), C)`, since the pooled
+    moment's effective sample size is the SUM of the per-cache row counts —
+    consistent with `mean_s(moments)` being algebraically the same object as
+    the second moment of the row-concatenated matrix when every cache
+    contributes equally, per `per_cache_weighted_moments`' pooling
+    convention), and adds three keys:
+
+        bias_factor_seq   = exp(mean_s(b_s))
+        bias_factor_pool  = exp(b_pool)
+        r_pred_debiased   = mean_s(gm_s * exp(-b_s)) / (gm_pool * exp(-b_pool))
+
+    HONEST SCOPE: `_wishart_logdet_bias` is EXACT only for iid Gaussian rows
+    (a real Wishart sample covariance) and requires `n_rows[s] >= C` for
+    every moment and `sum(n_rows) >= C` for the pool. Token rows in this
+    codebase's caches are autocorrelated (adjacent positions are highly
+    correlated), which makes the EFFECTIVE sample size smaller than the raw
+    row count — so this correction is FIRST-ORDER and systematically
+    UNDER-CORRECTS (the true bias at the smaller effective n is larger than
+    what `n_rows[s]` predicts). `r_pred_debiased` is a bias-REDUCED estimate
+    of the population ratio, not an exact one — report it as such, never as
+    "the corrected R_pred."
     """
     assert len(moments) > 0, "moments must be non-empty"
+    if n_rows is not None:
+        assert len(n_rows) == len(moments), (
+            f"n_rows length {len(n_rows)} != moments length {len(moments)}"
+        )
     tiny = 1e-300
     C = None
     gms: list[float] = []
@@ -303,7 +360,7 @@ def jensen_gap_report(moments: Sequence[torch.Tensor]) -> dict:
     mean_gm_seq = float(sum(gms) / len(gms))
     mean_log_gm_seq = float(sum(log_gms) / len(log_gms))
 
-    return dict(
+    report = dict(
         gm_pool=gm_pool,
         mean_gm_seq=mean_gm_seq,
         r_pred=mean_gm_seq / gm_pool,
@@ -311,6 +368,19 @@ def jensen_gap_report(moments: Sequence[torch.Tensor]) -> dict:
         n_seq=len(moments),
         n_clamped=n_clamped,
     )
+
+    if n_rows is not None:
+        b_seq_list = [_wishart_logdet_bias(int(n), C) for n in n_rows]
+        b_pool = _wishart_logdet_bias(int(sum(n_rows)), C)
+        mean_b_seq = sum(b_seq_list) / len(b_seq_list)
+        debiased_gms = [gm * math.exp(-b) for gm, b in zip(gms, b_seq_list)]
+        mean_debiased_gm_seq = sum(debiased_gms) / len(debiased_gms)
+        debiased_gm_pool = gm_pool * math.exp(-b_pool)
+        report["bias_factor_seq"] = math.exp(mean_b_seq)
+        report["bias_factor_pool"] = math.exp(b_pool)
+        report["r_pred_debiased"] = mean_debiased_gm_seq / debiased_gm_pool
+
+    return report
 
 
 def pack_from_basis(

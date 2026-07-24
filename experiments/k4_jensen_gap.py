@@ -61,10 +61,11 @@ def _whitened_moments(
     rope_ready: bool,
     layer_i: int,
     cfg: Config,
-) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+) -> tuple[list[torch.Tensor], list[int], torch.Tensor, torch.Tensor]:
     """Per-cache whitened moments T_s = Wh @ Σ_s @ Wh (fp64) for one layer,
     under the IDENTICAL conventions pack fitting uses (per_cache_weighted_moments),
-    plus the shared (Wh, Wh_inv)."""
+    plus the per-cache token-row counts (n_rows[s] = M_parts[s].shape[0], read
+    off the actual data — never hardcoded) and the shared (Wh, Wh_inv)."""
     pcm = per_cache_weighted_moments(
         layer_keys_list,
         get_cos_sins,
@@ -75,11 +76,13 @@ def _whitened_moments(
         position_stride=cfg.position_stride,
     )
     T_list = []
+    n_rows = []
     for M in pcm.M_parts:
         Sigma = key_second_moment(M)  # fp64 (C, C), raw per-cache moment
         T = pcm.Wh @ Sigma @ pcm.Wh
         T_list.append(T)
-    return T_list, pcm.Wh, pcm.Wh_inv
+        n_rows.append(int(M.shape[0]))
+    return T_list, n_rows, pcm.Wh, pcm.Wh_inv
 
 
 def _gm(evals: torch.Tensor) -> float:
@@ -176,13 +179,18 @@ def main(cfg: Config):
     per_layer_verdict: dict[int, dict] = {}
 
     for layer_i in layers:
-        T_list, _Wh, _Wh_inv = _whitened_moments(
+        T_list, n_rows, _Wh, _Wh_inv = _whitened_moments(
             layer_keys_list, get_cos_sins, rope_ready, layer_i, cfg
         )
 
-        report_all = jensen_gap_report(T_list)
-        report_flat = jensen_gap_report(T_list[: cfg.n_flat])
+        report_all = jensen_gap_report(T_list, n_rows=n_rows)
+        report_flat = jensen_gap_report(
+            T_list[: cfg.n_flat], n_rows=n_rows[: cfg.n_flat]
+        )
         flatness_delta = abs(report_flat["r_pred"] - report_all["r_pred"])
+        flatness_delta_debiased = abs(
+            report_flat["r_pred_debiased"] - report_all["r_pred_debiased"]
+        )
 
         per_budget: dict[str, dict] = {}
         for budget in cfg.budgets:
@@ -191,8 +199,10 @@ def main(cfg: Config):
 
         mixed_r_pred = None
         within_r_pred = report_all["r_pred"]
+        mixed_r_pred_debiased = None
+        within_r_pred_debiased = report_all["r_pred_debiased"]
         if alt_layer_keys_list:
-            T_alt, _, _ = _whitened_moments(
+            T_alt, n_rows_alt, _, _ = _whitened_moments(
                 alt_layer_keys_list, alt_get_cos_sins, rope_ready, layer_i, cfg
             )
             # Mixed-domain diagnostic: pool wiki+code moments under ONE shared
@@ -212,8 +222,11 @@ def main(cfg: Config):
                 position_stride=cfg.position_stride,
             )
             T_alt_shared = [_Wh @ key_second_moment(M) @ _Wh for M in pcm_alt.M_parts]
-            report_mixed = jensen_gap_report(T_list + T_alt_shared)
+            report_mixed = jensen_gap_report(
+                T_list + T_alt_shared, n_rows=n_rows + n_rows_alt
+            )
             mixed_r_pred = report_mixed["r_pred"]
+            mixed_r_pred_debiased = report_mixed["r_pred_debiased"]
 
         row = dict(
             model=model_label,
@@ -228,17 +241,32 @@ def main(cfg: Config):
             flatness_delta=flatness_delta,
             mixed_r_pred=mixed_r_pred if mixed_r_pred is not None else float("nan"),
             within_r_pred=within_r_pred,
+            r_pred_debiased=report_all["r_pred_debiased"],
+            bias_factor_seq=report_all["bias_factor_seq"],
+            bias_factor_pool=report_all["bias_factor_pool"],
+            r_pred_flat_debiased=report_flat["r_pred_debiased"],
+            flatness_delta_debiased=flatness_delta_debiased,
+            mixed_r_pred_debiased=(
+                mixed_r_pred_debiased
+                if mixed_r_pred_debiased is not None
+                else float("nan")
+            ),
+            within_r_pred_debiased=within_r_pred_debiased,
         )
         for budget in cfg.budgets:
             disc = per_budget[f"{budget:g}"]
             row[f"r_discrete_b{budget:g}"] = disc["r_discrete"]
             row[f"identity_check_b{budget:g}"] = disc["identity_check"]
             row[f"abs_gap_b{budget:g}"] = abs(report_all["r_pred"] - disc["r_discrete"])
+            row[f"abs_gap_debiased_b{budget:g}"] = abs(
+                report_all["r_pred_debiased"] - disc["r_discrete"]
+            )
         rows.append(row)
         per_layer_verdict[layer_i] = dict(row)
 
         print(
             f"[layer {layer_i:2d}] r_pred={report_all['r_pred']:.4f} "
+            f"r_pred_debiased={report_all['r_pred_debiased']:.4f} "
             f"log_gap={report_all['log_gap']:.4f} "
             + " ".join(
                 f"r_disc@{b:g}={per_budget[f'{b:g}']['r_discrete']:.4f}"
@@ -268,8 +296,15 @@ def _jensen_verdict(df: pd.DataFrame, cfg: Config) -> dict:
     r_pred_flat_mean = float(df.r_pred_flat.mean())
     flatness_delta_mean = float(df.flatness_delta.mean())
 
+    r_pred_debiased_mean = float(df.r_pred_debiased.mean())
+    bias_factor_seq_mean = float(df.bias_factor_seq.mean())
+    bias_factor_pool_mean = float(df.bias_factor_pool.mean())
+    r_pred_flat_debiased_mean = float(df.r_pred_flat_debiased.mean())
+    flatness_delta_debiased_mean = float(df.flatness_delta_debiased.mean())
+
     per_budget: dict[str, dict] = {}
     match_all = True
+    match_debiased_all = True
     for budget in cfg.budgets:
         b = f"{budget:g}"
         r_discrete_mean = float(df[f"r_discrete_b{b}"].mean())
@@ -277,15 +312,26 @@ def _jensen_verdict(df: pd.DataFrame, cfg: Config) -> dict:
         abs_gap_mean = abs(r_pred_mean - r_discrete_mean)
         match = bool(abs_gap_mean <= 0.10)
         match_all = match_all and match
+
+        abs_gap_debiased_mean = abs(r_pred_debiased_mean - r_discrete_mean)
+        match_debiased = bool(abs_gap_debiased_mean <= 0.10)
+        match_debiased_all = match_debiased_all and match_debiased
+
         per_budget[b] = dict(
             r_discrete=r_discrete_mean,
             identity_check=identity_check_mean,
             abs_gap=abs_gap_mean,
             match=match,
+            abs_gap_debiased=abs_gap_debiased_mean,
+            match_debiased=match_debiased,
         )
 
     mixed_r_pred_mean = float(df.mixed_r_pred.mean()) if cfg.cache_paths_alt else None
     within_r_pred_mean = float(df.within_r_pred.mean())
+    mixed_r_pred_debiased_mean = (
+        float(df.mixed_r_pred_debiased.mean()) if cfg.cache_paths_alt else None
+    )
+    within_r_pred_debiased_mean = float(df.within_r_pred_debiased.mean())
 
     return dict(
         r_pred=r_pred_mean,
@@ -296,14 +342,33 @@ def _jensen_verdict(df: pd.DataFrame, cfg: Config) -> dict:
             r_pred_at_n_flat=r_pred_flat_mean,
             r_pred_at_all=r_pred_mean,
             delta=flatness_delta_mean,
+            r_pred_at_n_flat_debiased=r_pred_flat_debiased_mean,
+            r_pred_at_all_debiased=r_pred_debiased_mean,
+            delta_debiased=flatness_delta_debiased_mean,
         ),
         mixed_domain=dict(
             mixed_r_pred=mixed_r_pred_mean,
             within_r_pred=within_r_pred_mean,
+            mixed_r_pred_debiased=mixed_r_pred_debiased_mean,
+            within_r_pred_debiased=within_r_pred_debiased_mean,
         )
         if cfg.cache_paths_alt
         else None,
         n_layers=int(df.shape[0]),
+        wishart_debiasing=dict(
+            post_hoc=True,
+            note=(
+                "r_pred_debiased/match_debiased are a LABELED POST-HOC analysis "
+                "(closed-form Bartlett/digamma Wishart log-det debiasing, "
+                "math review finding #7 connection) — the PRE-REGISTERED "
+                "readout is `match` on raw r_pred above; match_debiased is "
+                "reported alongside it, not in place of it."
+            ),
+            r_pred_debiased=r_pred_debiased_mean,
+            bias_factor_seq=bias_factor_seq_mean,
+            bias_factor_pool=bias_factor_pool_mean,
+            match_debiased=match_debiased_all,
+        ),
     )
 
 

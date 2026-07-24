@@ -905,3 +905,100 @@ def test_jensen_gap_requires_square_and_matching_shapes():
 def test_jensen_gap_requires_nonempty():
     with pytest.raises(AssertionError):
         jensen_gap_report([])
+
+
+# ---------------------------------------------------------------------------
+# jensen_gap_report Wishart log-det debiasing (n_rows-aware follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_jensen_gap_n_rows_none_bit_identical_regression_pin():
+    """Default n_rows=None must reproduce EXACTLY the pre-follow-up return
+    dict: the same 6 keys (gm_pool, mean_gm_seq, r_pred, log_gap, n_seq,
+    n_clamped), none of the new debiasing keys, and the SAME values a fixed
+    seed produced before this follow-up (hand-verified against the identical
+    -moments closed form: r_pred == 1.0, log_gap == 0.0)."""
+    pre_follow_up_keys = {
+        "gm_pool",
+        "mean_gm_seq",
+        "r_pred",
+        "log_gap",
+        "n_seq",
+        "n_clamped",
+    }
+    g = torch.Generator().manual_seed(3)
+    M = _random_psd(9, g)
+    report = jensen_gap_report([M, M.clone(), M.clone()])
+    assert set(report) == pre_follow_up_keys
+    assert abs(report["r_pred"] - 1.0) < 1e-12
+    assert abs(report["log_gap"]) < 1e-12
+
+
+def test_jensen_gap_debiasing_closed_form_wishart_correction():
+    """Synthetic iid Gaussian rows, known population covariance = identity
+    (population gm = 1 exactly). At n=48, C=32 (n < 2C, a real small-sample
+    regime) the RAW sample gm is a substantial underestimate of the
+    population gm; averaging the DEBIASED gm over many trials must land much
+    closer to 1.0 than the raw estimate does. Seeded, generous tolerance,
+    200 trials (fast: C=32 eigh is cheap)."""
+    import math
+
+    torch.manual_seed(11)
+    C, n, trials = 32, 48, 200
+    raw_gms = []
+    for _ in range(trials):
+        X = torch.randn(n, C, dtype=torch.float64)
+        S = X.mT @ X / n
+        report = jensen_gap_report([S], n_rows=[n])
+        raw_gms.append(report["mean_gm_seq"])
+    raw_mean = sum(raw_gms) / trials
+    assert abs(raw_mean - 1.0) > 0.2, "fixture must show a REAL raw bias to debias away"
+
+    # Closed-form Bartlett/digamma correction, computed independently here.
+    i = torch.arange(1, C + 1, dtype=torch.float64)
+    psi = torch.special.digamma((n - i + 1) / 2.0)
+    b_expected = float((psi + math.log(2.0 / n)).mean())
+    bias_factor_expected = math.exp(b_expected)
+
+    # bias_factor_seq from the report (single-moment case: mean_s b_s == b_s).
+    single_report = jensen_gap_report([torch.eye(C, dtype=torch.float64)], n_rows=[n])
+    assert abs(single_report["bias_factor_seq"] - bias_factor_expected) < 1e-9
+
+    # The debiased trial-mean must land far closer to the true population
+    # gm (1.0) than the raw trial-mean does.
+    debiased_trial_means = [g / bias_factor_expected for g in raw_gms]
+    debiased_mean = sum(debiased_trial_means) / trials
+    assert abs(debiased_mean - 1.0) < abs(raw_mean - 1.0) / 3
+
+
+def test_jensen_gap_debiasing_equal_n_algebraic_identity():
+    """Equal n_rows for every moment, pooled n = sum(n_rows): the DEBIASED
+    r_pred reduces to raw_r_pred * exp(b_pool - b_seq) exactly (b_seq is the
+    common per-moment bias since every moment shares the same n; algebraic
+    identity, no synthetic-data randomness needed to prove it)."""
+    import math
+
+    g = torch.Generator().manual_seed(4)
+    moments = [_random_psd(10, g) for _ in range(4)]
+    n_each = 40
+    n_rows = [n_each] * len(moments)
+
+    report = jensen_gap_report(moments, n_rows=n_rows)
+    raw = jensen_gap_report(moments)  # no n_rows -> raw r_pred, for cross-check
+
+    assert abs(report["r_pred"] - raw["r_pred"]) < 1e-12  # raw field untouched
+
+    C = moments[0].shape[0]
+
+    def b(n):
+        idx = torch.arange(1, C + 1, dtype=torch.float64)
+        psi = torch.special.digamma((n - idx + 1) / 2.0)
+        return float((psi + math.log(2.0 / n)).mean())
+
+    b_seq = b(n_each)
+    b_pool = b(n_each * len(moments))
+    expected_r_pred_debiased = raw["r_pred"] * math.exp(b_pool - b_seq)
+
+    assert abs(report["r_pred_debiased"] - expected_r_pred_debiased) < 1e-9
+    assert abs(report["bias_factor_seq"] - math.exp(b_seq)) < 1e-9
+    assert abs(report["bias_factor_pool"] - math.exp(b_pool)) < 1e-9
