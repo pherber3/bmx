@@ -430,7 +430,7 @@ Packs: reuse `results/cache/k4_packs_llama31_instruct.safetensors` if still on t
 for OFF in 2048 4096 6144 8192; do
   uv run python experiments/collect_cache.py --model-name meta-llama/Llama-3.1-8B-Instruct --seq-len 2048 --token-offset $OFF
 done
-uv run python experiments/k4_fit_packs.py \
+uv run python -m experiments.k4_fit_packs \
   --corpus-cache-paths results/cache/llama-3.1-8b-instruct_2048_off2048.safetensors results/cache/llama-3.1-8b-instruct_2048_off4096.safetensors results/cache/llama-3.1-8b-instruct_2048_off6144.safetensors results/cache/llama-3.1-8b-instruct_2048_off8192.safetensors \
   --out-path results/cache/k4_packs_llama31_instruct.safetensors --model-label llama-3.1-8b-instruct \
   --model-name meta-llama/Llama-3.1-8B-Instruct --w-source corpus
@@ -452,7 +452,7 @@ uv run python scripts/profile_decode_ab.py --model-name meta-llama/Llama-3.1-8B-
 
 ```bash
 mkdir -p results/logs
-setsid nohup uv run python experiments/k3_kernel_census.py \
+setsid nohup uv run python -m experiments.k3_kernel_census \
   --model-name meta-llama/Llama-3.1-8B-Instruct \
   --arms fp16 k2b k4_b2.5 --seq-lens 32768 65536 98304 \
   --pack-path results/cache/k4_packs_llama31_instruct.safetensors \
@@ -461,16 +461,17 @@ setsid nohup uv run python experiments/k3_kernel_census.py \
 
 (`k2b` rides as the June-census continuity anchor — its 32k/64k chunked numbers must reproduce ~27.3/39.5 GiB, drift means an environment change, stop and diagnose. The census writes its parquet after EVERY cell; an OOM is a sentinel row, not a crash.)
 
-**The 128k headroom gate (binding — run BEFORE any 128k cell):** read the stage-1 parquet; for each path × arm, project `resident_128k ≈ resident_96k + (resident_96k − resident_64k)` (growth is linear — June table). Proceed to 128k for a cell only if its projection ≤ **90 GiB** (≥5.6 GiB margin under the 95.6 GiB HBM ceiling; the prefill-mask transient once pushed a packed peak to ~94.7 GiB — that precedent is the reason this gate exists). `dense_stream` rows projected over the ceiling are EXPECTED (that's the point of the table) — run them anyway to get the honest OOM sentinel, but run them LAST in the process order and one arm per invocation so an OOM can't poison earlier cells' allocator state:
+**The 128k headroom gate (binding — run BEFORE any 128k cell):** read the stage-1 parquet; for each path × arm, project `resident_128k ≈ resident_96k + (resident_96k − resident_64k)` (growth is linear — June table). Proceed to 128k for a cell only if its projection ≤ **90 GiB** (≥5.6 GiB margin under the 95.6 GiB HBM ceiling; the prefill-mask transient once pushed a packed peak to ~94.7 GiB — that precedent is the reason this gate exists). `dense_stream` rows projected over the ceiling are EXPECTED (that's the point of the table) — run them anyway to get the honest OOM sentinel, but run them LAST in the process order and one arm per invocation so an OOM can't poison earlier cells' allocator state. **This gate is a human read-and-decide step — the GPU is idle while it happens; don't leave Stage 1 running unattended overnight expecting Stage 2 to follow automatically, there is no script here that computes the projection and launches for you:**
 
 ```bash
-setsid nohup uv run python experiments/k3_kernel_census.py \
+setsid nohup uv run python -m experiments.k3_kernel_census \
   --model-name meta-llama/Llama-3.1-8B-Instruct \
   --arms fp16 k4_b2.5 --seq-lens 131072 \
   --pack-path results/cache/k4_packs_llama31_instruct.safetensors \
   > results/logs/census_128k_a.log 2>&1 &
-# after it exits: the expected-OOM continuity cell, isolated:
-setsid nohup uv run python experiments/k3_kernel_census.py \
+wait  # BLOCKS until census_128k_a exits — do not launch the isolated k2b cell until it does
+# now the expected-OOM continuity cell, isolated (only after the line above returns):
+setsid nohup uv run python -m experiments.k3_kernel_census \
   --model-name meta-llama/Llama-3.1-8B-Instruct --arms k2b --seq-lens 131072 \
   --pack-path results/cache/k4_packs_llama31_instruct.safetensors \
   > results/logs/census_128k_b.log 2>&1 &
@@ -487,9 +488,9 @@ setsid nohup uv run python -m experiments.k3_niah --model-name meta-llama/Llama-
   > results/logs/niah_packed_128k.log 2>&1 &
 ```
 
-- fp16 routes to the dense cache automatically (`generate_through_cache` is_fp16 rule — the uncompressed baseline, one KV copy, fits at 128k); `k4_b2.5` and `k2b` run packed. Cells are sequential (no co-residency), matching the June 3-arm×3-depth precedent exactly; `partial/` shards resume a killed run (`--resume-from <run_dir>`).
+- fp16 routes to the dense cache automatically (`generate_through_cache` is_fp16 rule — the uncompressed baseline, one KV copy, fits at 128k); `k4_b2.5` and `k2b` run packed. Cells are sequential (no co-residency), matching the June 3-arm×3-depth precedent exactly; `partial/` shards resume a killed run (`--resume <run_dir>` — the CLI flag is `--resume`, not `--resume-from`; it takes the crashed run's `run_dir` path directly and is identity-asserted against `config.json` + git SHA).
 - **Delta-parity discipline:** report recall as deltas vs the SAME RUN's fp16 rows, never absolute (anchor forensics, `dd84143`). Success bar: k4_b2.5 recall-delta at 64k reproduces the streaming-path result (7.71 vs fp16 6.76 in the duel table — a packed-path number in the same class closes quality), and the 128k row is the FIRST spectral 128k evidence, whatever it reads.
-- Known risk, accepted: `compression_for` runs a streaming prefill per (arm, length) cell for the bpe columns — at 128k that's the 83.5-GiB-class transient; it fit in the June 128k process, and a per-cell fresh relaunch via `--resume-from` is the cheap fallback if fragmentation bites.
+- Known risk, accepted: `compression_for` runs a streaming prefill per (arm, length) cell for the bpe columns — at 128k that's the 83.5-GiB-class transient; it fit in the June 128k process, and a per-cell fresh relaunch via `--resume <run_dir>` is the cheap fallback if fragmentation bites.
 - Prefill-rate note: packed spectral flushes per PAGE (512 codec calls/layer at 64k — no batched super-spans on the packed path). k2b's per-page SVD flush at 128k was acceptable in June; if spectral prefill is pathologically slower, record it as a finding (a batched-pack span mirroring `_flush_spans` is the known remedy, NOT to be built mid-run).
 
 ### Task 11: [VM-RUN] Results doc + traceability + bundle back
