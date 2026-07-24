@@ -325,7 +325,7 @@ def main(cfg: Config):
             materiality_pass_at_S4096=bool(saving_delta_by_s[4096] >= 0.3),
         )
         print(
-            f"  [per-layer] b={budget:g} T_ℓ={t_map} "
+            f"  [per-layer] b={budget:g} T_l={t_map} "
             f"saving_delta@4096={saving_delta_by_s[4096]:.4f} "
             f"(bar=0.3, pass={per_layer_summary[f'{budget:g}']['materiality_pass_at_S4096']})",
             flush=True,
