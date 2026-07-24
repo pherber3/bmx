@@ -1314,3 +1314,43 @@ def test_k4_g_table_deterministic(tmp_path):
     g1 = json.loads((r1 / "g_table.json").read_text())["g_table"]
     g2 = json.loads((r2 / "g_table.json").read_text())["g_table"]
     assert g1 == g2
+
+
+def test_k4_int8_certificate_smoke(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from experiments.k4_int8_certificate import Config, main
+
+    fit = tmp_path / "f.safetensors"
+    _tiny_cache(fit, seed=0)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.0, 2.5), group=16)
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            budgets=(2.0, 2.5),
+            model_label="tiny",
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert {
+        "budget",
+        "layer",
+        "added",
+        "payload",
+        "noise_to_signal",
+        "implied_rel_degradation",
+    } <= set(df.columns)
+    assert (df.implied_rel_degradation >= 0).all()
+    v = json.loads((run_dir / "certificate_verdict.json").read_text())
+    assert "max_implied_rel_degradation" in v
+    assert v["vm_gate_line"] == 0.05
+    assert v["user_review_required_before_vm_task8_release"] is True
+    # margin_factor consistency pin
+    assert (
+        abs(v["margin_factor"] - 0.05 / max(v["max_implied_rel_degradation"], 1e-300))
+        < 1e-6 * v["margin_factor"]
+    )

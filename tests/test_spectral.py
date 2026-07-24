@@ -581,3 +581,69 @@ def test_query_moment_rotated_null_on_no_rope():
         q, cos, sin, h_kv=2, position_stride=8, w_rope="rotated"
     )
     assert torch.allclose(frozen, rotated, atol=1e-10)
+
+
+def test_int8_certificate_analytic_identity():
+    """Fit-cache-free identity: on synthetic rows whose code second moment is
+    EXACTLY diag(lam), the closed form sum_i lam_i*||enc^T ddec[:,i]||^2 must
+    equal the brute-force mean weighted row norm mean_s ||enc^T ddec y_s||^2.
+    Non-identity diagonal whitener so enc != dec (the mutant-visible regime,
+    same rationale as test_rank_overlap_pinned_to_dec_not_enc)."""
+    import math as _math
+
+    from bmx.cache.spectral import (
+        fit_spectral_pack,
+        int8_decoder_certificate,
+        int8_decoder_roundtrip,
+    )
+
+    C, S = 16, 200
+    scales = torch.linspace(0.2, 5.0, C, dtype=torch.float64)
+    Wh, Wh_inv = torch.diag(scales), torch.diag(1.0 / scales)
+    g = torch.Generator().manual_seed(0)
+    M = torch.randn(S, C, generator=g)
+    pack = fit_spectral_pack(M, Wh, Wh_inv, 2.5, tiers=(0, 2, 4), group=8)
+    assert 0 < pack.c_used < C  # fixture must have both used and dropped dirs
+
+    cert = int8_decoder_certificate(pack)
+    for key in ("added", "payload", "noise_to_signal", "implied_rel_degradation"):
+        assert key in cert and cert[key] >= 0.0
+
+    # Brute force on rows with exact code moment diag(lam):
+    lam = pack.lam.double()
+    G = torch.randn(4 * C, C, generator=g, dtype=torch.float64)
+    Q, _ = torch.linalg.qr(G)  # (4C, C), Q^T Q = I
+    Z = _math.sqrt(4 * C) * Q @ torch.diag(lam.clamp_min(0).sqrt())
+    ddec = int8_decoder_roundtrip(pack.dec, pack.bits).double() - pack.dec.double()
+    brute = float(((Z @ ddec.mT @ pack.enc.double()) ** 2).sum() / (4 * C))
+    assert abs(cert["added"] - brute) < 1e-9 * max(brute, 1e-12)
+
+    # Payload closed form pinned against the independent expression.
+    payload = float((lam * torch.pow(4.0, -pack.bits.double())).sum())
+    assert abs(cert["payload"] - payload) < 1e-12
+    assert (
+        abs(
+            cert["implied_rel_degradation"]
+            - cert["added"] / (cert["payload"] + cert["added"])
+        )
+        < 1e-15
+    )
+
+
+def test_int8_certificate_dropped_columns_and_determinism():
+    """Mutating dropped dec columns cannot change the certificate (the
+    test_dropped_decoder_columns_never_read license extends to it), and the
+    certificate is deterministic."""
+    import dataclasses as _dc
+
+    from bmx.cache.spectral import fit_spectral_pack, int8_decoder_certificate
+
+    M, _ = _spiked_keys(S=256, C=64, seed=1)
+    Wh, Wh_inv = identity_whitener(64)
+    pack = fit_spectral_pack(M, Wh, Wh_inv, 1.5, group=16)
+    assert pack.c_used < 64
+    c1 = int8_decoder_certificate(pack)
+    dec_mut = pack.dec.clone()
+    dec_mut[:, pack.bits == 0] = torch.randn_like(dec_mut[:, pack.bits == 0])
+    c2 = int8_decoder_certificate(_dc.replace(pack, dec=dec_mut))
+    assert c1 == c2 == int8_decoder_certificate(pack)

@@ -511,6 +511,48 @@ def int8_decoder_roundtrip(dec: torch.Tensor, bits_pc: torch.Tensor) -> torch.Te
     return dec_rt
 
 
+def int8_decoder_certificate(pack: SpectralPack) -> dict[str, float]:
+    """Exact offline certificate for the int8-decoder distortion (math review
+    2026-07-24 #9): the roundtrip perturbation ddec = dec_int8 - dec is
+    deterministic per pack, so the added weighted reconstruction distortion is
+    a computable NUMBER, not a bound and not a VM measurement.
+
+    Closed form (fp64; derivation): the added K-space error on a row with
+    code vector y_hat is ddec @ y_hat; its weighted norm is
+    ||W^{1/2} ddec y_hat||^2 = ||enc^T ddec y_hat||^2 (W = enc enc^T exactly,
+    since enc = W^{1/2} E with E orthogonal). Taking the expectation with the
+    code second moment diag(lam) — exact on the fit corpus, where
+    enc^T Sigma_fit enc = diag(lam) by the eigendecomposition:
+
+        added   = sum_i lam_i * ||enc^T ddec[:, i]||^2
+        payload = sum_i lam_i * 4^{-bits_i}     (dropped dirs: 4^0 = 1)
+
+    noise_to_signal = added/payload; implied_rel_degradation =
+    added/(payload + added) — the same axis as the pre-registered VM gate
+    rel_degradation_int8 < 5% (win is inverse distortion, so
+    1 - win_int8/win_fp16 = added/(payload + added) under matched bpe).
+
+    Honest limits (what this does NOT capture): E[y_hat y_hat^T] is modeled
+    by diag(lam) — the payload-error shift of the code moment and the
+    payload x decoder cross-term (both O(g(b)) relative on a ~7e-5 base) are
+    not represented; query-distribution interaction beyond the modeled second
+    moment is not represented; task-level effects are NOT certified (they
+    remain the VM half of the ledger). pack.lam is the fp32-stored spectrum
+    (1e-7 relative rounding — three orders below the certificate's margin).
+    """
+    ddec = int8_decoder_roundtrip(pack.dec, pack.bits).double() - pack.dec.double()
+    proj = pack.enc.double().mT @ ddec  # (C, C): column i = enc^T ddec[:, i]
+    lam = pack.lam.double().clamp_min(0.0)
+    added = float((lam * (proj**2).sum(dim=0)).sum())
+    payload = float((lam * torch.pow(4.0, -pack.bits.double())).sum())
+    return dict(
+        added=added,
+        payload=payload,
+        noise_to_signal=added / max(payload, 1e-300),
+        implied_rel_degradation=added / max(payload + added, 1e-300),
+    )
+
+
 def save_pack_file(
     path: str | Path,
     bases: dict[int, SpectralBasis],
