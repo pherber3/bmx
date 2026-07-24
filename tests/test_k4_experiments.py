@@ -920,3 +920,203 @@ def test_k4_corpus_transfer_overlap_row_pinned_to_dec(tmp_path):
         f"enc-derived value {enc_val} too close to dec-derived expected "
         f"{expected} -- fixture doesn't discriminate the dec->enc mutant"
     )
+
+
+def _tiny_niah_run(tmp_path, run_id, arm, lengths, bits_by_length):
+    import pandas as pd
+
+    run = tmp_path / "k3_niah" / run_id
+    run.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "arm": [arm] * len(lengths),
+            "length": list(lengths),
+            "kv_size_bits": [bits_by_length[length] for length in lengths],
+        }
+    ).to_parquet(run / "metrics.parquet")
+    return run
+
+
+def test_plot_k4_paper_smoke(tmp_path):
+    import pandas as pd
+
+    from experiments.plot_k4_paper import Config, main
+
+    # -- fig 1 inputs: tiny NIAH run dirs (k4_b2.5, k4_b2.2, both TQ arms) +
+    # a tiny fit-packs parquet (n_zero_dirs -> C_used correction). ----------
+    lengths = (4096, 8192)
+    niah_dirs = [
+        _tiny_niah_run(tmp_path, "r_b25", "k4_b2.5", lengths, {4096: 4.8, 8192: 3.6}),
+        _tiny_niah_run(tmp_path, "r_b22", "k4_b2.2", lengths, {4096: 3.0, 8192: 2.5}),
+        _tiny_niah_run(
+            tmp_path,
+            "r_tqb3",
+            "turboquant_mse_b3",
+            lengths,
+            {4096: 3.42, 8192: 3.22},
+        ),
+        _tiny_niah_run(
+            tmp_path,
+            "r_tqk3v2",
+            "turboquant_mse_k3v2",
+            lengths,
+            {4096: 2.94, 8192: 2.73},
+        ),
+    ]
+    fit_packs = tmp_path / "fit.parquet"
+    pd.DataFrame(
+        {
+            "model": ["tiny"] * 4,
+            "layer": [0, 1, 0, 1],
+            "budget": [2.5, 2.5, 2.2, 2.2],
+            "n_zero_dirs": [3, 4, 5, 6],  # tiny C=16 fixture
+        }
+    ).to_parquet(fit_packs)
+
+    # -- figs 2-3 inputs: a tiny corpus-transfer run dir mirroring the real
+    # verdict JSON's shape + a tiny overlap.parquet. -------------------------
+    transfer_dir = tmp_path / "k4_corpus_transfer" / "tiny"
+    transfer_dir.mkdir(parents=True)
+    verdict = {
+        "headline_metric": "logit",
+        "verdict_rule": "D<0.10 insensitive; D>0.25 domain-sensitive; else as-measured",
+        "gpt2_yellow_flag": "tiny-fixture yellow flag",
+        "per_budget": {
+            "2.5": {
+                "D": {
+                    "code->wiki": {
+                        "mean": 0.46,
+                        "min": 0.40,
+                        "max": 0.50,
+                        "label": "domain-sensitive",
+                    },
+                    "null->wiki": {
+                        "mean": 0.09,
+                        "min": 0.07,
+                        "max": 0.11,
+                        "label": "insensitive",
+                    },
+                    "wiki->code": {
+                        "mean": 0.56,
+                        "min": 0.51,
+                        "max": 0.61,
+                        "label": "domain-sensitive",
+                    },
+                    "null->code": {
+                        "mean": 0.55,
+                        "min": 0.50,
+                        "max": 0.59,
+                        "label": "domain-sensitive",
+                    },
+                    "shufcode->wiki": {
+                        "mean": 0.09,
+                        "min": 0.07,
+                        "max": 0.11,
+                        "label": "insensitive",
+                    },
+                    "shufcode->code": {
+                        "mean": 0.11,
+                        "min": 0.09,
+                        "max": 0.14,
+                        "label": "as-measured",
+                    },
+                    "uniwiki->wiki": {
+                        "mean": 0.12,
+                        "min": 0.07,
+                        "max": 0.16,
+                        "label": "as-measured",
+                    },
+                    "unicode->code": {
+                        "mean": 0.14,
+                        "min": 0.13,
+                        "max": 0.15,
+                        "label": "as-measured",
+                    },
+                    "biwiki->wiki": {
+                        "mean": 0.01,
+                        "min": -0.03,
+                        "max": 0.06,
+                        "label": "insensitive",
+                    },
+                    "bicode->code": {
+                        "mean": 0.03,
+                        "min": 0.02,
+                        "max": 0.04,
+                        "label": "insensitive",
+                    },
+                },
+                "synthesis": {
+                    "rules": {
+                        "wiki": {
+                            "D_uni": 0.12,
+                            "D_bi": 0.01,
+                            "D_shuf": 0.09,
+                            "recipe_confirmed": False,
+                            "order2_earns_keep": True,
+                        },
+                        "code": {
+                            "D_uni": 0.14,
+                            "D_bi": 0.03,
+                            "D_shuf": 0.11,
+                            "recipe_confirmed": False,
+                            "order2_earns_keep": True,
+                        },
+                    },
+                    "climb_to_order3": True,
+                },
+            }
+        },
+    }
+    (transfer_dir / "corpus_transfer_verdict.json").write_text(json.dumps(verdict))
+
+    rows = []
+    for pair in ("wiki-code", "wiki-null", "code-null"):
+        for layer in (0, 1):
+            for rank in (8, 16):
+                rows.append(
+                    dict(
+                        kind="overlap",
+                        pair=pair,
+                        corpus="",
+                        layer=layer,
+                        rank=rank,
+                        budget=float("nan"),
+                        tier=-1,
+                        centered=False,
+                        value=0.5 if rank == 8 else 0.4,
+                    )
+                )
+    pd.DataFrame(rows).to_parquet(transfer_dir / "overlap.parquet")
+
+    out_dir = tmp_path / "figures"
+    cfg = Config(
+        niah_run_dirs=tuple(str(d) for d in niah_dirs),
+        fit_packs_parquet=str(fit_packs),
+        corpus_transfer_run_dir=str(transfer_dir),
+        charge_budgets=(2.2, 2.5),
+        transfer_budget="2.5",
+        C=16,
+        group=16,
+        out_dir=str(out_dir),
+    )
+    main(cfg)
+
+    expected = {
+        "k4_bits_vs_context.png",
+        "k4_bits_vs_context.pdf",
+        "k4_corpus_transfer.png",
+        "k4_corpus_transfer.pdf",
+        "k4_overlap.png",
+        "k4_overlap.pdf",
+    }
+    got = {p.name for p in out_dir.iterdir()}
+    assert expected <= got
+    for name in expected:
+        assert (out_dir / name).stat().st_size > 0
+
+    # Deterministic bytes: re-running must reproduce identical PDF output
+    # (no embedded timestamp).
+    pdf_before = (out_dir / "k4_bits_vs_context.pdf").read_bytes()
+    main(cfg)
+    pdf_after = (out_dir / "k4_bits_vs_context.pdf").read_bytes()
+    assert pdf_before == pdf_after
