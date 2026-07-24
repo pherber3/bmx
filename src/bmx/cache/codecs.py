@@ -152,22 +152,107 @@ def _round_to_tiers(b: torch.Tensor, tiers_t: torch.Tensor) -> torch.Tensor:
     return tiers_t[idx]
 
 
+_LN4 = math.log(4.0)
+
+
+def _tier_g(tiers_t: torch.Tensor, g_table: tuple[float, ...] | None) -> torch.Tensor:
+    """Per-tier distortion shape g(b), index-aligned with the ascending tier
+    grid. None => the model curve g(b) = 4^{-b}. A measured table (finding #4)
+    must satisfy the optimality lemma's conditions: strictly decreasing,
+    grid-convex (per-bit marginal gains strictly decreasing), and g(0) = 1
+    exactly when tier 0 is present (a dropped direction's error IS the
+    coordinate — no quantizer model enters at the drop boundary)."""
+    if g_table is None:
+        return torch.pow(4.0, -tiers_t)
+    g = torch.tensor(g_table, dtype=torch.float64, device=tiers_t.device)
+    assert g.shape == tiers_t.shape, (
+        f"g_table length {tuple(g.shape)} != n_tiers {tuple(tiers_t.shape)}"
+    )
+    if float(tiers_t[0]) == 0.0:
+        assert float(g[0]) == 1.0, f"g(0) must be exactly 1.0; got {float(g[0])}"
+    assert (g[:-1] > g[1:]).all(), "g_table must be strictly decreasing"
+    marg = (g[:-1] - g[1:]) / (tiers_t[1:] - tiers_t[:-1])
+    assert (marg[:-1] > marg[1:]).all(), (
+        "g_table must be grid-convex (strictly decreasing per-bit marginals) — "
+        "the optimality lemma (math review 2026-07-24 #1) is false without it"
+    )
+    return g
+
+
+def _lagrange_select(
+    var: torch.Tensor,
+    kappa_l: float,
+    tiers_t: torch.Tensor,
+    g_t: torch.Tensor,
+    fixed_charge: float,
+) -> torch.Tensor:
+    """Exact per-direction tier choice (math review #1/#2):
+
+        b_i = argmin_{b in T}  var_i * g(b) + kappa_l * (b + s * 1[b>0])
+
+    Enumeration over the tier grid — exact even though the fixed charge s
+    makes the per-direction cost non-convex at 0. Ties resolve to the SMALLER
+    tier (argmin first occurrence over ascending tiers). Everett's theorem:
+    the selection minimizes total distortion among all allocations whose
+    total charge sum_i (b_i + s*1[b_i>0]) is <= the achieved one."""
+    used = (tiers_t > 0).double()
+    cost = var.unsqueeze(-1) * g_t + kappa_l * (tiers_t + fixed_charge * used)
+    return tiers_t[cost.argmin(dim=-1)]
+
+
 def allocate_bits_from_variance(
     var: torch.Tensor,
     budget_bits: float,
     tiers: tuple[int, ...] = (0, 2, 3, 4),
     *,
     n_search: int = 40,
+    selection: str = "round",
+    g_table: tuple[float, ...] | None = None,
+    fixed_charge: float = 0.0,
 ) -> torch.Tensor:
     """Reverse-water-filling bit allocation from a per-direction variance vector.
 
     Same bisection as allocate_channel_bits; factored out so corpus spectra
     (K4 spectral packs) and per-matrix variances share one implementation.
     Returns (C,) int64 bit-widths, each a member of `tiers`.
+
+    selection="round" (default): the historical midpoint-rounding bisection,
+    bit-exact forever. selection="lagrange": exact Lagrangian tier choice
+    b_i = argmin_{b in T} var_i*g(b) + kappa_l*(b + fixed_charge*1[b>0])
+    with bisection on kappa_l (Everett-optimal at the achieved total charge;
+    math review 2026-07-24 #1/#2). Under "lagrange", budget_bits bounds the
+    mean per-direction TOTAL charge (1/C)*sum_i (b_i + fixed_charge*1[b_i>0])
+    — with fixed_charge=0.0 that is mean(bits), the same semantics as
+    "round". g_table (finding #4) replaces the 4^{-b} model with measured
+    per-tier ratios; g_table/fixed_charge are lagrange-only.
     """
     assert var.dim() == 1, f"var must be 1-D (C,); got {tuple(var.shape)}"
     var = var.double().clamp_min(1e-30)
     tiers_t = torch.tensor(sorted(tiers), dtype=torch.float64, device=var.device)
+
+    assert selection in ("round", "lagrange"), f"unknown selection {selection!r}"
+    if selection == "round":
+        assert g_table is None and fixed_charge == 0.0, (
+            "g_table/fixed_charge require selection='lagrange'"
+        )
+    else:
+        g_t = _tier_g(tiers_t, g_table)
+        lo = math.log(float(var.min().item()) * _LN4 * 1e-6)
+        hi = math.log(float(var.max().item()) * _LN4 * 1e6)
+
+        def charged_mean(b: torch.Tensor) -> float:
+            return float((b + fixed_charge * (b > 0).double()).mean().item())
+
+        best = _lagrange_select(var, math.exp(hi), tiers_t, g_t, fixed_charge)
+        for _ in range(n_search):
+            mid = 0.5 * (lo + hi)
+            b = _lagrange_select(var, math.exp(mid), tiers_t, g_t, fixed_charge)
+            if charged_mean(b) <= budget_bits + 1e-12:
+                best = b  # feasible; try smaller kappa_l (more bits)
+                hi = mid
+            else:
+                lo = mid
+        return best.to(torch.int64)
 
     def rounded_mean(kappa: float) -> tuple[torch.Tensor, float]:
         b_cont = (0.5 * torch.log2(var / kappa)).clamp_min(0.0)
