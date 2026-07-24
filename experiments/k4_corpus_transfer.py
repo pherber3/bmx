@@ -421,7 +421,7 @@ def main(cfg: Config):
             f"pack C mismatch at layer {layer_i}: {pack.enc.shape} vs C={ctx.C}"
         )
         M_hat, bpe_model = spectral_quantize(ctx.M_pre, pack)
-        rf, lg, lg_rope = _score_tail(
+        rf, lg, lg_rope, _lg_causal = _score_tail(
             M_hat,
             ctx.h_kv,
             ctx.tail,
@@ -462,7 +462,7 @@ def main(cfg: Config):
                 M_hat_tq, bpe_tq = quantize_cache(
                     "turboquant_mse", ctx.M_pre, bits=b, seed=cfg.seed
                 )
-                rf, lg, lg_rope = _score_tail(
+                rf, lg, lg_rope, _lg_causal = _score_tail(
                     M_hat_tq,
                     ctx.h_kv,
                     ctx.tail,

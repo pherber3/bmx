@@ -197,7 +197,7 @@ def main(cfg: Config):
                         basis, budget, tiers=cfg.tiers, group=cfg.group
                     )
                     M_hat, bpe_model = spectral_quantize(M, pack)
-                    rf, lg, lg_rope = _score_tail(
+                    rf, lg, lg_rope, _lg_causal = _score_tail(
                         M_hat,
                         h_kv,
                         tail,
@@ -261,7 +261,7 @@ def main(cfg: Config):
             group=cfg.group,
             seed=cfg.seed,
         )
-        rf_ref, lg_ref, lg_rope_ref = _score_tail(
+        rf_ref, lg_ref, lg_rope_ref, _lg_causal_ref = _score_tail(
             M_hat_ref,
             h_kv,
             tail,

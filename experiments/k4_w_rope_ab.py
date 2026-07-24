@@ -129,7 +129,7 @@ def main(cfg: Config):
                 M_hat, bpe = quantize_cache(
                     "turboquant_mse", ctx.M_pre, bits=b, seed=cfg.seed
                 )
-                rf, lg, lg_rope = _score_tail(
+                rf, lg, lg_rope, lg_causal = _score_tail(
                     M_hat,
                     ctx.h_kv,
                     ctx.tail,
@@ -154,6 +154,7 @@ def main(cfg: Config):
                         rel_fro=rf,
                         logit=lg,
                         logit_rope=lg_rope,
+                        logit_causal=lg_causal,
                     )
                 )
             for variant in W_ROPE_VARIANTS:
@@ -165,7 +166,7 @@ def main(cfg: Config):
                         group=cfg.group,
                     )
                     M_hat, bpe_model = spectral_quantize(ctx.M_pre, pack)
-                    rf, lg, lg_rope = _score_tail(
+                    rf, lg, lg_rope, lg_causal = _score_tail(
                         M_hat,
                         ctx.h_kv,
                         ctx.tail,
@@ -193,6 +194,7 @@ def main(cfg: Config):
                             rel_fro=rf,
                             logit=lg,
                             logit_rope=lg_rope,
+                            logit_causal=lg_causal,
                         )
                     )
                     print(
@@ -236,6 +238,65 @@ def main(cfg: Config):
         )
     scoped = all(abs(d) < 0.02 for d in deltas)
     ov_df = pd.DataFrame(ov_rows)
+
+    # ---- THIRD INSTRUMENT: true causal per-position logit error -----------
+    # Non-circular by construction (logit_rope leaves Q un-rotated and scores
+    # a positionally-unrelated tail window against ALL of it — equivalent to
+    # the SAME frozen quadratic form the W is fit to match; logit_causal
+    # forward-rotates Q at its true absolute positions and masks to real
+    # causal (t, s) pairs — see logit_distortion_causal / math review #3(b)).
+    # Deciding readout: the DIRECT ratio of causal distortions of the two
+    # packs at the SAME budget/layer/cache — no TQ interpolation, no shared
+    # metric with either W's own fitting objective. dist_causal_frozen /
+    # dist_causal_rotated per (cache, layer); mean +/- min/max across the
+    # per-(cache, layer) ratios, per budget. > 1 means rotated is better
+    # (lower causal distortion).
+    causal_per_budget: dict[str, dict] = {}
+    causal_deltas: list[float] = []
+    if any_rope:
+        for budget in cfg.budgets:
+            sub = df[df.budget == float(budget)]
+            piv = sub.pivot_table(
+                index=["cache", "layer"], columns="w_rope", values="logit_causal"
+            )
+            ratios = (piv["frozen"] / piv["rotated"].clip(lower=1e-300)).dropna()
+            causal_per_budget[f"{budget:g}"] = dict(
+                ratio_frozen_over_rotated_mean=float(ratios.mean()),
+                ratio_frozen_over_rotated_min=float(ratios.min()),
+                ratio_frozen_over_rotated_max=float(ratios.max()),
+                dist_causal_frozen_mean=float(piv["frozen"].mean()),
+                dist_causal_rotated_mean=float(piv["rotated"].mean()),
+                n_layer_cache=int(ratios.shape[0]),
+            )
+            # rotated-vs-frozen relative improvement, matching rel_win_delta's
+            # sign convention (positive = rotated better) for the neutrality band.
+            causal_deltas.append(float(ratios.mean()) - 1.0)
+        causal_scoped = all(abs(d) < 0.02 for d in causal_deltas)
+        third_instrument_verdict = (
+            "rotated_preferred_causal"
+            if all(d > 0.02 for d in causal_deltas)
+            else "frozen_preferred_causal"
+            if all(d < -0.02 for d in causal_deltas)
+            else "neutral_causal"
+            if causal_scoped
+            else "mixed_causal"
+        )
+    else:
+        # No-RoPE substrate (e.g. gpt2): logit_causal is NaN everywhere —
+        # frozen/rotated are mathematically identical there too, so the
+        # third instrument has nothing to decide (matches the existing
+        # any_rope guard on `headline`/logit_rope above).
+        for budget in cfg.budgets:
+            causal_per_budget[f"{budget:g}"] = dict(
+                ratio_frozen_over_rotated_mean=float("nan"),
+                ratio_frozen_over_rotated_min=float("nan"),
+                ratio_frozen_over_rotated_max=float("nan"),
+                dist_causal_frozen_mean=float("nan"),
+                dist_causal_rotated_mean=float("nan"),
+                n_layer_cache=0,
+            )
+        third_instrument_verdict = "no_rope_null_control"
+
     verdict = dict(
         headline_metric=headline,
         rule=(
@@ -244,11 +305,33 @@ def main(cfg: Config):
             "measured-negligible at this scale; Llama spot-check queued); "
             ">= 2% -> rotated_form_required (paper uses rotated numbers; "
             "Llama refit REQUIRED on the rental). Sign-flip footnote enters "
-            "the methods section either way."
+            "the methods section either way. NOTE (task-4 third instrument):"
+            " logit_rope/win_frozen/win_rotated above are CIRCULAR — logit_rope"
+            " leaves Q un-rotated, which is exactly the same frozen quadratic"
+            " form W is fit to match, so this A/B could not distinguish"
+            " frozen from rotated on independent grounds. The deciding"
+            " readout is `causal` below (logit_distortion_causal, the true"
+            " masked per-position causal logit error)."
         ),
         per_budget=per_budget,
         decision="scoped_negligible" if scoped else "rotated_form_required",
         llama_refit_required=not scoped,
+        causal=dict(
+            metric="logit_distortion_causal (forward-RoPE Q at true absolute "
+            "position, masked to causal s<=t pairs, over the FULL sequence)",
+            rule=(
+                "Direct ratio dist_causal_frozen/dist_causal_rotated per "
+                "(cache, layer), mean +/- min/max across layers, per budget. "
+                "> 1 means rotated is better (lower causal distortion). "
+                "2% neutrality band retained: |mean_ratio - 1| < 2% at every "
+                "budget -> neutral_causal; consistently > 2% -> "
+                "rotated_preferred_causal; consistently < -2% -> "
+                "frozen_preferred_causal; sign disagreement across budgets "
+                "-> mixed_causal."
+            ),
+            per_budget=causal_per_budget,
+            third_instrument_verdict=third_instrument_verdict,
+        ),
         overlap_mean_by_rank={
             str(r): float(ov_df[ov_df["rank"] == r].value.mean())
             for r in cfg.overlap_ranks

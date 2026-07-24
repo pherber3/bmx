@@ -28,6 +28,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from bmx.cache.rope import apply_rope
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -171,4 +173,91 @@ def attn_output_distortion(
     out_approx = attn_approx @ Vq_exp  # (h, T, d_v)
 
     per_head_err = _frobenius_rel_error(out_approx, out_ref)  # (h,)
+    return per_head_err.mean().item()
+
+
+def logit_distortion_causal(
+    K: torch.Tensor,
+    Kq: torch.Tensor,
+    Q: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    q_start: int,
+) -> float:
+    """The THIRD INSTRUMENT (K4 math review #3(b)/(c)): true causal
+    per-position logit error, masked to real attention pairs.
+
+    Delta L_{t,s} = (R_t q_t)^T e_s,  e_s = Kq_s - K_s,  s <= t only.
+
+    R is the FORWARD RoPE rotation (`apply_rope`, positive sin — unlike
+    `logit_distortion`, which leaves Q un-rotated and so implicitly measures
+    an inverse-rotation, time-reversed, causally-unmasked quadratic form; see
+    module docstring of `bmx.cache.spectral.query_position_moment` and math
+    review finding #3). By the RoPE-composition identity
+    `(R_t q)^T(R_s k) = (R_{t-s} q)^T k` (pinned in
+    `tests/test_cache_metrics.py::test_rope_composition_absolute_equals_relative`),
+    this is equivalent to forward-rotating q by the relative offset t-s and
+    dotting against the UN-rotated key error — this function uses the
+    absolute-position form because K/Kq are already stored post-RoPE
+    (`apply_rope` at read, the codebase convention) and Q is not.
+
+    Parameters
+    ----------
+    K, Kq : (h_kv, S, d) — original / approximated POST-RoPE key caches
+        (fp16 or fp32), covering the FULL sequence (every causal source
+        position s a masked query can attend to).
+    Q     : (h, T, d)    — PRE-RoPE probe queries; h may be a multiple of
+        h_kv (GQA). Row i sits at TRUE absolute position q_start + i.
+    cos, sin : (S, d)    — RoPE tables from `rope_cos_sin`, absolute
+        positions [0, S).
+    q_start  : absolute position of Q's first row (e.g. S - T for the
+        stored last-T-token probe-query window).
+
+    Returns
+    -------
+    Python float — mean over heads of the relative Frobenius error of the
+    causal logit-error matrix: for each head, ||Delta L||_F / ||L_true||_F
+    computed over the masked (t, s), s <= t entries only (mirrors
+    `logit_distortion`'s per-head relative-Frobenius normalization
+    convention — see `_frobenius_rel_error`).
+
+    No GQA head may see a future key: the mask is applied per (t, s) pair
+    before the Frobenius reduction, so causality holds exactly regardless of
+    head expansion.
+    """
+    K = K.float()
+    Kq = Kq.float()
+    Q = Q.float()
+    cos = cos.float()
+    sin = sin.float()
+
+    h = Q.shape[0]
+    T = Q.shape[1]
+    S = K.shape[1]
+    K_exp = _expand_kv(K, h)  # (h, S, d)
+    Kq_exp = _expand_kv(Kq, h)  # (h, S, d)
+
+    # Forward-rotate the probe queries at their TRUE absolute positions.
+    q_positions = torch.arange(q_start, q_start + T, device=Q.device)
+    assert q_positions.max() < S, (
+        f"probe query position {int(q_positions.max())} out of range S={S}"
+    )
+    Rt_Q = apply_rope(Q, cos[q_positions], sin[q_positions])  # (h, T, d)
+
+    logits_ref = Rt_Q @ K_exp.transpose(-1, -2)  # (h, T, S)
+    logits_approx = Rt_Q @ Kq_exp.transpose(-1, -2)  # (h, T, S)
+
+    # Causal mask: query row i (absolute position q_start+i) may only see
+    # source columns s <= q_start+i.
+    s_positions = torch.arange(S, device=Q.device)
+    mask = s_positions.view(1, -1) <= q_positions.view(-1, 1)  # (T, S) bool
+    mask = mask.view(1, T, S)  # broadcast over heads
+
+    diff = torch.where(mask, logits_approx - logits_ref, torch.zeros_like(logits_ref))
+    ref = torch.where(mask, logits_ref, torch.zeros_like(logits_ref))
+
+    per_head_err = diff.flatten(1).norm(dim=-1) / ref.flatten(1).norm(dim=-1).clamp_min(
+        1e-12
+    )
     return per_head_err.mean().item()

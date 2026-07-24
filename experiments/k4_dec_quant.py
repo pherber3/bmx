@@ -129,7 +129,7 @@ def main(cfg: Config):
                 M_hat_tq, bpe_tq = quantize_cache(
                     "turboquant_mse", ctx.M_pre, bits=b, seed=cfg.seed
                 )
-                rf_tq, lg_tq, lg_rope_tq = _score_tail(
+                rf_tq, lg_tq, lg_rope_tq, _lg_causal_tq = _score_tail(
                     M_hat_tq,
                     ctx.h_kv,
                     ctx.tail,
@@ -179,7 +179,7 @@ def main(cfg: Config):
                     dec_variant = _dec_variant(pack.dec, pack.bits, mode)
                     pack_variant = dataclasses.replace(pack, dec=dec_variant)
                     M_hat, bpe_model = spectral_quantize(ctx.M_pre, pack_variant)
-                    rf, lg, lg_rope = _score_tail(
+                    rf, lg, lg_rope, _lg_causal = _score_tail(
                         M_hat,
                         ctx.h_kv,
                         ctx.tail,

@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 
 from bmx.cache.collect import from_matrix, load_cache, to_matrix
-from bmx.cache.metrics import logit_distortion, rel_fro
+from bmx.cache.metrics import logit_distortion, logit_distortion_causal, rel_fro
 from bmx.cache.rope import apply_rope
 from bmx.cache.spectral import (
     SpectralBasis,
@@ -224,16 +224,44 @@ def corpus_fit_bases(
 
 
 def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_t, M):
-    K_hat = from_matrix(M_hat, h_kv)[:, tail, :].float()
+    """Returns (rel_fro, logit, logit_rope, logit_causal).
+
+    logit_causal is the THIRD INSTRUMENT (math review #3(b), task-4
+    prescription): true causal per-position logit error, additive alongside
+    the pre-existing (rel_fro, logit, logit_rope) triple — those three keep
+    their exact prior values and normalization; `logit_causal` is a NEW,
+    independently-computed column.
+
+    Unlike `logit`/`logit_rope` above (which use the positionally-unrelated
+    `tail = slice(S//2, S)` window and leave Q un-rotated — equivalent to an
+    inverse-rotation, causally-unmasked quadratic form; see
+    `logit_distortion_causal`'s docstring / math review #3), `logit_causal`
+    scores Q — the stored last-T probe-query window — at its TRUE absolute
+    positions [S-T, S), forward-rotated, masked to real causal (t, s) pairs
+    (s <= t), against K/Kq over the FULL sequence (every source position a
+    causal query can attend to), not just `tail`.
+
+    NaN when rope is not ready (no-RoPE models: frozen/rotated W are
+    mathematically identical there too — nothing to decide).
+    """
+    K_hat_full = from_matrix(M_hat, h_kv).float()  # (h_kv, S, d), full sequence
+    K_hat = K_hat_full[:, tail, :]
     rf = rel_fro(M_hat[tail], M[tail])
     if rope_ready:
-        K_hat_rope = apply_rope(K_hat, cos[tail], sin[tail])
+        K_hat_rope_full = apply_rope(K_hat_full, cos, sin)
+        K_hat_rope = K_hat_rope_full[:, tail, :]
         lg_rope = logit_distortion(K_post_true[:, tail], K_hat_rope, Q)
         lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
+        T = Q.shape[1]
+        S = K_post_true.shape[1]
+        lg_causal = logit_distortion_causal(
+            K_post_true, K_hat_rope_full, Q, cos, sin, q_start=S - T
+        )
     else:
         lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
         lg_rope = float("nan")
-    return rf, lg, lg_rope
+        lg_causal = float("nan")
+    return rf, lg, lg_rope, lg_causal
 
 
 class _LayerCtx(NamedTuple):

@@ -313,7 +313,7 @@ def main(cfg: Config):
                         basis, budget, tiers=cfg.tiers, group=cfg.group
                     )
                     M_hat, bpe_model = spectral_quantize(M_pre, pack)
-                    rf, lg, lg_rope = score(M_hat, "k_pre")
+                    rf, lg, lg_rope, _lg_causal = score(M_hat, "k_pre")
                     bpe_skeptic = bpe_model + skeptic_charge(
                         C, S, cfg.tiers, c_used=pack.c_used
                     )
@@ -357,7 +357,7 @@ def main(cfg: Config):
                     randbasis, budget, tiers=cfg.tiers, group=cfg.group
                 )
                 M_hat, bpe_model = spectral_quantize(M_pre, pack)
-                rf, lg, lg_rope = score(M_hat, "k_pre")
+                rf, lg, lg_rope, _lg_causal = score(M_hat, "k_pre")
                 bpe_skeptic = bpe_model + skeptic_charge(
                     C, S, cfg.tiers, c_used=pack.c_used
                 )
@@ -399,7 +399,7 @@ def main(cfg: Config):
                 M_hat, bpe = quantize_cache(
                     "turboquant_mse", M_orig, bits=b, seed=cfg.seed
                 )
-                rf, lg, lg_rope = score(M_hat, kind)
+                rf, lg, lg_rope, _lg_causal = score(M_hat, kind)
                 emit(
                     full_row(
                         layer=layer_i,
@@ -430,7 +430,7 @@ def main(cfg: Config):
                 seed=cfg.seed,
                 svd_factors=get_svd(ur),
             )
-            rf, lg, lg_rope = score(M_hat, "k_pre")
+            rf, lg, lg_rope, _lg_causal = score(M_hat, "k_pre")
             emit(
                 full_row(
                     layer=layer_i,
@@ -460,7 +460,7 @@ def main(cfg: Config):
                 seed=cfg.seed,
                 svd_factors=get_svd(r),
             )
-            rf, lg, lg_rope = score(M_hat, "k_pre")
+            rf, lg, lg_rope, _lg_causal = score(M_hat, "k_pre")
             emit(
                 full_row(
                     layer=layer_i,
@@ -490,7 +490,7 @@ def main(cfg: Config):
             cfg.seed,
             get_svd(cr),
         )
-        rf, lg, lg_rope = score(M_hat, "k_pre")
+        rf, lg, lg_rope, _lg_causal = score(M_hat, "k_pre")
         emit(
             full_row(
                 layer=layer_i,
@@ -512,7 +512,7 @@ def main(cfg: Config):
         # rtn_channel b3 x mse_scale in {False, True}, on k_pre
         for mse_scale in (False, True):
             M_hat, bpe = _rtn_channel_arm(M_pre, 3, cfg.group, mse_scale)
-            rf, lg, lg_rope = score(M_hat, "k_pre")
+            rf, lg, lg_rope, _lg_causal = score(M_hat, "k_pre")
             row = full_row(
                 layer=layer_i,
                 kind="k_pre",
