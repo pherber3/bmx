@@ -50,8 +50,7 @@ from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.spectral import (
     SpectralPack,
-    int8_decoder_roundtrip,
-    load_packs,
+    load_packs_for_spec,
     skeptic_charge,
     spectral_quantize,
 )
@@ -230,7 +229,15 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
     return bpe_k, bpe_v
 
 
-def kv_memory_report(model_config, bpe_k: float, bpe_v: float, seq_len: int) -> dict:
+def kv_memory_report(
+    model_config,
+    bpe_k: float,
+    bpe_v: float,
+    seq_len: int,
+    *,
+    h_kv: int | None = None,
+    d_head: int | None = None,
+) -> dict:
     """Honest KV footprint: dense fp16 baseline vs packed (bpe-derived) bytes.
 
     Shared by StreamingQuantizedCache and PackedStreamingCache (pure code
@@ -242,10 +249,16 @@ def kv_memory_report(model_config, bpe_k: float, bpe_v: float, seq_len: int) -> 
     the win because Stage-B stores the dequant for the model to read; the bpe is
     the deployable number. Process-level peak memory (the literal 5x) is the
     fused-kernel/paged-store VM measurement.
+
+    h_kv / d_head: override the config-resolved head geometry (unused by any
+    current caller — StreamingQuantizedCache.memory_report's override
+    parameters thread through here rather than re-implementing this body).
     """
     cfg = resolve_text_config(model_config)
-    h_kv = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
-    d = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+    h_kv = h_kv or getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+    d = d_head or (
+        getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+    )
     n_layer = cfg.num_hidden_layers
     entries_per_side = n_layer * h_kv * seq_len * d  # K (and V) entries
     fp16_bytes = 2 * entries_per_side * 2  # 2 sides, 2 bytes/entry
@@ -629,28 +642,10 @@ class StreamingQuantizedCache(Cache):
     ):
         # Spectral K arm: pre-RoPE only, and the corpus pack file is loaded ONCE
         # here (never per-layer, never per-call) then handed out by layer_idx.
-        assert k_spec.dec_quant in ("fp32", "int8"), (
-            f"dec_quant must be 'fp32' or 'int8'; got {k_spec.dec_quant!r}"
-        )
-        self._packs: dict[int, SpectralPack] = {}
-        if k_spec.arm == "spectral":
-            assert k_spec.pre_rope, (
-                "spectral quantizes pre-RoPE keys; set pre_rope=True"
-            )
-            assert k_spec.pack_path, "spectral requires pack_path"
-            self._packs = load_packs(k_spec.pack_path, k_spec.budget)
-            if k_spec.dec_quant == "int8":
-                # Lever 2 (gated on a later VM quality measurement): roundtrip
-                # each layer pack's decoder through int8 ONCE, here, at init --
-                # never refit, never re-applied per call. dataclasses.replace
-                # keeps every other pack field (enc, lam, bits, tiers, ...)
-                # untouched; only dec's stored precision changes.
-                self._packs = {
-                    i: dataclasses.replace(
-                        pack, dec=int8_decoder_roundtrip(pack.dec, pack.bits)
-                    )
-                    for i, pack in self._packs.items()
-                }
+        # load_packs_for_spec owns the dec_quant decision (spectral.py) —
+        # asserts dec_quant validity, loads the pack file when arm=="spectral",
+        # and int8-roundtrips the decoder once when dec_quant=="int8".
+        self._packs: dict[int, SpectralPack] = load_packs_for_spec(k_spec)
 
         # layer_class_to_replicate lazily appends one layer per new layer_idx, always
         # in order (transformers' Cache.update appends up to layer_idx while
@@ -685,10 +680,6 @@ class StreamingQuantizedCache(Cache):
         self.v_spec = v_spec
         self.recent_window = recent_window
         self._handles: list = []
-        # dec_quant=="int8" charges the skeptic decoder term at 8 bits/entry
-        # (the pack's dec was already roundtripped to int8 precision above);
-        # bits_per_entry()'s spectral branch reads this.
-        self._dec_bits = 8.0 if k_spec.dec_quant == "int8" else 16.0
 
     def _pack_for_layer(self, i: int) -> "SpectralPack | None":
         """Look up layer i's spectral pack, asserting it's present when spectral."""
@@ -780,28 +771,10 @@ class StreamingQuantizedCache(Cache):
 
         Thin wrapper over the shared `kv_memory_report` (also called by
         PackedStreamingCache) — see that function's docstring. h_kv/d_head
-        overrides (unused by any current caller) are resolved locally so the
-        shared function's signature stays exactly (model_config, bpe_k, bpe_v,
-        seq_len).
+        overrides (unused by any current caller) pass straight through to the
+        shared function's own override kwargs (byte-identical resolution).
         """
         bpe_k, bpe_v = self.bits_per_entry()
-        if h_kv is None and d_head is None:
-            return kv_memory_report(self.model_config, bpe_k, bpe_v, seq_len)
-        cfg = resolve_text_config(self.model_config)
-        h_kv = h_kv or getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
-        d = d_head or (
-            getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+        return kv_memory_report(
+            self.model_config, bpe_k, bpe_v, seq_len, h_kv=h_kv, d_head=d_head
         )
-        n_layer = cfg.num_hidden_layers
-        entries_per_side = n_layer * h_kv * seq_len * d  # K (and V) entries
-        fp16_bytes = 2 * entries_per_side * 2  # 2 sides, 2 bytes/entry
-        # nan (passthrough) => treat as 16 bpe (no compression).
-        bpe_k = 16.0 if bpe_k != bpe_k else bpe_k
-        bpe_v = 16.0 if bpe_v != bpe_v else bpe_v
-        packed_bits = entries_per_side * (bpe_k + bpe_v)
-        packed_bytes = packed_bits / 8.0
-        return {
-            "fp16_bytes": float(fp16_bytes),
-            "packed_bytes": float(packed_bytes),
-            "compression": fp16_bytes / max(packed_bytes, 1e-9),
-        }

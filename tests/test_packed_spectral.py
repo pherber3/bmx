@@ -175,6 +175,116 @@ def test_packed_spectral_decode_matches_oracle(tmp_path):
     assert drift["max_abs"] < 1e-3, drift
 
 
+def test_packed_spectral_read_path_k_tier_cols_bitwise_identical(tmp_path):
+    """FIX 1 license: threading k_tier_cols (the precomputed
+    tier_columns(pack.bits)) through chunked_dequant_attention's read path is
+    the SAME math as leaving it None (spectral_dequant_packed recomputes it
+    internally) — bitwise-identical output either way. Trivial by
+    construction (see spectral_dequant_packed's cols_by_tier default), pinned
+    here so the threading itself can't silently change values."""
+    from bmx.cache.chunked_attention import chunked_dequant_attention
+    from bmx.cache.spectral import tier_columns
+
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    k_spec, v_spec = _k4_specs(path)
+    cache = PackedStreamingCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(ids(seq=300), past_key_values=cache, use_cache=True)
+    layer = cache.layers[0]
+    n_q_heads = layer._h_kv * (
+        model.config.num_attention_heads // model.config.num_key_value_heads
+    )
+    d = layer._d_head
+    q = torch.randn(n_q_heads, 1, d, dtype=torch.float16)
+    scale = 1.0 / (d**0.5)
+    k_tail = layer.keys.squeeze(0)
+    v_tail = layer.values.squeeze(0)
+    common = dict(
+        k_arm=layer.k_spec.arm,
+        v_arm=layer.v_spec.arm,
+        group=layer.k_spec.group,
+        seed=layer.k_spec.seed,
+        k_pre_rope=layer.k_spec.pre_rope,
+        rope_cos=layer._rope_cos,
+        rope_sin=layer._rope_sin,
+        k_tail=k_tail,
+        v_tail=v_tail,
+        n_q_groups=n_q_heads // layer._h_kv,
+        scale=scale,
+        v_group=layer.v_spec.group,
+        v_seed=layer.v_spec.seed,
+    )
+    without_cols = chunked_dequant_attention(
+        q, layer._k_blocks, layer._v_blocks, k_pack=layer._pack, **common
+    )
+    with_cols = chunked_dequant_attention(
+        q,
+        layer._k_blocks,
+        layer._v_blocks,
+        k_pack=layer._pack,
+        k_tier_cols=tier_columns(layer._pack.bits),
+        **common,
+    )
+    assert torch.equal(with_cols, without_cols)
+    # And layer._tier_cols itself (the precomputed value the layer actually
+    # threads) reproduces the identical result.
+    with_layer_cols = chunked_dequant_attention(
+        q,
+        layer._k_blocks,
+        layer._v_blocks,
+        k_pack=layer._pack,
+        k_tier_cols=layer._tier_cols,
+        **common,
+    )
+    assert torch.equal(with_layer_cols, without_cols)
+
+
+def test_packed_spectral_cached_decode_never_recomputes_tier_columns(
+    tmp_path, monkeypatch
+):
+    """Structural pin for FIX 1: the hot decode loop must receive
+    PackedStreamingLayer._tier_cols already threaded, never recomputing
+    tier_columns(pack.bits) per block per decode step. Monkeypatch
+    bmx.cache.spectral.tier_columns to raise — a real CUDA decode step
+    through the cache path must not hit it (CPU decode also routes through
+    chunked_dequant_attention here, since the fused k2b/packed kernels
+    require CUDA — see test_packed_dispatch.py's fallback pattern)."""
+    import bmx.cache.spectral as spectral_mod
+
+    model = tiny_llama()
+    path = str(tmp_path / "packs.safetensors")
+    _fit_tiny_packs(model, path)
+    k_spec, v_spec = _k4_specs(path)
+    cache = PackedStreamingCache(
+        model.config, k_spec=k_spec, v_spec=v_spec, recent_window=8
+    )
+    cache.attach(model)
+
+    def _raise_if_called(bits):
+        raise AssertionError(
+            "tier_columns recomputed during cached decode — the hot-path "
+            "k_tier_cols threading regressed"
+        )
+
+    with cache:
+        with torch.no_grad():
+            # Prefill: commits at least one page (seq=300 with recent_window=8
+            # crosses the flush threshold — matches the fixture used above).
+            # _tier_cols is precomputed once at layer construction (before
+            # this call), so prefill itself must not hit tier_columns either
+            # — but guard only the decode step below to isolate the claim
+            # FIX 1 actually makes (the hot per-block read loop).
+            model(ids(seq=300), past_key_values=cache, use_cache=True)
+            monkeypatch.setattr(spectral_mod, "tier_columns", _raise_if_called)
+            model(ids(seq=1), past_key_values=cache, use_cache=True)
+
+
 def test_packed_spectral_generate_matches_streaming(tmp_path):
     """BINDING GATE 2 (short context): greedy tokens identical, both the
     no-flush (seq=120) and flush-during-prefill (seq=300) variants — mirrors

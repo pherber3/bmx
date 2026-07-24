@@ -531,3 +531,41 @@ def load_packs(path: str | Path, budget: float) -> dict[int, SpectralPack]:
             budget=float(budget),
         )
     return packs
+
+
+def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
+    """Materialize the per-layer pack dict a KV cache should hold for `k_spec`.
+
+    Pack materialization owns the dec_quant decision — this is the
+    design-note altitude both StreamingQuantizedCache.__init__ and
+    PackedStreamingCache.__init__ delegate to (pure code motion, zero
+    numeric change: byte-identical blocks extracted verbatim from both).
+
+    Non-spectral arms (arm != "spectral") return {} — nothing to load.
+    Spectral arms load the fitted pack file (asserting pre_rope + pack_path
+    are set) and, when k_spec.dec_quant == "int8", roundtrip every layer's
+    decoder matrix through int8 ONCE here (Lever 2 — see
+    int8_decoder_roundtrip) via dataclasses.replace, which keeps every other
+    pack field (enc, lam, bits, tiers, ...) untouched.
+
+    k_spec: a CacheCodecSpec (arm, pre_rope, pack_path, budget, dec_quant).
+    """
+    assert k_spec.dec_quant in ("fp32", "int8"), (
+        f"dec_quant must be 'fp32' or 'int8'; got {k_spec.dec_quant!r}"
+    )
+    if k_spec.arm != "spectral":
+        return {}
+    assert k_spec.pre_rope, "spectral quantizes pre-RoPE keys; set pre_rope=True"
+    assert k_spec.pack_path, "spectral requires pack_path"
+    packs = load_packs(k_spec.pack_path, k_spec.budget)
+    if k_spec.dec_quant == "int8":
+        # Lever 2 (gated on a later VM quality measurement): roundtrip each
+        # layer pack's decoder through int8 ONCE, here, at init -- never
+        # refit, never re-applied per call.
+        packs = {
+            i: dataclasses.replace(
+                pack, dec=int8_decoder_roundtrip(pack.dec, pack.bits)
+            )
+            for i, pack in packs.items()
+        }
+    return packs

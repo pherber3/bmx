@@ -40,8 +40,7 @@ from bmx.cache.rope import rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.spectral import (
     SpectralPack,
-    int8_decoder_roundtrip,
-    load_packs,
+    load_packs_for_spec,
     spectral_quantize_packed,
     tier_columns,
 )
@@ -1018,25 +1017,24 @@ class PackedStreamingLayer(DynamicLayer):
             # fused decode kernels — other arms (e.g. turboquant_mse full-C) land
             # here BY DESIGN. Warn once so a benchmark can't silently attribute
             # this cost to the Triton path (2026-07-04 desk review, finding F0).
-            # Split the message so benchmarks can't misattribute cost: spectral
+            # Message differs so benchmarks can't misattribute cost: spectral
             # decode ALWAYS runs chunked (Phase A resident-memory path, no fused
             # spectral kernel exists) — that is by design, not a misrouted arm.
             if self.k_spec.arm == "spectral":
-                warnings.warn(
+                msg = (
                     "PackedStreamingCache spectral decode runs the CHUNKED path "
                     "BY DESIGN (Phase A resident-memory path, no fused spectral "
-                    "kernel); expect chunked-class decode latency.",
-                    stacklevel=2,
+                    "kernel); expect chunked-class decode latency."
                 )
             else:
-                warnings.warn(
+                msg = (
                     f"PackedStreamingCache decode falling back to chunked dequant on "
                     f"CUDA for arms K={self.k_spec.arm!r}/V={self.v_spec.arm!r} — no "
                     f"fused kernel covers this pair; expect ~30-70x slower decode than "
                     f"StreamingQuantizedCache. Use use_packed only with rtn_token or "
-                    f"k2b_ph arms, or accept the cost knowingly.",
-                    stacklevel=2,
+                    f"k2b_ph arms, or accept the cost knowingly."
                 )
+            warnings.warn(msg, stacklevel=2)
         return chunked_dequant_attention(
             q,
             self._k_blocks,
@@ -1057,6 +1055,7 @@ class PackedStreamingLayer(DynamicLayer):
             v_seed=self.v_spec.seed,
             attn_mask=attention_mask,
             k_pack=self._pack,
+            k_tier_cols=self._tier_cols,
         )
 
 
@@ -1086,33 +1085,12 @@ class PackedStreamingCache(Cache):
     ):
         # Spectral K arm: pre-RoPE only, and the corpus pack file is loaded ONCE
         # here (never per-layer, never per-call) then handed out by layer_idx —
-        # mirrors StreamingQuantizedCache.__init__ exactly. The guard MOVES here
-        # (init-time asserts), not deleted: quantize_packed's own NotImplementedError
-        # (codecs.py) still guards any other pack-gated/misrouted arm that reaches it.
-        assert k_spec.dec_quant in ("fp32", "int8"), (
-            f"dec_quant must be 'fp32' or 'int8'; got {k_spec.dec_quant!r}"
-        )
-        self._packs: dict[int, SpectralPack] = {}
-        if k_spec.arm == "spectral":
-            assert k_spec.pre_rope, (
-                "spectral quantizes pre-RoPE keys; set pre_rope=True"
-            )
-            assert k_spec.pack_path, "spectral requires pack_path"
-            self._packs = load_packs(k_spec.pack_path, k_spec.budget)
-            if k_spec.dec_quant == "int8":
-                # Lever 2 (gated on a later VM quality measurement): roundtrip
-                # each layer pack's decoder through int8 ONCE, here, at init --
-                # never refit, never re-applied per call. dataclasses.replace
-                # keeps every other pack field (enc, lam, bits, tiers, ...)
-                # untouched; only dec's stored precision changes. Mirrors
-                # StreamingQuantizedCache.__init__ so packed and streaming
-                # caches load bit-identical packs under the same spec.
-                self._packs = {
-                    i: dataclasses.replace(
-                        pack, dec=int8_decoder_roundtrip(pack.dec, pack.bits)
-                    )
-                    for i, pack in self._packs.items()
-                }
+        # mirrors StreamingQuantizedCache.__init__ exactly (both delegate to
+        # load_packs_for_spec, spectral.py — pack materialization owns the
+        # dec_quant decision). The guard MOVES here (init-time asserts), not
+        # deleted: quantize_packed's own NotImplementedError (codecs.py) still
+        # guards any other pack-gated/misrouted arm that reaches it.
+        self._packs: dict[int, SpectralPack] = load_packs_for_spec(k_spec)
 
         # layer_class_to_replicate lazily appends one layer per new layer_idx, always
         # in order (transformers' Cache.update appends up to layer_idx while

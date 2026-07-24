@@ -240,6 +240,83 @@ def test_pack_file_roundtrip(tmp_path):
         load_packs(path, 4.0)
 
 
+def test_load_packs_for_spec_matches_load_packs_and_owns_dec_quant(tmp_path):
+    """FIX 2 license: load_packs_for_spec(k_spec) is the hoisted altitude both
+    StreamingQuantizedCache.__init__ and PackedStreamingCache.__init__ now
+    delegate to — pack materialization owns the dec_quant decision.
+
+    Non-spectral arm -> {} (nothing to load). Spectral arm with dec_quant="fp32"
+    -> bitwise matches a direct load_packs() call. dec_quant="int8" ->
+    matches int8_decoder_roundtrip applied by hand. Invalid dec_quant / missing
+    pre_rope / missing pack_path all raise, exactly as the pre-hoist inline
+    blocks did."""
+    from bmx.cache.spectral import (
+        fit_spectral_basis,
+        identity_whitener,
+        int8_decoder_roundtrip,
+        load_packs,
+        load_packs_for_spec,
+        save_pack_file,
+    )
+    from bmx.cache.specs import CacheCodecSpec
+
+    C = 32
+    Wh, Wh_inv = identity_whitener(C)
+    bases = {}
+    for i in range(2):
+        M, _ = _spiked_keys(S=256, C=C, seed=i)
+        bases[i] = fit_spectral_basis(M, Wh, Wh_inv)
+    path = tmp_path / "packs.safetensors"
+    save_pack_file(path, bases, budgets=(2.5,), group=16, meta={"model": "tiny"})
+
+    # Non-spectral arm: nothing to load.
+    fp16_spec = CacheCodecSpec(arm="fp16")
+    assert load_packs_for_spec(fp16_spec) == {}
+
+    # Spectral, dec_quant="fp32" (default): bitwise matches load_packs directly.
+    fp32_spec = CacheCodecSpec(
+        arm="spectral", pre_rope=True, pack_path=str(path), budget=2.5
+    )
+    via_spec = load_packs_for_spec(fp32_spec)
+    via_direct = load_packs(path, 2.5)
+    assert set(via_spec) == set(via_direct) == {0, 1}
+    for i in via_direct:
+        assert torch.equal(via_spec[i].dec, via_direct[i].dec)
+        assert torch.equal(via_spec[i].bits, via_direct[i].bits)
+
+    # Spectral, dec_quant="int8": matches int8_decoder_roundtrip applied by hand.
+    int8_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path=str(path),
+        budget=2.5,
+        dec_quant="int8",
+    )
+    via_int8 = load_packs_for_spec(int8_spec)
+    for i in via_direct:
+        expected_dec = int8_decoder_roundtrip(via_direct[i].dec, via_direct[i].bits)
+        assert torch.equal(via_int8[i].dec, expected_dec)
+        assert via_int8[i].dec.dtype == via_direct[i].dec.dtype
+
+    # Guard preservation: invalid dec_quant / missing pre_rope / missing pack_path.
+    with pytest.raises(AssertionError, match="dec_quant"):
+        load_packs_for_spec(
+            CacheCodecSpec(
+                arm="spectral",
+                pre_rope=True,
+                pack_path=str(path),
+                budget=2.5,
+                dec_quant="bf16",
+            )
+        )
+    with pytest.raises(AssertionError, match="pre_rope"):
+        load_packs_for_spec(
+            CacheCodecSpec(arm="spectral", pack_path=str(path), budget=2.5)
+        )
+    with pytest.raises(AssertionError, match="pack_path"):
+        load_packs_for_spec(CacheCodecSpec(arm="spectral", pre_rope=True))
+
+
 def test_skeptic_charge_v2_hand_computed():
     """v2 arithmetic pinned exactly; defaults reproduce v1 bit-exactly."""
     tiers7 = (0, 2, 3, 4, 5, 6, 8)
