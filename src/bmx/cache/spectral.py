@@ -75,6 +75,7 @@ def query_position_moment(
     h_kv: int,
     *,
     position_stride: int = 8,
+    w_rope: str = "frozen",
 ) -> torch.Tensor:
     """W blocks (h_kv, d, d): E over probe queries and sampled key positions of
     (R_pᵀ q)(R_pᵀ q)ᵀ, pooled over each kv-head's GQA query group.
@@ -82,6 +83,15 @@ def query_position_moment(
     R_pᵀ q is RoPE at position p with negated sin (inverse rotation). cos/sin
     are (S, d) tables from rope_cos_sin; pass cos=ones/sin=zeros for no-RoPE
     models (gpt2) — then W is the plain pooled query second moment.
+
+    w_rope="frozen" (default, bit-exact): the shipped instrument — inverse
+    rotation R_p^T q at uniform-strided absolute positions (the query's own
+    rotation frozen at zero). w_rope="rotated" (math review 2026-07-24 #3):
+    the causal-attention-corrected moment — FORWARD rotation R_m q (sign of
+    sin flipped) at the same strided positions read as relative offsets
+    m = p, each weighted triangularly (#pairs at offset m ~ S - m). Even
+    plane terms agree between the two up to the offset distribution; the odd
+    sin*cos plane term flips sign — identical when sin == 0 (no-RoPE models).
     """
     h, T, d = q.shape
     assert h % h_kv == 0, f"h={h} not divisible by h_kv={h_kv}"
@@ -89,15 +99,29 @@ def query_position_moment(
     S = cos.shape[0]
     q64 = q.double()
     W = torch.zeros(h_kv, d, d, dtype=torch.float64)
+    assert w_rope in ("frozen", "rotated"), f"unknown w_rope {w_rope!r}"
     positions = list(range(0, S, position_stride))
-    for p in positions:
-        cp = cos[p].double().view(1, 1, d)
-        sp = sin[p].double().view(1, 1, d)
-        q_rot = q64 * cp + _rotate_half(q64) * (-sp)  # (h, T, d) = R_pᵀ q
-        for j in range(h_kv):
-            qj = q_rot[j * grp : (j + 1) * grp].reshape(-1, d)  # (grp*T, d)
-            W[j] += qj.mT @ qj
-    W /= len(positions) * grp * T
+    if w_rope == "frozen":
+        for p in positions:
+            cp = cos[p].double().view(1, 1, d)
+            sp = sin[p].double().view(1, 1, d)
+            q_rot = q64 * cp + _rotate_half(q64) * (-sp)  # (h, T, d) = R_pᵀ q
+            for j in range(h_kv):
+                qj = q_rot[j * grp : (j + 1) * grp].reshape(-1, d)
+                W[j] += qj.mT @ qj
+        W /= len(positions) * grp * T
+    else:
+        total = 0.0
+        for p in positions:
+            cp = cos[p].double().view(1, 1, d)
+            sp = sin[p].double().view(1, 1, d)
+            q_rot = q64 * cp + _rotate_half(q64) * sp  # (h, T, d) = R_m q (forward)
+            wt = float(S - p)  # triangular offset weight
+            for j in range(h_kv):
+                qj = q_rot[j * grp : (j + 1) * grp].reshape(-1, d)
+                W[j] += wt * (qj.mT @ qj)
+            total += wt
+        W /= total * grp * T
     return W
 
 

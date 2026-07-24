@@ -126,6 +126,7 @@ def corpus_query_moment(
     h_kv,
     d,
     position_stride,
+    w_rope="frozen",
 ):
     """Equal-weight per-cache average of query_position_moment over corpus caches.
 
@@ -141,7 +142,12 @@ def corpus_query_moment(
         else:
             c_cos, c_sin = torch.ones(c_S, d), torch.zeros(c_S, d)
         W_sum += query_position_moment(
-            c_q_t.float(), c_cos, c_sin, h_kv, position_stride=position_stride
+            c_q_t.float(),
+            c_cos,
+            c_sin,
+            h_kv,
+            position_stride=position_stride,
+            w_rope=w_rope,
         )
     return W_sum / len(corpus_layer_keys)
 
@@ -163,6 +169,7 @@ def corpus_fit_bases(
     w_source: str,
     ridge: float,
     position_stride: int,
+    w_rope: str = "frozen",
 ) -> CorpusFit:
     """Corpus-pooled per-layer spectral fit, extracted from k4_fit_packs.main:
     Σ_k = concat of ALL corpus caches' k_pre matrices; W = pooled corpus query
@@ -199,6 +206,7 @@ def corpus_fit_bases(
                 h_kv,
                 d,
                 position_stride,
+                w_rope,
             )
             Wh, Wh_inv = assemble_whitener(W_blocks, ridge=ridge)
         else:  # "none"

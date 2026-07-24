@@ -1221,3 +1221,40 @@ def test_k4_charge_alloc_verdict_arithmetic(tmp_path):
     ).mean()
     assert abs(e["bpe_ca"] - float(expected_bpe)) < 1e-9
     assert abs(e["bits_saved_blended"] - 0.5 * e["bits_saved_k_side"]) < 1e-12
+
+
+def test_k4_w_rope_ab_smoke(tmp_path):
+    import json
+
+    import pandas as pd
+
+    from experiments.k4_w_rope_ab import Config, main
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    scored = tmp_path / "s.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+    _tiny_cache(scored, seed=2)
+    cfg = Config(
+        corpus_cache_paths=(str(p1), str(p2)),
+        cache_paths=(str(scored),),
+        model_label="tiny",
+        budgets=(2.0, 2.5),
+        group=16,
+        overlap_ranks=(4, 8),
+        out_root=str(tmp_path / "results"),
+    )
+    run_dir = main(cfg)
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert set(df.w_rope) == {"frozen", "rotated"}
+    ov = pd.read_parquet(run_dir / "overlap.parquet")
+    assert set(ov["rank"]) == {4, 8}
+    assert ((ov.value >= -1e-9) & (ov.value <= 1 + 1e-9)).all()
+    v = json.loads((run_dir / "w_rope_verdict.json").read_text())
+    assert set(v["per_budget"]) == {"2", "2.5"}
+    for e in v["per_budget"].values():
+        assert {"win_frozen", "win_rotated", "rel_win_delta"} <= set(e)
+    assert v["decision"] in ("scoped_negligible", "rotated_form_required")
+    # tiny fixture has no RoPE (model_name="") => the null: delta ~ 0.
+    for e in v["per_budget"].values():
+        assert abs(e["rel_win_delta"]) < 1e-6

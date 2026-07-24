@@ -514,3 +514,70 @@ def test_s_ref_c_used_monotone():
     c_1k = pack_from_basis(basis, 2.5, group=16, s_ref=1024).c_used
     assert c_1k <= c_8k <= c_none
     assert c_1k < c_none, "fixture must actually exercise the charge"
+
+
+def test_query_moment_w_rope_default_inert():
+    """w_rope='frozen' default == bare call, bit-exact (the default-inert pin)."""
+    g = torch.Generator().manual_seed(11)
+    q = torch.randn(4, 16, 8, generator=g)
+    S = 32
+    theta = torch.linspace(0, 2.0, S).unsqueeze(1) * torch.ones(1, 8)
+    cos, sin = theta.cos(), theta.sin()
+    bare = query_position_moment(q, cos, sin, h_kv=2, position_stride=8)
+    frozen = query_position_moment(
+        q, cos, sin, h_kv=2, position_stride=8, w_rope="frozen"
+    )
+    assert torch.equal(bare, frozen)
+
+
+def test_query_moment_rotated_matches_explicit_forward_rotation():
+    """Value-pin for w_rope='rotated' (math review #3(b)): W must equal
+    sum_p (S-p) * R_p (pooled qq^T) R_p^T / sum_p (S-p) with R_p the FORWARD
+    rotation (columns apply_rope(e_i)) — no transpose, unlike the frozen
+    path's ground-truth test. Duplicated-half cos/sin structure as in real
+    RoPE tables."""
+    from bmx.cache.rope import apply_rope
+
+    g = torch.Generator().manual_seed(12)
+    h, T, d, h_kv, S = 2, 16, 4, 1, 8
+    q = torch.randn(h, T, d, generator=g)
+    freqs = torch.linspace(0.5, 1.0, d // 2)
+    theta = torch.linspace(0.3, 2.0, S).unsqueeze(1) * torch.cat(
+        [freqs, freqs]
+    ).unsqueeze(0)
+    cos, sin = theta.cos(), theta.sin()
+
+    stride = 2
+    W = query_position_moment(
+        q, cos, sin, h_kv, position_stride=stride, w_rope="rotated"
+    )
+
+    q_flat = q.double().reshape(-1, d)
+    pooled = q_flat.mT @ q_flat / (h * T)
+    positions = list(range(0, S, stride))
+    W_expected = torch.zeros(d, d, dtype=torch.float64)
+    total = 0.0
+    for p in positions:
+        basis = torch.eye(d).double().unsqueeze(1)
+        Rp_cols = apply_rope(basis, cos[p : p + 1].double(), sin[p : p + 1].double())
+        Rp = Rp_cols.squeeze(1).mT  # (d, d), column i = R_p e_i (FORWARD)
+        wt = float(S - p)  # triangular: #pairs at offset p ~ S - p
+        W_expected += wt * (Rp @ pooled @ Rp.mT)
+        total += wt
+    W_expected /= total
+    assert torch.allclose(W[0], W_expected, atol=1e-10)
+
+
+def test_query_moment_rotated_null_on_no_rope():
+    """gpt2 null control: with sin == 0 the odd (sign-flipping) term vanishes
+    and every position contributes the identical qq^T, so frozen == rotated
+    up to fp summation order (the reason the A/B must run on a RoPE model)."""
+    g = torch.Generator().manual_seed(13)
+    q = torch.randn(4, 16, 8, generator=g)
+    S = 64
+    cos, sin = torch.ones(S, 8), torch.zeros(S, 8)
+    frozen = query_position_moment(q, cos, sin, h_kv=2, position_stride=8)
+    rotated = query_position_moment(
+        q, cos, sin, h_kv=2, position_stride=8, w_rope="rotated"
+    )
+    assert torch.allclose(frozen, rotated, atol=1e-10)
