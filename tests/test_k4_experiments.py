@@ -362,6 +362,50 @@ def test_k4_fit_packs_default_unchanged(tmp_path):
         assert torch.equal(t_main[key], t_ref[key]), f"tensor {key} differs"
 
 
+def test_k4_fit_packs_tier_counts(tmp_path):
+    """Metrics rows gain n_t0,n_t2,n_t3,n_t4,n_t5,n_t6,n_t8 per (layer,
+    budget): counts of pack.bits == that tier. Sanity: they sum to C, and
+    n_t0 == n_zero_dirs (additive schema; existing columns unchanged)."""
+    import pandas as pd
+
+    from bmx.cache.spectral import load_packs
+    from experiments.k4_fit_packs import Config, main
+
+    p1, p2 = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    _tiny_cache(p1, seed=0)
+    _tiny_cache(p2, seed=1)
+    out = tmp_path / "packs.safetensors"
+    cfg = Config(
+        corpus_cache_paths=(str(p1), str(p2)),
+        out_path=str(out),
+        model_label="tiny",
+        budgets=(2.5,),
+        group=16,
+        out_root=str(tmp_path / "results"),
+    )
+    run_dir = main(cfg)
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+
+    tier_cols = ["n_t0", "n_t2", "n_t3", "n_t4", "n_t5", "n_t6", "n_t8"]
+    assert set(tier_cols) <= set(df.columns)
+    # Existing columns must survive untouched.
+    assert {"model", "layer", "budget", "am_gm", "top16_energy", "n_zero_dirs"} <= set(
+        df.columns
+    )
+
+    packs = load_packs(out, 2.5)
+    for _, row in df.iterrows():
+        layer_i = int(row["layer"])
+        C = packs[layer_i].bits.shape[0]
+        counts = [int(row[c]) for c in tier_cols]
+        assert sum(counts) == C, f"layer {layer_i}: tier counts {counts} != C={C}"
+        assert row["n_t0"] == row["n_zero_dirs"]
+        # Cross-check against the pack's own bits tensor directly.
+        bits = packs[layer_i].bits
+        for tier, col in zip((0, 2, 3, 4, 5, 6, 8), tier_cols):
+            assert int(row[col]) == int((bits == tier).sum())
+
+
 def test_k4_spectra_w_source_corpus(tmp_path):
     import pandas as pd
 
@@ -436,6 +480,115 @@ def test_k4_charge_curve_smoke(tmp_path):
         - (scale_bits(group) * (1 - c_used / C)) / 2
     )
     assert f"{expected:.2f}" in text
+
+
+def _charge_curve_fixture(tmp_path):
+    """Shared fixture for the int8_frac_variants tests below — same shape as
+    test_k4_charge_curve_smoke's, factored out so both variant tests share it."""
+    import pandas as pd
+
+    run = tmp_path / "niah" / "r1"
+    run.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "arm": ["k4_b2.5", "k4_b2.5"],
+            "length": [8192, 32768],
+            "kv_size_bits": [3.60, 2.69],
+        }
+    ).to_parquet(run / "metrics.parquet")
+    fp = tmp_path / "fit.parquet"
+    pd.DataFrame(
+        {
+            "model": ["m"] * 2,
+            "layer": [0, 1],
+            "budget": [2.5] * 2,
+            "n_zero_dirs": [190, 198],
+        }
+    ).to_parquet(fp)
+    return run, fp
+
+
+def test_k4_charge_curve_int8_frac_1_matches_blanket_int8(tmp_path):
+    """frac=1.0 must reproduce the existing dec_bits=8.0 (skeptic-v2-int8)
+    column EXACTLY — mixed_dec_charge(c_int8=c_used) == skeptic_charge
+    (dec_bits=8.0) is endpoint-pinned, so this must hold through the full
+    corrected() blend, not just at the spectral.py level."""
+    from experiments.k4_charge_curve import Config, main
+
+    run, fp = _charge_curve_fixture(tmp_path)
+
+    out_blanket = tmp_path / "blanket.md"
+    main(
+        Config(
+            niah_run_dirs=(str(run),),
+            fit_packs_parquet=str(fp),
+            budgets=(2.5,),
+            dec_bits_variants=(16.0, 8.0),
+            out_path=str(out_blanket),
+        )
+    )
+    out_frac = tmp_path / "frac.md"
+    main(
+        Config(
+            niah_run_dirs=(str(run),),
+            fit_packs_parquet=str(fp),
+            budgets=(2.5,),
+            dec_bits_variants=(),
+            int8_frac_variants=(1.0,),
+            out_path=str(out_frac),
+        )
+    )
+
+    blanket_text = out_blanket.read_text()
+    frac_text = out_frac.read_text()
+
+    # Pull the numeric cells for the k4_b2.5/8192 row out of each table's
+    # last column and assert they match exactly (same measured input, same
+    # blend, only the accounting path to the decoder charge differs).
+    def _last_cell(text: str, needle: str) -> str:
+        for line in text.splitlines():
+            if line.startswith(f"| {needle} |"):
+                cells = [c.strip() for c in line.strip("|").split("|")]
+                return cells[-1]
+        raise AssertionError(f"row {needle!r} not found in:\n{text}")
+
+    blanket_cell = _last_cell(blanket_text, "k4_b2.5 | 8192")
+    frac_cell = _last_cell(frac_text, "k4_b2.5 | 8192")
+    assert blanket_cell == frac_cell
+
+
+def test_k4_charge_curve_int8_frac_between_endpoints(tmp_path):
+    """A frac of 0.9 must sit strictly between the dec_bits=16.0 (v2) and
+    dec_bits=8.0 (v2-int8) columns for a k4 arm row (the mix is a strict
+    convex combination when 0 < frac < 1 and c_used > 0)."""
+    from experiments.k4_charge_curve import Config, main
+
+    run, fp = _charge_curve_fixture(tmp_path)
+
+    out = tmp_path / "table.md"
+    main(
+        Config(
+            niah_run_dirs=(str(run),),
+            fit_packs_parquet=str(fp),
+            budgets=(2.5,),
+            dec_bits_variants=(16.0, 8.0),
+            int8_frac_variants=(0.9,),
+            out_path=str(out),
+        )
+    )
+    text = out.read_text()
+    assert "int8frac0.9" in text
+
+    for line in text.splitlines():
+        if line.startswith("| k4_b2.5 | 8192 |"):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            # columns: arm, length, v1, skeptic-v2 (16.0), skeptic-v2-int8
+            # (8.0), skeptic-v2-int8frac0.9
+            v2, v2_int8, v2_frac = (float(cells[3]), float(cells[4]), float(cells[5]))
+            assert v2_int8 < v2_frac < v2
+            break
+    else:
+        raise AssertionError(f"row not found in:\n{text}")
 
 
 def test_k4_dec_quant_smoke(tmp_path):

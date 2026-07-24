@@ -33,7 +33,7 @@ import pandas as pd
 import tyro
 
 from bmx.cache.codecs import scale_bits
-from bmx.cache.spectral import skeptic_charge
+from bmx.cache.spectral import mixed_dec_charge, skeptic_charge
 
 _K4_ARM_RE = re.compile(r"^k4_b(?P<budget>[\d.]+)$")
 
@@ -49,6 +49,13 @@ class Config:
     group: int = 64
     tiers: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 8)
     dec_bits_variants: tuple[float, ...] = (16.0, 8.0)
+    # Tier-gated honest replacement for the blanket skeptic-v2-int8 column
+    # (rejected by its own certificate, see §3b of the local-levers design
+    # doc). Each frac f is applied to C_used as c_int8 = f * c_used through
+    # `mixed_dec_charge` — NOT an effective-dec-bits value routed through
+    # `skeptic_charge`, which would double-count the fp16-scale term. Empty
+    # by default (today's output unchanged).
+    int8_frac_variants: tuple[float, ...] = ()
     out_path: str = ""
 
 
@@ -87,8 +94,36 @@ def _corrected_bits(
     return measured - decoder_delta - scale_delta
 
 
+def _corrected_bits_mixed(
+    measured: float,
+    C: int,
+    S: int,
+    tiers: tuple[int, ...],
+    group: int,
+    c_used: float,
+    frac: float,
+) -> float:
+    """Same corrected() blend as `_corrected_bits` (same /2 K-V blend factor,
+    same scale_bits term), but the decoder charge routes through
+    `mixed_dec_charge(c_int8=frac*c_used)` instead of
+    `skeptic_charge(dec_bits=db)` — the tier-gated honest replacement for the
+    blanket int8 column (see module docstring / §3b of the local-levers
+    design doc). Endpoint-pinned: frac=0.0 == dec_bits=16.0 (skeptic-v2),
+    frac=1.0 == dec_bits=8.0 (skeptic-v2-int8) EXACTLY, since
+    mixed_dec_charge reduces to skeptic_charge at c_int8 in {0, c_used}."""
+    charge_v1 = skeptic_charge(C, S, tiers)
+    charge_mixed = mixed_dec_charge(C, S, tiers, c_used=c_used, c_int8=frac * c_used)
+    decoder_delta = (charge_v1 - charge_mixed) / 2.0
+    scale_delta = (scale_bits(group) * (1 - c_used / C)) / 2.0
+    return measured - decoder_delta - scale_delta
+
+
 def _mode_label(dec_bits: float) -> str:
     return "skeptic-v2" if dec_bits == 16.0 else "skeptic-v2-int8"
+
+
+def _frac_mode_label(frac: float) -> str:
+    return f"skeptic-v2-int8frac{frac:g}"
 
 
 def _crossover_context(curve: dict[int, float], other: dict[int, float]) -> str:
@@ -118,7 +153,11 @@ def main(cfg: Config) -> None:
 
     c_used_by_budget = {b: _mean_c_used(fit_df, b, cfg.C) for b in cfg.budgets}
 
-    mode_names = ["v1 as-measured"] + [_mode_label(db) for db in cfg.dec_bits_variants]
+    mode_names = (
+        ["v1 as-measured"]
+        + [_mode_label(db) for db in cfg.dec_bits_variants]
+        + [_frac_mode_label(f) for f in cfg.int8_frac_variants]
+    )
 
     # arm -> length -> {mode_name: bits}
     arm_curves: dict[str, dict[int, dict[str, float]]] = {}
@@ -141,10 +180,22 @@ def main(cfg: Config) -> None:
                             c_used,
                             db,
                         )
+                    for f in cfg.int8_frac_variants:
+                        row_modes[_frac_mode_label(f)] = _corrected_bits_mixed(
+                            measured,
+                            cfg.C,
+                            int(length),
+                            cfg.tiers,
+                            cfg.group,
+                            c_used,
+                            f,
+                        )
             else:
                 # TQ baseline (or other non-k4 arm): pass through unchanged.
                 for db in cfg.dec_bits_variants:
                     row_modes[_mode_label(db)] = measured
+                for f in cfg.int8_frac_variants:
+                    row_modes[_frac_mode_label(f)] = measured
             arm_curves.setdefault(arm, {})[int(length)] = row_modes
 
     lines = []

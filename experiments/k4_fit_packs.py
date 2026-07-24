@@ -225,6 +225,15 @@ def main(cfg: Config):
             am_gm = (lam.mean() / lam.clamp_min(1e-12).log().mean().exp()).item()
             top16_energy = (lam[:16].sum() / lam.sum().clamp_min(1e-12)).item()
             n_zero_dirs = int((pack.bits == 0).sum())
+            tier_counts = {f"n_t{t}": int((pack.bits == t).sum()) for t in cfg.tiers}
+            assert tier_counts["n_t0"] == n_zero_dirs, (
+                f"layer {layer_i} budget {budget}: n_t0={tier_counts['n_t0']} "
+                f"!= n_zero_dirs={n_zero_dirs}"
+            )
+            assert sum(tier_counts.values()) == pack.bits.shape[0], (
+                f"layer {layer_i} budget {budget}: tier counts "
+                f"{tier_counts} don't sum to C={pack.bits.shape[0]}"
+            )
             row = dict(
                 model=model_label,
                 layer=layer_i,
@@ -232,6 +241,7 @@ def main(cfg: Config):
                 am_gm=am_gm,
                 top16_energy=top16_energy,
                 n_zero_dirs=n_zero_dirs,
+                **tier_counts,
             )
             if layer_budgets is not None:
                 # pack.budget is this layer's ALLOCATED budget b_l (the label
