@@ -1647,6 +1647,66 @@ def test_lloyd_packed_bitwise_faithful_roundtrip(tier):
     assert torch.equal(unpacked.long(), codes)
 
 
+@pytest.mark.parametrize("tier", [5, 6, 8])
+def test_lloyd_packed_bitwise_faithful_roundtrip_high_tiers(tier):
+    """quantize -> pack -> unpack -> dequant identity for lloyd codes at
+    tiers 5/6/8 (raw-int8 containers, no sub-byte packing) -- closes concern
+    (2) from the Task 1 report. Two things the {2,3,4} pins above don't
+    exercise:
+
+    1. The FULL unsigned index range [0, 2**b-1] INCLUDING BOTH ENDPOINTS.
+       At tier 8 this is [0, 255] -- codes.to(torch.int8) bit-reinterprets
+       128..255 as negative int8 values (e.g. 200 -> -56) before the
+       unsigned->signed container offset is even applied, so the offset
+       arithmetic is composing on top of an already-wrapped representation.
+       It happens to compose correctly (mod-256 arithmetic cancels exactly),
+       but that is exactly the kind of thing that looks right and needs a
+       pinned test, not a proof by inspection.
+    2. A non-multiple-of-container-width S (tail handling). Tiers 5/6/8 have
+       NO sub-byte packing (`_pack_tier_codes` returns the int8 tensor as-is,
+       `_unpack_tier_codes` returns `t` unchanged) -- unlike tiers 2/4
+       (4/2 codes per byte) and tier 3 (2 codes per nibble-packed byte),
+       there is no divisibility constraint on the last axis at all. Using an
+       odd S=5 here documents that contrast explicitly rather than leaving it
+       implicit.
+    """
+    from bmx.cache.spectral import _pack_tier_codes, _unpack_tier_codes
+
+    n_levels = 2**tier
+    # Full range including both endpoints (0 and 2**tier - 1), plus a
+    # deterministic in-between spread. S=5 (odd, not a multiple of any
+    # sub-byte packing width) is the ragged-tail case.
+    codes = torch.tensor(
+        [
+            [0, 1, n_levels // 2 - 1, n_levels // 2, n_levels - 1],
+            [n_levels - 1, n_levels - 2, 0, 1, n_levels // 2],
+        ],
+        dtype=torch.int64,
+    )
+    S = codes.shape[-1]
+    assert S == 5, "S must be a ragged (non-power-of-2, non-multiple) tail width"
+
+    Q_int = codes.to(torch.int8)  # the exact cast _lloyd_quantize_packed performs
+    packed = _pack_tier_codes(Q_int, tier, quantizer="lloyd")
+    assert packed.dtype == torch.int8, f"tier {tier} is a raw-int8 container"
+    assert packed.shape == codes.shape, "no sub-byte packing at tiers 5/6/8"
+    unpacked = _unpack_tier_codes(packed, tier, S, quantizer="lloyd")
+    assert torch.equal(unpacked.long(), codes), (
+        f"tier {tier} roundtrip failed: {unpacked.tolist()} != {codes.tolist()}"
+    )
+
+    # Full dequant identity too: scale * codebook[codes] must match what
+    # _lloyd_dequantize_packed produces directly from the unsigned codes,
+    # proving the pack/unpack offset round-trips through to real values, not
+    # just integer identity.
+    from bmx.cache.spectral import _lloyd_dequantize_packed
+
+    scale = torch.tensor([[[1.7]], [[0.3]]], dtype=torch.float32)  # (2, 1, 1)
+    direct = _lloyd_dequantize_packed(Q_int, scale, tier, S)
+    via_container = _lloyd_dequantize_packed(unpacked.to(torch.int8), scale, tier, S)
+    assert torch.equal(direct, via_container)
+
+
 def test_spectral_quantize_packed_lloyd_bitwise_matches_spectral_quantize():
     from bmx.cache.spectral import spectral_dequant_packed, spectral_quantize_packed
 
