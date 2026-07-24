@@ -511,6 +511,22 @@ def int8_decoder_roundtrip(dec: torch.Tensor, bits_pc: torch.Tensor) -> torch.Te
     return dec_rt
 
 
+def _int8_cert_terms(pack: SpectralPack, ddec: torch.Tensor) -> dict[str, float]:
+    """The certificate's shared closed form on a (possibly column-gated) fp64
+    decoder perturbation ddec — see `int8_decoder_certificate` for the
+    derivation and honest limits."""
+    proj = pack.enc.double().mT @ ddec  # (C, C): column i = enc^T ddec[:, i]
+    lam = pack.lam.double().clamp_min(0.0)
+    added = float((lam * (proj**2).sum(dim=0)).sum())
+    payload = float((lam * torch.pow(4.0, -pack.bits.double())).sum())
+    return dict(
+        added=added,
+        payload=payload,
+        noise_to_signal=added / max(payload, 1e-300),
+        implied_rel_degradation=added / max(payload + added, 1e-300),
+    )
+
+
 def int8_decoder_certificate(pack: SpectralPack) -> dict[str, float]:
     """Exact offline certificate for the int8-decoder distortion (math review
     2026-07-24 #9): the roundtrip perturbation ddec = dec_int8 - dec is
@@ -541,16 +557,7 @@ def int8_decoder_certificate(pack: SpectralPack) -> dict[str, float]:
     (1e-7 relative rounding — three orders below the certificate's margin).
     """
     ddec = int8_decoder_roundtrip(pack.dec, pack.bits).double() - pack.dec.double()
-    proj = pack.enc.double().mT @ ddec  # (C, C): column i = enc^T ddec[:, i]
-    lam = pack.lam.double().clamp_min(0.0)
-    added = float((lam * (proj**2).sum(dim=0)).sum())
-    payload = float((lam * torch.pow(4.0, -pack.bits.double())).sum())
-    return dict(
-        added=added,
-        payload=payload,
-        noise_to_signal=added / max(payload, 1e-300),
-        implied_rel_degradation=added / max(payload + added, 1e-300),
-    )
+    return _int8_cert_terms(pack, ddec)
 
 
 def int8_decoder_certificate_tiered(pack: SpectralPack, tier_threshold: int) -> dict:
@@ -582,20 +589,13 @@ def int8_decoder_certificate_tiered(pack: SpectralPack, tier_threshold: int) -> 
 
     ddec_full = int8_decoder_roundtrip(pack.dec, pack.bits).double() - pack.dec.double()
     ddec = ddec_full * gate.to(ddec_full.dtype)  # zero columns above threshold
-    proj = pack.enc.double().mT @ ddec
-    lam = pack.lam.double().clamp_min(0.0)
-    added = float((lam * (proj**2).sum(dim=0)).sum())
-    payload = float((lam * torch.pow(4.0, -pack.bits.double())).sum())
 
     return dict(
         tier_threshold=int(tier_threshold),
         c_used=c_used,
         c_int8=c_int8,
         frac_int8=c_int8 / c_used if c_used > 0 else 0.0,
-        added=added,
-        payload=payload,
-        noise_to_signal=added / max(payload, 1e-300),
-        implied_rel_degradation=added / max(payload + added, 1e-300),
+        **_int8_cert_terms(pack, ddec),
     )
 
 

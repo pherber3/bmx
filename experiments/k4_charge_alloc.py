@@ -295,16 +295,15 @@ def _verdict(cfg: Config, point, diag_df: pd.DataFrame, headline: str) -> dict:
     per_point: dict[str, dict] = {}
     gate_passes: list[bool] = []
     for s_ref in cfg.s_refs:
-        # Plain frontier AT this S_ref: (bpe, win) per plain budget.
+        # Plain frontier AT this S_ref: [(bpe, win)] sorted by bpe.
         plain_pts = sorted(point("plain", b, -1, s_ref)[:2] for b in cfg.plain_budgets)
-        win_by_bpe = plain_pts  # [(bpe, win)] sorted by bpe
         bpe_by_win = sorted((w, b) for b, w in plain_pts)  # [(win, bpe)]
         frontier_monotone = all(
-            win_by_bpe[i][1] <= win_by_bpe[i + 1][1] for i in range(len(win_by_bpe) - 1)
+            plain_pts[i][1] <= plain_pts[i + 1][1] for i in range(len(plain_pts) - 1)
         )
         for budget in cfg.ca_budgets:
             bpe_ca, win_ca, ex_ca = point("charge_aware", budget, s_ref, s_ref)
-            win_plain_at_bpe, ex1 = _log_interp(win_by_bpe, bpe_ca)
+            win_plain_at_bpe, ex1 = _log_interp(plain_pts, bpe_ca)
             bpe_plain_at_win, ex2 = _log_interp(bpe_by_win, win_ca)
             bits_saved_k = bpe_plain_at_win - bpe_ca
             bits_saved_blended = 0.5 * bits_saved_k

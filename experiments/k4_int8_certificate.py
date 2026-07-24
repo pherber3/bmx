@@ -118,12 +118,16 @@ def main(cfg: Config):
     )
 
     # ---- tier-gated rescue sweep (6b) --------------------------------------
-    # Per-(budget, threshold, layer) detail table (full transparency).
+    # Per-(budget, threshold, layer) detail table (full transparency). The
+    # certs dict is reused by the aggregate loop below (each tiered
+    # certificate re-runs the roundtrip + projection — compute it once).
     sweep_layer_rows: list[dict] = []
+    tiered_certs: dict[tuple[float, int, int], dict] = {}
     for budget, packs in packs_by_budget.items():
         for layer_i, pack in sorted(packs.items()):
             for T in cfg.tier_thresholds:
                 tiered = int8_decoder_certificate_tiered(pack, T)
+                tiered_certs[(budget, T, layer_i)] = tiered
                 sweep_layer_rows.append(
                     dict(
                         model=model_label,
@@ -142,22 +146,20 @@ def main(cfg: Config):
     # charge saving summed over every layer's decoder at each S in the grid.
     sweep_rows: list[dict] = []
     for budget, packs in packs_by_budget.items():
+        # effective_dec_bits requires a single C; assert layer uniformity
+        # (true for every pack file this repo has fit so far) rather than
+        # silently mixing per-layer channel counts into one number.
+        Cs = {int(pack.enc.shape[0]) for pack in packs.values()}
+        assert len(Cs) == 1, f"non-uniform per-layer C not supported: {Cs}"
+        C = next(iter(Cs))
         for T in cfg.tier_thresholds:
             layer_certs = {
-                layer_i: int8_decoder_certificate_tiered(pack, T)
-                for layer_i, pack in packs.items()
+                layer_i: tiered_certs[(budget, T, layer_i)] for layer_i in packs
             }
             c_used_total = sum(c["c_used"] for c in layer_certs.values())
             c_int8_total = sum(c["c_int8"] for c in layer_certs.values())
             worst_impl = max(c["implied_rel_degradation"] for c in layer_certs.values())
             worst_n2s = max(c["noise_to_signal"] for c in layer_certs.values())
-
-            # effective_dec_bits requires a single C; assert layer uniformity
-            # (true for every pack file this repo has fit so far) rather than
-            # silently mixing per-layer channel counts into one number.
-            Cs = {int(pack.enc.shape[0]) for pack in packs.values()}
-            assert len(Cs) == 1, f"non-uniform per-layer C not supported: {Cs}"
-            C = next(iter(Cs))
             eff_bits = effective_dec_bits(C, c_used_total, c_int8_total)
 
             row = dict(

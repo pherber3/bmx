@@ -126,6 +126,7 @@ def corpus_query_moment(
     h_kv,
     d,
     position_stride,
+    *,
     w_rope="frozen",
 ):
     """Equal-weight per-cache average of query_position_moment over corpus caches.
@@ -206,7 +207,7 @@ def corpus_fit_bases(
                 h_kv,
                 d,
                 position_stride,
-                w_rope,
+                w_rope=w_rope,
             )
             Wh, Wh_inv = assemble_whitener(W_blocks, ridge=ridge)
         else:  # "none"
@@ -247,18 +248,17 @@ def _score_tail(M_hat, h_kv, tail, K_post_true, Q, cos, sin, rope_ready, k_true_
     K_hat_full = from_matrix(M_hat, h_kv).float()  # (h_kv, S, d), full sequence
     K_hat = K_hat_full[:, tail, :]
     rf = rel_fro(M_hat[tail], M[tail])
+    lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
     if rope_ready:
         K_hat_rope_full = apply_rope(K_hat_full, cos, sin)
         K_hat_rope = K_hat_rope_full[:, tail, :]
         lg_rope = logit_distortion(K_post_true[:, tail], K_hat_rope, Q)
-        lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
         T = Q.shape[1]
         S = K_post_true.shape[1]
         lg_causal = logit_distortion_causal(
             K_post_true, K_hat_rope_full, Q, cos, sin, q_start=S - T
         )
     else:
-        lg = logit_distortion(k_true_t.float()[:, tail], K_hat, Q)
         lg_rope = float("nan")
         lg_causal = float("nan")
     return rf, lg, lg_rope, lg_causal
