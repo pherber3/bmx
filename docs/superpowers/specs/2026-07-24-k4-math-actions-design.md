@@ -63,7 +63,10 @@ rather than triangular. The measured record is valid AS MEASURED; the paper's
 **Mechanism:** implement the corrected variant behind a flag on the W-moment
 construction (`w_rope: str = "frozen"` default — today's path bit-exact —
 vs `"rotated"` applying the query-side rotation per the math doc's
-formulation). Fit gpt2 bases both ways on the same caches.
+formulation). SUBSTRATE CORRECTION (2026-07-24, planning-time catch): gpt2
+has no RoPE, so frozen==rotated there by construction — the A/B runs on the
+local qwen3-0.6b caches (the SM pre-flight artifacts), with gpt2 kept as an
+exact-null control pinned by a unit test.
 
 **Pre-registered readout (measurement, not a pass/fail gate):** heldout G1
 win ratio (rotated vs frozen) and per-rank subspace overlap between the two
