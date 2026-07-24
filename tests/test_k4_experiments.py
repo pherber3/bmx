@@ -528,6 +528,296 @@ def test_k4_dec_quant_two_caches_keys_tq_curve_per_cache(tmp_path):
     assert not tq_df2.duplicated(subset=["cache", "layer", "bpe_model"]).any()
 
 
+def test_k4_dec_quant_tier_thresholds_run_and_gate_bind_on_t5(tmp_path):
+    """K4 local-levers Task 2: with tier_thresholds set, the run emits
+    int8_t{T} dec_mode rows, a cert_vs_measured.parquet, and the verdict
+    reports rel_degradation_int8_t5 as a gating field (blanket still
+    reported, not gating)."""
+    import pandas as pd
+
+    from experiments.k4_dec_quant import Config, main
+
+    fit, scored = tmp_path / "f.safetensors", tmp_path / "s.safetensors"
+    _tiny_cache(fit, seed=0)
+    _tiny_cache(scored, seed=1)
+    packs_path = tmp_path / "packs.safetensors"
+    _fit_tiny_pack_file(fit, packs_path, budgets=(2.5,), group=16)
+    run_dir = main(
+        Config(
+            pack_path=str(packs_path),
+            cache_paths=(str(scored),),
+            model_label="tiny",
+            budgets=(2.5,),
+            tier_thresholds=(4, 5, 6),
+            out_root=str(tmp_path / "results"),
+        )
+    )
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert set(df.dec_mode) == {"fp32", "fp16", "int8", "int8_t4", "int8_t5", "int8_t6"}
+
+    v = json.loads((run_dir / "dec_quant_verdict.json").read_text())
+    pb = v["per_budget"]["2.5"]
+    assert "rel_degradation_int8_t5" in pb
+    assert "rel_degradation_int8" in pb  # blanket still reported
+    assert "ordering_ok" in pb
+    assert "gate_pass" in v
+
+    cvm = pd.read_parquet(run_dir / "cert_vs_measured.parquet")
+    assert set(cvm.tier_threshold.unique()) == {4, 5, 6, 8}
+    for col in (
+        "model",
+        "cache",
+        "budget",
+        "layer",
+        "tier_threshold",
+        "implied_rel_degradation",
+        "measured_rel_deg",
+        "frac_int8",
+        "c_used",
+        "c_int8",
+    ):
+        assert col in cvm.columns
+
+
+def test_dec_quant_verdict_gate_binds_on_int8_t5_when_present():
+    """Synthetic frame: blanket int8 fails 5% but int8_t5 passes -> gate_pass
+    True (binding moves off the blanket mode). Then flip so t5 fails ->
+    gate_pass False, even though nothing else changed."""
+    import pandas as pd
+
+    from experiments.k4_dec_quant import Config, _dec_quant_verdict
+
+    def _frame(win_int8, win_int8_t5):
+        # tq curve: flat at distortion=1.0 across bpe 0..100 so tq_dist==1.0
+        # for every interpolation, making win == 1/dist directly controllable.
+        tq_rows = [
+            dict(
+                model="t",
+                cache="c",
+                layer=0,
+                kind="k_pre",
+                arm="turboquant_mse",
+                dec_mode="",
+                budget=float("nan"),
+                bpe_model=bpe,
+                bpe_skeptic_deploy=bpe,
+                rel_fro=0.0,
+                logit=1.0,
+                logit_rope=1.0,
+            )
+            for bpe in (0.0, 100.0)
+        ]
+        modes = {
+            "fp32": 1.0,
+            "fp16": 1.0,
+            "int8": 1.0 / win_int8,
+            "int8_t4": 1.0 / win_int8_t5 * 1.5,  # arbitrary, not gated
+            "int8_t5": 1.0 / win_int8_t5,
+            "int8_t6": 1.0 / win_int8_t5 * 0.9,  # arbitrary, not gated
+        }
+        rows = [
+            dict(
+                model="t",
+                cache="c",
+                layer=0,
+                kind="k_pre",
+                arm="spectral",
+                dec_mode=mode,
+                budget=2.5,
+                bpe_model=10.0,
+                bpe_skeptic_deploy=10.0,
+                rel_fro=0.0,
+                logit=dist,
+                logit_rope=dist,
+            )
+            for mode, dist in modes.items()
+        ]
+        return pd.DataFrame(rows), pd.DataFrame(tq_rows)
+
+    cfg = Config(
+        pack_path="unused",
+        cache_paths=("unused",),
+        budgets=(2.5,),
+        tier_thresholds=(4, 5, 6),
+    )
+
+    # blanket int8 fails (rel_degradation_int8 = 1 - 0.5/1.0 = 0.5 >> 5%);
+    # int8_t5 passes (rel_degradation = 1 - 0.99 = 0.01 < 5%).
+    df, tq_df = _frame(win_int8=0.5, win_int8_t5=0.99)
+    v = _dec_quant_verdict(df, tq_df, "logit", cfg)
+    pb = v["per_budget"]["2.5"]
+    assert pb["rel_degradation_int8"] > 0.05  # blanket would have failed
+    assert pb["rel_degradation_int8_t5"] < 0.05
+    assert v["gate_pass"] is True
+
+    # Now int8_t5 also fails -> gate_pass must flip False even if blanket
+    # (no longer binding) were to pass.
+    df2, tq_df2 = _frame(win_int8=0.99, win_int8_t5=0.5)
+    v2 = _dec_quant_verdict(df2, tq_df2, "logit", cfg)
+    pb2 = v2["per_budget"]["2.5"]
+    assert pb2["rel_degradation_int8"] < 0.05  # blanket passes here
+    assert pb2["rel_degradation_int8_t5"] > 0.05
+    assert v2["gate_pass"] is False
+
+
+def test_dec_quant_verdict_empty_tier_thresholds_preserves_blanket_gate():
+    """tier_thresholds=() (default): no int8_t{T} modes are present, and
+    gate_pass binds on the blanket rel_degradation_int8 exactly as before
+    Task 2 (today's behavior, unchanged)."""
+    import pandas as pd
+
+    from experiments.k4_dec_quant import Config, _dec_quant_verdict
+
+    tq_rows = [
+        dict(
+            model="t",
+            cache="c",
+            layer=0,
+            kind="k_pre",
+            arm="turboquant_mse",
+            dec_mode="",
+            budget=float("nan"),
+            bpe_model=bpe,
+            bpe_skeptic_deploy=bpe,
+            rel_fro=0.0,
+            logit=1.0,
+            logit_rope=1.0,
+        )
+        for bpe in (0.0, 100.0)
+    ]
+    modes = {"fp32": 1.0, "fp16": 1.0, "int8": 1.0 / 0.5}  # win_int8 = 0.5 -> fails
+    rows = [
+        dict(
+            model="t",
+            cache="c",
+            layer=0,
+            kind="k_pre",
+            arm="spectral",
+            dec_mode=mode,
+            budget=2.5,
+            bpe_model=10.0,
+            bpe_skeptic_deploy=10.0,
+            rel_fro=0.0,
+            logit=dist,
+            logit_rope=dist,
+        )
+        for mode, dist in modes.items()
+    ]
+    df = pd.DataFrame(rows)
+    tq_df = pd.DataFrame(tq_rows)
+    cfg = Config(
+        pack_path="unused", cache_paths=("unused",), budgets=(2.5,), tier_thresholds=()
+    )
+    v = _dec_quant_verdict(df, tq_df, "logit", cfg)
+    pb = v["per_budget"]["2.5"]
+    assert pb["rel_degradation_int8"] > 0.05
+    assert "rel_degradation_int8_t5" not in pb
+    assert v["gate_pass"] is False  # blanket still binds when no tier modes present
+
+
+def test_dec_quant_deploy_bpe_endpoints_match_old_skeptic_charge():
+    """mixed_dec_charge-computed bpe_skeptic_deploy for fp32/fp16/int8 modes
+    must equal bpe_model + skeptic_charge(..., dec_bits=16 or 8) exactly —
+    the old formula, on a small real fitted pack."""
+    from bmx.cache.spectral import mixed_dec_charge, skeptic_charge
+
+    C, S = 16, 200
+    scales = torch.linspace(0.2, 5.0, C, dtype=torch.float64)
+    Wh, Wh_inv = torch.diag(scales), torch.diag(1.0 / scales)
+    g = torch.Generator().manual_seed(0)
+    M = torch.randn(S, C, generator=g)
+
+    from bmx.cache.spectral import fit_spectral_pack
+
+    pack = fit_spectral_pack(M, Wh, Wh_inv, 2.5, tiers=(0, 2, 3, 4, 5, 6, 8), group=8)
+    deploy_s = 32768
+    c_used = pack.c_used
+    c_int8_blanket = int(((pack.bits > 0) & (pack.bits <= 8)).sum())
+    assert c_int8_blanket == c_used  # blanket covers every used column
+
+    old_fp16 = skeptic_charge(C, deploy_s, pack.tiers, c_used=c_used, dec_bits=16.0)
+    old_int8 = skeptic_charge(C, deploy_s, pack.tiers, c_used=c_used, dec_bits=8.0)
+
+    new_fp32 = mixed_dec_charge(C, deploy_s, pack.tiers, c_used=c_used, c_int8=0)
+    new_fp16 = mixed_dec_charge(C, deploy_s, pack.tiers, c_used=c_used, c_int8=0)
+    new_int8 = mixed_dec_charge(
+        C, deploy_s, pack.tiers, c_used=c_used, c_int8=c_int8_blanket
+    )
+
+    assert abs(new_fp32 - old_fp16) < 1e-12
+    assert abs(new_fp16 - old_fp16) < 1e-12
+    assert abs(new_int8 - old_int8) < 1e-12
+
+
+def test_dec_quant_measured_rel_deg_matches_hand_computed():
+    """Per-layer measured_rel_deg in cert_vs_measured must equal
+    1 - win_T(layer)/win_fp16(layer) hand-computed from the same rows the
+    gate uses (single-layer synthetic frame, exact arithmetic check)."""
+    import pandas as pd
+
+    from bmx.cache.spectral import fit_spectral_pack, identity_whitener
+    from experiments.k4_dec_quant import _cert_vs_measured_rows
+
+    # dist chosen so win_fp16 = 1/0.4 = 2.5, win_t5 = 1/0.5 = 2.0
+    # -> measured_rel_deg = 1 - 2.0/2.5 = 0.2 exactly.
+    modes = {"fp32": 0.4, "fp16": 0.4, "int8": 0.4, "int8_t5": 0.5}
+    rows = [
+        dict(
+            model="t",
+            cache="c",
+            layer=0,
+            kind="k_pre",
+            arm="spectral",
+            dec_mode=mode,
+            budget=2.5,
+            bpe_model=10.0,
+            bpe_skeptic_deploy=10.0,
+            rel_fro=0.0,
+            logit=dist,
+            logit_rope=dist,
+        )
+        for mode, dist in modes.items()
+    ]
+    df = pd.DataFrame(rows)
+
+    C = 16
+    Ih, Ih_inv = identity_whitener(C)
+    g = torch.Generator().manual_seed(0)
+    M = torch.randn(200, C, generator=g)
+    pack = fit_spectral_pack(M, Ih, Ih_inv, 2.5, tiers=(0, 2, 3, 4, 5, 6, 8), group=8)
+
+    tq_curves = {"c": {0: [(0.0, 1.0), (100.0, 1.0)]}}
+    cvm_rows = _cert_vs_measured_rows(
+        df=df,
+        tq_curves=tq_curves,
+        headline_col="logit",
+        budget=2.5,
+        packs_by_cache={"c": {0: pack}},
+        tier_thresholds_incl_blanket=(5,),
+    )
+    row = next(r for r in cvm_rows if r["tier_threshold"] == 5 and r["layer"] == 0)
+    assert abs(row["measured_rel_deg"] - 0.2) < 1e-9
+
+
+def test_dec_quant_ordering_ok():
+    """ordering_ok: True when measured rel_degradation is monotone
+    nondecreasing T4 <= T5 <= T6 <= blanket; False when violated."""
+    from experiments.k4_dec_quant import _ordering_ok
+
+    assert _ordering_ok(
+        {"int8_t4": 0.01, "int8_t5": 0.02, "int8_t6": 0.03, "int8": 0.16}
+    )
+    assert _ordering_ok({"int8_t4": 0.0, "int8_t5": 0.0, "int8_t6": 0.0, "int8": 0.0})
+    assert not _ordering_ok(
+        {"int8_t4": 0.05, "int8_t5": 0.02, "int8_t6": 0.03, "int8": 0.16}
+    )
+    assert not _ordering_ok(
+        {"int8_t4": 0.01, "int8_t5": 0.02, "int8_t6": 0.20, "int8": 0.16}
+    )
+    # missing modes (e.g. tier_thresholds empty) -> vacuously True
+    assert _ordering_ok({})
+
+
 def test_corpus_fit_bases_matches_direct_fit(tmp_path):
     from bmx.cache.spectral import fit_spectral_basis, identity_whitener
     from experiments._k4_common import corpus_fit_bases, load_layer_keys, setup_rope
