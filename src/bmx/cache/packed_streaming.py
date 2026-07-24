@@ -10,7 +10,9 @@ StreamingQuantizedCache is the correctness gate.
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
+import weakref
 
 import torch
 from transformers.cache_utils import Cache, DynamicLayer
@@ -25,6 +27,7 @@ from bmx.cache.triton_dequant_attention import (
     build_kv_stacked_packed,
     fused_decode_attention_k2b,
     fused_decode_attention_packed,
+    pack_codes,
 )
 from bmx.cache.collect import reshape_heads, to_matrix
 from bmx.cache.hf_compat import (
@@ -35,6 +38,13 @@ from bmx.cache.hf_compat import (
 )
 from bmx.cache.rope import rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
+from bmx.cache.spectral import (
+    SpectralPack,
+    int8_decoder_roundtrip,
+    load_packs,
+    spectral_quantize_packed,
+    tier_columns,
+)
 from bmx.cache.streaming import compute_flush_schedule
 from bmx.decomp.lrs import truncated_svd
 
@@ -300,12 +310,23 @@ class PackedStreamingLayer(DynamicLayer):
         recent_window: int = 32,
         pack_v: bool = True,
         pack_k: bool = True,
+        pack: SpectralPack | None = None,
     ):
         super().__init__()
         self.k_spec = k_spec
         self.v_spec = v_spec
         self.model_config = model_config
         self.recent_window = recent_window
+        # Corpus-fit spectral pack for this layer (k_spec.arm == "spectral" only);
+        # handed in once at cache-init time (loaded once at the cache level,
+        # mirrors StreamingQuantizedLayer._pack). _tier_cols is the sort-by-tier
+        # column permutation, precomputed ONCE here (CPU, before any device
+        # move) since spectral_quantize_packed would otherwise recompute it
+        # every flush call.
+        self._pack = pack
+        self._tier_cols: dict[int, torch.Tensor] | None = (
+            tier_columns(pack.bits) if pack is not None else None
+        )
         # W5-2: pack the k2b stacked V indices 4-codes/byte (uint8) instead of
         # int16. Flag-gated, default OFF everywhere -- flips only on GH200
         # oracle evidence (see triton_dequant_attention.build_kv_stacked_k2b /
@@ -382,6 +403,14 @@ class PackedStreamingLayer(DynamicLayer):
         # FlashInfer CSR + DeepSeek-V4 HCA=128 precedent). Must be a multiple of _g so
         # each page satisfies the codec's S % group == 0; default 128 (= 2*64).
         self._page = max(self._g, (128 // self._g) * self._g) if self._g > 1 else 128
+        # PAGE alignment for spectral is against the PACK's sidecar group (what
+        # spectral_quantize_packed asserts along S), NOT spec.group — the pack
+        # file's group can differ from k_spec.group (which is otherwise inert
+        # for spectral; the pack carries its own fitted group).
+        if pack is not None:
+            assert self._page % pack.group == 0, (
+                f"PAGE={self._page} not a multiple of pack.group={pack.group}"
+            )
 
     def stash_pre_rope(self, out: torch.Tensor) -> None:
         """Called by the cache's QK-capture hook: append captured pre-RoPE keys.
@@ -413,17 +442,35 @@ class PackedStreamingLayer(DynamicLayer):
         k_block_pre: torch.Tensor,
         block_start: int,
         block_end: int,
-    ) -> dict:
+    ) -> tuple[dict, float]:
         """Quantize a pre-RoPE K block to packed form.
 
         k_block_pre: (h_kv, block_len, d) fp32.
         Mirrors the frozen-subspace logic in StreamingQuantizedLayer exactly.
-        Returns a packed dict; RoPE is applied at READ (chunked_dequant_attention).
+        Returns (packed dict, codec bpe); RoPE is applied at READ
+        (chunked_dequant_attention).
         """
         M = to_matrix(k_block_pre)  # (block_len, h_kv*d)
         spec = self.k_spec
 
-        if spec.arm == "lowrank_rtn_channel":
+        if spec.arm == "spectral":
+            # Corpus-fit spectral basis (frozen pack, loaded once at cache
+            # init): no per-block fitting, unlike lowrank_rtn_channel below.
+            if self._pack.enc.device != M.device:  # one-time device placement
+                self._pack = dataclasses.replace(
+                    self._pack,
+                    enc=self._pack.enc.to(M.device),
+                    dec=self._pack.dec.to(M.device),
+                    lam=self._pack.lam.to(M.device),
+                    bits=self._pack.bits.to(M.device),
+                )
+                self._tier_cols = {
+                    b: c.to(M.device) for b, c in self._tier_cols.items()
+                }
+            packed, bpe = spectral_quantize_packed(
+                M, self._pack, mse_scale=True, cols_by_tier=self._tier_cols
+            )
+        elif spec.arm == "lowrank_rtn_channel":
             if self._frozen_svd is None:
                 # First flush: fit the SVD and freeze V (mirrors streaming.py).
                 Us, V = truncated_svd(M, spec.rank)
@@ -432,7 +479,7 @@ class PackedStreamingLayer(DynamicLayer):
                 # Later flushes: project onto frozen subspace.
                 _, V_frozen = self._frozen_svd
                 Us = M @ V_frozen  # (block_len, rank)
-            packed, _ = quantize_packed(
+            packed, bpe = quantize_packed(
                 spec.arm,
                 M,
                 bits=spec.bits,
@@ -442,7 +489,7 @@ class PackedStreamingLayer(DynamicLayer):
                 seed=spec.seed,
             )
         else:
-            packed, _ = quantize_packed(
+            packed, bpe = quantize_packed(
                 spec.arm,
                 M,
                 bits=spec.bits,
@@ -453,19 +500,28 @@ class PackedStreamingLayer(DynamicLayer):
 
         # Extend RoPE table to cover this block (needed later in attend()).
         self._extend_rope(block_end, k_block_pre.device)
-        return packed
+        return packed, bpe
 
-    def _pack_v_block(self, v_block: torch.Tensor) -> dict:
+    def _pack_v_block(self, v_block: torch.Tensor) -> tuple[dict, float]:
         """Quantize a V block to packed form.
 
-        v_block: (h_kv, block_len, d) fp32.
+        v_block: (h_kv, block_len, d) fp32. Returns (packed dict, codec bpe).
+
+        Container packing, scoped to the spectral K path only (every other
+        arm pairing keeps its byte-identical block dicts): when K is spectral
+        and V is a turboquant-family arm whose bit width sub-byte-packs
+        (8 % bits == 0 and bits < 8), the int16 "indices" entry is replaced
+        with a uint8 "indices_packed" (pack_codes, established W5-2 replace-
+        key idiom — consumers transiently unpack, never store back) and
+        "norms" is stored fp16 (exact — already fp16-roundtripped at quantize
+        time).
         """
         M = to_matrix(v_block)  # (block_len, h_kv*d)
         spec = self.v_spec
         # h_heads is inert for every arm except turboquant_mse_perhead (which uses it
         # for the block-diagonal d_head rotation), so pass it unconditionally rather
         # than sniffing the arm name here.
-        packed, _ = quantize_packed(
+        packed, bpe = quantize_packed(
             spec.arm,
             M,
             bits=spec.bits,
@@ -474,7 +530,15 @@ class PackedStreamingLayer(DynamicLayer):
             seed=spec.seed,
             h_heads=self._h_kv,
         )
-        return packed
+        if (
+            self.k_spec.arm == "spectral"
+            and "indices" in packed
+            and 8 % spec.bits == 0
+            and spec.bits < 8
+        ):
+            packed["indices_packed"] = pack_codes(packed.pop("indices"), spec.bits)
+            packed["norms"] = packed["norms"].half()
+        return packed, bpe
 
     def update(
         self,
@@ -524,7 +588,7 @@ class PackedStreamingLayer(DynamicLayer):
                     local_start = block_start - self._k_pre_offset
                     local_end = block_end - self._k_pre_offset
                     k_block_pre = self._k_pre[:, local_start:local_end, :].float()
-                    kpacked = self._pack_k_block(k_block_pre, block_start, block_end)
+                    kpacked, _ = self._pack_k_block(k_block_pre, block_start, block_end)
                 else:
                     # Post-RoPE: page is pristine fp16 in the slab until now.
                     k_block_fp32 = keys.squeeze(0)[
@@ -544,7 +608,7 @@ class PackedStreamingLayer(DynamicLayer):
                 v_block_fp32 = values.squeeze(0)[
                     ..., slab_off : slab_off + block_len, :
                 ].float()
-                vpacked = self._pack_v_block(v_block_fp32)
+                vpacked, _ = self._pack_v_block(v_block_fp32)
 
                 self._k_blocks.append((kpacked, block_start, block_end))
                 self._v_blocks.append((vpacked, block_start, block_end))
@@ -933,16 +997,67 @@ class PackedStreamingCache(Cache):
         pack_v: bool = True,
         pack_k: bool = True,
     ):
-        super().__init__(
-            layer_class_to_replicate=lambda: PackedStreamingLayer(
+        # Spectral K arm: pre-RoPE only, and the corpus pack file is loaded ONCE
+        # here (never per-layer, never per-call) then handed out by layer_idx —
+        # mirrors StreamingQuantizedCache.__init__ exactly. The guard MOVES here
+        # (init-time asserts), not deleted: quantize_packed's own NotImplementedError
+        # (codecs.py) still guards any other pack-gated/misrouted arm that reaches it.
+        assert k_spec.dec_quant in ("fp32", "int8"), (
+            f"dec_quant must be 'fp32' or 'int8'; got {k_spec.dec_quant!r}"
+        )
+        self._packs: dict[int, SpectralPack] = {}
+        if k_spec.arm == "spectral":
+            assert k_spec.pre_rope, (
+                "spectral quantizes pre-RoPE keys; set pre_rope=True"
+            )
+            assert k_spec.pack_path, "spectral requires pack_path"
+            self._packs = load_packs(k_spec.pack_path, k_spec.budget)
+            if k_spec.dec_quant == "int8":
+                # Lever 2 (gated on a later VM quality measurement): roundtrip
+                # each layer pack's decoder through int8 ONCE, here, at init --
+                # never refit, never re-applied per call. dataclasses.replace
+                # keeps every other pack field (enc, lam, bits, tiers, ...)
+                # untouched; only dec's stored precision changes. Mirrors
+                # StreamingQuantizedCache.__init__ so packed and streaming
+                # caches load bit-identical packs under the same spec.
+                self._packs = {
+                    i: dataclasses.replace(
+                        pack, dec=int8_decoder_roundtrip(pack.dec, pack.bits)
+                    )
+                    for i, pack in self._packs.items()
+                }
+
+        # layer_class_to_replicate lazily appends one layer per new layer_idx, always
+        # in order (transformers' Cache.update appends up to layer_idx while
+        # len(self.layers) <= layer_idx) -- so len(self.layers) at call time IS the
+        # new layer's index. Used to hand each layer its own pack. This closure only
+        # ever EXECUTES from inside a later update() call (never during __init__
+        # itself) OR from attach()'s pre-size loop below, by which point
+        # self.k_spec/_pack_for_layer are fully set up below. Stored as
+        # self._make_layer so attach() reuses the exact same construction path
+        # instead of re-spelling the constructor call.
+        # weakref, not self: this closure is stored on self, so a strong capture
+        # is a self->closure->self cycle — the cache (holding packed codes + the
+        # frozen subspace) then survives until a gen-2 gc pass instead of dying by
+        # refcount; cycle-trapped caches accumulated to an 88 GiB CUDA OOM across
+        # 31.5k-token LongBench shards (streaming.py precedent, commit 562d696).
+        # The proxy is only dereferenced while the cache is alive (update()/
+        # attach() call through self).
+        wself = weakref.proxy(self)
+
+        def _make_layer():
+            return PackedStreamingLayer(
                 k_spec,
                 v_spec,
                 model_config,
                 recent_window,
                 pack_v=pack_v,
                 pack_k=pack_k,
+                pack=wself._pack_for_layer(len(wself.layers)),
             )
-        )
+
+        self._make_layer = _make_layer
+        super().__init__(layer_class_to_replicate=_make_layer)
         self.model_config = model_config
         self.k_spec = k_spec
         self.v_spec = v_spec
@@ -954,6 +1069,13 @@ class PackedStreamingCache(Cache):
         self._handles: list = []
         self._saved_impl: str | None = None
         self._model = None
+
+    def _pack_for_layer(self, i: int) -> "SpectralPack | None":
+        """Look up layer i's spectral pack, asserting it's present when spectral."""
+        if self.k_spec.arm != "spectral":
+            return None
+        assert i in self._packs, f"spectral pack file missing layer {i}"
+        return self._packs[i]
 
     def attach(self, model) -> "PackedStreamingCache":
         """Register the chunked-dequant attention fn and pre-RoPE capture hooks.
@@ -969,18 +1091,12 @@ class PackedStreamingCache(Cache):
         model.config._attn_implementation = _ATTN_NAME
 
         # Pre-size layers so hooks can find self.layers[i] before the first update.
+        # Reuses the same _make_layer closure __init__ hands to
+        # layer_class_to_replicate, so there is one construction path, not two
+        # (matching StreamingQuantizedCache.attach()).
         n_layers = model_config_n_layers(model)
         while len(self.layers) < n_layers:
-            self.layers.append(
-                PackedStreamingLayer(
-                    self.k_spec,
-                    self.v_spec,
-                    self.model_config,
-                    self.recent_window,
-                    pack_v=self.pack_v,
-                    pack_k=self.pack_k,
-                )
-            )
+            self.layers.append(self._make_layer())
 
         for i, mlayer in enumerate(resolve_decoder_layers(model)):
             # Back-reference so chunked_attention_forward can find this layer's state.
