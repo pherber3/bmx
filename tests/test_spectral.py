@@ -705,3 +705,103 @@ def test_int8_certificate_tiered_endpoints_and_charge():
     assert abs(mc_all - sc_int8) < 1e-15
     assert effective_dec_bits(C, cu, 0) == 16.0
     assert abs(effective_dec_bits(C, cu, cu) - (8.0 + 16.0 / C)) < 1e-12
+
+
+def test_roundtrip_tier_threshold_blanket_equiv():
+    """K4 local-levers Task 1: tier_threshold=None (default) and tier_threshold
+    == max used tier (blanket, here 8, the top of the standard 7-tier grid)
+    must both reproduce today's un-gated int8_decoder_roundtrip bit-for-bit."""
+    from bmx.cache.spectral import int8_decoder_roundtrip
+
+    torch.manual_seed(0)
+    dec = torch.randn(32, 32)
+    bits = torch.tensor([2, 3, 4, 5, 6, 8] * 5 + [0, 0])
+    blanket = int8_decoder_roundtrip(dec, bits)
+    default_none = int8_decoder_roundtrip(dec, bits, tier_threshold=None)
+    thr_8 = int8_decoder_roundtrip(dec, bits, tier_threshold=8)
+    assert torch.equal(blanket, default_none)
+    assert torch.equal(blanket, thr_8)
+
+
+def test_roundtrip_tier_gated_masks_columns():
+    """Columns with bits > T stay fp32-as-loaded (untouched); columns with
+    0 < bits <= T match the blanket roundtrip exactly for those columns;
+    zero-bit columns are always untouched."""
+    from bmx.cache.spectral import int8_decoder_roundtrip
+
+    torch.manual_seed(1)
+    dec = torch.randn(16, 16)
+    bits = torch.tensor([2, 3, 4, 5, 6, 8, 0, 0, 2, 3, 4, 5, 6, 8, 0, 0])
+    T = 5
+    gated = int8_decoder_roundtrip(dec, bits, tier_threshold=T)
+    blanket = int8_decoder_roundtrip(dec, bits)
+
+    above_t = (bits > T) & (bits != 0)
+    at_or_below_t = (bits != 0) & (bits <= T)
+    zero_bit = bits == 0
+
+    assert torch.equal(gated[:, above_t], dec[:, above_t])  # untouched (fp32-as-loaded)
+    assert torch.equal(gated[:, at_or_below_t], blanket[:, at_or_below_t])
+    assert torch.equal(gated[:, zero_bit], dec[:, zero_bit])
+
+
+def test_dec_quant_threshold_parse():
+    """dec_quant_threshold: 'fp32'->None, 'int8'->8, 'int8_t{T}'->T (2<=T<=8);
+    anything else (including out-of-range T) asserts."""
+    from bmx.cache.spectral import dec_quant_threshold
+
+    assert dec_quant_threshold("fp32") is None
+    assert dec_quant_threshold("int8") == 8
+    assert dec_quant_threshold("int8_t5") == 5
+    assert dec_quant_threshold("int8_t2") == 2
+    assert dec_quant_threshold("int8_t8") == 8
+
+    with pytest.raises(AssertionError):
+        dec_quant_threshold("int8_t1")
+    with pytest.raises(AssertionError):
+        dec_quant_threshold("int9")
+    with pytest.raises(AssertionError):
+        dec_quant_threshold("bf16")
+
+
+def test_load_packs_for_spec_tier_gated(tmp_path):
+    """A tier-gated dec_quant ('int8_t{T}') spec: columns with bits > T stay
+    bit-identical to the file; columns with 0 < bits <= T are roundtripped
+    (matching int8_decoder_roundtrip with tier_threshold=T applied by hand)."""
+    from bmx.cache.spectral import (
+        fit_spectral_basis,
+        identity_whitener,
+        int8_decoder_roundtrip,
+        load_packs,
+        save_pack_file,
+    )
+    from bmx.cache.specs import CacheCodecSpec
+    from bmx.cache.spectral import load_packs_for_spec
+
+    C = 32
+    Wh, Wh_inv = identity_whitener(C)
+    M, _ = _spiked_keys(S=256, C=C, seed=0)
+    bases = {0: fit_spectral_basis(M, Wh, Wh_inv)}
+    path = tmp_path / "packs.safetensors"
+    save_pack_file(path, bases, budgets=(2.5,), group=16, meta={"model": "tiny"})
+
+    via_direct = load_packs(path, 2.5)
+    pack = via_direct[0]
+    used_tiers = sorted(set(int(b) for b in pack.bits.tolist() if b != 0))
+    assert len(used_tiers) >= 2, "fixture must span more than one used tier"
+    T = used_tiers[0]  # a real, low threshold so both sides of the gate exercise
+
+    tiered_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        pack_path=str(path),
+        budget=2.5,
+        dec_quant=f"int8_t{T}",
+    )
+    via_tiered = load_packs_for_spec(tiered_spec)
+    expected_dec = int8_decoder_roundtrip(pack.dec, pack.bits, tier_threshold=T)
+    assert torch.equal(via_tiered[0].dec, expected_dec)
+
+    above_t = (pack.bits > T) & (pack.bits != 0)
+    assert above_t.any(), "fixture must have columns above the threshold"
+    assert torch.equal(via_tiered[0].dec[:, above_t], pack.dec[:, above_t])

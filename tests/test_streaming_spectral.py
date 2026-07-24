@@ -320,3 +320,92 @@ def test_streaming_dec8_charges_int8_and_degrades_gracefully(tmp_path):
         C, S, t, c_used=mc, dec_bits=8.0
     )
     assert abs((bpe_fp32 - bpe_int8) - expected_delta) < 1e-9
+
+
+def test_streaming_bpe_refactor_bitexact(tmp_path):
+    """K4 local-levers Task 1 pin: after the mixed_dec_charge refactor,
+    bits_per_entry() for both the fp32 and blanket-int8 arms must equal the
+    OLD skeptic_charge(dec_bits=...) formula computed by hand -- zero numeric
+    change at the streaming accounting level, not just at the endpoint-unit
+    level (test_mixed_dec_charge_endpoints_match_skeptic_charge covers only
+    the standalone function equality)."""
+    from bmx.cache.spectral import skeptic_charge
+
+    path = str(tmp_path / "packs.safetensors")
+    model = tiny_llama()
+    _fit_tiny_packs(model, path)
+    caches = {}
+    for dq in ("fp32", "int8"):
+        k_spec = CacheCodecSpec(
+            arm="spectral",
+            pre_rope=True,
+            group=8,
+            pack_path=path,
+            budget=2.5,
+            dec_quant=dq,
+        )
+        cache = StreamingQuantizedCache(
+            model.config,
+            k_spec=k_spec,
+            v_spec=CacheCodecSpec(arm="fp16"),
+            recent_window=8,
+        )
+        cache.attach(model)
+        with cache:
+            with torch.no_grad():
+                model(ids(seq=150), past_key_values=cache, use_cache=True)
+        caches[dq] = cache
+
+    for dq, old_dec_bits in (("fp32", 16.0), ("int8", 8.0)):
+        cache = caches[dq]
+        bpe_k, _ = cache.bits_per_entry()
+        per_layer = [layer.bpe_k for layer in cache.layers]
+        S = cache.layers[-1].get_seq_length()
+        C = cache.layers[-1]._h_kv * cache.layers[-1]._d_head
+        mean_c_used = sum(ly._pack.c_used for ly in cache.layers) / len(cache.layers)
+        expected_old = sum(per_layer) / len(per_layer) + skeptic_charge(
+            C,
+            S,
+            cache.layers[-1]._pack.tiers,
+            c_used=mean_c_used,
+            dec_bits=old_dec_bits,
+        )
+        assert abs(bpe_k - expected_old) < 1e-9, dq
+
+
+def test_streaming_bpe_int8_t5(tmp_path):
+    """Tier-gated dec_quant='int8_t5': bpe_k's pack charge equals a hand-computed
+    mixed_dec_charge with per-layer gate counts (c_int8 = count(0 < bits <= 5))
+    averaged the same way mean_c_used is averaged."""
+    from bmx.cache.spectral import mixed_dec_charge
+
+    path = str(tmp_path / "packs.safetensors")
+    model = tiny_llama()
+    _fit_tiny_packs(model, path, budget=2.5, group=8)
+    k_spec = CacheCodecSpec(
+        arm="spectral",
+        pre_rope=True,
+        group=8,
+        pack_path=path,
+        budget=2.5,
+        dec_quant="int8_t5",
+    )
+    cache = StreamingQuantizedCache(
+        model.config, k_spec=k_spec, v_spec=CacheCodecSpec(arm="fp16"), recent_window=8
+    )
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(ids(seq=150), past_key_values=cache, use_cache=True)
+    bpe_k, _ = cache.bits_per_entry()
+    per_layer = [layer.bpe_k for layer in cache.layers]
+    S = cache.layers[-1].get_seq_length()
+    C = cache.layers[-1]._h_kv * cache.layers[-1]._d_head
+    mean_c_used = sum(ly._pack.c_used for ly in cache.layers) / len(cache.layers)
+    mean_c_int8 = sum(
+        int(((ly._pack.bits > 0) & (ly._pack.bits <= 5)).sum()) for ly in cache.layers
+    ) / len(cache.layers)
+    expected = sum(per_layer) / len(per_layer) + mixed_dec_charge(
+        C, S, cache.layers[-1]._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
+    )
+    assert abs(bpe_k - expected) < 1e-9

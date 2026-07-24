@@ -112,3 +112,20 @@ def test_k4_recipe_spec_pair():
     assert v.arm == "turboquant_mse" and v.bits == 2
     with pytest.raises(ValueError, match="pack"):
         spec_pair("k4_b2.5")
+
+
+def test_recipe_dec8t_suffix():
+    """K4 local-levers Task 1: '_dec8t{T}' parses to dec_quant='int8_t{T}',
+    parsed BEFORE the plain '_dec8' suffix (longer suffix first) so
+    'k4_b2.5_dec8t5' does not get mis-parsed as budget '2.5_dec8t5'."""
+    k, v = spec_pair("k4_b2.5_dec8t5", pack_path="/p/packs.safetensors")
+    assert k.arm == "spectral" and k.budget == 2.5 and k.dec_quant == "int8_t5"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    # Plain '_dec8' (blanket) still parses to "int8" (unchanged).
+    k2, _ = spec_pair("k4_b2.5_dec8", pack_path="/p/packs.safetensors")
+    assert k2.dec_quant == "int8"
+
+    # Other T values.
+    k3, _ = spec_pair("k4_b2.2_dec8t4", pack_path="/p/packs.safetensors")
+    assert k3.budget == 2.2 and k3.dec_quant == "int8_t4"

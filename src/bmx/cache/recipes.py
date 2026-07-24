@@ -87,9 +87,11 @@ def spec_pair(
         )
     if arm.startswith("k4_b"):
         # k4_b{budget}: corpus-fitted spectral K via packs + proven turboquant V@2b.
-        # Requires --pack-path (a fitted spectral pack file). Optional "_dec8"
-        # suffix (e.g. "k4_b2.5_dec8") selects the int8-decoder Lever-2 variant
-        # (same spec, dec_quant="int8"); parsed BEFORE the float since the
+        # Requires --pack-path (a fitted spectral pack file). Optional "_dec8t{T}"
+        # or "_dec8" suffix (e.g. "k4_b2.5_dec8t5" / "k4_b2.5_dec8") selects the
+        # int8-decoder Lever-2 variant (same spec, dec_quant="int8_t{T}" tier-gated
+        # or dec_quant="int8" blanket); the longer "_dec8t{T}" suffix is checked
+        # FIRST (it's a superstring-prefix of "_dec8"), then the float, since the
         # budget itself may contain no further "_" delimiters.
         if not pack_path:
             raise ValueError(
@@ -97,7 +99,10 @@ def spec_pair(
             )
         budget_str = arm[len("k4_b") :]
         dec_quant = "fp32"
-        if budget_str.endswith("_dec8"):
+        if "_dec8t" in budget_str:
+            budget_str, _, t_str = budget_str.partition("_dec8t")
+            dec_quant = f"int8_t{t_str}"
+        elif budget_str.endswith("_dec8"):
             dec_quant = "int8"
             budget_str = budget_str[: -len("_dec8")]
         budget = float(budget_str)

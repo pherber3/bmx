@@ -27,7 +27,12 @@ expression documented beside it):
 - skeptic-v2-int8 (used-columns, int8 decoder): `8·c_used/S +
   16·c_used/(S·C) + tier_bits(tiers, S)`. Same used-columns charge but the
   decoder itself is stored int8 (8 bits/entry) plus one fp16 per-column
-  scale amortized over S rows (16·c_used/(S·C)).
+  scale amortized over S rows (16·c_used/(S·C)). Generalized by
+  `mixed_dec_charge` (K4 local-levers Task 1): `c_int8` of the `c_used`
+  columns int8-stored, the rest fp16 — reduces to skeptic-v2 at `c_int8=0`
+  and to skeptic-v2-int8 (blanket) at `c_int8=c_used`; the tier-gated case
+  (`0 < c_int8 < c_used`, driven by `dec_quant="int8_t{T}"` via
+  `dec_quant_threshold`) is the interior of that range.
 - payload-v1: `mean(bits) + scale_bits(group)`. Charges the groupwise fp16
   scale for every one of the C directions, including zero-bit (dropped)
   ones that store no payload and so need no scale.
@@ -491,7 +496,9 @@ def skeptic_charge(
     return dec_bits * c_used / S + int8_scale_term + tier_bits(tiers, S)
 
 
-def int8_decoder_roundtrip(dec: torch.Tensor, bits_pc: torch.Tensor) -> torch.Tensor:
+def int8_decoder_roundtrip(
+    dec: torch.Tensor, bits_pc: torch.Tensor, *, tier_threshold: int | None = None
+) -> torch.Tensor:
     """Simulate int8 storage of a decoder matrix's USED columns (Lever 2).
 
     Per-column symmetric absmax int8: scale = absmax/127, cast to fp16 (the
@@ -501,13 +508,24 @@ def int8_decoder_roundtrip(dec: torch.Tensor, bits_pc: torch.Tensor) -> torch.Te
     test_dropped_decoder_columns_never_read) are returned untouched.
     Deterministic; fp32 in, fp32 out. Refits nothing -- this operates on an
     already-fitted pack's dec tensor.
+
+    `tier_threshold` (K4 local-levers Task 1, the tier-gated int8 promotion):
+    None (default) gates only on bits_pc != 0 -- today's blanket behavior,
+    reproduced bit-exactly. When given, only columns with
+    `0 < bits_pc <= tier_threshold` are roundtripped; used columns above the
+    threshold are left fp32-as-loaded (they ship fp16 in the mixed accounting
+    -- see mixed_dec_charge). The standard tier grid tops out at 8, so
+    `tier_threshold=8` reproduces the blanket roundtrip exactly (every used
+    column is <= 8).
     """
-    used = bits_pc != 0
+    gate = bits_pc != 0
+    if tier_threshold is not None:
+        gate = gate & (bits_pc <= tier_threshold)
     dec_rt = dec.clone()
-    dec_used = dec[:, used]
-    scale = (dec_used.abs().amax(dim=0) / 127.0).clamp_min(1e-12).half().float()
-    codes = (dec_used / scale).round().clamp(-127, 127)
-    dec_rt[:, used] = codes * scale
+    dec_gated = dec[:, gate]
+    scale = (dec_gated.abs().amax(dim=0) / 127.0).clamp_min(1e-12).half().float()
+    codes = (dec_gated / scale).round().clamp(-127, 127)
+    dec_rt[:, gate] = codes * scale
     return dec_rt
 
 
@@ -567,13 +585,15 @@ def int8_decoder_certificate_tiered(pack: SpectralPack, tier_threshold: int) -> 
     columns (`0 < bits_i <= tier_threshold`) are int8-stored and the rest
     stay fp16.
 
-    Pure post-processing of the existing `ddec = dec_int8 - dec`: columns
-    with `bits_i > tier_threshold` are zeroed in `ddec` BEFORE the same
-    `enc^T ddec` projection the blanket certificate uses (those columns stay
-    fp16 -> zero added error; no codec change, no new roundtrip). `added`,
-    `payload`, `noise_to_signal`, `implied_rel_degradation` are exactly
-    `int8_decoder_certificate`'s expressions restricted to the gated ddec —
-    at `tier_threshold >= max(pack.bits)` this reproduces the blanket
+    Re-expressed through `int8_decoder_roundtrip(..., tier_threshold=)`
+    (K4 local-levers Task 1): columns with `bits_i > tier_threshold` are left
+    fp32-as-loaded by the gated roundtrip itself, so `ddec` is zero there
+    without any manual post-processing — same numbers as the prior
+    zero-after-the-fact formulation (columns above T contribute nothing to
+    `enc^T ddec` either way). `added`, `payload`, `noise_to_signal`,
+    `implied_rel_degradation` are exactly `int8_decoder_certificate`'s
+    expressions restricted to the gated ddec — at
+    `tier_threshold >= max(pack.bits)` this reproduces the blanket
     certificate bit-for-bit (nothing gets zeroed); at
     `tier_threshold < min(used tier)` `added == 0.0` exactly (everything
     gets zeroed).
@@ -587,8 +607,10 @@ def int8_decoder_certificate_tiered(pack: SpectralPack, tier_threshold: int) -> 
     c_used = int(used.sum())
     c_int8 = int(gate.sum())
 
-    ddec_full = int8_decoder_roundtrip(pack.dec, pack.bits).double() - pack.dec.double()
-    ddec = ddec_full * gate.to(ddec_full.dtype)  # zero columns above threshold
+    dec_gated = int8_decoder_roundtrip(
+        pack.dec, pack.bits, tier_threshold=tier_threshold
+    )
+    ddec = dec_gated.double() - pack.dec.double()
 
     return dict(
         tier_threshold=int(tier_threshold),
@@ -600,7 +622,7 @@ def int8_decoder_certificate_tiered(pack: SpectralPack, tier_threshold: int) -> 
 
 
 def mixed_dec_charge(
-    C: int, S: int, tiers: tuple[int, ...], *, c_used: int, c_int8: int
+    C: int, S: int, tiers: tuple[int, ...], *, c_used: float, c_int8: float
 ) -> float:
     """Per-sequence decoder+tier-map charge (skeptic-v2 arithmetic) when only
     `c_int8` of the `c_used` used columns are int8-stored and the remaining
@@ -615,6 +637,12 @@ def mixed_dec_charge(
     Reduces to `skeptic_charge(dec_bits=16.0)` at `c_int8=0` and to
     `skeptic_charge(dec_bits=8.0)` at `c_int8=c_used`
     (checked by `test_mixed_dec_charge_endpoints_match_skeptic_charge`).
+
+    `c_used`/`c_int8` accept float (K4 local-levers Task 1): the streaming
+    call site passes across-layer MEANS of per-layer integer counts, and the
+    expression is linear in both, so the mean-of-charges equals the
+    charge-of-means exactly -- the same license `cache_bits_per_entry`
+    already relies on for `mean_c_used`.
     """
     assert 0 <= c_int8 <= c_used <= C, (
         f"need 0<=c_int8<=c_used<=C; got {c_int8},{c_used},{C}"
@@ -724,6 +752,39 @@ def load_packs(path: str | Path, budget: float) -> dict[int, SpectralPack]:
     return packs
 
 
+def dec_quant_threshold(dec_quant: str) -> int | None:
+    """Parse a `CacheCodecSpec.dec_quant` string to the tier threshold
+    `int8_decoder_roundtrip` expects (K4 local-levers Task 1 -- the one
+    parameter the whole dec_quant surface collapses to):
+
+        "fp32"      -> None   (no int8 storage; fp32-as-loaded/fp16-shipped)
+        "int8"      -> 8      (blanket -- every used column is <= 8, the top
+                                of the standard tier grid, so this reproduces
+                                today's blanket roundtrip exactly)
+        "int8_t{T}" -> T       (2 <= T <= 8; tier-gated -- only columns with
+                                0 < bits <= T are int8-stored)
+
+    Anything else asserts with a clear message.
+    """
+    if dec_quant == "fp32":
+        return None
+    if dec_quant == "int8":
+        return 8
+    if dec_quant.startswith("int8_t"):
+        t_str = dec_quant[len("int8_t") :]
+        assert t_str.isdigit(), (
+            f"dec_quant int8_t suffix must be an integer; got {dec_quant!r}"
+        )
+        t = int(t_str)
+        assert 2 <= t <= 8, (
+            f"dec_quant int8_t threshold must be in [2, 8]; got {t} from {dec_quant!r}"
+        )
+        return t
+    raise AssertionError(
+        f"dec_quant must be 'fp32', 'int8', or 'int8_t{{T}}' (2<=T<=8); got {dec_quant!r}"
+    )
+
+
 def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
     """Materialize the per-layer pack dict a KV cache should hold for `k_spec`.
 
@@ -734,28 +795,30 @@ def load_packs_for_spec(k_spec) -> dict[int, SpectralPack]:
 
     Non-spectral arms (arm != "spectral") return {} — nothing to load.
     Spectral arms load the fitted pack file (asserting pre_rope + pack_path
-    are set) and, when k_spec.dec_quant == "int8", roundtrip every layer's
-    decoder matrix through int8 ONCE here (Lever 2 — see
-    int8_decoder_roundtrip) via dataclasses.replace, which keeps every other
-    pack field (enc, lam, bits, tiers, ...) untouched.
+    are set) and, when `dec_quant_threshold(k_spec.dec_quant)` is not None,
+    roundtrip every layer's decoder matrix through the gated int8 roundtrip
+    ONCE here (Lever 2 — see int8_decoder_roundtrip) via dataclasses.replace,
+    which keeps every other pack field (enc, lam, bits, tiers, ...)
+    untouched. `dec_quant="int8"` parses to threshold 8 (blanket -- the same
+    result as before this generalization, pinned by
+    test_load_packs_for_spec_matches_load_packs_and_owns_dec_quant).
 
     k_spec: a CacheCodecSpec (arm, pre_rope, pack_path, budget, dec_quant).
     """
-    assert k_spec.dec_quant in ("fp32", "int8"), (
-        f"dec_quant must be 'fp32' or 'int8'; got {k_spec.dec_quant!r}"
-    )
+    thr = dec_quant_threshold(k_spec.dec_quant)
     if k_spec.arm != "spectral":
         return {}
     assert k_spec.pre_rope, "spectral quantizes pre-RoPE keys; set pre_rope=True"
     assert k_spec.pack_path, "spectral requires pack_path"
     packs = load_packs(k_spec.pack_path, k_spec.budget)
-    if k_spec.dec_quant == "int8":
+    if thr is not None:
         # Lever 2 (gated on a later VM quality measurement): roundtrip each
-        # layer pack's decoder through int8 ONCE, here, at init -- never
-        # refit, never re-applied per call.
+        # layer pack's decoder through the gated int8 roundtrip ONCE, here,
+        # at init -- never refit, never re-applied per call.
         packs = {
             i: dataclasses.replace(
-                pack, dec=int8_decoder_roundtrip(pack.dec, pack.bits)
+                pack,
+                dec=int8_decoder_roundtrip(pack.dec, pack.bits, tier_threshold=thr),
             )
             for i, pack in packs.items()
         }

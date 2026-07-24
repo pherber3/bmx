@@ -35,15 +35,24 @@ class CacheCodecSpec:
         Quantization budget in bits (for ``"spectral"`` arm); 0.0 for packless
         arms (default-inert).
     dec_quant : str
-        Decoder storage precision for the ``"spectral"`` arm (Lever 2).
-        ``"fp32"`` (default) is inert -- today's byte-identical compute path.
-        ``"int8"`` roundtrips the loaded pack's decoder matrix once at cache
-        init (see ``spectral.int8_decoder_roundtrip``) and charges
-        ``dec_bits=8`` instead of 16 in the skeptic accounting. Ignored by
-        every other arm. A third mode, fp16 (``dec.half().float()``), exists
-        only as a measurement arm in ``experiments/k4_dec_quant.py`` (the
-        shippability check for what skeptic-v1 charges) and is deliberately
-        not a streaming ``dec_quant`` value here.
+        Decoder storage precision for the ``"spectral"`` arm (Lever 2; K4
+        local-levers Task 1 collapses this to one tier threshold parsed by
+        ``spectral.dec_quant_threshold``). Three forms:
+        ``"fp32"`` (default) is inert -- today's byte-identical compute path;
+        threshold None, no int8 storage.
+        ``"int8"`` roundtrips EVERY used decoder column through int8 once at
+        cache init (see ``spectral.int8_decoder_roundtrip``); threshold 8 (the
+        top of the standard tier grid, so this is the blanket case) and
+        charges the mixed-decoder accounting (``spectral.mixed_dec_charge``)
+        at ``c_int8 = c_used``.
+        ``"int8_t{T}"`` (e.g. ``"int8_t5"``, 2 <= T <= 8) tier-gates: only
+        columns whose allocated bits satisfy ``0 < bits <= T`` are
+        int8-roundtripped; used columns above T stay fp32-as-loaded (fp16
+        cost in the accounting). Ignored by every other arm. A fourth mode,
+        fp16 (``dec.half().float()``), exists only as a measurement arm in
+        ``experiments/k4_dec_quant.py`` (the shippability check for what
+        skeptic-v1 charges) and is deliberately not a streaming ``dec_quant``
+        value here.
     """
 
     arm: str = "fp16"

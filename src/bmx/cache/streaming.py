@@ -50,8 +50,9 @@ from bmx.cache.rope import apply_rope, rope_cos_sin
 from bmx.cache.specs import CacheCodecSpec
 from bmx.cache.spectral import (
     SpectralPack,
+    dec_quant_threshold,
     load_packs_for_spec,
-    skeptic_charge,
+    mixed_dec_charge,
     spectral_quantize,
 )
 from bmx.decomp.lrs import truncated_svd
@@ -170,22 +171,32 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
     For the spectral K arm, bpe_k is the layer's blended block-payload bpe
     (quantized-prefix codec_bpe + fp16-tail 16.0, both already blended in
     StreamingQuantizedLayer.update — see bpe_k there) PLUS the per-sequence
-    skeptic pack charge, skeptic-v2 (used-columns; see spectral.py's
-    "Accounting modes" docstring):
+    mixed decoder+tier-map charge (K4 local-levers Task 1 — one threshold
+    parameter unifies fp32/int8/tier-gated accounting; see spectral.py's
+    "Accounting modes" docstring and `mixed_dec_charge`):
 
         bpe_k = (blended block payload bpe)
-                + skeptic_charge(C, S, tiers, c_used=mean_c_used, dec_bits=dec_bits)
+                + mixed_dec_charge(C, S, tiers, c_used=mean_c_used, c_int8=mean_c_int8)
 
     where mean_c_used = mean over layers of layer._pack.c_used (the number
     of decoder columns actually carrying nonzero bits — see
-    SpectralPack.c_used). skeptic_charge is linear in c_used, so the
-    across-layer mean of per-layer v2 charges equals the charge evaluated
-    at mean_c_used; this is exact for allocated packs too, where each
-    layer's own budget gives it a different c_used (range 139-423 zero
-    dirs at b2.5). skeptic-v1 (the expression every parquet before
-    2026-07-23 measured) was the same call with c_used left at its
-    default (None -> C, the full decoder charged regardless of how many
-    columns are actually read at decode):
+    SpectralPack.c_used) and mean_c_int8 = mean over layers of each layer's
+    count of columns with `0 < bits <= thr` (`thr =
+    dec_quant_threshold(k_spec.dec_quant)`; 0 when thr is None — no int8
+    storage). `mixed_dec_charge` is linear in both c_used and c_int8, so the
+    across-layer mean of per-layer charges equals the charge evaluated at
+    the means; this is exact for allocated packs too, where each layer's own
+    budget gives it a different c_used (range 139-423 zero dirs at b2.5) and
+    a different per-layer tier-column count. `dec_quant="fp32"` (thr=None,
+    mean_c_int8=0) and `dec_quant="int8"` (thr=8, blanket) reproduce the
+    prior `skeptic_charge(dec_bits=16.0)` / `skeptic_charge(dec_bits=8.0)`
+    call sites bit-exactly — `mixed_dec_charge` is endpoint-pinned to
+    `skeptic_charge` at `c_int8 ∈ {0, c_used}`
+    (test_mixed_dec_charge_endpoints_match_skeptic_charge), and this refactor
+    is additionally pinned at the streaming level
+    (test_streaming_bpe_refactor_bitexact). skeptic-v1 (the expression every
+    parquet before 2026-07-23 measured) was the same call with c_used (and
+    c_int8) left at 0/None-equivalent full-C fp16 charging:
 
         bpe_k = (blended block payload bpe) + skeptic_charge(C, S, tiers)
 
@@ -193,15 +204,9 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
     tail included — NOT just the quantized-committed count) and
     C = h_kv * d_head. This charge amortizes the corpus pack's decoder matrix
     + tier map over the WHOLE sequence once here, rather than re-charging it
-    per flushed block (skeptic_charge's own S-amortization already does the
+    per flushed block (mixed_dec_charge's own S-amortization already does the
     1/S scaling; calling it once per block would double-count blocks that
     preceded S growing).
-
-    dec_bits (skeptic decoder-precision term): 8.0 iff k_spec.dec_quant ==
-    "int8" else 16.0 — mirrors StreamingQuantizedCache.__init__'s _dec_bits
-    exactly (dec_quant=="int8" charges the skeptic decoder term at 8
-    bits/entry; the pack's dec was already roundtripped to int8 precision at
-    cache-init time).
     """
     layers = list(layers)
     if not layers:
@@ -212,19 +217,28 @@ def cache_bits_per_entry(layers, k_spec: CacheCodecSpec) -> tuple[float, float]:
     # Only charge once something has actually flushed through the spectral
     # path (_committed_S_q > 0); an all-fp16 cache (nothing quantized yet)
     # must report bpe_k == 16.0, not 16.0 + a charge for an unused pack.
-    # The charge is layer-independent (same C/S/tiers) but NOT c_used-
-    # independent (each layer's pack can have a different c_used under
-    # per-layer allocation), so the mean_c_used passed to skeptic_charge
-    # must be computed BEFORE this single call — linearity in c_used
-    # (see spectral.skeptic_charge) makes that equal to averaging
-    # per-layer charged values.
+    # The charge is layer-independent (same C/S/tiers) but NOT c_used/c_int8-
+    # independent (each layer's pack can have a different c_used and tier-
+    # column count under per-layer allocation), so the means passed to
+    # mixed_dec_charge must be computed BEFORE this single call — linearity
+    # in (c_used, c_int8) (see spectral.mixed_dec_charge) makes that equal
+    # to averaging per-layer charged values.
     if k_spec.arm == "spectral" and last._committed_S_q > 0:
-        dec_bits = 8.0 if k_spec.dec_quant == "int8" else 16.0
+        thr = dec_quant_threshold(k_spec.dec_quant)
         S = last.get_seq_length()
         C = last._h_kv * last._d_head
         mean_c_used = sum(layer._pack.c_used for layer in layers) / len(layers)
-        bpe_k = bpe_k + skeptic_charge(
-            C, S, last._pack.tiers, c_used=mean_c_used, dec_bits=dec_bits
+        mean_c_int8 = (
+            0
+            if thr is None
+            else sum(
+                int(((layer._pack.bits > 0) & (layer._pack.bits <= thr)).sum())
+                for layer in layers
+            )
+            / len(layers)
+        )
+        bpe_k = bpe_k + mixed_dec_charge(
+            C, S, last._pack.tiers, c_used=mean_c_used, c_int8=mean_c_int8
         )
     return bpe_k, bpe_v
 
@@ -644,7 +658,9 @@ class StreamingQuantizedCache(Cache):
         # here (never per-layer, never per-call) then handed out by layer_idx.
         # load_packs_for_spec owns the dec_quant decision (spectral.py) —
         # asserts dec_quant validity, loads the pack file when arm=="spectral",
-        # and int8-roundtrips the decoder once when dec_quant=="int8".
+        # and (gated) int8-roundtrips the decoder once when
+        # dec_quant_threshold(dec_quant) is not None ("int8" = blanket
+        # threshold 8; "int8_t{T}" = tier-gated threshold T).
         self._packs: dict[int, SpectralPack] = load_packs_for_spec(k_spec)
 
         # layer_class_to_replicate lazily appends one layer per new layer_idx, always
@@ -760,7 +776,7 @@ class StreamingQuantizedCache(Cache):
         Thin wrapper over the shared `cache_bits_per_entry` (also called by
         PackedStreamingCache) — see that function's docstring for the full
         accounting derivation (across-layer mean, skeptic-v2 spectral charge,
-        _dec_bits int8 decoder term).
+        mixed_dec_charge int8/fp16 decoder term).
         """
         return cache_bits_per_entry(self.layers, self.k_spec)
 
