@@ -251,6 +251,43 @@ def test_k4_fit_packs_smoke(tmp_path):
     assert side["w_source"] == "corpus"
 
 
+def test_k4_fit_packs_w_rope_threading(tmp_path):
+    """The CLI threads w_rope (the locked-refit enabler): 'rotated' is accepted
+    and recorded in the sidecar; an unknown value fails loud before any fitting.
+    The numeric frozen-vs-rotated value pins live in test_spectral.py."""
+    import pytest
+
+    from experiments.k4_fit_packs import Config, main
+
+    p1 = tmp_path / "a.safetensors"
+    _tiny_cache(p1, seed=0)
+    out = tmp_path / "packs.safetensors"
+    cfg = Config(
+        corpus_cache_paths=(str(p1),),
+        out_path=str(out),
+        model_label="tiny",
+        budgets=(2.5,),
+        group=16,
+        w_rope="rotated",
+        out_root=str(tmp_path),
+    )
+    main(cfg)
+    side = json.loads(open(str(out) + ".json").read())
+    assert side["w_rope"] == "rotated"
+
+    bad = Config(
+        corpus_cache_paths=(str(p1),),
+        out_path=str(tmp_path / "p2.safetensors"),
+        model_label="tiny",
+        budgets=(2.5,),
+        group=16,
+        w_rope="bogus",
+        out_root=str(tmp_path),
+    )
+    with pytest.raises(AssertionError, match="w_rope"):
+        main(bad)
+
+
 def test_k4_fit_packs_alloc_mode(tmp_path):
     import pandas as pd
 

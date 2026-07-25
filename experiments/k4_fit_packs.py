@@ -70,6 +70,10 @@ class Config:
     ridge: float = 1e-3
     position_stride: int = 8
     w_source: str = "corpus"
+    # W RoPE treatment for the corpus query moment: "frozen" (shipped
+    # instrument default, bit-exact) or "rotated" (causal-instrument verdict —
+    # the locked Llama refit config, docs/2026-07-24-k4-math-actions-results.md §D).
+    w_rope: str = "frozen"
     # k4_alloc metrics.parquet (Part-A sensitivity rows). Empty = uniform
     # budgets (unchanged behavior); set = budgets are TARGET MEANS allocated
     # across layers via greedy_layer_allocation.
@@ -158,6 +162,9 @@ def _allocate_layer_budgets(
 
 def main(cfg: Config):
     assert cfg.w_source in _W_SOURCES, f"w_source={cfg.w_source!r} not in {_W_SOURCES}"
+    assert cfg.w_rope in ("frozen", "rotated"), (
+        f"w_rope={cfg.w_rope!r} not in ('frozen', 'rotated')"
+    )
     assert len(cfg.corpus_cache_paths) >= 1, "corpus_cache_paths must be non-empty"
 
     run = (
@@ -188,6 +195,7 @@ def main(cfg: Config):
         w_source=cfg.w_source,
         ridge=cfg.ridge,
         position_stride=cfg.position_stride,
+        w_rope=cfg.w_rope,
     )
     bases = fit.bases
     rows: list[dict] = []
@@ -212,6 +220,7 @@ def main(cfg: Config):
             "git_sha": git_sha(),
             "corpus_cache_paths": list(cfg.corpus_cache_paths),
             "w_source": cfg.w_source,
+            "w_rope": cfg.w_rope,
             "ridge": cfg.ridge,
             **alloc_meta,
         },
