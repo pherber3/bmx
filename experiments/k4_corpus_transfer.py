@@ -20,15 +20,20 @@ as measured. Null-fit ≈ wikitext-fit on the wiki eval side (D < 10%) raises
 model_intrinsic_flag — the stronger "basis is model-intrinsic" claim. All
 gpt2-scale numbers are MECHANISM verdicts only (yellow flag in the JSON).
 
-Synthesis-order addendum (spec §3b): five FIT-SIDE-ONLY arms — shufcode
+Synthesis-order addendum (spec §3b): FIT-SIDE-ONLY arms — shufcode
 (token-permuted code slices), uniwiki/unicode (i.i.d. samples from each fit
-slice's unigram histogram), biwiki/bicode (bigram-Markov samples) — join the
-same matrix at matched budgets. Verdict gains per_budget[b]["synthesis"]
+slice's unigram histogram), biwiki/bicode (bigram-Markov samples), and the
+order-3 climb triwiki/tricode (trigram-Markov samples, default-inert) — join
+the same matrix at matched budgets. Verdict gains per_budget[b]["synthesis"]
 with the pre-registered order-ladder rules: (a) recipe-confirmed for eval
-side E if D(uni_E->E) < 10%; (b) order-2 earns its keep if
-D(uni_E->E) - D(bi_E->E) >= 0.5 * D(uni_E->E); no higher orders unless (b)
-passes on BOTH sides. uni_* is the recipe estimator, shuf_* its
-without-replacement control.
+side E if D(uni_E->E) < 10% OR (when the trigram arm is present)
+D(tri_E->E) < 10% — a higher order that meets the same insensitive bar
+confirms the recipe; (b) order-2 earns its keep if
+D(uni_E->E) - D(bi_E->E) >= 0.5 * D(uni_E->E); (c) order-3 earns its keep
+if D(bi_E->E) - D(tri_E->E) >= 0.5 * D(bi_E->E) — the same half-the-gap
+test one order up. Order-3 is licensed only after (b) passes on BOTH sides
+(the committed 2026-07-25 A2 gate: order2_earns_keep + climb_to_order3 both
+True). uni_* is the recipe estimator, shuf_* its without-replacement control.
 """
 
 from __future__ import annotations
@@ -66,8 +71,23 @@ from experiments._k4_common import (
 FIT_CORPORA = ("wiki", "code", "null")
 EVAL_CORPORA = ("wiki", "code")
 # §3b synthesis-order fit arms (fit-side only; labels compose as
-# f"uni{eval_side}" / f"bi{eval_side}" in the order-ladder rules).
-SYNTH_FIT_CORPORA = ("shufcode", "uniwiki", "unicode", "biwiki", "bicode")
+# f"uni{eval_side}" / f"bi{eval_side}" / f"tri{eval_side}" in the order-ladder
+# rules). shufcode/uni*/bi* are the mandatory orders-1+2 block (all-or-none);
+# tri* is the default-inert order-3 climb (its own both-or-none pair, only
+# licensed after order-2 earned its keep on both sides).
+SYNTH_FIT_CORPORA = (
+    "shufcode",
+    "uniwiki",
+    "unicode",
+    "biwiki",
+    "bicode",
+    "triwiki",
+    "tricode",
+)
+# The order-1+2 block that the all-or-nothing / order-ladder rules require in
+# full; the trigram climb is optional on top (guarded inline in main()).
+_BASE_SYNTH_FIT_CORPORA = ("shufcode", "uniwiki", "unicode", "biwiki", "bicode")
+_TRI_SYNTH_FIT_CORPORA = ("triwiki", "tricode")
 # (basis_corpus, alloc_corpus) — scored on the alloc corpus's eval side (H3).
 _HYBRID_CELLS = (("wiki", "code"), ("code", "wiki"))
 # (sigma_corpus, w_corpus) — scored on BOTH eval sides (binding decision 2).
@@ -255,12 +275,15 @@ class Config:
     null_fit_paths: tuple[str, ...]
     wiki_eval_paths: tuple[str, ...]
     code_eval_paths: tuple[str, ...]
-    # ---- §3b synthesis-order fit arms (fit-side only; all five or none) ----
+    # ---- §3b synthesis-order fit arms (fit-side only; base five all-or-none;
+    #      trigram pair default-inert, both-or-none on top) -------------------
     shufcode_fit_paths: tuple[str, ...] = ()
     uniwiki_fit_paths: tuple[str, ...] = ()
     unicode_fit_paths: tuple[str, ...] = ()
     biwiki_fit_paths: tuple[str, ...] = ()
     bicode_fit_paths: tuple[str, ...] = ()
+    triwiki_fit_paths: tuple[str, ...] = ()
+    tricode_fit_paths: tuple[str, ...] = ()
     model_label: str = ""
     model_name: str = ""  # HF repo id for RoPE; empty => no-RoPE (gpt2), headline=logit
     budgets: tuple[float, ...] = (2.2, 2.5)
@@ -299,21 +322,38 @@ def main(cfg: Config):
         "code": cfg.code_fit_paths,
         "null": cfg.null_fit_paths,
     }
-    synth_paths = {
+    base_synth_paths = {
         "shufcode": cfg.shufcode_fit_paths,
         "uniwiki": cfg.uniwiki_fit_paths,
         "unicode": cfg.unicode_fit_paths,
         "biwiki": cfg.biwiki_fit_paths,
         "bicode": cfg.bicode_fit_paths,
     }
-    n_synth = sum(1 for p in synth_paths.values() if p)
-    assert n_synth in (0, len(synth_paths)), (
+    tri_synth_paths = {
+        "triwiki": cfg.triwiki_fit_paths,
+        "tricode": cfg.tricode_fit_paths,
+    }
+    n_base = sum(1 for p in base_synth_paths.values() if p)
+    assert n_base in (0, len(base_synth_paths)), (
         "§3b synthesis arms are all-or-nothing (the order-ladder rules need "
-        f"all five): got {n_synth}/5 non-empty "
-        f"{ {k: len(v) for k, v in synth_paths.items()} }"
+        f"all five): got {n_base}/5 non-empty "
+        f"{ {k: len(v) for k, v in base_synth_paths.items()} }"
     )
-    if n_synth:
-        fit_paths.update(synth_paths)
+    n_tri = sum(1 for p in tri_synth_paths.values() if p)
+    assert n_tri in (0, len(tri_synth_paths)), (
+        "§3b trigram arms are both-or-nothing (the order-3 climb needs both "
+        f"eval sides): got {n_tri}/2 non-empty "
+        f"{ {k: len(v) for k, v in tri_synth_paths.items()} }"
+    )
+    # The trigram climb rides ON TOP of the base block — its half-the-gap gate
+    # is computed against the bigram arms, so bi* must be present too.
+    assert not (n_tri and not n_base), (
+        "§3b trigram arms require the base order-1+2 block (bi* is the "
+        "order-3 gate's reference); provide all five base arms too"
+    )
+    synth_paths = {**base_synth_paths, **tri_synth_paths}
+    if n_base:
+        fit_paths.update({k: v for k, v in synth_paths.items() if v})
     for name, paths in fit_paths.items():
         assert paths, f"{name}_fit_paths must be non-empty"
     assert cfg.wiki_eval_paths and cfg.code_eval_paths, "eval paths must be non-empty"
@@ -739,22 +779,41 @@ def _transfer_verdict(
         # §3b synthesis-order rules — gates for the RECIPE claim (spec §3b).
         synthesis: dict = {}
         if any(c in fit_corpora for c in SYNTH_FIT_CORPORA):
+            # The order-3 climb is present iff the trigram arms are in the
+            # matrix; when absent the rules dicts stay byte-identical to the
+            # order-1+2 pipeline (no D_tri / order3_* keys, recipe_confirmed
+            # unchanged) so committed order-2 verdicts reproduce exactly.
+            tri_present = any(c in fit_corpora for c in _TRI_SYNTH_FIT_CORPORA)
             rules: dict[str, dict] = {}
             for eval_c in EVAL_CORPORA:
                 d_uni = D.get(f"uni{eval_c}->{eval_c}", {}).get("mean")
                 d_bi = D.get(f"bi{eval_c}->{eval_c}", {}).get("mean")
                 if d_uni is None or d_bi is None:
                     continue
+                d_tri = D.get(f"tri{eval_c}->{eval_c}", {}).get("mean")
                 shuf_cell = "shufcode->code" if eval_c == "code" else "null->wiki"
-                rules[eval_c] = dict(
+                rule = dict(
                     D_uni=d_uni,
                     D_bi=d_bi,
                     D_shuf=D.get(shuf_cell, {}).get("mean"),
-                    # rule (a): the sampled-unigram recipe transfers on E
-                    recipe_confirmed=bool(d_uni < 0.10),
+                    # rule (a): the sampled-unigram recipe transfers on E — or,
+                    # when the order-3 climb is present, a higher order that
+                    # meets the SAME insensitive bar (D < 0.10) confirms it.
+                    recipe_confirmed=bool(
+                        d_uni < 0.10 or (d_tri is not None and d_tri < 0.10)
+                    ),
                     # rule (b): bigram closes >= half the unigram gap on E
                     order2_earns_keep=bool((d_uni - d_bi) >= 0.5 * d_uni),
                 )
+                if tri_present:
+                    # rule (c): trigram closes >= half the bigram gap on E
+                    # (the same half-the-gap test one order up; None-safe if a
+                    # tri cell is missing — treated as not earning its keep).
+                    rule["D_tri"] = d_tri
+                    rule["order3_earns_keep"] = bool(
+                        d_tri is not None and (d_bi - d_tri) >= 0.5 * d_bi
+                    )
+                rules[eval_c] = rule
             synthesis = dict(
                 rules=rules,
                 # "on BOTH eval sides" (note below) is binding: a missing D

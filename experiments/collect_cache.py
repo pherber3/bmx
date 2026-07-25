@@ -10,6 +10,8 @@ Usage
         --split train --text-field content --corpus-label code
     uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024 \
         --token-offset 1024 --synth unigram --synth-seed 20260723 --corpus-label uniwiki
+    uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024 \
+        --token-offset 1024 --synth trigram --synth-seed 20260723 --corpus-label triwiki
 
 --token-offset shifts the wikitext slice so distinct offsets act as distinct
 documents (calibration corpora for the corpus-vs-heldout transfer test).
@@ -45,7 +47,7 @@ class Config:
     split: str = "test"
     text_field: str = "text"
     shuffle_seed: int = -1  # >=0 => seeded post-slice token shuffle (null corpus)
-    synth: str = ""  # "" | "unigram" | "bigram" — §3b sampled synthetic stream
+    synth: str = ""  # "" | "unigram" | "bigram" | "trigram" — §3b sampled stream
     synth_seed: int = -1  # required >=0 when synth set; recorded seed: 20260723
     corpus_label: str = ""  # REQUIRED when any corpus knob above is non-default
 

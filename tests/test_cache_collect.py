@@ -659,6 +659,51 @@ def test_synth_stream_bigram_unseen_context_backoff():
     assert hit.shape == (2,) and hit[1].item() in (5, 9)
 
 
+def test_synth_stream_trigram_transitions():
+    from bmx.eval.layer_swap import synth_stream
+
+    # Deterministic 4-cycle: every observed 2-context (a, b) has the UNIQUE
+    # successor (b + 1) % 4, so once the chain is seeded with two consecutive
+    # tokens it must follow the cycle exactly (order-3 pins the successor even
+    # more tightly than order-2 would on a branchier stream).
+    window = torch.tensor([0, 1, 2, 3] * 512, dtype=torch.int64)
+    out = synth_stream(window, "trigram", seed=5)
+    assert out.shape == window.shape and out.dtype == window.dtype
+    assert torch.equal(out[2:], (out[1:-1] + 1) % 4)
+    assert torch.equal(out, synth_stream(window, "trigram", seed=5))  # deterministic
+    assert not torch.equal(out, synth_stream(window, "trigram", seed=6))  # seed enters
+
+    # Branching on the 2-context: after context (0, 1) the source goes to 2
+    # three times per rep and to 3 once (P = 0.75 / 0.25); the sampled
+    # order-3 conditional frequencies must match the source trigram counts.
+    # The pattern also makes the order-2 successors of 1 ambiguous (1 -> 2 and
+    # 1 -> 0), so this only holds because the sampler keys on the FULL pair.
+    window = torch.tensor(([0, 1, 2] * 3 + [0, 1, 3]) * 512, dtype=torch.int64)
+    out = synth_stream(window, "trigram", seed=11)
+    a, b, nx = out[:-2], out[1:-1], out[2:]
+    ctx01 = (a == 0) & (b == 1)
+    frac2 = float((nx[ctx01] == 2).float().mean())
+    assert abs(frac2 - 0.75) < 0.05
+    # source support: every sampled token appears in the window
+    assert set(out.tolist()) <= set(window.tolist())
+
+
+def test_synth_stream_trigram_unseen_context_backoff():
+    from bmx.eval.layer_swap import synth_stream
+
+    # window [5, 9, 5]: succ2 = {(5, 9): [5], (9, 5): []-absent}. The 2-context
+    # (9, 5) is never observed with a successor, so a step landing on it must
+    # back off ONE order to the bigram conditional (succ = {5: [9, 5], 9: [5]})
+    # — never crash, and stay in the window's support {5, 9}. Longer output
+    # forces the chain through (9, 5) at least once.
+    w = torch.tensor([5, 9, 5], dtype=torch.int64)
+    for s in range(8):
+        o = synth_stream(w, "trigram", seed=s)
+        assert set(o.tolist()) <= {5, 9}
+    o0 = synth_stream(w, "trigram", seed=0)
+    assert o0.shape == (3,) and torch.equal(o0, synth_stream(w, "trigram", seed=0))
+
+
 def test_load_eval_tokens_synth_wiring(monkeypatch):
     import bmx.eval.layer_swap as ls
 
@@ -673,11 +718,15 @@ def test_load_eval_tokens_synth_wiring(monkeypatch):
     bi = ls.load_eval_tokens(
         "gpt2", n_tokens=16, token_offset=8, synth="bigram", synth_seed=20260723
     )
+    tri = ls.load_eval_tokens(
+        "gpt2", n_tokens=16, token_offset=8, synth="trigram", synth_seed=20260723
+    )
     assert torch.equal(uni1, uni2)  # deterministic under the recorded seed
-    assert uni1.shape == bi.shape == nat.shape == (16,)
+    assert uni1.shape == bi.shape == tri.shape == nat.shape == (16,)
     # sampled from the window at THIS offset: support subset of the natural slice
     assert set(uni1.tolist()) <= set(nat.tolist())
     assert set(bi.tolist()) <= set(nat.tolist())
+    assert set(tri.tolist()) <= set(nat.tolist())
     # WITH replacement (unlike the shuffle null): not a permutation of the
     # window — the arange window has 16 distinct tokens, so a permutation
     # would preserve the multiset exactly
@@ -721,7 +770,7 @@ def test_load_eval_tokens_synth_validation(monkeypatch):
 
     _patch_eval_tokens_io(monkeypatch)
     with pytest.raises(AssertionError, match="synth mode"):
-        ls.load_eval_tokens("gpt2", n_tokens=8, synth="trigram", synth_seed=0)
+        ls.load_eval_tokens("gpt2", n_tokens=8, synth="quadgram", synth_seed=0)
     with pytest.raises(AssertionError, match="synth_seed"):
         ls.load_eval_tokens("gpt2", n_tokens=8, synth="unigram")
     with pytest.raises(AssertionError, match="mutually exclusive"):
@@ -758,6 +807,17 @@ def test_collect_cache_synth_labels_and_guard():
     )
     assert not _corpus_is_default(bicode)
     assert _out_path(bicode).name == "gpt2_1024_bicode_off2048.safetensors"
+
+    triwiki = Config(
+        model_name="gpt2",
+        seq_len=1024,
+        token_offset=4096,
+        synth="trigram",
+        synth_seed=20260723,
+        corpus_label="triwiki",
+    )
+    assert not _corpus_is_default(triwiki)
+    assert _out_path(triwiki).name == "gpt2_1024_triwiki_off4096.safetensors"
 
     shufcode = Config(
         model_name="gpt2",

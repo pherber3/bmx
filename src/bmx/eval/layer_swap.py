@@ -70,13 +70,15 @@ def load_eval_tokens(
     `shuffle_seed + token_offset` so distinct slices get distinct — but fully
     recorded — permutations.
 
-    `synth` ∈ {"unigram", "bigram"} replaces the RETURNED natural slice with a
-    same-length stream sampled from that slice's own n-gram statistics (spec
-    §3b — the traffic-histogram calibration recipe at orders 1 and 2); the
-    generator is seeded `synth_seed + token_offset` (same per-slice scheme as
-    shuffle). Mutually exclusive with shuffle_seed.
+    `synth` ∈ {"unigram", "bigram", "trigram"} replaces the RETURNED natural
+    slice with a same-length stream sampled from that slice's own n-gram
+    statistics (spec §3b — the traffic-histogram calibration recipe at orders
+    1, 2 and 3); the generator is seeded `synth_seed + token_offset` (same
+    per-slice scheme as shuffle). Mutually exclusive with shuffle_seed.
     """
-    assert synth in ("", "unigram", "bigram"), f"unknown synth mode {synth!r}"
+    assert synth in ("", "unigram", "bigram", "trigram"), (
+        f"unknown synth mode {synth!r}"
+    )
     assert not synth or synth_seed >= 0, "synth requires synth_seed >= 0"
     assert not (synth and shuffle_seed >= 0), (
         "synth and shuffle_seed are mutually exclusive (distinct §3b arms)"
@@ -156,7 +158,7 @@ def load_eval_tokens(
 def synth_stream(window: torch.Tensor, mode: str, seed: int) -> torch.Tensor:
     """Sample a same-length synthetic token stream from `window`'s own n-gram
     statistics (spec §3b: the 'synthesize calibration text from traffic token
-    counts' recipe, orders 1 and 2).
+    counts' recipe, orders 1, 2 and 3).
 
     "unigram": i.i.d. WITH replacement from the window's empirical histogram
     (uniform position draws — each token's probability is count/N; contrast
@@ -166,9 +168,17 @@ def synth_stream(window: torch.Tensor, mode: str, seed: int) -> torch.Tensor:
     multiset of tokens observed after the current context); the first token
     and any context with no observed successor back off to the unigram
     histogram. Deterministic in `seed`; output shape/dtype match `window`.
+    "trigram": the same construction one order up — a successor is drawn
+    uniformly from the multiset of tokens observed after the current
+    two-token context; an unseen 2-context backs off one order to the bigram
+    conditional, which itself backs off to the unigram histogram (the same
+    add-nothing / uniform-from-observed-multiset style as bigram). The first
+    token is drawn from the unigram histogram and the second from the bigram
+    conditional on it. Deterministic in `seed`; output shape/dtype match
+    `window`.
     """
     assert window.ndim == 1 and window.numel() > 0, "window must be 1-D, non-empty"
-    assert mode in ("unigram", "bigram"), f"unknown synth mode {mode!r}"
+    assert mode in ("unigram", "bigram", "trigram"), f"unknown synth mode {mode!r}"
     n = window.numel()
     g = torch.Generator().manual_seed(seed)
 
@@ -177,20 +187,52 @@ def synth_stream(window: torch.Tensor, mode: str, seed: int) -> torch.Tensor:
 
     if mode == "unigram":
         return uni(n)
+
+    # Order-2 successor multiset (used directly by "bigram" and as the
+    # one-order-down backoff for "trigram").
     succ: dict[int, list[int]] = {}
     for c, nx in zip(window[:-1].tolist(), window[1:].tolist()):
         succ.setdefault(c, []).append(nx)
-    out = torch.empty(n, dtype=window.dtype)
-    cur = int(uni(1).item())
-    out[0] = cur
-    for t in range(1, n):
-        choices = succ.get(cur)
+
+    def draw_bi(prev: int) -> int:
+        """Bigram step: a successor observed after `prev`, else unigram backoff."""
+        choices = succ.get(prev)
         if choices is None:  # context never observed with a successor
-            cur = int(uni(1).item())
+            return int(uni(1).item())
+        j = int(torch.randint(0, len(choices), (1,), generator=g).item())
+        return choices[j]
+
+    if mode == "bigram":
+        out = torch.empty(n, dtype=window.dtype)
+        cur = int(uni(1).item())
+        out[0] = cur
+        for t in range(1, n):
+            cur = draw_bi(cur)
+            out[t] = cur
+        return out
+
+    # trigram: order-3 successor multiset keyed on the previous two tokens.
+    succ2: dict[tuple[int, int], list[int]] = {}
+    prevs = window[:-2].tolist()
+    curs = window[1:-1].tolist()
+    nxts = window[2:].tolist()
+    for a, b, nx in zip(prevs, curs, nxts):
+        succ2.setdefault((a, b), []).append(nx)
+    out = torch.empty(n, dtype=window.dtype)
+    prev = int(uni(1).item())  # first token: unigram histogram
+    out[0] = prev
+    if n > 1:
+        cur = draw_bi(prev)  # second token: bigram conditional on the first
+        out[1] = cur
+    for t in range(2, n):
+        choices = succ2.get((prev, cur))
+        if choices is None:  # 2-context unseen -> back off one order (bigram)
+            nxt = draw_bi(cur)
         else:
             j = int(torch.randint(0, len(choices), (1,), generator=g).item())
-            cur = choices[j]
-        out[t] = cur
+            nxt = choices[j]
+        out[t] = nxt
+        prev, cur = cur, nxt
     return out
 
 

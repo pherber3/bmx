@@ -1310,6 +1310,10 @@ def test_k4_corpus_transfer_synthesis_smoke(tmp_path):
         assert r["recipe_confirmed"] == (r["D_uni"] < 0.10)
         assert r["order2_earns_keep"] == ((r["D_uni"] - r["D_bi"]) >= 0.5 * r["D_uni"])
         assert r["D_shuf"] is not None
+        # order-3 arms inert by default: no trigram keys leak into the order-2
+        # rules, and recipe_confirmed stays byte-identical to rule (a) alone.
+        assert "D_tri" not in r and "order3_earns_keep" not in r
+    assert "triwiki->wiki" not in pb["D"] and "tricode->code" not in pb["D"]
     assert pb["synthesis"]["climb_to_order3"] == all(
         r["order2_earns_keep"] for r in rules.values()
     )
@@ -1329,6 +1333,91 @@ def test_k4_corpus_transfer_synthesis_guards(tmp_path):
     # the matched-fit-budget guard extends over the synthesis arms
     with pytest.raises(AssertionError, match="matched fit"):
         main(dataclasses.replace(cfg, uniwiki_fit_paths=cfg.uniwiki_fit_paths[:1]))
+
+
+def _tiny_corpus_transfer_cfg_trigram(tmp_path, budgets=(2.5,)):
+    """The order-1+2 synthesis cfg + the two §3b order-3 (trigram) fit arms
+    (2 slices each — matched with every other corpus, binding decision 1)."""
+    import dataclasses
+
+    cfg = _tiny_corpus_transfer_cfg_synth(tmp_path, budgets=budgets)
+    paths, seed = {}, 200
+    for name in ("tw", "tc"):
+        group = []
+        for j in range(2):
+            p = tmp_path / f"{name}{j}.safetensors"
+            _tiny_cache(p, seed=seed)
+            seed += 1
+            group.append(str(p))
+        paths[name] = tuple(group)
+    return dataclasses.replace(
+        cfg,
+        triwiki_fit_paths=paths["tw"],
+        tricode_fit_paths=paths["tc"],
+    )
+
+
+def test_k4_corpus_transfer_trigram_smoke(tmp_path):
+    import pandas as pd
+
+    from experiments.k4_corpus_transfer import main
+
+    run_dir = main(_tiny_corpus_transfer_cfg_trigram(tmp_path))
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    spec = df[df.arm == "spectral"]
+    synth = ("shufcode", "uniwiki", "unicode", "biwiki", "bicode", "triwiki", "tricode")
+    assert set(spec.fit_corpus) == {"wiki", "code", "null", *synth}
+    for c in ("triwiki", "tricode"):
+        sub = spec[spec.fit_corpus == c]
+        assert set(sub.eval_corpus) == {"wiki", "code"}
+        assert (sub.w_corpus == c).all() and (sub.alloc_corpus == c).all()
+
+    v = json.loads((run_dir / "corpus_transfer_verdict.json").read_text())
+    pb = v["per_budget"]["2.5"]
+    assert {"triwiki->wiki", "tricode->code"} <= set(pb["D"])
+    rules = pb["synthesis"]["rules"]
+    assert set(rules) == {"wiki", "code"}
+    for eval_c, r in rules.items():
+        # order-3 keys present now that the trigram arm is in the matrix
+        assert "D_tri" in r and "order3_earns_keep" in r
+        assert isinstance(r["order3_earns_keep"], bool)
+        # rule (a) extended: a higher order meeting the same insensitive bar
+        # confirms the recipe (recomputable from the same JSON)
+        assert r["recipe_confirmed"] == (
+            r["D_uni"] < 0.10 or (r["D_tri"] is not None and r["D_tri"] < 0.10)
+        )
+        # rule (c): trigram closes >= half the bigram gap (mirrors rule (b))
+        assert r["order3_earns_keep"] == (
+            r["D_tri"] is not None and (r["D_bi"] - r["D_tri"]) >= 0.5 * r["D_bi"]
+        )
+
+
+def test_k4_corpus_transfer_trigram_guards(tmp_path):
+    import dataclasses
+
+    import pytest
+
+    from experiments.k4_corpus_transfer import main
+
+    cfg = _tiny_corpus_transfer_cfg_trigram(tmp_path)
+    # trigram arms are both-or-nothing (the climb needs both eval sides)
+    with pytest.raises(AssertionError, match="both-or-nothing"):
+        main(dataclasses.replace(cfg, tricode_fit_paths=()))
+    # trigram requires the base order-1+2 block (bi* is the order-3 gate ref)
+    with pytest.raises(AssertionError, match="require the base"):
+        main(
+            dataclasses.replace(
+                cfg,
+                shufcode_fit_paths=(),
+                uniwiki_fit_paths=(),
+                unicode_fit_paths=(),
+                biwiki_fit_paths=(),
+                bicode_fit_paths=(),
+            )
+        )
+    # the matched-fit-budget guard extends over the trigram arms too
+    with pytest.raises(AssertionError, match="matched fit"):
+        main(dataclasses.replace(cfg, triwiki_fit_paths=cfg.triwiki_fit_paths[:1]))
 
 
 def test_k4_corpus_transfer_matched_fit_budget_guard(tmp_path):
