@@ -126,6 +126,15 @@ def spec_pair(
         if budget_str.endswith("_lq"):
             payload_quant = "lloyd"
             budget_str = budget_str[: -len("_lq")]
+        # Fail loud on a mis-ordered "_lq" (e.g. "k4_b2.5_dec8tl_lq"): the
+        # dec8 partition above would otherwise swallow it into a confusing
+        # dec_quant string that only crashes far downstream.
+        if "_lq" in arm and payload_quant != "lloyd":
+            raise ValueError(
+                f"malformed k4 arm {arm!r}: '_lq' must sit between the budget "
+                "and any '_dec8*' suffix — canonical 'k4_b<b>_lq[_dec8*]', "
+                "e.g. 'k4_b2.5_lq_dec8tl'"
+            )
         budget = float(budget_str)
         return (
             CacheCodecSpec(

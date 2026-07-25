@@ -71,6 +71,13 @@ from bmx.quant.rtn import rtn_dequantize_packed, rtn_quantize_packed
 QUANTIZERS: tuple[str, ...] = ("rtn", "lloyd")
 
 
+def _check_quantizer(quantizer: str) -> None:
+    """One validation home for the payload-quantizer dispatch (5 call sites)."""
+    assert quantizer in QUANTIZERS, (
+        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
+    )
+
+
 def key_second_moment(M: torch.Tensor) -> torch.Tensor:
     """Uncentered per-channel second moment MᵀM/S of an (S, C) fp matrix, fp64."""
     assert M.dim() == 2, f"M must be (S, C); got {tuple(M.shape)}"
@@ -638,17 +645,6 @@ def tier_columns(bits: torch.Tensor) -> dict[int, torch.Tensor]:
     return cols_by_tier
 
 
-def _rtn_quantize_for_tier(
-    W: torch.Tensor, bits: int, group_size: int, *, mse_scale: bool = True
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Thin name for `rtn_quantize_packed` at the tier-loop call convention
-    (mse_scale defaults True here, matching `spectral_quantize`'s call site) —
-    kept as a distinct symbol so quantizer dispatch in the tier loop reads as
-    `_rtn_quantize_for_tier` vs `_lloyd_quantize_packed`, symmetric names for
-    symmetric roles."""
-    return rtn_quantize_packed(W, bits, group_size, mse_scale=mse_scale)
-
-
 def _lloyd_quantize_packed(
     W: torch.Tensor, bits: int, group_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -727,9 +723,7 @@ def _pack_tier_codes(
     Exercised at tiers {2,3,4} by `test_lloyd_packed_bitwise_faithful_roundtrip`
     (unsigned index containers are the K4 Lloyd-gate design's explicit
     requirement — do NOT silently reuse the signed rtn packer un-adjusted)."""
-    assert quantizer in QUANTIZERS, (
-        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
-    )
+    _check_quantizer(quantizer)
     if quantizer == "rtn":
         if b in _SUBBYTE_TIERS:
             return pack_codes(Q_int.to(torch.int16) + 2 ** (b - 1), b)
@@ -751,9 +745,7 @@ def _unpack_tier_codes(
     """Exact inverse of `_pack_tier_codes`. `quantizer="lloyd"` returns
     UNSIGNED level indices in `[0, 2**b-1]` (int16, wide enough for tier 8's
     256 levels); `quantizer="rtn"` returns the historical signed int8 codes."""
-    assert quantizer in QUANTIZERS, (
-        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
-    )
+    _check_quantizer(quantizer)
     if quantizer == "rtn":
         if b in _SUBBYTE_TIERS:
             return (unpack_codes(t, b, S) - 2 ** (b - 1)).to(torch.int8)
@@ -797,9 +789,7 @@ def spectral_quantize_packed(
     same container-choice-per-tier policy, only the per-tier quantize call and
     the packed container's signedness convention (`_pack_tier_codes`) differ.
     """
-    assert quantizer in QUANTIZERS, (
-        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
-    )
+    _check_quantizer(quantizer)
     S, C = M.shape
     assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
     assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"
@@ -830,9 +820,7 @@ def spectral_dequant_packed(
     to `spectral_quantize(M, pack)[0]` (same `quantizer` on both calls — the
     packed container's signedness convention differs by quantizer, see
     `_pack_tier_codes`)."""
-    assert quantizer in QUANTIZERS, (
-        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
-    )
+    _check_quantizer(quantizer)
     cols_by_tier = cols_by_tier if cols_by_tier is not None else tier_columns(pack.bits)
     first_b = next(iter(cols_by_tier))
     S = packed[f"t{first_b}_scale"].shape[1] * pack.group  # scale is (n_b, S//group, 1)
@@ -877,9 +865,7 @@ def spectral_quantize(
     per-tier compose is the same enc/dec matmuls, same order, same
     device/dtype as the direct `quantize_by_bits` path it replaces).
     """
-    assert quantizer in QUANTIZERS, (
-        f"quantizer must be one of {QUANTIZERS}; got {quantizer!r}"
-    )
+    _check_quantizer(quantizer)
     S, C = M.shape
     assert pack.enc.shape == (C, C), f"pack C mismatch: {pack.enc.shape} vs C={C}"
     assert S % pack.group == 0, f"S={S} not divisible by group={pack.group}"

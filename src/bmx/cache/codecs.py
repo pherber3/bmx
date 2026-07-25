@@ -322,6 +322,27 @@ def allocate_channel_bits(
 # ---------------------------------------------------------------------------
 
 
+_ANALYTIC_LLOYD_N = 2_000_000
+_ANALYTIC_LLOYD_SEED = 0
+
+
+@functools.lru_cache(maxsize=16)
+def analytic_gaussian_lloyd_distortion(bits: int) -> float:
+    """Closed reference: MSE of quantizing a large fixed-seed N(0,1) fp64
+    sample against the analytic Gaussian Lloyd-Max codebook for `bits`. The
+    source has unit variance, so this MSE already equals a RELATIVE
+    distortion. Deterministic; cached per tier (lives beside
+    `gaussian_codebook`, its codebook source; consumed by
+    experiments/k4_g_table.py's analytic-reference column)."""
+    g = torch.Generator().manual_seed(_ANALYTIC_LLOYD_SEED)
+    x = torch.randn(_ANALYTIC_LLOYD_N, generator=g, dtype=torch.float64)
+    cb = gaussian_codebook(bits).double()  # (2**bits,) sorted, unit-variance-fit
+    mid = (cb[:-1] + cb[1:]) / 2
+    idx = torch.bucketize(x, mid)
+    x_hat = cb[idx]
+    return float(((x - x_hat) ** 2).mean())
+
+
 @functools.lru_cache(maxsize=16)
 def gaussian_codebook(
     bits: int,

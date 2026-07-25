@@ -72,7 +72,11 @@ class CacheCodecSpec:
         ``spectral_quantize_packed``'s docstring). Ignored by every non-spectral
         arm and by the V side (turboquant already ships Lloyd via
         ``gaussian_codebook`` — this field only ever reaches the K-side
-        spectral quantize calls).
+        spectral quantize calls). VERDICT: the pre-registered gate FAILED
+        (win ratio 0.25/0.22 vs the 1.02 bar — Lloyd loses 2–26× at the
+        metric-dominant sub-Gaussian top tiers;
+        ``docs/2026-07-25-k4-lloyd-gate-results.md``); ``"lloyd"`` remains
+        default-inert measured-negative machinery, not a live candidate.
     """
 
     arm: str = "fp16"

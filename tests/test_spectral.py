@@ -1588,12 +1588,13 @@ def test_quantizer_lloyd_beats_rtn_mse_on_synthetic_gaussian_tier_2_and_3():
     """Textbook gap (generous floor): on iid Gaussian codes, the analytic
     Lloyd-Max codebook must beat uniform RTN quantization MSE by >= 20% at
     tiers 2 and 3."""
-    from bmx.cache.spectral import _lloyd_quantize_packed, _rtn_quantize_for_tier
+    from bmx.cache.spectral import _lloyd_quantize_packed
+    from bmx.quant.rtn import rtn_quantize_packed
 
     g = torch.Generator().manual_seed(11)
     for bits in (2, 3):
         x = torch.randn(4096, 64, generator=g)
-        rtn_codes, rtn_scale = _rtn_quantize_for_tier(x, bits, group_size=64)
+        rtn_codes, rtn_scale = rtn_quantize_packed(x, bits, 64, mse_scale=True)
         from bmx.quant.rtn import rtn_dequantize_packed
 
         rtn_hat = rtn_dequantize_packed(rtn_codes, rtn_scale, 64)

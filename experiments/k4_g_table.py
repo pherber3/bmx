@@ -50,7 +50,6 @@ pre-existing column byte-identically (pinned by
 from __future__ import annotations
 
 import dataclasses
-import functools
 import json
 
 import pandas as pd
@@ -58,62 +57,31 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, git_sha, write_metrics
-from bmx.cache.codecs import _tier_g, gaussian_codebook
+from bmx.cache.codecs import (
+    _tier_g,
+    analytic_gaussian_lloyd_distortion,
+)
 from bmx.cache.collect import to_matrix
 from bmx.cache.spectral import QUANTIZERS, load_packs
 from bmx.quant.rtn import rtn_quantize
 from experiments._k4_common import load_layer_keys
-
-# The analytic-reference sample: fixed seed, n >= 2e6, fp64 standard normal --
-# deterministic and cached per (bits, seed) so repeated tiers/layers/caches
-# within (and across) a run never re-draw or re-quantize it.
-_ANALYTIC_N_SAMPLES = 2_000_000
-_ANALYTIC_SEED = 0
-
-
-@functools.lru_cache(maxsize=16)
-def _analytic_gaussian_distortion(bits: int) -> float:
-    """Closed reference: MSE of quantizing a large fixed-seed N(0,1) fp64
-    sample against the analytic Gaussian Lloyd-Max codebook for `bits`. The
-    source has unit variance, so this MSE already equals a RELATIVE
-    distortion -- directly comparable to g_hat (which normalizes by the
-    empirical per-direction energy). Deterministic; cached per tier."""
-    g = torch.Generator().manual_seed(_ANALYTIC_SEED)
-    x = torch.randn(_ANALYTIC_N_SAMPLES, generator=g, dtype=torch.float64)
-    cb = gaussian_codebook(bits).double()  # (2**bits,) sorted, unit-variance-fit
-    mid = (cb[:-1] + cb[1:]) / 2
-    idx = torch.bucketize(x, mid)
-    x_hat = cb[idx]
-    return float(((x - x_hat) ** 2).mean())
 
 
 def _lloyd_quantize_unpacked(
     Y: torch.Tensor, bits: int, group_size: int
 ) -> torch.Tensor:
     """Groupwise dequantized reconstruction of Y against the analytic
-    Gaussian Lloyd-Max codebook -- the unpacked-form twin of
-    `spectral._lloyd_quantize_packed`/`_lloyd_dequantize_packed` (this script
-    measures distortion directly on the dequantized reconstruction, never
-    stores containers, so there is no packed-format concern). SAME
-    alternating-minimization (assign <-> refit scale), deterministic, fp32,
-    3 iterations from a group-std init -- mirrors `rtn_quantize`'s call
-    convention exactly: `(..., d) -> (..., d)` dequantized values.
+    Gaussian Lloyd-Max codebook -- composes spectral's packed twins
+    (`_lloyd_quantize_packed` then `_lloyd_dequantize_packed`; this script
+    measures distortion on the dequantized values and never stores
+    containers, and the tier-8 int8 index wrap cancels exactly through
+    Python's negative indexing on the 256-level codebook). Mirrors
+    `rtn_quantize`'s call convention: `(..., d) -> (..., d)` dequantized.
     """
-    *lead, d = Y.shape
-    assert d % group_size == 0, f"dim {d} not divisible by group {group_size}"
-    cb = gaussian_codebook(bits).to(device=Y.device, dtype=Y.dtype)
-    mid = (cb[:-1] + cb[1:]) / 2
-    G = Y.reshape(*lead, d // group_size, group_size)
-    scale = G.std(dim=-1, keepdim=True).clamp_min(1e-12)
-    codes = torch.bucketize((G / scale).contiguous(), mid)
-    for _ in range(3):
-        level = cb[codes.long()]
-        num = (G * level).sum(dim=-1, keepdim=True)
-        den = (level * level).sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        scale = (num / den).clamp_min(1e-12)
-        codes = torch.bucketize((G / scale).contiguous(), mid)
-    level = cb[codes.long()]
-    return (level * scale).reshape(Y.shape)
+    from bmx.cache.spectral import _lloyd_dequantize_packed, _lloyd_quantize_packed
+
+    Q_int, scale = _lloyd_quantize_packed(Y, bits, group_size)
+    return _lloyd_dequantize_packed(Q_int, scale, bits, group_size)
 
 
 @dataclasses.dataclass
@@ -173,7 +141,7 @@ def main(cfg: Config):
             r = ((Y[:, keep] - Y_hat) ** 2).mean(dim=0) / energy[keep]
             pooled[t].append(r)
             g_hat_t = float(r.mean())
-            analytic_t = _analytic_gaussian_distortion(t)
+            analytic_t = analytic_gaussian_lloyd_distortion(t)
             rows.append(
                 dict(
                     model=cfg.model_label or "unknown",
@@ -204,7 +172,7 @@ def main(cfg: Config):
     _tier_g(tiers_t, tuple(table))
 
     analytic_gaussian_table = [
-        1.0 if t == 0 else _analytic_gaussian_distortion(t) for t in cfg.tiers
+        1.0 if t == 0 else analytic_gaussian_lloyd_distortion(t) for t in cfg.tiers
     ]
     out = dict(
         tiers=list(cfg.tiers),
