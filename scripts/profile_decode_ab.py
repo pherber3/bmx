@@ -319,9 +319,20 @@ def _logit_probe(model, tokenizer, cfg: Config, k_spec, v_spec) -> None:
     streaming's own greedy token fed to BOTH caches (teacher forcing) — this keeps the
     two trajectories comparable even if packed's own argmax would otherwise diverge
     the token stream, isolating the per-step logit delta from compounding drift.
-    Gate: 0 argmax flips over N >= 32 steps. The max-abs delta is RECORDED (printed),
-    never gated — long-context accumulation-order drift across many committed pages is
-    documented and expected (docs/2026-07-15-k4-duel-results.md: O(0.25-1.45) @ 64k).
+
+    Gate (amended 2026-07-25, user-approved): a flip FAILS only when it is
+    drift-INEXPLICABLE — the streaming top-2 gap at that step exceeds the step's
+    max-abs delta, so accumulation drift cannot account for it — or when flips
+    exceed N//8 (a path that flips >12.5% of steps is suspect regardless of
+    ties). Near-tie flips (gap <= delta) are WARN + forensics, not FAIL: the
+    duel doc pre-registered exactly this phenomenon (2026-07-15 §packed parity:
+    64k greedy parity "diverges probabilistically", 0-flips held only "on this
+    seed", "merge gate wording must change accordingly"), and the 2026-07-25
+    GH200 forensics confirmed it — a deterministic step-0 flip at stream gap
+    0.211 vs delta 1.59 on the random-token prompt's near-degenerate argmax,
+    with the top-5 token SET identical between paths at every step and the k4
+    drift class (1.3-7.4) statistically identical to the accepted fused-k2b
+    class (1.2-8.2). The max-abs delta itself stays RECORDED, never gated.
     """
     ctx = max(cfg.ctx_lens)
     N = cfg.logit_probe
@@ -344,6 +355,7 @@ def _logit_probe(model, tokenizer, cfg: Config, k_spec, v_spec) -> None:
 
     rows = []
     n_flips = 0
+    n_hard_flips = 0
     max_abs_overall = 0.0
     for step in range(N):
         # Teacher force: BOTH caches advance on streaming's greedy token, so a
@@ -365,13 +377,31 @@ def _logit_probe(model, tokenizer, cfg: Config, k_spec, v_spec) -> None:
         diff = (logits["packed"] - logits["streaming"]).abs()
         max_abs = diff.max().item()
         max_abs_overall = max(max_abs_overall, max_abs)
+        top2 = logits["streaming"].topk(2, dim=-1).values
+        gap = (top2[..., 0] - top2[..., 1]).item()
         flip = (
             logits["packed"].argmax(dim=-1) != logits["streaming"].argmax(dim=-1)
         ).item()
+        hard = bool(flip) and gap > max_abs
         n_flips += int(flip)
-        rows.append({"step": step, "max_abs_delta": round(max_abs, 6), "flip": flip})
+        n_hard_flips += int(hard)
+        rows.append(
+            {
+                "step": step,
+                "max_abs_delta": round(max_abs, 6),
+                "stream_top2_gap": round(gap, 6),
+                "flip": flip,
+                "hard": hard,
+            }
+        )
         print(
-            f"[logit probe] step={step:3d} max_abs_delta={max_abs:.6f} flip={flip}",
+            f"[logit probe] step={step:3d} max_abs_delta={max_abs:.6f} "
+            f"stream_top2_gap={gap:.6f} flip={flip}"
+            + (
+                " HARD (drift-inexplicable)"
+                if hard
+                else (" (near-tie WARN)" if flip else "")
+            ),
             flush=True,
         )
 
@@ -388,11 +418,16 @@ def _logit_probe(model, tokenizer, cfg: Config, k_spec, v_spec) -> None:
         f"\n[logit probe] arm={cfg.arm} ctx={ctx} N={N} "
         f"flips={n_flips} max_abs_envelope={max_abs_overall:.6f}"
     )
-    assert n_flips == 0, (
-        f"LOGIT PROBE FAIL: {n_flips} argmax flip(s) over {N} teacher-forced steps at "
-        f"ctx={ctx} (max_abs_envelope={max_abs_overall:.6f}) — packed and streaming "
-        f"disagree on the actual greedy token, not just magnitude; this is a real "
-        f"divergence, not the documented accumulation-order drift."
+    assert n_hard_flips == 0, (
+        f"LOGIT PROBE FAIL: {n_hard_flips} drift-INEXPLICABLE argmax flip(s) over {N} "
+        f"teacher-forced steps at ctx={ctx} (max_abs_envelope={max_abs_overall:.6f}) — "
+        f"a flip whose streaming top-2 gap exceeds that step's max-abs delta cannot be "
+        f"accumulation-order drift; this is a real divergence."
+    )
+    assert n_flips <= N // 8, (
+        f"LOGIT PROBE FAIL: {n_flips} flips over {N} steps (> N//8 = {N // 8}) — even "
+        f"near-tie flips at this rate indicate the packed path's drift class has "
+        f"changed, not seed luck; investigate before trusting the path."
     )
 
 
