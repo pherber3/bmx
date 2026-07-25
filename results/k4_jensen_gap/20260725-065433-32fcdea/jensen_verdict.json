@@ -1,0 +1,41 @@
+{
+  "r_pred": 0.5190916605320635,
+  "per_budget": {
+    "2.2": {
+      "r_discrete": 0.6431547388959843,
+      "identity_check": 2.188617738137905,
+      "abs_gap": 0.12406307836392083,
+      "match": false,
+      "abs_gap_debiased": 0.04040770589081333,
+      "match_debiased": true
+    },
+    "2.5": {
+      "r_discrete": 0.6754060573324421,
+      "identity_check": 2.6217468338834022,
+      "abs_gap": 0.15631439680037862,
+      "match": false,
+      "abs_gap_debiased": 0.00815638745435554,
+      "match_debiased": true
+    }
+  },
+  "match": false,
+  "flatness": {
+    "n_flat": 3,
+    "r_pred_at_n_flat": 0.6309993623394191,
+    "r_pred_at_all": 0.5190916605320635,
+    "delta": 0.11190770180735574,
+    "r_pred_at_n_flat_debiased": 0.7852599777684635,
+    "r_pred_at_all_debiased": 0.6835624447867976,
+    "delta_debiased": 0.10169753298166581
+  },
+  "mixed_domain": null,
+  "n_layers": 32,
+  "wishart_debiasing": {
+    "post_hoc": true,
+    "note": "r_pred_debiased/match_debiased are a LABELED POST-HOC analysis (closed-form Bartlett/digamma Wishart log-det debiasing, math review finding #7 connection) \u2014 the PRE-REGISTERED readout is `match` on raw r_pred above; match_debiased is reported alongside it, not in place of it.",
+    "r_pred_debiased": 0.6835624447867976,
+    "bias_factor_seq": 0.7355099355861145,
+    "bias_factor_pool": 0.9685514292772374,
+    "match_debiased": true
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "cache_path": "results/cache/llama-3.1-8b-instruct_2048_off16384.safetensors",
+  "corpus_cache_paths": [
+    "results/cache/llama-3.1-8b-instruct_2048_off2048.safetensors",
+    "results/cache/llama-3.1-8b-instruct_2048_off4096.safetensors",
+    "results/cache/llama-3.1-8b-instruct_2048_off6144.safetensors",
+    "results/cache/llama-3.1-8b-instruct_2048_off8192.safetensors"
+  ],
+  "model_label": "llama-3.1-8b-instruct",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "tiers": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8
+  ],
+  "group": 64,
+  "ridge": 0.001,
+  "position_stride": 8,
+  "ranks": [
+    16,
+    32
+  ],
+  "uniform_rank": 16,
+  "uniform_bits": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "tq_bits": [
+    2,
+    3,
+    4
+  ],
+  "coeffquant_rank": 32,
+  "coeffquant_bits": 6,
+  "coeffquant_res_bits": 2,
+  "k2t_bits": 2,
+  "seed": 0,
+  "max_layers": 0,
+  "w_source": "corpus",
+  "out_root": ""
+}
