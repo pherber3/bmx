@@ -26,9 +26,10 @@ Mode C (--logit-probe N): numerical divergence between the packed and streaming
 caches over N teacher-forced decode steps at max(ctx_lens) — both caches fed
 streaming's greedy token at each step (so trajectories stay comparable even if they'd
 otherwise diverge), recording max|logits_packed - logits_streaming| and the argmax
-flip count per step. Gate: 0 flips over N >= 32; the max-abs envelope is RECORDED
-against the documented O(0.25-1.45) 64k class (docs/2026-07-15-k4-duel-results.md
-appendix), never gated bitwise — long-context accumulation-order drift across many
+flip count per step. Gate (amended 2026-07-25): FAIL on drift-INEXPLICABLE flips
+(streaming top-2 gap > that step's max-abs delta) or flips > N//8; near-tie flips
+WARN with forensics — see _logit_probe's docstring. The max-abs envelope is
+RECORDED, never gated bitwise — long-context accumulation-order drift across many
 committed pages is expected and pre-existing, not a correctness bug.
 
 Usage (VM):
@@ -65,9 +66,10 @@ class Config:
     profile_steps: int = 0  # >0: also run Mode B on the packed cache at ctx_lens[0]
     logit_probe: int = 0
     """>0: also run Mode C — N teacher-forced decode steps at max(ctx_lens), recording
-    per-step max|logits_packed - logits_streaming| and the argmax flip count. Gate: 0
-    flips over N >= 32; the max-abs envelope is recorded, never gated bitwise (see
-    module docstring)."""
+    per-step max|logits_packed - logits_streaming|, the streaming top-2 gap, and the
+    argmax flip count. Gate: fail on drift-inexplicable flips (gap > step delta) or
+    flips > N//8; near-tie flips warn; the max-abs envelope is recorded, never gated
+    bitwise (see _logit_probe)."""
     skip_dense: bool = False  # dense fp16 OOMs first at long ctx; skip to keep sweeping
     pack_path: str = ""
     """Fitted spectral pack file — required for k4_* arms. Pack-gated (spectral) arms
