@@ -1,0 +1,105 @@
+# K4 paper shelf — banked paper-ready material (2026-07-25)
+
+Consolidated at the pre-rental pause so nothing lives only in session scratch.
+Each item names its source doc (the number-bearing record). Drafting is HELD
+until all results are in (user's call); this is the shelf, not the draft.
+
+## Method / theory section
+
+- **Everett-tightness of the tier allocator** (foundational pass, ledger):
+  the Lagrangian allocation is exactly primal-optimal at its achieved charge;
+  vs the target budget the duality gap is ≤ κ*·Δ_max/C ≈ 0.002 bpe at C=1024
+  (staircase perturbation function; requires grid-convexity of g, which
+  `_tier_g` asserts; allocator can land slightly under budget at a plateau,
+  never over). Frame the allocator as a Lagrangian slice of the
+  rate-distortion frontier (κ_L ≡ the RD multiplier).
+- **The Jensen residual is an exact AM/GM gap**
+  (`docs/2026-07-25-k4-local-levers-results.md` §3 + estimation-axis pass):
+  continuous waterfill equalizes per-direction distortion (AM=GM, ratio 1);
+  the tier grid makes it non-flat; the 7.6–10.5× identity-check residual IS
+  the discretization AM/GM gap — closed-form decomposition zero-bit (12–17%)
+  vs funded-tier-rounding (83–88%). Optional 4-line emit in
+  `k4_jensen_gap._discrete_readout` makes future runs self-documenting.
+- **Transfer ceiling = mutual information** (Matrix Analysis Thm 7.8.21
+  Minkowski + Thm 7.6.6 log-det concavity; HDS §15.3 eq. 15.50 uses the same
+  inequality to bound I(Z;J)): the corpus-transfer ceiling
+  (1/C)(log det Σ̄ − E_s log det Σ_s) is (2/C)× a sequence-identity mutual
+  information — intrinsic, corpus-size-independent. Measured: r_pred
+  debiased 0.586 in the Gate-A band; honest bracket **[0.586, 0.72]**
+  (effective-n n_eff≈848 correction overshoots the band → raw-n anchor
+  retained as conservative; Wishart debias exact in the log-det first
+  moment, exp step exact to O(1/C²)).
+- **W-instrument scoping** (`docs/2026-07-24-k4-math-actions-results.md` §B):
+  all G1 `logit_rope` numbers are frozen-instrument (fair codec-vs-codec,
+  not the deployment metric); the causal instrument decides; sign-flip
+  footnote; triangular weighting = the matched offset density of a causal
+  window (measured AT the peak — every recency-discounted variant worse);
+  mechanism for first-order size: 29/64 Llama rotary planes have wavelength
+  > 64k so the odd sin·cos term never phase-averages. Scope note: the
+  instrument covers full-rotary models (Llama/Qwen3); partial-rotary needs
+  the non-rotated sub-block added.
+- **Why scalar quantization on eigencoordinates** (MacKay Ch. 20 unequal-
+  variance VQ failure modes + the 13-order spectrum): scalar-per-direction
+  after KLT is the right structure; block-VQ would need variance-aware
+  distance to not degenerate.
+
+## Quantizer-choice account (the declination ledger, each with numbers)
+
+- **Why uniform RTN (the shape-matched finding)**
+  (`docs/2026-07-25-k4-lloyd-gate-results.md`): blanket Gaussian-Lloyd fails
+  0.25/0.22× (two legs: ≥5-bit per-group MSE-scale beats a fixed codebook
+  even on N(0,1); metric-dominant top directions are sub-Gaussian,
+  λ-weighted Pearson kurtosis 2.58 — low tiers are heavy-tailed 4.2, Lloyd's
+  low-tier 20–24% win is coarse-quantization). Per-tier mix certified
+  +3.4–4.9% but confined to ~0.02% of the λ-metric — immaterial.
+- **Unbiased coding reconciliation** (RD-axis pass): unbiasedness pays only
+  under long aggregation (TurboQuant's NIAH regime); our per-position causal
+  logit metric is low-aggregation → biased RTN's lower per-estimate
+  distortion dominates (measured 0.197 vs 0.090 at b3). Predicts where the
+  verdict would flip — falsifiable.
+- **Entropy coding declined** (foundational pass): deployed-code entropy gap
+  is real (1.2–1.8 bits — it IS the uniform-codebook inefficiency) but
+  random access for paged decode forecloses stream coding; the fix belongs
+  at the codebook, which was then measured and declined (above). One
+  limitations paragraph.
+- **Sign tier / ternary tier**: ternary non-convex vs measured g (dominated);
+  1-bit sign raises c_used at the deployed path (+15 dirs ⇒ +0.059 bpe ≫
+  the payload gain) and is never selected at the charge-aware point.
+- **Linear shrinkage (LW/OAS)** (`docs/2026-07-25-k4-estimation-levers-results.md`):
+  additive-lift mechanism, no small-n rescue; row truncation right-signed
+  but no fuel (row-norm spread 1.24–1.49) at cost +0.4–3.2% distortion;
+  log-domain shrinkage not licensed (two families dead, burden on the next
+  design). Charge-aware allocation dead (budget knob walks the same locus).
+- **V-side Gaussian codebook exactness**: √d-scaled post-Hadamard marginal
+  at d=128: variance 0.999, kurtosis 2.957 — the Gaussian Lloyd codebook is
+  exact-optimal for V with no asymptotics appeal.
+
+## Accounting / deployment section
+
+- **AutoQuantize framing**: `mixed_dec_charge` + `int8_tl` = operator-level
+  mixed-precision PTQ with a CLOSED-FORM sensitivity (the certificate's
+  per-column `added_i`), cleaner than diagonal-Fisher; footnote where the
+  two sensitivities coincide.
+- **The cheap-analytic-instruments pattern, 3 validations**: int8 blanket
+  (conservative 3–4×, layer 2 anti-conservative ≤3× — stated), int8 tier
+  ordering (exact, 0/96), Lloyd blanket (near-exact magnitude). This is a
+  methods contribution: offline certificates gating GPU spend.
+- **Heavy-tail localization one-liner** (probability pass): whitened-tail
+  kurtosis is CREATED by W^{-1/2} amplification in near-null query
+  directions (layer-0-localized, funded mid-tier) — the principled account
+  of the 0↔2 boundary fragility; ridge is RELATIVE (model-portable);
+  whitener conditioning bounded by ridge cap (κ(W̃) ≤ ridge^{-1/2} ≈ 31.6).
+- **Measured-ĝ hygiene**: `sampling_limited` flag reads "sub-Gaussian source
+  OR sampling-limited" (cannot distinguish without shape stats); the
+  measured high-tier values are real (platykurtic), do not pin analytic.
+
+## Numbers the headline tables cite (current, pre-refit)
+
+- Duel crossovers under certified accounting: k4_b2.5 vs tq_b3 ~5.6–5.7k
+  (band → exact at refit); vs tq_k3v2 ~23.1–23.6k
+  (`docs/2026-07-15-k4-duel-results.md` §3 supersession block).
+- int8_tl: measured 0.75%/0.93%, saving 0.594/0.836 bits/token over uniform
+  T=5; T_ℓ map layer1→5 others→6
+  (`docs/2026-07-25-k4-estimation-levers-results.md` §2).
+- Figures: `results/figures/` (bits-vs-context with certified band;
+  cert-vs-measured scatter; corpus matrix + synthesis ladder; overlap).
