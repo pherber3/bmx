@@ -1,0 +1,35 @@
+{
+  "corpus_cache_paths": [
+    "results/cache/qwen3-8b_2048_off2048.safetensors",
+    "results/cache/qwen3-8b_2048_off4096.safetensors",
+    "results/cache/qwen3-8b_2048_off6144.safetensors",
+    "results/cache/qwen3-8b_2048_off8192.safetensors"
+  ],
+  "out_path": "results/cache/k4_packs_qwen3.safetensors",
+  "model_label": "qwen3-8b",
+  "model_name": "Qwen/Qwen3-8B",
+  "budgets": [
+    2.0,
+    2.2,
+    2.5,
+    2.7,
+    3.0,
+    3.2
+  ],
+  "tiers": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8
+  ],
+  "group": 64,
+  "ridge": 0.001,
+  "position_stride": 8,
+  "w_source": "corpus",
+  "w_rope": "frozen",
+  "alloc_sens_parquet": "",
+  "out_root": ""
+}

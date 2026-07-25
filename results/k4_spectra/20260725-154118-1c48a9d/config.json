@@ -1,0 +1,27 @@
+{
+  "cache_path": "results/cache/qwen3-8b_2048_off12288.safetensors",
+  "corpus_cache_paths": [],
+  "model_label": "qwen3-8b",
+  "model_name": "Qwen/Qwen3-8B",
+  "budgets": [
+    2.5
+  ],
+  "tiers": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8
+  ],
+  "group": 64,
+  "ridge": 0.001,
+  "position_stride": 8,
+  "ref_rank": 16,
+  "ref_bits": 3,
+  "seed": 0,
+  "max_layers": 0,
+  "w_source": "scored",
+  "out_root": ""
+}
