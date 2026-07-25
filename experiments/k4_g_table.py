@@ -29,10 +29,19 @@ directly, not containers). Every row gains a `quantizer` column and an
 reference distortion for that tier (quantize a large fixed-seed N(0,1) sample
 against `gaussian_codebook(bits)` and report its MSE -- unit-variance source,
 so the MSE IS the relative distortion, directly comparable to g_hat). A row
-is `sampling_limited=True` when `g_hat < analytic_gaussian`: impossible for a
-real quantizer against the Gaussian-OPTIMAL reference when the source is
-truly Gaussian, so it flags undersampled tail bins (expected at the high
-tiers, per the design doc's prior finding at tiers 6/8 for rtn). Both new
+is `sampling_limited=True` when `g_hat < analytic_gaussian`: for a truly
+Gaussian source this is impossible for a real quantizer against the
+Gaussian-OPTIMAL reference and flags undersampled tail bins — but the
+lloyd-gate run (2026-07-24) showed the metric-dominant top directions are
+sub-Gaussian in the lambda-weighted sense (lambda-weighted Pearson kurtosis
+2.58; a top-few/weighted statement, NOT uniform across the tier-8 tranche —
+see docs/2026-07-25-k4-lloyd-gate-results.md §2, the authoritative
+statement), and a group-adaptive uniform quantizer legitimately beats the
+GAUSSIAN-Lloyd reference on such sources. Read the flag as
+"sub-Gaussian source OR sampling-limited" — it cannot distinguish the two
+without per-direction shape statistics; do NOT auto-pin analytic values
+over flagged measurements (the 2026-07-25 lloyd-gate results doc records
+the corrected inference). Both new
 columns are ADDITIVE -- `quantizer="rtn"` (default) reproduces every
 pre-existing column byte-identically (pinned by
 `test_k4_g_table_rtn_default_byte_identical_to_prior`).
