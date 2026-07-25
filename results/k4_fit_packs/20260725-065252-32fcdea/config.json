@@ -1,0 +1,31 @@
+{
+  "corpus_cache_paths": [
+    "results/cache/llama-3.1-8b-instruct_2048_off2048.safetensors",
+    "results/cache/llama-3.1-8b-instruct_2048_off4096.safetensors",
+    "results/cache/llama-3.1-8b-instruct_2048_off6144.safetensors",
+    "results/cache/llama-3.1-8b-instruct_2048_off8192.safetensors"
+  ],
+  "out_path": "results/cache/k4_packs_llama31_instruct_rotw_ridge1e-2.safetensors",
+  "model_label": "llama-3.1-8b-instruct-ridge1e-2",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "tiers": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8
+  ],
+  "group": 64,
+  "ridge": 0.01,
+  "position_stride": 8,
+  "w_source": "corpus",
+  "w_rope": "rotated",
+  "alloc_sens_parquet": "",
+  "out_root": ""
+}
