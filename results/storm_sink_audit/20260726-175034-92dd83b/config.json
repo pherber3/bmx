@@ -1,0 +1,12 @@
+{
+  "score_cache_path": "results/cache/gpt2_1024.safetensors",
+  "pack_path": "results/cache/k4_packs_gpt2.safetensors",
+  "model_label": "gpt2",
+  "model_name": "",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "n_sinks": 4,
+  "out_root": ""
+}

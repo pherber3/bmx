@@ -1,0 +1,33 @@
+{
+  "task": "storm Task-3 sink carve-out audit",
+  "model": "gpt2",
+  "n_sinks": 4,
+  "gate_pct": 5.0,
+  "per_budget": {
+    "2.2": {
+      "sink_distortion": 434.025945186615,
+      "total_distortion": 103478.96307373047,
+      "sink_dist_share": 0.004194339915035333,
+      "sink_dist_share_pct": 0.41943399150353333,
+      "sink_attn_mass": 0.3111629598667302,
+      "sink_attn_mass_pct": 31.11629598667302,
+      "max_layer_sink_dist_share": 0.00695067646110675,
+      "min_layer_sink_dist_share": 0.002652201276339168,
+      "mean_layer_sink_dist_share": 0.004014278837573585
+    },
+    "2.5": {
+      "sink_distortion": 320.6218137741089,
+      "total_distortion": 75299.49340820312,
+      "sink_dist_share": 0.0042579544597464766,
+      "sink_dist_share_pct": 0.42579544597464764,
+      "sink_attn_mass": 0.3111629598667302,
+      "sink_attn_mass_pct": 31.11629598667302,
+      "max_layer_sink_dist_share": 0.007681969831093177,
+      "min_layer_sink_dist_share": 0.002581789756817973,
+      "mean_layer_sink_dist_share": 0.003982510765953787
+    }
+  },
+  "gate_outcome": "honest null (W-metric validated)",
+  "carve_out_confirmed": false,
+  "git_sha": "92dd83b"
+}

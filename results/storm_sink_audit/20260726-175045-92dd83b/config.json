@@ -1,0 +1,12 @@
+{
+  "score_cache_path": "results/cache/qwen3-0.6b_2048.safetensors",
+  "pack_path": "results/cache/k4_packs_qwen3_06b.safetensors",
+  "model_label": "qwen3-0.6b",
+  "model_name": "Qwen/Qwen3-0.6B",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "n_sinks": 4,
+  "out_root": ""
+}
