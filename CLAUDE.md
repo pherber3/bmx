@@ -93,9 +93,9 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   incrementally. Eval on real Llama-3.1-8B reproduces the NIAH frontier (k2b_ph
   recall_full 6.98/7.46/8.89 vs 6.94/7.41/8.98). Final review (MERGE AFTER FIXES) +
   external audit both cleared; **GH200 re-verify PASSED 2026-07-25** (671/2/1 on
-  GPU, parity OK, path probe 96 fused calls, 0 flips/64 @64k — merge gate GREEN,
-  merge decision with the user; Gate-C amended to drift-inexplicable flips,
-  `2bb0d6a`, per the duel doc's own pre-registration).
+  GPU, parity OK, path probe 96 fused calls, 0 flips/64 @64k) — **MERGED to main
+  2026-07-26**; Gate-C amended to drift-inexplicable flips (`2bb0d6a`, per the
+  duel doc's own pre-registration).
   **Debloat:** the dead dense `fused_decode_attention`, the unwired graphable CUDA-graph
   path, and the obsolete `hadamard_kernel_ref` were DELETED (commit `7b07552`, −1559 net) —
   if a future task needs CUDA-graph capture or an in-kernel FWHT, the removed code +

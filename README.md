@@ -46,8 +46,8 @@ codes resident with chunked dequant-attention at decode (merged to main); the
 Phase-3 Triton split-KV decode kernel dequants in-kernel (RTN + the real k2b
 recipe with in-kernel low-rank K + RoPE + per-head Hadamard V), uniform paged
 layout, GH200-re-verified 2026-07-25 (full CUDA suite green, real-model parity,
-fused-path probe, 0 argmax flips over 64 steps at 64k) — branch
-`feat/triton-decode-kernel`, merge gate green. Docs:
+fused-path probe, 0 argmax flips over 64 steps at 64k) — **merged to main
+2026-07-26**. Docs:
 `2026-06-23-kernel-census-results.md`, `2026-06-24-triton-decode-results.md`.
 
 **5. K4 spectral codec (closed, positive — the headline program).**
