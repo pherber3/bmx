@@ -335,6 +335,12 @@ def _logit_probe(model, tokenizer, cfg: Config, k_spec, v_spec) -> None:
     with the top-5 token SET identical between paths at every step and the k4
     drift class (1.3-7.4) statistically identical to the accepted fused-k2b
     class (1.2-8.2). The max-abs delta itself stays RECORDED, never gated.
+
+    Two deliberate strictness choices: the hard test uses gap > delta rather
+    than the tight two-sided bound gap > 2*delta, so it errs toward FAIL on
+    the band in between (a merge gate should); and at N < 8 the count gate
+    (N//8 = 0) collapses back to zero-flip tolerance — too few steps to
+    distinguish seed luck from a drift-class change (intended usage N >= 32).
     """
     ctx = max(cfg.ctx_lens)
     N = cfg.logit_probe

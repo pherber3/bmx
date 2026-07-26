@@ -75,19 +75,11 @@ EVAL_CORPORA = ("wiki", "code")
 # rules). shufcode/uni*/bi* are the mandatory orders-1+2 block (all-or-none);
 # tri* is the default-inert order-3 climb (its own both-or-none pair, only
 # licensed after order-2 earned its keep on both sides).
-SYNTH_FIT_CORPORA = (
-    "shufcode",
-    "uniwiki",
-    "unicode",
-    "biwiki",
-    "bicode",
-    "triwiki",
-    "tricode",
-)
 # The order-1+2 block that the all-or-nothing / order-ladder rules require in
 # full; the trigram climb is optional on top (guarded inline in main()).
 _BASE_SYNTH_FIT_CORPORA = ("shufcode", "uniwiki", "unicode", "biwiki", "bicode")
 _TRI_SYNTH_FIT_CORPORA = ("triwiki", "tricode")
+SYNTH_FIT_CORPORA = _BASE_SYNTH_FIT_CORPORA + _TRI_SYNTH_FIT_CORPORA
 # (basis_corpus, alloc_corpus) — scored on the alloc corpus's eval side (H3).
 _HYBRID_CELLS = (("wiki", "code"), ("code", "wiki"))
 # (sigma_corpus, w_corpus) — scored on BOTH eval sides (binding decision 2).

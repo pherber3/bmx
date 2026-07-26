@@ -1,7 +1,7 @@
 [project]
 name = "bmx"
 version = "0.1.0"
-description = "Tensor-decomposition weight-compression research framework (BMD / hypermatrix algebra on LLM weights)"
+description = "Kill-or-confirm LLM tensor-compression research: weights break-even law, KV-cache codecs (K2b/K3 streaming, K4 spectral), fused dequant-attention kernels"
 readme = "README.md"
 authors = [
     { name = "pherber3", email = "" }

@@ -1,5 +1,10 @@
 # VM rental queue — consolidated (2026-07-25, pre-pause)
 
+> **EXECUTED IN FULL (2026-07-25/26):** every queue item and both riders ran
+> green on one GH200 rental, plus a filler/overnight extension —
+> see `docs/2026-07-26-gh200-rental-results.md` for the complete record.
+> (Suite count below predates the rental-period commits; now 651/17/1.)
+
 One GH200 rental executes everything below, sequentially on one machine
 (git-bundle transport; detached setsid launches; module-form invocation;
 never sudo pip; don't kill long runs). All runbooks are validated against
@@ -43,8 +48,8 @@ Core total ≈ 45–60 GPU-h ≈ 2–2.5 days.
 ## Resume checklist (after the pause)
 
 - Branch `feat/triton-decode-kernel`, all work committed+pushed; suite
-  646 passed / 17 skipped / 1 xfailed; tree clean except the user's
-  `docs/user-notes.md` (their call).
+  646 passed / 17 skipped / 1 xfailed at pause time; tree clean except the
+  user's private notes file (untracked, their call).
 - Session ledger `.superpowers/sdd/progress.md` is gitignored scratch — the
   durable record is: this doc, `docs/2026-07-25-k4-paper-shelf.md`, the
   results docs, and the auto-memory.

@@ -693,7 +693,7 @@ def test_synth_stream_trigram_unseen_context_backoff():
 
     # window [5, 9, 5]: succ2 = {(5, 9): [5], (9, 5): []-absent}. The 2-context
     # (9, 5) is never observed with a successor, so a step landing on it must
-    # back off ONE order to the bigram conditional (succ = {5: [9, 5], 9: [5]})
+    # back off ONE order to the bigram conditional (succ = {5: [9], 9: [5]})
     # — never crash, and stay in the window's support {5, 9}. Longer output
     # forces the chain through (9, 5) at least once.
     w = torch.tensor([5, 9, 5], dtype=torch.int64)

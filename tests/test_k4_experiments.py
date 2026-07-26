@@ -241,6 +241,7 @@ def test_k4_fit_packs_smoke(tmp_path):
         model_label="tiny",
         budgets=(2.5,),
         group=16,
+        out_root=str(tmp_path / "results"),
     )
     main(cfg)
     packs = load_packs(out, 2.5)

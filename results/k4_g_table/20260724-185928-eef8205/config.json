@@ -1,5 +1,5 @@
 {
-  "pack_path": "C:\\Users\\Patrick\\AppData\\Local\\Temp\\claude\\d--Projects-bmx\\8f1cfcc4-b3e0-4bf8-9347-e762b115ad87\\scratchpad\\gpt2_gtable_packs.safetensors",
+  "pack_path": "<scrubbed-local-scratchpad>/gpt2_gtable_packs.safetensors",
   "corpus_cache_paths": [
     "results/cache/gpt2_1024_off1024.safetensors",
     "results/cache/gpt2_1024_off2048.safetensors",

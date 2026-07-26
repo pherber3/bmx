@@ -1,7 +1,8 @@
 # CLAUDE.md — bmx
 
 Kill-or-confirm research code for LLM tensor compression (weights program
-closed, KV-cache program closed-positive — see README for the findings arc).
+closed, KV-cache program closed-positive, K4 spectral codec closed-positive
+with the GH200 evidence batch — see README for the findings arc).
 Experiments exist to close gates; an honest negative is a valid result. Don't
 polish numbers; report them. Theory questions: use the `personal-brain` skill /
 `mcp__wiki__*` tools (vault anchors: VQ distortion objectives, Beta-coordinate
@@ -24,7 +25,7 @@ rotation, two-stage quantization, BM-decomposition notes).
 ## Commands
 
 ```bash
-uv run pytest -q                  # ≈ 50 s; expected: 271 passed, 8 skipped, 1 xfailed
+uv run pytest -q                  # ≈ 95 s; expected: 651 passed, 17 skipped, 1 xfailed
 uv run python experiments/<x>.py --help   # tyro CLIs; tuples space-separated
 uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024
                                   # regenerates results/cache/* (gitignored)

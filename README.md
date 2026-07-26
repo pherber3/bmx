@@ -2,7 +2,7 @@
 
 Kill-or-confirm research on LLM tensor compression: matched-budget experiments,
 permutation/random controls, honest bit accounting, every result a committed
-parquet. Two completed programs:
+parquet. Five programs, all closed:
 
 **1. Weights (closed, negative-with-a-law).** Started as a test of
 Bhattacharya–Mesner (hypermatrix) decomposition for bandwidth-amplified decode;
@@ -41,15 +41,42 @@ naive re-quantization), frozen pre-RoPE subspace, fp16 residual window. Quality 
 (1.001× fp16 on token-by-token ppl), packed bpe < fp16, all arms (K2b/TurboQuant/KIVI/
 fp16) on one fair code path — `docs/2026-06-19-k3-streaming-cache-results.md`.
 
-Remaining work is engineering, not science: the fused dequant-attention kernel (for the
-literal process-RSS win; the Track B byte model in `src/bmx/bench/` predicts kernel wins
-before any CUDA is written), the authoritative SOTA-model VM run, and a 32k-context
-re-check.
+**4. Fused kernels (closed, positive).** `PackedStreamingCache` keeps packed
+codes resident with chunked dequant-attention at decode (merged to main); the
+Phase-3 Triton split-KV decode kernel dequants in-kernel (RTN + the real k2b
+recipe with in-kernel low-rank K + RoPE + per-head Hadamard V), uniform paged
+layout, GH200-re-verified 2026-07-25 (full CUDA suite green, real-model parity,
+fused-path probe, 0 argmax flips over 64 steps at 64k) — branch
+`feat/triton-decode-kernel`, merge gate green. Docs:
+`2026-06-23-kernel-census-results.md`, `2026-06-24-triton-decode-results.md`.
+
+**5. K4 spectral codec (closed, positive — the headline program).**
+Corpus-calibrated query-weighted KLT over key coordinates + reverse-waterfill
+bit allocation, values rotate+Lloyd @2b, tier-gated int8 decoders. Shipped
+recipe `k4_b2.5_dec8tl` (rotated-W calibration, per-layer int8_tl), all
+measured on a GH200 across Llama-3.1-8B-Instruct AND Qwen3-8B
+(`docs/2026-07-26-gh200-rental-results.md` + four verified appendices):
+LongBench macro **40.85 @ 3.081 mean bits** (+0.48 over the strongest
+TurboQuant baseline at −0.125 bits; +0.13 over its own fp32 decoders at
+−0.72 bits), NIAH parity with fp16 at 4k–128k (5-seed), measured int8
+decoder cost 0.55–0.90% vs a 5% bar on both models, 128k resident memory
+50.5 GiB vs fp16's 63.3. Side findings with their own legs: calibration
+needs only ~2k tokens of general text (gate passes from one cache, both
+models); packs can be synthesized from trigram count tables alone (D < 0.10,
+both models, ladder self-terminates at order 3); the gpt2-scale
+"token-marginal" calibration claim reverses at 8B (word order matters);
+TurboQuant-family arms collapse on Qwen at 32k while K4 holds (mechanism
+open). Full theory + declination ledger: `docs/2026-07-25-k4-paper-shelf.md`.
+
+Remaining open items are engineering: a wider batched-128k co-residency sweep,
+a needle-reseeding NIAH harness knob, the Qwen TurboQuant-collapse mechanism
+probe, and a fused spectral decode kernel (gated on a deployment-latency claim
+the science does not need).
 
 ## Quickstart
 
     uv sync
-    uv run pytest -q                      # 264 passed, 17 skipped, 1 xfailed (intentional)
+    uv run pytest -q                      # 651 passed, 17 skipped, 1 xfailed (intentional)
     uv run python experiments/k1_cache_census.py --help   # tyro CLIs everywhere
 
 Experiments run on CPU except where noted (this repo was developed against an
@@ -70,7 +97,8 @@ Raw caches (`results/cache/`, gitignored) regenerate via
 - `docs/` — results docs (the program record), research plans,
   `superpowers/` (implementation plans/specs)
 - `scripts/` — NVIDIA-VM setup + Nsight wrappers, SageMath fixture exporter
-- `tests/` — 129 tests; agents: see `CLAUDE.md` for conventions and pitfalls
+- `tests/` — 600+ tests across 63 files; agents: see `CLAUDE.md` for
+  conventions and pitfalls
 
 ## NVIDIA VM workflow (GPU-authoritative numbers)
 

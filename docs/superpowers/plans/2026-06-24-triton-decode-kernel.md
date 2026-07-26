@@ -663,7 +663,7 @@ Propose: `feat(cache): split-KV decode parallelism + autotune (stage 3b)`. STOP 
 
 **Files:**
 - Create: `docs/2026-06-2x-triton-decode-results.md` (date-stamp at write time)
-- Modify: `CLAUDE.md` (Phase-3 status line), `C:\Users\Patrick\.claude\projects\d--Projects-bmx\memory\fused-kernel-status.md`
+- Modify: `CLAUDE.md` (Phase-3 status line), plus the assistant's local memory note for the fused-kernel status (off-repo)
 
 **Context:** GPU-authoritative — runs on the VM. Predict first (Task 0 curve), then measure (Task 5 ledger), then reconcile honestly (like the memory-census doc did).
 
