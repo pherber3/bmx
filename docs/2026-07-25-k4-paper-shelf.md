@@ -93,7 +93,43 @@ until all results are in (user's call); this is the shelf, not the draft.
   OR sampling-limited" (cannot distinguish without shape stats); the
   measured high-tier values are real (platykurtic), do not pin analytic.
 
-## Numbers the headline tables cite (current, pre-refit)
+## RENTAL ADDITIONS (2026-07-26 — every number now measured; the pre-refit
+## section below is superseded by `2026-07-26-gh200-rental-results.md`)
+
+- **Headline table row (the shipped recipe, measured)**: k4_b2.5_dec8tl
+  LongBench macro 40.85 @ 3.081 mean bits — +0.48 over tq_b3 (40.37) at
+  −0.125 bits; +0.13 over own fp32/frozen at −0.72 bits (the int8_tl
+  accounting win as a single number). Macro convention mandatory. Category
+  composition: synthetic +3.36 / code +1.40; language cats slightly favor b3.
+- **NIAH figure**: honest null on Llama (all arms within noise at 32k/64k,
+  5 seeds) = parity-at-fewer-bits; seed bars are codec-RNG bars (one fixed
+  needle/length — stated limitation). Qwen: TQ-family collapse at 32k
+  (tq_b3 → 2.60 vs fp16 10.00 flat) while k4 holds parity — cross-model
+  robustness as a differentiator (n=1 model-pair, mechanism open).
+- **Deployment section**: measured int8_tl 0.80/0.90% (Llama) and
+  0.55/0.57% (Qwen) vs the 5% bar; certificate conservatism 5.3–8.6×
+  (validations 3+4 of the cheap-instruments pattern); 128k census measured
+  k4 chunked 50.48 GiB vs fp16 63.30 (20% below) with packed NIAH healthy
+  at 128k; k2b 128k dense FITS post-mask-fix (83.31 — the June OOM was
+  pre-fix).
+- **Calibration story (the "general corpus" section)**: cross-domain
+  penalty halves at 8B; token-marginal REVERSES at 8B on both models (order
+  matters — scale-scoped narrative required); trigram count-table recipe
+  CONFIRMS both models (D_tri 0.036–0.074 < 0.10) and the ladder
+  self-terminates at order 3 by the pre-registered both-sides rule; G1
+  passes from nc=1 (a single 2048-token cache) on both models, win curve
+  monotone to nc=8. Privacy framing: ship general-text packs; the n-gram
+  recipe needs order-3 statistics, not raw text.
+- **Theory anchors extended**: Jensen debiased r_pred 0.684 at Llama inside
+  the gpt2 band with the identity matching (0.008–0.040) — two-scale
+  anchor; H3 basis non-transfer replicates at 8B (0.63–0.75 < 0.9).
+- **Methods honesty items**: Gate-C amendment (drift-inexplicable flips;
+  pre-registered by the duel doc itself); k3v2 = our asymmetric steelman
+  (`5720588`); rotated-W is Llama-licensed (Qwen frozen-W by scope); the
+  full incident record (rental doc §9) as ops-transparency material.
+
+## Numbers the headline tables cite (SUPERSEDED — pre-refit; see the rental
+## additions above)
 
 - Duel crossovers under certified accounting: k4_b2.5 vs tq_b3 ~5.6–5.7k
   (band → exact at refit); vs tq_k3v2 ~23.1–23.6k

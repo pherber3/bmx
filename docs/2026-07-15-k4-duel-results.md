@@ -1,5 +1,15 @@
 # K4 spectral codec — Stage-3 VM duel results (2026-07-15)
 
+> **SUPERSESSION (2026-07-26,** `docs/2026-07-26-gh200-rental-results.md`**):**
+> §4 NIAH is superseded by the rental doc §4 (final recipe rotated-W +
+> int8_tl, 5-seed tables, the `f9eeafe` run excluded as non-duel provenance;
+> verdict: honest null — parity at fewer bits). The final recipe's LongBench
+> macro is 40.85 @ 3.081 bits (+0.48 over tq_b3 at −0.125 bits). Two
+> corrections: "n=2,930" below should read 3750 samples/arm (parquet count);
+> the §packed-parity O(0.25–1.45) envelope class was measured on a different
+> basis — both fused arms measure 7–12 envelopes at 64k with healthy amended
+> gates (rental doc §8, Gate-C amendment `2bb0d6a`).
+
 **Verdict up front: the pre-registered effect-size targets (spec §10.2) are NOT
 met under the licensed accounting; the underlying effect is real, measured, and
 smaller.** K4 is the best quantized arm on the full LongBench table (+0.35 Avg

@@ -1,5 +1,15 @@
 # K4 corpus-transfer gate — results (gpt2 mechanism scale)
 
+> **SCALE-SCOPING (2026-07-26,** `docs/2026-07-26-gh200-rental-results.md` §5**):**
+> the token-marginal verdict below (shuffle-null ≈ in-domain,
+> `model_intrinsic_flag=True`) is a gpt2-scale result and REVERSES at 8B on
+> BOTH Llama-3.1-8B-Instruct and Qwen3-8B: the shuffled-order null is WORSE
+> than cross-domain transfer on every side (flag False both models) — word
+> order in calibration text matters at deployment scale. Meanwhile the
+> cross-domain penalty roughly halves vs gpt2, and the n-gram synthesis
+> ladder CONFIRMS at order 3 (D_tri < 0.10 both models; ladder
+> self-terminates). H3 and the top-tier findings below replicate at 8B.
+
 Spec: `docs/superpowers/specs/2026-07-23-k4-corpus-transfer-design.md`.
 Run: `results/k4_corpus_transfer/20260723-190823-8dced47` (git SHA `8dced47`).
 Harness: `experiments/k4_corpus_transfer.py`. Fit budgets MATCHED by

@@ -1,5 +1,13 @@
 # K4 estimation levers — results (2026-07-25)
 
+> **SCALE COMPLETION (2026-07-26,** `docs/2026-07-26-gh200-rental-results.md`
+> §§2, 6**):** int8_tl shipped and measured at deployment scale on BOTH
+> models. Nominal binding margins: Llama 1.00× (b2.2, layer 27) / 1.06×
+> (b2.5, layer 7); Qwen 1.09× (b2.2, log-cited) / 1.02× (b2.5, layer 19).
+> Measured degradation: Llama 0.80%/0.90%, Qwen 0.55%/0.57% vs the 5% bar —
+> conservatism ratios 5.3–8.6× (the certificate's 3rd/4th validations).
+> Blanket int8 fails 14–20% at scale, as predicted below.
+
 Provenance: spec `docs/superpowers/specs/2026-07-25-k4-estimation-levers-design.md`,
 plan `docs/superpowers/plans/2026-07-25-k4-estimation-levers.md`. All local
 (gpt2 mechanism scale + analytic). Run ids:
