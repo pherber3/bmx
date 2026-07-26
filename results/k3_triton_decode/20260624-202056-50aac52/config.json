@@ -1,0 +1,17 @@
+{
+  "seq_lens": [
+    512,
+    2048,
+    8192,
+    32768
+  ],
+  "n_warmup": 5,
+  "n_repeat": 30,
+  "n_q_heads": 32,
+  "n_q_groups": 4,
+  "d": 128,
+  "blk": 64,
+  "arm": "rtn_token",
+  "group": 64,
+  "seed": 42
+}

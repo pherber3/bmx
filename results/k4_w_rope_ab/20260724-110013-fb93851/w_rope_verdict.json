@@ -1,0 +1,50 @@
+{
+  "headline_metric": "logit_rope",
+  "rule": "Pre-registered (spec 2026-07-24 SB): |rel_win_delta| < 2% at both budgets -> scoped_negligible (frozen-rotation approximation measured-negligible at this scale; Llama spot-check queued); >= 2% -> rotated_form_required (paper uses rotated numbers; Llama refit REQUIRED on the rental). Sign-flip footnote enters the methods section either way. NOTE (task-4 third instrument): logit_rope/win_frozen/win_rotated above are CIRCULAR \u2014 logit_rope leaves Q un-rotated, which is exactly the same frozen quadratic form W is fit to match, so this A/B could not distinguish frozen from rotated on independent grounds. The deciding readout is `causal` below (logit_distortion_causal, the true masked per-position causal logit error).",
+  "per_budget": {
+    "2.2": {
+      "win_frozen": 13.410119653565825,
+      "win_rotated": 10.665475961438926,
+      "rel_win_delta": -0.20466959005821272,
+      "n_samples": 28
+    },
+    "2.5": {
+      "win_frozen": 13.679836918446984,
+      "win_rotated": 10.706276997462686,
+      "rel_win_delta": -0.21736808258105134,
+      "n_samples": 28
+    }
+  },
+  "decision": "rotated_form_required",
+  "llama_refit_required": true,
+  "causal": {
+    "metric": "logit_distortion_causal (forward-RoPE Q at true absolute position, masked to causal s<=t pairs, over the FULL sequence)",
+    "rule": "Direct ratio dist_causal_frozen/dist_causal_rotated per (cache, layer), mean +/- min/max across layers, per budget. > 1 means rotated is better (lower causal distortion). 2% neutrality band retained: |mean_ratio - 1| < 2% at every budget -> neutral_causal; consistently > 2% -> rotated_preferred_causal; consistently < -2% -> frozen_preferred_causal; sign disagreement across budgets -> mixed_causal.",
+    "per_budget": {
+      "2.2": {
+        "ratio_frozen_over_rotated_mean": 1.2004429442371065,
+        "ratio_frozen_over_rotated_min": 1.1301979022738105,
+        "ratio_frozen_over_rotated_max": 1.2702550645426351,
+        "dist_causal_frozen_mean": 0.036909251872982295,
+        "dist_causal_rotated_mean": 0.03078696337927665,
+        "n_layer_cache": 28
+      },
+      "2.5": {
+        "ratio_frozen_over_rotated_mean": 1.2095022326608773,
+        "ratio_frozen_over_rotated_min": 1.1479988204283431,
+        "ratio_frozen_over_rotated_max": 1.2923301998490953,
+        "dist_causal_frozen_mean": 0.030338637996464968,
+        "dist_causal_rotated_mean": 0.02510712734822716,
+        "n_layer_cache": 28
+      }
+    },
+    "third_instrument_verdict": "rotated_preferred_causal"
+  },
+  "overlap_mean_by_rank": {
+    "8": 0.9222762586331078,
+    "16": 0.9206141352458692,
+    "32": 0.9286430312550505,
+    "64": 0.9316949789869374
+  },
+  "git_sha": "fb93851"
+}

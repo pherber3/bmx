@@ -5,20 +5,10 @@ tokens INTO the streaming cache, then teacher-forces the continuation so each
 step attends to the on-append compressed cache. The end-to-end 'in practice'
 metric for the K3 verdict.
 
-token_by_token mode (Task 11):
-    When token_by_token=True, the continuation is scored one token at a time.
-    Each decode step appends exactly one token to the cache (triggering
-    quantize-on-append), and the logit predicting the NEXT token is scored.
-    This is the honest streaming regime: quant errors compound step by step.
-
-    Indexing: after prefill([0:n_prefill]), cache holds [0..n_prefill-1].
-    HF causal LM: model(ids[:,a:b], past_key_values=cache) appends tokens
-    a..b-1 to the cache; logits[:,-1] predicts token b.
-    So to score token i+1, we feed token i (ids[:,i:i+1]); the cache then
-    holds [0..i].  Loop: for i in range(n_prefill, N-1) → feed token i,
-    score target token i+1.  This yields n_eval = N-1-n_prefill tokens,
-    matching the batched path (which uses HF label-shift: cont_ids=[n_prefill:]
-    scored over [n_prefill+1..N-1]).
+token_by_token mode: scores the continuation one token at a time so each
+    next-token NLL attends to the incrementally-built compressed cache, the
+    honest streaming regime where quant errors compound step by step
+    (derivation at the scoring loop below).
 
 NOTE on tiny-model quality numbers:
     tiny_llama has random weights, so absolute ppl is meaningless (~vocab size).
@@ -34,29 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from bmx.cache.specs import CacheCodecSpec
-from bmx.cache.streaming import StreamingQuantizedCache, resolve_vocab_size
-
-
-def compression_for(model, k_spec, v_spec, length: int) -> tuple[float, float, float]:
-    """Measured (bpe_k, bpe_v, compression) for an arm at a given sequence length.
-
-    Runs a calibration prefill of `length` tokens first: bits_per_entry is nan until a
-    forward pass quantizes a block. Then reads the blended-bpe accounting off the cache.
-    """
-    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
-    cache.attach(model)
-    g = torch.Generator().manual_seed(0)
-    # Generate on CPU (seeded Generator is CPU-only), then move to the model's device.
-    vocab = resolve_vocab_size(model.config)
-    ids = torch.randint(0, vocab, (1, length), generator=g).to(model.device)
-    with cache:
-        with torch.no_grad():
-            # logits_to_keep=1: only the cache's bpe accounting is read, never the logits, so
-            # don't materialize the (length × vocab) logit tensor (~32 GB at 64k × 128k vocab).
-            model(ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
-    bpe_k, bpe_v = cache.bits_per_entry()
-    mem = cache.memory_report(seq_len=length)
-    return bpe_k, bpe_v, mem["compression"]
+from bmx.cache.streaming import StreamingQuantizedCache
 
 
 def live_generation_ppl(
@@ -85,11 +53,9 @@ def live_generation_ppl(
     recent_window : int
         Most-recent tokens kept fp16 before flushing (passed to StreamingQuantizedCache).
     token_by_token : bool
-        If False (default), teacher-force the full continuation in one batched forward
-        (fast; unchanged from before Task 11).
-        If True, score the continuation one token at a time so each next-token NLL
-        attends to the incrementally-built compressed cache (write-once, errors
-        compound).  This is the honest streaming regime for the K3 verdict.
+        If False (default), teacher-force the full continuation in one batched forward.
+        If True, score one token at a time in the honest streaming regime (write-once,
+        errors compound) — see the scoring loop below for the indexing derivation.
 
     Returns
     -------

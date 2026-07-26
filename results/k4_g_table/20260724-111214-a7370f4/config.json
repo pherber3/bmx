@@ -1,0 +1,23 @@
+{
+  "pack_path": "<scrubbed-local-scratchpad>/gpt2_gtable_packs.safetensors",
+  "corpus_cache_paths": [
+    "results/cache/gpt2_1024_off1024.safetensors",
+    "results/cache/gpt2_1024_off2048.safetensors",
+    "results/cache/gpt2_1024_off3072.safetensors",
+    "results/cache/gpt2_1024_off4096.safetensors"
+  ],
+  "model_label": "gpt2",
+  "enc_budget": 2.5,
+  "tiers": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8
+  ],
+  "group": 64,
+  "energy_floor": 1e-12,
+  "out_root": ""
+}

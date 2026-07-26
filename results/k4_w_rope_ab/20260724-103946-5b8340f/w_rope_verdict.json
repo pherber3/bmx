@@ -1,0 +1,27 @@
+{
+  "headline_metric": "logit_rope",
+  "rule": "Pre-registered (spec 2026-07-24 SB): |rel_win_delta| < 2% at both budgets -> scoped_negligible (frozen-rotation approximation measured-negligible at this scale; Llama spot-check queued); >= 2% -> rotated_form_required (paper uses rotated numbers; Llama refit REQUIRED on the rental). Sign-flip footnote enters the methods section either way.",
+  "per_budget": {
+    "2.2": {
+      "win_frozen": 13.410119653565825,
+      "win_rotated": 10.665475961438926,
+      "rel_win_delta": -0.20466959005821272,
+      "n_samples": 28
+    },
+    "2.5": {
+      "win_frozen": 13.679836918446984,
+      "win_rotated": 10.706276997462686,
+      "rel_win_delta": -0.21736808258105134,
+      "n_samples": 28
+    }
+  },
+  "decision": "rotated_form_required",
+  "llama_refit_required": true,
+  "overlap_mean_by_rank": {
+    "8": 0.9222762586331078,
+    "16": 0.9206141352458692,
+    "32": 0.9286430312550505,
+    "64": 0.9316949789869374
+  },
+  "git_sha": "5b8340f"
+}

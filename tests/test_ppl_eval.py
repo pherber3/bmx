@@ -16,7 +16,8 @@ from factories import ids as _ids
 from factories import tiny_gpt2 as _tiny_gpt2
 from factories import tiny_llama as _tiny_llama
 
-from bmx.cache.ppl_eval import CacheCodecSpec, quantized_prefill_ppl, run_prefill
+from bmx.cache.ppl_eval import quantized_prefill_ppl, run_prefill
+from bmx.cache.specs import CacheCodecSpec
 
 
 # ---------------------------------------------------------------------------

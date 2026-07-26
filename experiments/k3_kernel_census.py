@@ -23,9 +23,10 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
+from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.packed_streaming import PackedStreamingCache
-from bmx.cache.specs import CacheCodecSpec
-from bmx.cache.streaming import StreamingQuantizedCache, resolve_vocab_size
+from bmx.cache.recipes import spec_pair
+from bmx.cache.streaming import StreamingQuantizedCache
 
 
 @dataclasses.dataclass
@@ -34,19 +35,9 @@ class Config:
     seq_lens: tuple[int, ...] = (4096, 16384, 32768)
     arms: tuple[str, ...] = ("fp16", "k2b")
     max_new_tokens: int = 4
-
-
-def _specs(arm):
-    if arm == "fp16":
-        return CacheCodecSpec(arm="fp16"), CacheCodecSpec(arm="fp16")
-    if arm == "k2b":
-        return (
-            CacheCodecSpec(
-                arm="lowrank_rtn_channel", bits=3, rank=16, group=64, pre_rope=True
-            ),
-            CacheCodecSpec(arm="turboquant_mse", bits=2),
-        )
-    raise ValueError(arm)
+    pack_path: str = ""
+    """Fitted spectral pack file — required for k4_* arms (spec_pair raises
+    ValueError without it)."""
 
 
 def _measure(model, input_ids, cache, max_new_tokens: int = 4):
@@ -104,7 +95,7 @@ def main(cfg: Config):
             0, resolve_vocab_size(model.config), (1, S), device=model.device
         )
         for arm in cfg.arms:
-            k_spec, v_spec = _specs(arm)
+            k_spec, v_spec = spec_pair(arm, pack_path=cfg.pack_path)
             for path, Cls in [
                 ("dense_stream", StreamingQuantizedCache),
                 ("chunked", PackedStreamingCache),

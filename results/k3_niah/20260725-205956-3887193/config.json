@@ -1,0 +1,27 @@
+{
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "device": "cuda",
+  "arms": [
+    "fp16",
+    "k4_b2.5",
+    "k2b"
+  ],
+  "lengths": [
+    65536,
+    131072
+  ],
+  "depths": [
+    0.25,
+    0.5,
+    0.75
+  ],
+  "n_prefill": 128,
+  "rank": 16,
+  "group": 64,
+  "seed": 0,
+  "answer_id": 7,
+  "max_new_tokens": 50,
+  "use_packed": true,
+  "pack_path": "results/cache/k4_packs_llama31_instruct.safetensors",
+  "resume": null
+}

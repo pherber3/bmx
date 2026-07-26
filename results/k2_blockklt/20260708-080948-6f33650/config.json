@@ -1,0 +1,22 @@
+{
+  "cache_path": "results/cache/llama-3.1-8b_2048.safetensors",
+  "model_label": "llama-3.1-8b",
+  "model_name": "meta-llama/Llama-3.1-8B",
+  "budgets": [
+    2.0,
+    2.5,
+    3.0
+  ],
+  "group": 64,
+  "rank": 16,
+  "tiers": [
+    0,
+    2,
+    3,
+    4
+  ],
+  "seed": 0,
+  "layer_stride": 32,
+  "deploy_s": 32768,
+  "out_root": ""
+}

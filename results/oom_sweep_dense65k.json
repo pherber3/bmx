@@ -1,0 +1,40 @@
+[
+  {
+    "mode": "dense",
+    "ctx": 65536,
+    "n_seqs": 1,
+    "peak_gib": 39.15,
+    "marginal_gib_per_seq": null,
+    "trial_s": 4.8
+  },
+  {
+    "mode": "dense",
+    "ctx": 65536,
+    "n_seqs": 2,
+    "peak_gib": 47.15,
+    "marginal_gib_per_seq": 8.0,
+    "trial_s": 8.8
+  },
+  {
+    "mode": "dense",
+    "ctx": 65536,
+    "n_seqs": 4,
+    "peak_gib": 63.15,
+    "marginal_gib_per_seq": 8.0,
+    "trial_s": 17.6
+  },
+  {
+    "mode": "dense",
+    "ctx": 65536,
+    "n_seqs": 6,
+    "peak_gib": 79.15,
+    "marginal_gib_per_seq": 8.0,
+    "trial_s": 26.4
+  },
+  {
+    "mode": "dense",
+    "ctx": 65536,
+    "n_seqs": 8,
+    "oom": true
+  }
+]

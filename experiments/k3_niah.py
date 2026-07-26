@@ -11,19 +11,27 @@ small lengths (≤64) — schema and mechanism only, no download.
 from __future__ import annotations
 
 import dataclasses
+import time
+from pathlib import Path
 
-import pandas as pd
-import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.live_eval import compression_for
+from bmx.cache.generate import avg_bpe, compression_for
+from bmx.cache.hf_compat import resolve_vocab_size
 from bmx.cache.niah import (
     build_niah_ids_synthetic,
     niah_recall_argmax,
 )
-from bmx.cache.streaming import resolve_vocab_size
-from experiments.k3_live_generation import _spec_pair
+from bmx.cache.recipes import spec_pair
+from experiments._common import (
+    assert_resume_identity,
+    done_pairs,
+    load_shards,
+    pair_key,
+    print_progress,
+    write_shard,
+)
 
 
 @dataclasses.dataclass
@@ -45,39 +53,72 @@ class Config:
     chunked dequant-attention at decode) instead of StreamingQuantizedCache.
     Token-identical output (parity-gated); lower resident memory — the path that
     unblocks the batched 128k sweep. Real path only (ignored offline)."""
+    pack_path: str = ""
+    """Path to a fitted spectral pack file; only needed for k4_* arms."""
+    # Resume a crashed/killed run: path to its run_dir. Skips (arm, length) pairs whose
+    # partial/<arm>__<length>.parquet shard already exists; identity-asserted against the
+    # stored config.json + git SHA (mismatch is a hard error, not a warning) so a resumed
+    # run can never mix rows measured under different code/config. Not itself part of the
+    # measured configuration, so it is excluded from that identity check (see
+    # experiments._common.RESUME_EXCLUDED_FIELDS).
+    resume: str | None = None
 
 
-def run(cfg: Config, model=None, root: str = "results"):
+def run(
+    cfg: Config, model=None, root: str = "results", _stop_after_pairs: int | None = None
+):
     tokenizer = None
     haystack = None
     if model is None:
         # Real run (VM): model + tokenizer + Paul Graham essays.
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from experiments._common import load_model_and_tokenizer
 
-        from bmx.cache.haystack import load_pg_corpus
+        from bmx.cache.generate import generate_through_cache
         from bmx.cache.niah import (
             NEEDLE_TEXT,
             build_niah_prompt,
-            generate_through_cache,
+            load_pg_corpus,
             rouge1_recall,
             rouge1_recall_only,
         )
 
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name, torch_dtype=torch.float16
-        )
-        model = model.to(cfg.device)
-        model.eval()
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        model, tokenizer = load_model_and_tokenizer(cfg.model_name, cfg.device)
         haystack = load_pg_corpus()
 
-    run_dir = create_run("k3_niah", cfg, root=root)
-    rows = []
+    if cfg.resume is not None:
+        run_dir = Path(cfg.resume)
+        assert_resume_identity(run_dir, cfg)
+        skip_pairs = done_pairs(run_dir)
+        print(
+            f"[k3_niah] resuming {run_dir}: {len(skip_pairs)} pair(s) already done",
+            flush=True,
+        )
+    else:
+        run_dir = create_run("k3_niah", cfg, root=root)
+        skip_pairs = set()
+
+    n_pairs = len(cfg.arms) * len(cfg.lengths)
+    pair_i = 0
+    n_completed_this_run = 0
+    start_time = time.monotonic()
     for arm in cfg.arms:
-        k_spec, v_spec = _spec_pair(arm, cfg)
+        k_spec, v_spec = spec_pair(
+            arm, rank=cfg.rank, group=cfg.group, seed=cfg.seed, pack_path=cfg.pack_path
+        )
         for length in cfg.lengths:
+            pair_i += 1
+            key = pair_key(arm, length)
+            if key in skip_pairs:
+                print(
+                    f"[k3_niah pair {pair_i}/{n_pairs}] arm={arm} length={length} "
+                    "SKIP (resumed)",
+                    flush=True,
+                )
+                continue
+
             bpe_k, bpe_v, compression = compression_for(model, k_spec, v_spec, length)
-            for depth in cfg.depths:
+            pair_rows = []
+            for depth_i, depth in enumerate(cfg.depths, start=1):
                 if tokenizer is None:
                     # Offline: synthetic argmax proxy at this (small) length.
                     ids = build_niah_ids_synthetic(
@@ -120,7 +161,7 @@ def run(cfg: Config, model=None, root: str = "results"):
                     recall = rouge1_recall(NEEDLE_TEXT, response)
                     recall_full = rouge1_recall_only(NEEDLE_TEXT, response)
                     recall_kind = "rouge1"
-                rows.append(
+                pair_rows.append(
                     {
                         "arm": arm,
                         "length": length,
@@ -130,13 +171,40 @@ def run(cfg: Config, model=None, root: str = "results"):
                         "recall_kind": recall_kind,
                         "bpe_k": bpe_k,
                         "bpe_v": bpe_v,
+                        "kv_size_bits": avg_bpe(bpe_k, bpe_v),
                         "compression": compression,
                         "n_prefill": cfg.n_prefill,
                         "use_packed": cfg.use_packed,
                     }
                 )
+                if depth_i % 10 == 0 or depth_i == len(cfg.depths):
+                    print_progress(
+                        f"arm {arm} length {length} depth",
+                        depth_i,
+                        len(cfg.depths),
+                        start_time,
+                        recall=f"{recall:.4f}",
+                    )
 
-    write_metrics(run_dir, pd.DataFrame(rows))
+            # No samples shard here: the aggregate already stores one row per depth
+            # (the per-generation grain), so a samples file would be a byte-for-byte
+            # subset of it. LongBench, whose aggregate is a mean, does write one.
+            write_shard(run_dir, pair_rows, arm, str(length))
+            print(
+                f"[k3_niah pair {pair_i}/{n_pairs}] arm={arm} length={length} "
+                "DONE (checkpointed)",
+                flush=True,
+            )
+            n_completed_this_run += 1
+            if (
+                _stop_after_pairs is not None
+                and n_completed_this_run >= _stop_after_pairs
+            ):
+                raise RuntimeError(
+                    f"injected stop after {n_completed_this_run} pair(s) (test hook)"
+                )
+
+    write_metrics(run_dir, load_shards(run_dir))
     return run_dir
 
 

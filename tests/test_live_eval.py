@@ -28,12 +28,12 @@ def test_quantized_live_ppl_finite_and_compressed():
     # the body never made (the fp16 result was computed and discarded).  On a
     # random-weight tiny model that comparison is FLAKY (quant can lower loss), so
     # the honest gate is finiteness + honest compression — assert exactly that.
-    # seq=64 with recent_window=32 (default): after the 16-token prefill and 48-token
-    # continuation (sent as one batch, S=64), S_q = ((64-32)//16)*16 = 32 tokens get
-    # quantized, blended bpe < 16.  seq=32 was too short — max S=32 == W, so S_q=0
-    # and everything stayed fp16 (the window eclipsed all tokens).
+    # seq=200 with recent_window=32: S=200 -> S_q = ((200-32)//128)*128 = 128 tokens
+    # quantized (one 128-token PAGE flushed), blended bpe < 16. The cache now commits
+    # on a fixed 128-token PAGE grid; shorter sequences stay all-fp16 (window eclipses
+    # all committed tokens before a page fills).
     model = tiny_llama()
-    input_ids = ids(vocab=97, seq=64, seed=12)
+    input_ids = ids(vocab=97, seq=200, seed=12)
     quant = live_generation_ppl(
         model,
         input_ids,

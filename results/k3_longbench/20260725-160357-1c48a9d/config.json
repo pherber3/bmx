@@ -1,0 +1,29 @@
+{
+  "model_name": "Qwen/Qwen3-8B",
+  "device": "cuda",
+  "arms": [
+    "fp16",
+    "k4_b2.2",
+    "k4_b2.5",
+    "turboquant_mse_b3",
+    "turboquant_mse_k3v2"
+  ],
+  "tasks": [
+    "lcc",
+    "repobench-p"
+  ],
+  "categories": [
+    "synthetic",
+    "code"
+  ],
+  "longbench_version": "v1",
+  "n_samples": 100,
+  "max_prompt_tokens": 31500,
+  "chat_wrap": false,
+  "n_prefill": 128,
+  "rank": 16,
+  "group": 64,
+  "seed": 0,
+  "pack_path": "results/cache/k4_packs_qwen3.safetensors",
+  "resume": null
+}

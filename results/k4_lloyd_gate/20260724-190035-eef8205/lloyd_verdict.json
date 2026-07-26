@@ -1,0 +1,81 @@
+{
+  "rule": "Pre-registered (spec 2026-07-25): PROMOTE iff heldout win(lloyd)/win(rtn) >= win_factor at BOTH budgets AND the measured Lloyd g_table is grid-convex (_tier_g assert). Fail => honest negative; certificate/per-tier ratios reported, never gated.",
+  "win_factor": 1.02,
+  "per_budget": {
+    "2.2": {
+      "win_rtn": 9.735997097033573,
+      "win_lloyd": 2.451928235241856,
+      "win_ratio": 0.2518415125646376,
+      "gate_pass": false,
+      "n_samples": 24,
+      "certificate": {
+        "predicted_reduction_mean": -3.79123550585307,
+        "predicted_reduction_min": -6.784571065000713,
+        "predicted_reduction_max": -0.6057657763446251,
+        "n_packs": 24
+      }
+    },
+    "2.5": {
+      "win_rtn": 9.207323415082506,
+      "win_lloyd": 1.9884585864426676,
+      "win_ratio": 0.21596488977300132,
+      "gate_pass": false,
+      "n_samples": 24,
+      "certificate": {
+        "predicted_reduction_mean": -4.336675655294171,
+        "predicted_reduction_min": -6.871909464399796,
+        "predicted_reduction_max": -0.9545022009009634,
+        "n_packs": 24
+      }
+    }
+  },
+  "win_gate_pass": false,
+  "convex": true,
+  "convex_error": null,
+  "gate_pass": false,
+  "honest_negative": true,
+  "g_table_rtn": [
+    1.0,
+    0.16997327512917018,
+    0.05032970350986989,
+    0.013198477716174693,
+    0.003077431968472201,
+    0.0007300819138466808,
+    4.363801437155673e-05
+  ],
+  "g_table_lloyd": [
+    1.0,
+    0.13553914118414576,
+    0.03836117530039009,
+    0.01051402763994468,
+    0.0037742192718977167,
+    0.0016005958553710138,
+    0.00034948838707292846
+  ],
+  "tiers": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8
+  ],
+  "headline_metric": "logit",
+  "extrapolated": false,
+  "certificate": {
+    "2.2": {
+      "predicted_reduction_mean": -3.79123550585307,
+      "predicted_reduction_min": -6.784571065000713,
+      "predicted_reduction_max": -0.6057657763446251,
+      "n_packs": 24
+    },
+    "2.5": {
+      "predicted_reduction_mean": -4.336675655294171,
+      "predicted_reduction_min": -6.871909464399796,
+      "predicted_reduction_max": -0.9545022009009634,
+      "n_packs": 24
+    }
+  },
+  "git_sha": "eef8205"
+}

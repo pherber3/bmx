@@ -1,0 +1,84 @@
+{
+  "headline_metric": "logit",
+  "rule": "Pre-registered (spec 2026-07-24 SA): per (budget, s_ref), at MATCHED skeptic-v2 bpe@S_ref the charge-aware heldout G1 win must be >= the plain pack's, AND skeptic-v2 bpe@S_ref at matched win must undercut plain by >= 0.4 blended bits at S_ref=4096 (blended = K-side/2). Both budgets fail => honest negative; allocator stays as-is. S_ref=16384 reported, not gated.",
+  "gate_s_ref": 4096,
+  "gate_blended_bits": 0.4,
+  "g_table": null,
+  "per_point": {
+    "b2.2_s4096": {
+      "s_ref": 4096,
+      "budget": 2.2,
+      "bpe_ca": 2.197265651490953,
+      "win_ca": 5.56223968247057,
+      "win_plain_at_matched_bpe": 5.384495714127551,
+      "win_not_worse": true,
+      "bpe_plain_at_matched_win": 2.093301153943911,
+      "bits_saved_k_side": -0.10396449754704218,
+      "bits_saved_blended": -0.05198224877352109,
+      "extrapolated": true,
+      "plain_frontier_monotone": false,
+      "gate_pass": false
+    },
+    "b2.5_s4096": {
+      "s_ref": 4096,
+      "budget": 2.5,
+      "bpe_ca": 2.499294704861111,
+      "win_ca": 5.100150874632019,
+      "win_plain_at_matched_bpe": 4.914181232301655,
+      "win_not_worse": true,
+      "bpe_plain_at_matched_win": 2.3742505565995873,
+      "bits_saved_k_side": -0.12504414826152388,
+      "bits_saved_blended": -0.06252207413076194,
+      "extrapolated": false,
+      "plain_frontier_monotone": false,
+      "gate_pass": false
+    },
+    "b2.2_s16384": {
+      "s_ref": 16384,
+      "budget": 2.2,
+      "bpe_ca": 2.1987508171134524,
+      "win_ca": 8.680367574699291,
+      "win_plain_at_matched_bpe": 8.636984702159236,
+      "win_not_worse": true,
+      "bpe_plain_at_matched_win": 2.1591305128400244,
+      "bits_saved_k_side": -0.039620304273428,
+      "bits_saved_blended": -0.019810152136714,
+      "extrapolated": false,
+      "plain_frontier_monotone": false
+    },
+    "b2.5_s16384": {
+      "s_ref": 16384,
+      "budget": 2.5,
+      "bpe_ca": 2.4997490876250796,
+      "win_ca": 8.28075115048415,
+      "win_plain_at_matched_bpe": 8.247184989599624,
+      "win_not_worse": true,
+      "bpe_plain_at_matched_win": 2.473615979409771,
+      "bits_saved_k_side": -0.026133108215308454,
+      "bits_saved_blended": -0.013066554107654227,
+      "extrapolated": false,
+      "plain_frontier_monotone": false
+    }
+  },
+  "c_used_diagnostic": {
+    "b2.2": {
+      "by_s_ref": {
+        "4096": 268.0833333333333,
+        "16384": 412.9166666666667,
+        "plain": 509.5833333333333
+      },
+      "monotone_decreasing": true
+    },
+    "b2.5": {
+      "by_s_ref": {
+        "4096": 301.5833333333333,
+        "16384": 454.9166666666667,
+        "plain": 548.6666666666666
+      },
+      "monotone_decreasing": true
+    }
+  },
+  "a_gate_pass": false,
+  "honest_negative": true,
+  "git_sha": "570b407"
+}

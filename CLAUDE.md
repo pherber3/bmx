@@ -1,7 +1,8 @@
 # CLAUDE.md — bmx
 
 Kill-or-confirm research code for LLM tensor compression (weights program
-closed, KV-cache program closed-positive — see README for the findings arc).
+closed, KV-cache program closed-positive, K4 spectral codec closed-positive
+with the GH200 evidence batch — see README for the findings arc).
 Experiments exist to close gates; an honest negative is a valid result. Don't
 polish numbers; report them. Theory questions: use the `personal-brain` skill /
 `mcp__wiki__*` tools (vault anchors: VQ distortion objectives, Beta-coordinate
@@ -24,7 +25,7 @@ rotation, two-stage quantization, BM-decomposition notes).
 ## Commands
 
 ```bash
-uv run pytest -q                  # ≈ 50 s; expected: 243 passed, 1 xfailed
+uv run pytest -q                  # ≈ 95 s; expected: 651 passed, 17 skipped, 1 xfailed
 uv run python experiments/<x>.py --help   # tyro CLIs; tuples space-separated
 uv run python experiments/collect_cache.py --model-name gpt2 --seq-len 1024
                                   # regenerates results/cache/* (gitignored)
@@ -84,11 +85,38 @@ fixture regenerates via `scripts/export_sagemath_fixture.py`).
   A/B-confirmed vs dense at 64k). Triton (Phase 3) NOT required to clear the
   ceiling. `docs/2026-06-23-kernel-census-results.md`, spec/plan
   `docs/superpowers/{specs,plans}/2026-06-23-fused-dequant-attention*`.
-- **Open (engineering, not science):** Triton fused kernel (Phase 3, gated — only
-  for a deployment speed/RSS claim); a WIDER batched 128k sweep (more arms/seqs
+- Triton fused decode kernel (Phase 3, branch `feat/triton-decode-kernel`, NOT yet
+  merged): single-launch split-KV decode that dequants packed codes IN-KERNEL — RTN
+  (`fused_decode_attention_packed`) + the real k2b recipe (`fused_decode_attention_k2b`:
+  in-kernel lowrank-K + RoPE + per-head turboquant-V Hadamard). Uniform PAGE=128 paged
+  layout in both caches; `_PagedStacks` maintains the device-resident block table
+  incrementally. Eval on real Llama-3.1-8B reproduces the NIAH frontier (k2b_ph
+  recall_full 6.98/7.46/8.89 vs 6.94/7.41/8.98). Final review (MERGE AFTER FIXES) +
+  external audit both cleared; **GH200 re-verify PASSED 2026-07-25** (671/2/1 on
+  GPU, parity OK, path probe 96 fused calls, 0 flips/64 @64k — merge gate GREEN,
+  merge decision with the user; Gate-C amended to drift-inexplicable flips,
+  `2bb0d6a`, per the duel doc's own pre-registration).
+  **Debloat:** the dead dense `fused_decode_attention`, the unwired graphable CUDA-graph
+  path, and the obsolete `hadamard_kernel_ref` were DELETED (commit `7b07552`, −1559 net) —
+  if a future task needs CUDA-graph capture or an in-kernel FWHT, the removed code +
+  exact recovery steps are in `docs/2026-06-24-decode-path-debloat-removal.md` (recover
+  from parent `93751eb`). `docs/2026-06-24-triton-decode-results.md`.
+- K4 spectral program (GH200 rental 2026-07-25/26, ALL VM legs complete —
+  `docs/2026-07-26-gh200-rental-results.md` + 4 appendices): final recipe
+  k4_b2.5_dec8tl (rotated-W, int8_tl) = LongBench macro 40.85 @ 3.081 bits
+  (+0.48 over tq_b3 at −0.125 bits; +0.13 over own fp32 at −0.72 bits); NIAH
+  honest null (parity at fewer bits, 5-seed); int8_tl measured 0.55–0.90% ≪ 5%
+  both models; 128k census k4 chunked 50.48 GiB vs fp16 63.30; token-marginal
+  REVERSES at 8B both models (order matters); trigram calibration recipe
+  CONFIRMS both models (ladder self-terminates at order 3); calibration nc=1
+  suffices; TQ-family collapses on Qwen at 32k while k4 holds (n=1 model-pair,
+  mechanism open); Jensen debiased 0.684 in the gpt2 band.
+- **Open (engineering, not science):** a WIDER batched 128k sweep (more arms/seqs
   co-resident) may need the prefill mask materialization trimmed — the mask fix
-  raised packed peak to ~94.7 GiB, thin margin; the authoritative SOTA-model VM run
-  (real-text + planted needle, `--model-name`).
+  raised packed peak to ~94.7 GiB, thin margin; NIAH needle-reseeding harness
+  knob (seeds currently reseed codec RNG only); Qwen TQ-collapse mechanism
+  probe; fused spectral decode kernel (gated — only for a deployment
+  speed/RSS claim).
 
 ## Conventions (everything assumes them)
 
@@ -117,7 +145,9 @@ slice_svd, cp, tucker, shared_tucker, lrs. `src/bmx/cache/` — KV program:
 (CACHE_ARMS: rtn token/channel, rotate, turboquant mse/prod, lowrank;
 honest bpe), `rope` (cos/sin from config, apply-at-read), `metrics`
 (per-head logit/output distortion, GQA-aware), `ppl_eval` (quantized-prefill
-perplexity; `run_prefill` state is reusable across arms). `src/bmx/quant/` —
+perplexity; `run_prefill` state is reusable across arms), `recipes` (named
+arm→spec pairs), `generate` (shared generation loop + compression
+accounting), `hf_compat` (model introspection). `src/bmx/quant/` —
 hadamard rotations, groupwise RTN, `breakeven` (the ε > 1−4^(−Δb) instrument),
 `arms` (weight-side pipelines), stats. `src/bmx/stacks/`, `bench/` (Track B
 factored matvec + byte model), `census.py`, `sweep.py`, `artifacts.py`

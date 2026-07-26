@@ -1,0 +1,12 @@
+{
+  "model_name": "meta-llama/Llama-3.1-8B",
+  "frontier_parquet": "results/k4_frontier/20260713-131506-798d0ef/metrics.parquet",
+  "n_prefill": 768,
+  "n_cont": 256,
+  "target_means": [
+    2.5,
+    3.0
+  ],
+  "sens_bits": 2,
+  "out_root": ""
+}

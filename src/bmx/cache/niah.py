@@ -2,6 +2,9 @@
 
 The argmax proxy is the offline mechanism gate (tokenizer-free, ≤64 tokens for tiny_llama).
 The generate path scores ROUGE-1 against the needle sentence and needs a real model.
+
+Also home to the planted-needle probes (former needle.py) and the PG-essay corpus
+loader (former haystack.py).
 """
 
 from __future__ import annotations
@@ -9,9 +12,7 @@ from __future__ import annotations
 import torch
 from rouge_score import rouge_scorer
 
-from bmx.cache.needle import needle_retrieved
 from bmx.cache.specs import CacheCodecSpec
-from bmx.cache.packed_streaming import PackedStreamingCache
 from bmx.cache.streaming import StreamingQuantizedCache
 
 
@@ -53,12 +54,85 @@ def niah_recall_argmax(
 ) -> bool:
     """True iff the streaming-cache next-token argmax at query_pos equals answer_id.
 
-    Delegates to needle.needle_retrieved by trimming input_ids to query_pos. This is the
+    Delegates to needle_retrieved by trimming input_ids to query_pos. This is the
     offline mechanism gate (deterministic, indexing-correct), not a recall-quality measure.
     """
     return needle_retrieved(
         model, input_ids[:, : query_pos + 1], answer_id, k_spec, v_spec, n_prefill
     )
+
+
+def _argmax_next_at(model, input_ids, query_pos, k_spec, v_spec, n_prefill):
+    cache = StreamingQuantizedCache(model.config, k_spec=k_spec, v_spec=v_spec)
+    cache.attach(model)
+    with cache:
+        with torch.no_grad():
+            model(
+                input_ids[:, :n_prefill],
+                past_key_values=cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            # logits_to_keep=1: only the query-position logit is read (argmax), so the
+            # (S × vocab) tensor over all positions is never built — would OOM at long context.
+            out = model(
+                input_ids[:, n_prefill : query_pos + 1],
+                past_key_values=cache,
+                logits_to_keep=1,
+            )
+    return out.logits[0, -1].argmax().item()
+
+
+def needle_retrieved_from_ids(
+    model,
+    input_ids: torch.Tensor,
+    query_pos: int,
+    n_prefill: int,
+    k_spec: CacheCodecSpec,
+    v_spec: CacheCodecSpec,
+) -> bool:
+    """True if the quantized-cache next-token at query_pos matches the fp16 cache's.
+
+    Tokenizer-free retrieval-fidelity proxy: does compression change the model's
+    decision at the query? (Real needle accuracy uses build_needle_ids below.)
+    """
+    fp16 = CacheCodecSpec(arm="fp16")
+    ref = _argmax_next_at(model, input_ids, query_pos, fp16, fp16, n_prefill)
+    got = _argmax_next_at(model, input_ids, query_pos, k_spec, v_spec, n_prefill)
+    return bool(ref == got)
+
+
+def build_needle_ids(
+    tokenizer,
+    n_context: int,
+    depth_frac: float,
+    needle_text: str = "The secret code is 42.",
+    question_text: str = "\nThe secret code is",
+):
+    """Filler haystack with the needle at depth_frac; returns (ids, answer_id).
+
+    Used by the experiment with a real tokenizer; not exercised in unit tests.
+    """
+    filler = (" the cat sat on the mat.") * (n_context // 6)
+    ids_filler = tokenizer(filler, return_tensors="pt").input_ids
+    needle = tokenizer(needle_text, return_tensors="pt").input_ids
+    question = tokenizer(question_text, return_tensors="pt").input_ids
+    answer = tokenizer(" 42", return_tensors="pt").input_ids[0, -1].item()
+
+    cut = int(ids_filler.shape[1] * depth_frac)
+    input_ids = torch.cat(
+        [ids_filler[:, :cut], needle, ids_filler[:, cut:], question], dim=1
+    )
+    return input_ids, answer
+
+
+def needle_retrieved(
+    model, input_ids, answer_token_id, k_spec, v_spec, n_prefill
+) -> bool:
+    """True if the model's next-token argmax at the end equals answer_token_id."""
+    last_pos = input_ids.shape[1] - 1
+    predicted = _argmax_next_at(model, input_ids, last_pos, k_spec, v_spec, n_prefill)
+    return bool(predicted == answer_token_id)
 
 
 # Default needle/question from the Fu et al. NIAH harness.
@@ -139,112 +213,17 @@ def build_niah_prompt(
     return tokenizer(prompt, return_tensors="pt").input_ids
 
 
-def generate_through_cache(
-    model,
-    tokenizer,
-    prompt_ids: torch.Tensor,
-    n_prefill: int,
-    k_spec: CacheCodecSpec,
-    v_spec: CacheCodecSpec,
-    max_new_tokens: int,
-    strip: bool = True,
-    use_packed: bool = False,
-) -> str:
-    """Prefill prompt_ids into a streaming cache, greedy-decode, return the answer.
+PG_ESSAYS_DATASET = "sgoel9/paul_graham_essays"
 
-    ``use_packed``: when True, run through ``PackedStreamingCache`` (packed codes
-    resident + chunked dequant-attention at decode, flash SDPA at prefill) — the
-    memory-saving path that keeps the bpe footprint resident instead of a second
-    dense KV copy. When False (default), uses ``StreamingQuantizedCache`` (the
-    quality/parity reference, dense dequant resident). Both produce identical
-    tokens (parity-gated); ``use_packed`` only changes the resident memory.
 
-    The whole prompt is streamed into the cache (prefill block [0, n_prefill) then the rest
-    [n_prefill, L) as one forward), and greedy decoding continues from the last prompt logit.
-    Both prompt forwards pass ``logits_to_keep=1`` so the (S × vocab) logit tensor is never
-    materialized over all positions — at 128k context that all-position logit tensor is ~63 GB
-    (vocab 128k × 131k × fp32) and OOMs the GPU even though the compressed KV cache is only a
-    few GB. We never read prompt-position logits (only the last one seeds decoding), so keeping
-    1 is exact, not an approximation. ``strip`` removes surrounding whitespace (off for
-    whitespace-sensitive scorers).
+def load_pg_corpus() -> str:
+    """Concatenate the Paul Graham essays from the HF dataset into one string.
+
+    ``datasets`` is imported lazily so importing this module triggers no download.
     """
-    prompt_ids = prompt_ids.to(model.device)
-    L = prompt_ids.shape[1]
-    assert n_prefill < L, (
-        f"n_prefill={n_prefill} >= prompt length {L}; nothing to generate"
-    )
-    # Full EOS set, mirroring model.generate(): Llama-3.1-Instruct stops on any of
-    # {128001 <|end_of_text|>, 128008 <|eom_id|>, 128009 <|eot_id|>}, whereas
-    # tokenizer.eos_token_id is just one (128009). Prefer generation_config (what generate
-    # uses), fall back to model.config, then the tokenizer. None => never stop early.
-    _eos = (
-        getattr(getattr(model, "generation_config", None), "eos_token_id", None)
-        or getattr(model.config, "eos_token_id", None)
-        or getattr(tokenizer, "eos_token_id", None)
-    )
-    eos_ids = {_eos} if isinstance(_eos, int) else set(_eos or [])
+    from datasets import load_dataset
 
-    # fp16 is the uncompressed baseline — it has no packed representation
-    # (PackedStreamingCache's flush would call quantize_packed('fp16'), which raises).
-    # Route the all-fp16 spec through the dense cache even under use_packed; its
-    # recall is identical either way (no quantization), and fp16-through-packed
-    # would save zero memory. Only the compressing arms use the packed path.
-    is_fp16 = k_spec.arm == "fp16" and v_spec.arm == "fp16"
-    cache_cls = (
-        PackedStreamingCache
-        if (use_packed and not is_fp16)
-        else StreamingQuantizedCache
-    )
-    cache = cache_cls(model.config, k_spec=k_spec, v_spec=v_spec)
-    cache.attach(model)
-    new_ids: list[int] = []
-    with cache:
-        with torch.no_grad():
-            # Stream the whole prompt through the cache in two blocks (mirrors the prior
-            # prefill/continuation split so cache contents are identical), logits_to_keep=1.
-            model(
-                prompt_ids[:, :n_prefill],
-                past_key_values=cache,
-                use_cache=True,
-                logits_to_keep=1,
-            )
-            out = model(
-                prompt_ids[:, n_prefill:],
-                past_key_values=cache,
-                use_cache=True,
-                logits_to_keep=1,
-            )
-            nxt = out.logits[0, -1].argmax().view(1, 1)
-            new_ids.append(int(nxt))
-            for _ in range(max_new_tokens - 1):
-                out = model(
-                    nxt, past_key_values=cache, use_cache=True, logits_to_keep=1
-                )
-                nxt = out.logits[0, -1].argmax().view(1, 1)
-                tid = int(nxt)
-                new_ids.append(tid)
-                if tid in eos_ids:
-                    break
-    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-    return text.strip() if strip else text
-
-
-def niah_recall_generate(
-    model,
-    tokenizer,
-    prompt_ids: torch.Tensor,
-    n_prefill: int,
-    k_spec: CacheCodecSpec,
-    v_spec: CacheCodecSpec,
-    needle_text: str = NEEDLE_TEXT,
-    max_new_tokens: int = 50,
-) -> float:
-    """Prefill the prompt into the streaming cache, greedy-generate, score ROUGE-1.
-
-    Headline recall (VM/real model). Now a thin wrapper over generate_through_cache so the
-    generate path lives in one place across metrics.
-    """
-    response = generate_through_cache(
-        model, tokenizer, prompt_ids, n_prefill, k_spec, v_spec, max_new_tokens
-    )
-    return rouge1_recall(needle_text, response)
+    ds = load_dataset(PG_ESSAYS_DATASET, split="train")
+    texts = [t for t in ds["text"] if t]
+    assert texts, f"no essay text in {PG_ESSAYS_DATASET}"
+    return "\n".join(texts)

@@ -1,0 +1,46 @@
+{
+  "r_pred": 0.3652568954646782,
+  "per_budget": {
+    "2.2": {
+      "r_discrete": 0.7315150054938733,
+      "identity_check": 7.587001614094402,
+      "abs_gap": 0.36625811002919506,
+      "match": false,
+      "abs_gap_debiased": 0.1450940761503693,
+      "match_debiased": false
+    },
+    "2.5": {
+      "r_discrete": 0.7691761882947555,
+      "identity_check": 10.501003169289328,
+      "abs_gap": 0.4039192928300773,
+      "match": false,
+      "abs_gap_debiased": 0.18275525895125155,
+      "match_debiased": false
+    }
+  },
+  "match": false,
+  "flatness": {
+    "n_flat": 3,
+    "r_pred_at_n_flat": 0.40511725260556847,
+    "r_pred_at_all": 0.3652568954646782,
+    "delta": 0.03986035714089018,
+    "r_pred_at_n_flat_debiased": 0.6053698354383494,
+    "r_pred_at_all_debiased": 0.586420929343504,
+    "delta_debiased": 0.0189489060948454
+  },
+  "mixed_domain": {
+    "mixed_r_pred": 0.23403796930205623,
+    "within_r_pred": 0.3652568954646782,
+    "mixed_r_pred_debiased": 0.38851169026621307,
+    "within_r_pred_debiased": 0.586420929343504
+  },
+  "n_layers": 12,
+  "wishart_debiasing": {
+    "post_hoc": true,
+    "note": "r_pred_debiased/match_debiased are a LABELED POST-HOC analysis (closed-form Bartlett/digamma Wishart log-det debiasing, math review finding #7 connection) \u2014 the PRE-REGISTERED readout is `match` on raw r_pred above; match_debiased is reported alongside it, not in place of it.",
+    "r_pred_debiased": 0.586420929343504,
+    "bias_factor_seq": 0.5834455804733957,
+    "bias_factor_pool": 0.936723450729914,
+    "match_debiased": false
+  }
+}

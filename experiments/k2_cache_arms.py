@@ -35,7 +35,7 @@ import torch
 import tyro
 
 from bmx.artifacts import create_run, write_metrics
-from bmx.cache.codecs import CACHE_ARMS, quantize_cache
+from bmx.cache.codecs import CACHE_ARMS, PACK_GATED_ARMS, quantize_cache
 from bmx.cache.collect import from_matrix, load_cache, to_matrix
 from bmx.cache.metrics import attn_output_distortion, logit_distortion, rel_fro
 from bmx.cache.rope import apply_rope
@@ -44,7 +44,10 @@ from bmx.decomp.lrs import truncated_svd
 _LAYER_RE = re.compile(r"^layer(\d+)\.(k|v|q|k_pre)$")
 
 # Arms that accept a bits-only sweep (no rank param needed)
-_BASE_ARMS = [a for a in CACHE_ARMS if a != "lowrank_rtn_channel"]
+# spectral is pack-gated — no packless dispatch
+_BASE_ARMS = [
+    a for a in CACHE_ARMS if a not in ({"lowrank_rtn_channel"} | PACK_GATED_ARMS)
+]
 _LOWRANK_ARM = "lowrank_rtn_channel"
 
 

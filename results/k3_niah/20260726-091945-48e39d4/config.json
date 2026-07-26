@@ -1,0 +1,30 @@
+{
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "device": "cuda",
+  "arms": [
+    "fp16",
+    "k4_b2.5_dec8tl",
+    "k4_b2.2_dec8tl",
+    "turboquant_mse_b3",
+    "turboquant_mse_k3v2"
+  ],
+  "lengths": [
+    65536
+  ],
+  "depths": [
+    0.1,
+    0.3,
+    0.5,
+    0.7,
+    0.9
+  ],
+  "n_prefill": 128,
+  "rank": 16,
+  "group": 64,
+  "seed": 4,
+  "answer_id": 7,
+  "max_new_tokens": 50,
+  "use_packed": false,
+  "pack_path": "results/cache/k4_packs_llama31_instruct_rotw.safetensors",
+  "resume": null
+}

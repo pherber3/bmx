@@ -1,0 +1,185 @@
+"""Pin the named-recipe registry: arm string -> (k_spec, v_spec)."""
+
+import pytest
+
+from bmx.cache.recipes import spec_pair
+from bmx.cache.specs import CacheCodecSpec
+
+
+def test_fp16_pair():
+    k, v = spec_pair("fp16")
+    assert k == CacheCodecSpec(arm="fp16") and v == CacheCodecSpec(arm="fp16")
+
+
+def test_k2b_canonical():
+    k, v = spec_pair("k2b", rank=16, group=64, seed=0)
+    assert k == CacheCodecSpec(
+        arm="lowrank_rtn_channel", bits=3, rank=16, group=64, seed=0, pre_rope=True
+    )
+    assert v == CacheCodecSpec(arm="turboquant_mse", bits=2, seed=0)
+
+
+def test_k2b_parameterized_parsing():
+    k, _ = spec_pair("k2b_k2r8", rank=16, group=64, seed=0)
+    assert k.bits == 2 and k.rank == 8  # "k2b_k{bits}r{rank}" override
+
+
+def test_k2b_ph_uses_perhead_v():
+    _, v = spec_pair("k2b_ph", seed=0)
+    assert v == CacheCodecSpec(arm="turboquant_mse_perhead", bits=2, seed=0)
+
+
+def test_k2t_canonical():
+    # k2t = improved-k2b candidate: same structure, turboquant residual on K.
+    k, v = spec_pair("k2t", rank=16, group=64, seed=0)
+    assert k == CacheCodecSpec(
+        arm="lowrank_turboquant", bits=2, rank=16, group=64, seed=0, pre_rope=True
+    )
+    assert v == CacheCodecSpec(arm="turboquant_mse", bits=2, seed=0)
+
+
+def test_k2t_parameterized_parsing():
+    k, v = spec_pair("k2t_k3r8", rank=16, group=64, seed=0)
+    assert k.arm == "lowrank_turboquant"
+    assert k.bits == 3 and k.rank == 8  # "k2t_k{bits}r{rank}" override
+    assert k.pre_rope is True
+    assert v == CacheCodecSpec(arm="turboquant_mse", bits=2, seed=0)
+
+
+def test_kivi_pair():
+    k, v = spec_pair("kivi", group=64, seed=0)
+    assert k.arm == "rtn_channel" and v.arm == "rtn_token"
+    assert k.bits == v.bits == 2
+
+
+def test_turboquant_arms_symmetric():
+    for arm in ("turboquant_mse", "turboquant_prod"):
+        k, v = spec_pair(arm, seed=0)
+        assert k == v and k.arm == arm and k.bits == 2
+
+
+def test_unknown_arm_raises():
+    with pytest.raises(ValueError, match="unknown arm"):
+        spec_pair("nope")
+
+
+def test_census_specs_equivalence():
+    # k3_kernel_census previously hand-rolled its own _specs("k2b"); pin that
+    # spec_pair with defaults reproduces it exactly so the census swap is a no-op.
+    k, v = spec_pair("k2b")
+    assert k == CacheCodecSpec(
+        arm="lowrank_rtn_channel", bits=3, rank=16, group=64, pre_rope=True
+    )
+    assert v == CacheCodecSpec(arm="turboquant_mse", bits=2)
+
+
+def test_turboquant_parametric_bits():
+    """turboquant_mse_b{bits}/_prod_b{bits}: bit-width is a codec parameter, not a design
+    constraint — the parametric names enable the matched-bits comparison vs k2b."""
+    for name, base, bits in [
+        ("turboquant_mse_b3", "turboquant_mse", 3),
+        ("turboquant_mse_b4", "turboquant_mse", 4),
+        ("turboquant_prod_b3", "turboquant_prod", 3),
+    ]:
+        k, v = spec_pair(name)
+        assert k.arm == base and v.arm == base
+        assert k.bits == bits and v.bits == bits
+    # the plain names stay pinned at 2 bits (recorded-results compatibility)
+    k, v = spec_pair("turboquant_mse")
+    assert k.bits == 2
+
+
+def test_turboquant_asymmetric_bits():
+    """turboquant_mse_k{kb}v{vb}: turboquant's own best frontier point is asymmetric
+    (bits belong to K) — the honest baseline for any new sub-3-bit codec."""
+    for name, base, bk, bv in [
+        ("turboquant_mse_k3v2", "turboquant_mse", 3, 2),
+        ("turboquant_mse_k2v3", "turboquant_mse", 2, 3),
+        ("turboquant_mse_k4v2", "turboquant_mse", 4, 2),
+        ("turboquant_prod_k3v2", "turboquant_prod", 3, 2),
+    ]:
+        k, v = spec_pair(name)
+        assert k.arm == base and v.arm == base
+        assert k.bits == bk and v.bits == bv
+
+
+def test_k4_recipe_spec_pair():
+    """k4_b{budget}: corpus-fitted spectral K via packs + proven turboquant V@2b.
+    Requires --pack-path (a fitted spectral pack file); empty pack_path raises."""
+    k, v = spec_pair("k4_b2.5", pack_path="/some/packs.safetensors")
+    assert k.arm == "spectral" and k.pre_rope and k.budget == 2.5
+    assert k.pack_path == "/some/packs.safetensors"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+    with pytest.raises(ValueError, match="pack"):
+        spec_pair("k4_b2.5")
+
+
+def test_recipe_dec8t_suffix():
+    """K4 local-levers Task 1: '_dec8t{T}' parses to dec_quant='int8_t{T}',
+    parsed BEFORE the plain '_dec8' suffix (longer suffix first) so
+    'k4_b2.5_dec8t5' does not get mis-parsed as budget '2.5_dec8t5'."""
+    k, v = spec_pair("k4_b2.5_dec8t5", pack_path="/p/packs.safetensors")
+    assert k.arm == "spectral" and k.budget == 2.5 and k.dec_quant == "int8_t5"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    # Plain '_dec8' (blanket) still parses to "int8" (unchanged).
+    k2, _ = spec_pair("k4_b2.5_dec8", pack_path="/p/packs.safetensors")
+    assert k2.dec_quant == "int8"
+
+    # Other T values.
+    k3, _ = spec_pair("k4_b2.2_dec8t4", pack_path="/p/packs.safetensors")
+    assert k3.budget == 2.2 and k3.dec_quant == "int8_t4"
+
+
+def test_recipe_dec8tl_suffix():
+    """K4 estimation-levers Task 3: '_dec8tl' parses to dec_quant='int8_tl'
+    (per-layer certificate-derived thresholds), checked as an EXACT suffix
+    BEFORE the digit-parsing '_dec8t{T}' branch -- 'l' is not a digit, so if
+    '_dec8t' were matched first (substring check) the T-parse would try
+    int('l') and crash. '_dec8t5' and plain '_dec8' must still parse
+    unaffected by the new branch."""
+    k, v = spec_pair("k4_b2.5_dec8tl", pack_path="/p/packs.safetensors")
+    assert k.arm == "spectral" and k.budget == 2.5 and k.dec_quant == "int8_tl"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    # '_dec8t5' (digit form) still parses correctly, unaffected.
+    k2, _ = spec_pair("k4_b2.5_dec8t5", pack_path="/p/packs.safetensors")
+    assert k2.dec_quant == "int8_t5"
+
+    # Plain '_dec8' (blanket) still parses to "int8", unaffected.
+    k3, _ = spec_pair("k4_b2.5_dec8", pack_path="/p/packs.safetensors")
+    assert k3.dec_quant == "int8"
+
+    # A different budget, to make sure budget parsing survives the new suffix.
+    k4, _ = spec_pair("k4_b2.2_dec8tl", pack_path="/p/packs.safetensors")
+    assert k4.budget == 2.2 and k4.dec_quant == "int8_tl"
+
+
+def test_recipe_lq_suffix():
+    """K4 Lloyd-gate design (2026-07-25): '_lq' parses to
+    payload_quant='lloyd'. Default (no '_lq') stays payload_quant='rtn'
+    (default-inert, pinned)."""
+    k, v = spec_pair("k4_b2.5", pack_path="/p/packs.safetensors")
+    assert k.payload_quant == "rtn"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    k_lq, _ = spec_pair("k4_b2.5_lq", pack_path="/p/packs.safetensors")
+    assert k_lq.arm == "spectral" and k_lq.budget == 2.5
+    assert k_lq.payload_quant == "lloyd" and k_lq.dec_quant == "fp32"
+
+
+def test_recipe_lq_composes_with_dec8_suffixes_canonical_order():
+    """CANONICAL ORDER (pinned): '_lq' sits BETWEEN the budget and any
+    '_dec8*' suffix -- 'k4_b2.5_lq_dec8tl', not 'k4_b2.5_dec8tl_lq'."""
+    k, v = spec_pair("k4_b2.5_lq_dec8tl", pack_path="/p/packs.safetensors")
+    assert k.arm == "spectral" and k.budget == 2.5
+    assert k.payload_quant == "lloyd" and k.dec_quant == "int8_tl"
+    assert v.arm == "turboquant_mse" and v.bits == 2
+
+    k2, _ = spec_pair("k4_b2.2_lq_dec8t5", pack_path="/p/packs.safetensors")
+    assert (
+        k2.budget == 2.2 and k2.payload_quant == "lloyd" and k2.dec_quant == "int8_t5"
+    )
+
+    k3, _ = spec_pair("k4_b2.5_lq_dec8", pack_path="/p/packs.safetensors")
+    assert k3.payload_quant == "lloyd" and k3.dec_quant == "int8"

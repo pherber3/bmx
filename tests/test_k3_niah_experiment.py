@@ -1,6 +1,9 @@
 """k3_niah emits a parquet with the expected schema (tiny_llama, offline, no download)."""
 
+import dataclasses
+
 import pandas as pd
+import pytest
 
 from experiments.k3_niah import Config, run
 from factories import tiny_llama
@@ -45,6 +48,83 @@ def test_k3_niah_run_emits_parquet(tmp_path):
     assert set(df["recall_kind"]) == {"argmax_proxy"}
 
 
+def test_niah_rows_have_kv_size_bits(tmp_path):
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        lengths=(32, 48),
+        depths=(0.25, 0.5),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+    run_dir = run(cfg, model=model, root=str(tmp_path))
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    assert "kv_size_bits" in df.columns
+    assert (df["kv_size_bits"] > 0).all()
+    assert (df["kv_size_bits"] <= 16.0 + 1e-6).all()
+    # fp16 K and V are each 16 bpe → average 16.0.
+    fp16 = df[df["arm"] == "fp16"]
+    assert (fp16["kv_size_bits"] == 16.0).all()
+
+
+def test_niah_checkpoint_resume(tmp_path):
+    """A killed run leaves per-(arm,length) shards; --resume finishes the rest, no dupes."""
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        lengths=(32, 48),
+        depths=(0.25, 0.5),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+
+    with pytest.raises(RuntimeError, match="injected stop"):
+        run(cfg, model=model, root=str(tmp_path), _stop_after_pairs=1)
+
+    runs = list((tmp_path / "k3_niah").iterdir())
+    assert len(runs) == 1
+    run_dir = runs[0]
+
+    partial_dir = run_dir / "partial"
+    shards = list(partial_dir.glob("*.parquet"))
+    assert len(shards) == 1, "exactly one (arm, length) pair should have checkpointed"
+    assert not (run_dir / "metrics.parquet").exists()
+
+    resume_cfg = dataclasses.replace(cfg, resume=str(run_dir))
+    resumed_dir = run(resume_cfg, model=model, root=str(tmp_path))
+    assert resumed_dir == run_dir
+
+    df = pd.read_parquet(run_dir / "metrics.parquet")
+    # 2 arms x 2 lengths x 2 depths = 8 rows; 4 distinct (arm, length) pairs.
+    assert len(df) == 8
+    pairs = list(zip(df["arm"], df["length"]))
+    assert len(set(pairs)) == 4
+    assert len(list(partial_dir.glob("*.parquet"))) == 4
+
+
+def test_niah_resume_rejects_config_mismatch(tmp_path):
+    """Resuming with a changed config field is a hard error, not a silent continue."""
+    model = tiny_llama()
+    cfg = Config(
+        arms=("fp16", "kivi"),
+        lengths=(32, 48),
+        depths=(0.25, 0.5),
+        n_prefill=16,
+        group=16,
+        rank=4,
+    )
+    with pytest.raises(RuntimeError, match="injected stop"):
+        run(cfg, model=model, root=str(tmp_path), _stop_after_pairs=1)
+
+    run_dir = next((tmp_path / "k3_niah").iterdir())
+
+    mismatched_cfg = dataclasses.replace(cfg, rank=8, resume=str(run_dir))
+    with pytest.raises(ValueError, match="(?i)config.*mismatch|mismatch.*config"):
+        run(mismatched_cfg, model=model, root=str(tmp_path))
+
+
 def test_plot_k3_niah_makes_pngs(tmp_path):
     import pandas as pd
     from experiments.plots.plot_k3_niah import make_figures
@@ -84,3 +164,53 @@ def test_plot_k3_niah_makes_pngs(tmp_path):
     paths = make_figures(df, str(tmp_path))
     assert len(paths) >= 1
     assert all(p.exists() for p in paths)
+
+
+def test_niah_heatmap_has_aggregate_score(tmp_path):
+    import json
+    import math
+
+    import pandas as pd
+
+    from experiments.plots.plot_k3_niah import make_figures
+
+    # k2b cells average 7.5 → score 0.750; fp16 cells average 9.0 → score 0.900.
+    # depth.nunique() > 1 so the heatmap (and its scores) render.
+    df = pd.DataFrame(
+        [
+            {
+                "arm": "k2b",
+                "length": 4096,
+                "depth": 0.25,
+                "recall_full": 7.0,
+                "compression": 4.1,
+            },
+            {
+                "arm": "k2b",
+                "length": 4096,
+                "depth": 0.75,
+                "recall_full": 8.0,
+                "compression": 4.1,
+            },
+            {
+                "arm": "fp16",
+                "length": 4096,
+                "depth": 0.25,
+                "recall_full": 9.0,
+                "compression": 1.0,
+            },
+            {
+                "arm": "fp16",
+                "length": 4096,
+                "depth": 0.75,
+                "recall_full": 9.0,
+                "compression": 1.0,
+            },
+        ]
+    )
+    paths = make_figures(df, str(tmp_path))
+    score_paths = [p for p in paths if p.name == "niah_heatmap_scores.json"]
+    assert len(score_paths) == 1, "niah_heatmap_scores.json not emitted"
+    scores = json.loads(score_paths[0].read_text())
+    assert not math.isnan(scores["k2b"]) and abs(scores["k2b"] - 0.75) < 1e-6
+    assert not math.isnan(scores["fp16"]) and abs(scores["fp16"] - 0.90) < 1e-6

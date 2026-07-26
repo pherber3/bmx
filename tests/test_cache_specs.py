@@ -1,6 +1,5 @@
-"""CacheCodecSpec lives in cache.specs and is re-exported from ppl_eval."""
+"""CacheCodecSpec defaults (the codec-spec contract every arm builds on)."""
 
-from bmx.cache.ppl_eval import CacheCodecSpec as SpecFromPpl
 from bmx.cache.specs import CacheCodecSpec
 
 
@@ -16,5 +15,15 @@ def test_spec_defaults():
     )
 
 
-def test_ppl_eval_reexports_same_class():
-    assert SpecFromPpl is CacheCodecSpec
+def test_spec_pack_fields_default_inert():
+    s = CacheCodecSpec(arm="rtn_channel", bits=3)
+    assert s.pack_path == "" and s.budget == 0.0
+
+
+def test_dec_quant_default_inert_and_dec8_recipe(tmp_path):
+    from bmx.cache.recipes import spec_pair
+
+    assert CacheCodecSpec(arm="rtn_channel", bits=3).dec_quant == "fp32"
+    k, v = spec_pair("k4_b2.5_dec8", pack_path="/p/packs.safetensors")
+    assert k.arm == "spectral" and k.budget == 2.5 and k.dec_quant == "int8"
+    assert v.arm == "turboquant_mse" and v.bits == 2

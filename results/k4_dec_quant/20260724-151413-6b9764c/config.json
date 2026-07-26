@@ -1,0 +1,23 @@
+{
+  "pack_path": "results/cache/k4_packs_gpt2.safetensors",
+  "cache_paths": [
+    "results/cache/gpt2_1024.safetensors"
+  ],
+  "model_label": "gpt2",
+  "model_name": "",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "tq_bits": [
+    2,
+    3,
+    4
+  ],
+  "seed": 0,
+  "out_root": "",
+  "tier_thresholds": [
+    5
+  ],
+  "dec_tl": true
+}

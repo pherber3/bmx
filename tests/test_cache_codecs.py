@@ -7,6 +7,7 @@ import torch
 
 from bmx.cache.codecs import (
     CACHE_ARMS,
+    PACK_GATED_ARMS,
     allocate_channel_bits,
     gaussian_codebook,
     qjl_reconstruct,
@@ -89,8 +90,9 @@ class TestBitAccounting:
 
 
 class TestMonotonicity:
-    @pytest.mark.parametrize("arm", list(CACHE_ARMS))
+    @pytest.mark.parametrize("arm", [a for a in CACHE_ARMS if a not in PACK_GATED_ARMS])
     def test_higher_bits_lower_error(self, arm: str):
+        # pack-gated arm — no packless dispatch
         M = _seeded_matrix(seed=99)
         kwargs: dict = dict(seed=SEED, group=GROUP, rank=RANK)
         # b=2 and b=4 are valid for every arm (turboquant_prod requires b>=2)
@@ -106,7 +108,12 @@ class TestMonotonicity:
 # ---------------------------------------------------------------------------
 
 
-SEEDED_ARMS = ("rotate_rtn_token", "turboquant_mse", "turboquant_prod")
+SEEDED_ARMS = (
+    "rotate_rtn_token",
+    "turboquant_mse",
+    "turboquant_prod",
+    "lowrank_turboquant",
+)
 
 
 class TestDeterminism:
@@ -365,6 +372,204 @@ def test_allocate_returns_only_tier_values():
     tiers = (0, 2, 3, 4)
     bits = allocate_channel_bits(R, budget_bits=3.0, tiers=tiers)
     assert set(bits.tolist()).issubset(set(tiers))
+
+
+def test_allocate_from_variance_matches_channel_allocator():
+    from bmx.cache.codecs import allocate_bits_from_variance, allocate_channel_bits
+
+    g = torch.Generator().manual_seed(0)
+    R = torch.randn(256, 64, generator=g) * torch.linspace(0.1, 4.0, 64)
+    a = allocate_channel_bits(R, 3.0, tiers=(0, 2, 3, 4))
+    b = allocate_bits_from_variance(
+        R.var(dim=0, unbiased=False), 3.0, tiers=(0, 2, 3, 4)
+    )
+    assert torch.equal(a, b)
+
+
+def test_allocate_from_variance_rich_tiers():
+    from bmx.cache.codecs import allocate_bits_from_variance
+
+    # Spiked spectrum: 4 large eigenvalues over a flat bulk — the K4 tier set
+    # must fund the spikes at 5-8 bits and the bulk at 0-2.
+    var = torch.cat([torch.tensor([1e4, 1e4, 1e3, 1e3]), torch.ones(60)])
+    bits = allocate_bits_from_variance(var, 2.5, tiers=(0, 2, 3, 4, 5, 6, 8))
+    assert bits[:4].min() >= 5, f"spikes underfunded: {bits[:4]}"
+    assert bits[4:].max() <= 3
+    assert bits.float().mean().item() <= 2.5 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Lagrangian tier selection (math review 2026-07-24 findings #1/#2/#4)
+# ---------------------------------------------------------------------------
+
+
+def test_allocate_bits_selection_round_default_pin():
+    """Defaults reproduce the historical midpoint-rounding path bit-exactly:
+    explicit selection='round' == bare call, and a hand-computable case pins
+    the round path's exact output (var=(256,16,1), tiers (0,2,4), budget 2.0:
+    bisection's left feasible endpoint rounds to (4,2,0))."""
+    from bmx.cache.codecs import allocate_bits_from_variance
+
+    var = torch.tensor([256.0, 16.0, 1.0])
+    bare = allocate_bits_from_variance(var, 2.0, (0, 2, 4))
+    explicit = allocate_bits_from_variance(var, 2.0, (0, 2, 4), selection="round")
+    assert torch.equal(bare, explicit)
+    assert torch.equal(bare, torch.tensor([4, 2, 0], dtype=torch.int64))
+    # New kwargs are rejected on the round path (they only mean anything to
+    # the Lagrangian enumeration).
+    import pytest
+
+    with pytest.raises(AssertionError):
+        allocate_bits_from_variance(var, 2.0, (0, 2, 4), fixed_charge=1.0)
+    with pytest.raises(AssertionError):
+        allocate_bits_from_variance(var, 2.0, (0, 2, 4), g_table=(1.0, 0.1, 0.01))
+
+
+def test_lagrange_thresholds_match_math_review():
+    """The math doc's worked switch points are test vectors. With g=4^{-b},
+    tiers (0,2,3,4,5,6,8), kappa_l=1: the 0->2 switch sits at
+    lam* = 2/(1-4^{-2}) = 2.1333; the 2->3 switch at 1/(4^{-2}-4^{-3}) =
+    21.3333. In b_cont coordinates these are t + 0.782 (2-bit gap) and
+    t + 0.443 (unit gap)."""
+    import math
+
+    from bmx.cache.codecs import _lagrange_select, _tier_g
+
+    tiers_t = torch.tensor([0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0], dtype=torch.float64)
+    g_t = _tier_g(tiers_t, None)
+
+    def pick(lam):
+        return float(
+            _lagrange_select(
+                torch.tensor([lam], dtype=torch.float64), 1.0, tiers_t, g_t, 0.0
+            )[0]
+        )
+
+    assert pick(2.13) == 0.0 and pick(2.14) == 2.0  # 0<->2 boundary
+    assert pick(21.3) == 2.0 and pick(21.4) == 3.0  # 2<->3 boundary
+    # b_cont-coordinate offsets (kappa = kappa_l/ln4):
+    off2 = 0.5 * math.log2((2.0 / (1 - 4.0**-2)) * math.log(4.0))
+    off1 = 0.5 * math.log2((1.0 / (4.0**-2 - 4.0**-3)) * math.log(4.0)) - 2.0
+    assert abs(off2 - 0.782) < 5e-4
+    assert abs(off1 - 0.443) < 5e-4
+    # The (0.782, 1.0) window above the 0 boundary: b_cont=0.9 rounds to 0
+    # under the midpoint rule but the Lagrangian opens it to 2 (the provably
+    # dominated-window fix, finding #1(ii)).
+    from bmx.cache.codecs import _round_to_tiers
+
+    lam_w = 4.0**0.9  # kappa=1 => b_cont = 0.9 exactly
+    assert float(_round_to_tiers(torch.tensor([0.9]), tiers_t)[0]) == 0.0
+    assert (
+        float(
+            _lagrange_select(
+                torch.tensor([lam_w], dtype=torch.float64),
+                math.log(4.0),
+                tiers_t,
+                g_t,
+                0.0,
+            )[0]
+        )
+        == 2.0
+    )
+
+
+def test_lagrange_select_is_pointwise_argmin():
+    """Exact-enumeration property: every chosen tier minimizes
+    lam*g(b) + kappa_l*(b + s*[b>0]) over ALL tiers (brute force)."""
+    from bmx.cache.codecs import _lagrange_select, _tier_g
+
+    g = torch.Generator().manual_seed(0)
+    lam = torch.rand(64, generator=g).double() * 1e4 + 1e-6
+    tiers_t = torch.tensor([0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0], dtype=torch.float64)
+    g_t = _tier_g(tiers_t, None)
+    kappa_l, s = 0.37, 1.7
+    chosen = _lagrange_select(lam, kappa_l, tiers_t, g_t, s)
+    for i in range(64):
+        costs = [
+            float(lam[i]) * float(g_t[j]) + kappa_l * (float(t) + s * (float(t) > 0))
+            for j, t in enumerate(tiers_t)
+        ]
+        chosen_cost = costs[[float(t) for t in tiers_t].index(float(chosen[i]))]
+        assert chosen_cost <= min(costs) + 1e-12, f"dir {i} not argmin"
+
+
+def test_lagrange_fixed_charge_price_of_opening():
+    """Math review #2's worked S=4096 row: s = 0.25 + 4.0 = 4.25 makes the
+    true price of 0->2 equal 6.25, so the switch moves to
+    lam* = kappa_l * 6.25/(1-4^{-2}) = 6.6667 (at kappa_l=1)."""
+    from bmx.cache.codecs import _lagrange_select, _tier_g
+
+    tiers_t = torch.tensor([0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0], dtype=torch.float64)
+    g_t = _tier_g(tiers_t, None)
+
+    def pick(lam):
+        return float(
+            _lagrange_select(
+                torch.tensor([lam], dtype=torch.float64), 1.0, tiers_t, g_t, 4.25
+            )[0]
+        )
+
+    assert pick(6.66) == 0.0 and pick(6.67) == 2.0
+
+
+def test_lagrange_full_allocator_feasible_monotone_deterministic():
+    from bmx.cache.codecs import allocate_bits_from_variance
+
+    g = torch.Generator().manual_seed(3)
+    var = torch.sort(torch.rand(128, generator=g) * 1e3 + 1e-4, descending=True)[0]
+    s = 0.6
+    bits = allocate_bits_from_variance(
+        var, 2.5, (0, 2, 3, 4, 5, 6, 8), selection="lagrange", fixed_charge=s
+    )
+    bits2 = allocate_bits_from_variance(
+        var, 2.5, (0, 2, 3, 4, 5, 6, 8), selection="lagrange", fixed_charge=s
+    )
+    assert torch.equal(bits, bits2)  # deterministic
+    charged = (bits.double() + s * (bits > 0).double()).mean().item()
+    assert charged <= 2.5 + 1e-9  # budget bounds the TOTAL charge
+    assert (bits[:-1] >= bits[1:]).all()  # threshold structure in lam
+    # fixed_charge=0.0 lagrange must also respect plain mean-bits feasibility
+    b0 = allocate_bits_from_variance(
+        var, 2.5, (0, 2, 3, 4, 5, 6, 8), selection="lagrange"
+    )
+    assert b0.double().mean().item() <= 2.5 + 1e-9
+
+
+def test_g_table_validation_and_equivalence():
+    """g_table=None <=> explicit 4^{-b} table (bit-exact); the math doc's
+    measured RTN table is accepted (grid-convex); a non-convex table raises;
+    and the measured table moves the 2<->3 boundary DOWN (the ~0.9 log2-lam
+    misplacement, finding #4): at lam=15, kappa_l=1 the model picks 2, the
+    measured table picks 3."""
+    import pytest
+
+    from bmx.cache.codecs import _lagrange_select, _tier_g, allocate_bits_from_variance
+
+    tiers = (0, 2, 3, 4, 5, 6, 8)
+    tiers_t = torch.tensor([float(t) for t in tiers], dtype=torch.float64)
+    measured = (1.0, 0.119, 0.0374, 0.0115, 0.0035, 0.0010, 9e-5)
+
+    g = torch.Generator().manual_seed(4)
+    var = torch.rand(64, generator=g).double() * 100 + 1e-3
+    explicit = tuple(4.0 ** -float(t) for t in tiers)
+    a = allocate_bits_from_variance(var, 2.5, tiers, selection="lagrange")
+    b = allocate_bits_from_variance(
+        var, 2.5, tiers, selection="lagrange", g_table=explicit
+    )
+    assert torch.equal(a, b)
+
+    g_meas = _tier_g(tiers_t, measured)
+    lam15 = torch.tensor([15.0], dtype=torch.float64)
+    assert (
+        float(_lagrange_select(lam15, 1.0, tiers_t, _tier_g(tiers_t, None), 0.0)[0])
+        == 2.0
+    )
+    assert float(_lagrange_select(lam15, 1.0, tiers_t, g_meas, 0.0)[0]) == 3.0
+
+    with pytest.raises(AssertionError, match="grid-convex"):
+        _tier_g(tiers_t, (1.0, 0.119, 0.09, 0.0115, 0.0035, 0.0010, 9e-5))
+    with pytest.raises(AssertionError):
+        _tier_g(tiers_t, (0.9, 0.119, 0.0374, 0.0115, 0.0035, 0.0010, 9e-5))  # g(0)!=1
 
 
 # ---------------------------------------------------------------------------
@@ -994,3 +1199,144 @@ def test_frozen_vs_oracle_detects_drift():
     assert lg_orac_d <= lg_froz_d + 1e-9, (
         f"oracle did not beat frozen under drift: {lg_orac_d} vs {lg_froz_d}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. lowrank_turboquant — lowrank K + turboquant-MSE residual (the k2b
+#     bit-waster test: structure + good quantizer vs good quantizer alone)
+# ---------------------------------------------------------------------------
+
+
+def test_lowrank_turboquant_registered():
+    from bmx.cache.codecs import CACHE_ARMS, S_DIVISIBILITY_ARMS
+
+    assert "lowrank_turboquant" in CACHE_ARMS
+    # turboquant residual has no per-channel group over S — no S-divisibility.
+    assert "lowrank_turboquant" not in S_DIVISIBILITY_ARMS
+
+
+def test_lowrank_turboquant_roundtrip_shape_dtype():
+    M = _seeded_matrix()
+    m_hat, bpe = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED
+    )
+    assert m_hat.shape == M.shape
+    assert m_hat.dtype == M.dtype
+    assert math.isfinite(bpe) and bpe > 0
+
+
+def test_lowrank_turboquant_bpe_formula():
+    # bpe = bits (Lloyd payload) + 16/C (fp16 per-row residual norm)
+    #     + 16*r*(S+C)/(S*C) (fp16 factors). Codebook + Hadamard are
+    #     seed-generated: 0 stored bits (same convention as turboquant_mse).
+    M = _seeded_matrix()
+    _, bpe = quantize_cache("lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED)
+    expected = BITS + 16.0 / C + 16.0 * RANK * (S + C) / (S * C)
+    assert math.isclose(bpe, expected, rel_tol=1e-9), f"{bpe} != {expected}"
+
+
+def test_lowrank_turboquant_bpe_monotone_in_rank_and_bits():
+    M = _seeded_matrix()
+    _, bpe_r4 = quantize_cache("lowrank_turboquant", M, bits=BITS, rank=4, seed=SEED)
+    _, bpe_r8 = quantize_cache("lowrank_turboquant", M, bits=BITS, rank=8, seed=SEED)
+    assert bpe_r8 > bpe_r4, "bpe must grow with rank (factor metadata)"
+    _, bpe_b2 = quantize_cache("lowrank_turboquant", M, bits=2, rank=RANK, seed=SEED)
+    _, bpe_b3 = quantize_cache("lowrank_turboquant", M, bits=3, rank=RANK, seed=SEED)
+    assert bpe_b3 > bpe_b2, "bpe must grow with residual bit-width"
+
+
+def test_lowrank_turboquant_packed_split_contract():
+    # quantize_cache must be literally dequant_packed ∘ quantize_packed.
+    from bmx.cache.codecs import dequant_packed, quantize_packed
+
+    M = _seeded_matrix()
+    packed, bpe_p = quantize_packed(
+        "lowrank_turboquant", M, bits=BITS, seed=SEED, rank=RANK
+    )
+    m_split = dequant_packed("lowrank_turboquant", packed, seed=SEED)
+    m_cache, bpe_c = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, seed=SEED, rank=RANK
+    )
+    assert torch.equal(m_split, m_cache)
+    assert math.isclose(bpe_p, bpe_c, rel_tol=1e-12)
+    assert packed["res_indices"].dtype == torch.int16
+    assert packed["res_norms"].shape == (M.shape[0], 1)
+
+
+def test_lowrank_turboquant_requires_rank():
+    M = _seeded_matrix()
+    with pytest.raises(AssertionError):
+        quantize_cache("lowrank_turboquant", M, bits=BITS, rank=0, seed=SEED)
+
+
+def test_lowrank_turboquant_svd_factors_equivalence():
+    M = _seeded_matrix()
+    factors = truncated_svd(M, RANK)
+    m_default, bpe_default = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED
+    )
+    m_passed, bpe_passed = quantize_cache(
+        "lowrank_turboquant", M, bits=BITS, rank=RANK, seed=SEED, svd_factors=factors
+    )
+    assert torch.equal(m_default, m_passed)
+    assert math.isclose(bpe_default, bpe_passed, rel_tol=1e-12)
+
+
+def test_lowrank_turboquant_beats_turboquant_mse_at_matched_bits():
+    """The clean 'structure + good quantizer vs good quantizer alone' gate.
+
+    Planted rank-6 K + noise: lowrank_turboquant @(rank 6, 2b residual) must
+    achieve LOWER logit AND reconstruction distortion than plain turboquant_mse
+    @3b while spending FEWER total bits (repo bpe accounting, ALL metadata
+    counted — matched bits, never matched rank)."""
+    S_, C_, r_ = 1024, 128, 6
+    h_kv = 2
+    g = torch.Generator().manual_seed(21)
+    U = torch.randn(S_, r_, generator=g)
+    W = torch.randn(r_, C_, generator=g)
+    noise = torch.randn(S_, C_, generator=g)
+    M = U @ W / math.sqrt(r_) + 0.1 * noise
+
+    m_lt, bpe_lt = quantize_cache("lowrank_turboquant", M, bits=2, rank=r_, seed=SEED)
+    m_t3, bpe_t3 = quantize_cache("turboquant_mse", M, bits=3, seed=SEED)
+
+    # Matched-bits gate via the repo's honest accounting.
+    assert bpe_lt <= bpe_t3 + 1e-9, (
+        f"not a matched-bits comparison: lowrank_turboquant {bpe_lt:.4f} bpe > "
+        f"turboquant_mse@3b {bpe_t3:.4f} bpe"
+    )
+
+    # Logit distortion vs probe queries (the ranking metric; not Frobenius-only).
+    q = _qkv_for(M, h_kv=h_kv)
+    lg_lt = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(m_lt, h_kv).double(), q.double()
+    )
+    lg_t3 = _logit_distortion(
+        from_matrix(M, h_kv).double(), from_matrix(m_t3, h_kv).double(), q.double()
+    )
+    assert lg_lt < lg_t3, (
+        f"lowrank_turboquant logit distortion {lg_lt:.4f} not < "
+        f"turboquant_mse@3b {lg_t3:.4f} at fewer bits ({bpe_lt:.3f} vs {bpe_t3:.3f})"
+    )
+    # Reconstruction (secondary; same direction expected on this synthetic).
+    assert _rel_err(m_lt, M) < _rel_err(m_t3, M)
+
+
+def test_bpe_term_helpers_are_the_audit_surface():
+    # The named metadata terms: one place to audit "ALL metadata counted".
+    from bmx.cache.codecs import factor_bits, norm_bits, scale_bits, tier_bits
+
+    assert scale_bits(64) == 16.0 / 64
+    assert norm_bits(1, 128) == 16.0 / 128
+    assert norm_bits(8, 1024) == 16.0 * 8 / 1024
+    assert factor_bits(16, 256, 1024) == 16.0 * 16 * (256 + 1024) / (256 * 1024)
+    assert tier_bits((0, 2, 3, 4), 256) == 2 / 256  # ceil(log2(4)) = 2
+
+
+def test_spectral_registered_but_not_dispatchable():
+    from bmx.cache.codecs import S_DIVISIBILITY_ARMS
+
+    assert "spectral" in CACHE_ARMS and "spectral" in S_DIVISIBILITY_ARMS
+    M = torch.randn(64, 16)
+    with pytest.raises(NotImplementedError, match="pack"):
+        quantize_cache("spectral", M, bits=0)

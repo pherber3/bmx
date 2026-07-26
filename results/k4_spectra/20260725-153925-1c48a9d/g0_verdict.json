@@ -1,0 +1,11 @@
+{
+  "headline_metric": "logit_rope",
+  "ref_budget": 2.5,
+  "mean_headline_oracle": 0.017910566976449143,
+  "retention_heldout": 0.49871494846845127,
+  "g0_pass_heldout": false,
+  "mean_headline_heldout": 0.036215306363172,
+  "retention_corpus": 0.5238101833837602,
+  "g0_pass_corpus": false,
+  "mean_headline_corpus": 0.03410388746609291
+}
