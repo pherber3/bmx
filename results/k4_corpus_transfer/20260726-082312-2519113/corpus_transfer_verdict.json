@@ -1,0 +1,549 @@
+{
+  "headline_metric": "logit_rope",
+  "verdict_rule": "D<0.10 insensitive; D>0.25 domain-sensitive; else as-measured",
+  "gpt2_yellow_flag": "gpt2 scale = mechanism verdict only (corpus-W retention ~0.47-0.52, docs/2026-07-15-k4-duel-results.md); Llama fit-side replication pre-registered before any paper claim",
+  "per_budget": {
+    "2.2": {
+      "cells": {
+        "wiki->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 5.92266039311262,
+            "qwen3-8b_2048_off10240.safetensors": 4.968932320497175
+          },
+          "win_mean": 5.445796356804898,
+          "extrapolated": false
+        },
+        "wiki->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.967773989965789,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.9933350144033852
+          },
+          "win_mean": 3.980554502184587,
+          "extrapolated": false
+        },
+        "code->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 4.148302944721785,
+            "qwen3-8b_2048_off10240.safetensors": 4.13030961099793
+          },
+          "win_mean": 4.139306277859857,
+          "extrapolated": false
+        },
+        "code->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 6.208675524617327,
+            "qwen3-8b_2048_code_off10240.safetensors": 4.9440870837115325
+          },
+          "win_mean": 5.57638130416443,
+          "extrapolated": false
+        },
+        "null->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 4.301813014467314,
+            "qwen3-8b_2048_off10240.safetensors": 3.847719125625078
+          },
+          "win_mean": 4.074766070046196,
+          "extrapolated": false
+        },
+        "null->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.323413449056721,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.3374379994153403
+          },
+          "win_mean": 3.3304257242360307,
+          "extrapolated": false
+        },
+        "shufcode->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 3.284060423336383,
+            "qwen3-8b_2048_off10240.safetensors": 3.292785344035397
+          },
+          "win_mean": 3.28842288368589,
+          "extrapolated": false
+        },
+        "shufcode->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 4.230783939543759,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.672361899301397
+          },
+          "win_mean": 3.9515729194225777,
+          "extrapolated": false
+        },
+        "uniwiki->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 4.1956592267216495,
+            "qwen3-8b_2048_off10240.safetensors": 3.792397529024071
+          },
+          "win_mean": 3.9940283778728602,
+          "extrapolated": false
+        },
+        "uniwiki->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.2854229985818764,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.2824960774725778
+          },
+          "win_mean": 3.283959538027227,
+          "extrapolated": false
+        },
+        "unicode->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 3.230378439744293,
+            "qwen3-8b_2048_off10240.safetensors": 3.2592287666330955
+          },
+          "win_mean": 3.244803603188694,
+          "extrapolated": false
+        },
+        "unicode->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 4.176463954635672,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.598951508890699
+          },
+          "win_mean": 3.8877077317631854,
+          "extrapolated": false
+        },
+        "biwiki->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 5.2461577987334564,
+            "qwen3-8b_2048_off10240.safetensors": 4.588781863334463
+          },
+          "win_mean": 4.9174698310339595,
+          "extrapolated": false
+        },
+        "biwiki->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.7140992268708724,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.711580424013155
+          },
+          "win_mean": 3.7128398254420136,
+          "extrapolated": false
+        },
+        "bicode->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 3.8545580359414036,
+            "qwen3-8b_2048_off10240.safetensors": 3.8274790279184807
+          },
+          "win_mean": 3.841018531929942,
+          "extrapolated": false
+        },
+        "bicode->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 5.405494462593208,
+            "qwen3-8b_2048_code_off10240.safetensors": 4.486551086570134
+          },
+          "win_mean": 4.946022774581671,
+          "extrapolated": false
+        }
+      },
+      "D": {
+        "code->wiki": {
+          "mean": 0.23418056514622804,
+          "min": 0.1687732203636324,
+          "max": 0.29958790992882367,
+          "label": "as-measured"
+        },
+        "null->wiki": {
+          "mean": 0.24965674653472542,
+          "min": 0.22564469035873524,
+          "max": 0.2736688027107156,
+          "label": "as-measured"
+        },
+        "shufcode->wiki": {
+          "mean": 0.3914173126359647,
+          "min": 0.33732537864272394,
+          "max": 0.44550924662920544,
+          "label": "domain-sensitive"
+        },
+        "uniwiki->wiki": {
+          "mean": 0.26418515963242967,
+          "min": 0.23677818806664364,
+          "max": 0.2915921311982157,
+          "label": "domain-sensitive"
+        },
+        "unicode->wiki": {
+          "mean": 0.39932586595783653,
+          "min": 0.34407865585358033,
+          "max": 0.45457307606209274,
+          "label": "domain-sensitive"
+        },
+        "biwiki->wiki": {
+          "mean": 0.09536410855046118,
+          "min": 0.0765054608601865,
+          "max": 0.11422275624073586,
+          "label": "insensitive"
+        },
+        "bicode->wiki": {
+          "mean": 0.2894513568505113,
+          "min": 0.22971801967801497,
+          "max": 0.34918469402300767,
+          "label": "domain-sensitive"
+        },
+        "wiki->code": {
+          "mean": 0.27661576145568434,
+          "min": 0.1923008339477743,
+          "max": 0.36093068896359437,
+          "label": "domain-sensitive"
+        },
+        "null->code": {
+          "mean": 0.3948391684927346,
+          "min": 0.3249637510612129,
+          "max": 0.4647145859242563,
+          "label": "domain-sensitive"
+        },
+        "shufcode->code": {
+          "mean": 0.2878952210752784,
+          "min": 0.25722143701713485,
+          "max": 0.3185690051334219,
+          "label": "domain-sensitive"
+        },
+        "uniwiki->code": {
+          "mean": 0.40345495973171164,
+          "min": 0.33607640361212976,
+          "max": 0.4708335158512935,
+          "label": "domain-sensitive"
+        },
+        "unicode->code": {
+          "mean": 0.29969380304648574,
+          "min": 0.27206955541952926,
+          "max": 0.3273180506734422,
+          "label": "domain-sensitive"
+        },
+        "biwiki->code": {
+          "mean": 0.3255389143555633,
+          "min": 0.24928902724203905,
+          "max": 0.4017888014690876,
+          "label": "domain-sensitive"
+        },
+        "bicode->code": {
+          "mean": 0.11095318731331794,
+          "min": 0.0925420587045821,
+          "max": 0.12936431592205377,
+          "label": "as-measured"
+        }
+      },
+      "model_intrinsic_flag": false,
+      "hybrid": {
+        "basis_wiki_alloc_code": {
+          "win_mean": 3.886590095685758,
+          "recovery": 0.696973518074035,
+          "h3_pass": false,
+          "extrapolated": false
+        },
+        "basis_code_alloc_wiki": {
+          "win_mean": 3.996141615801675,
+          "recovery": 0.733802983802033,
+          "h3_pass": false,
+          "extrapolated": false
+        }
+      },
+      "wcross": {
+        "sigma_wiki_W_code->wiki": {
+          "win_mean": 5.28493475235266,
+          "extrapolated": false
+        },
+        "sigma_wiki_W_code->code": {
+          "win_mean": 4.213630888874291,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->wiki": {
+          "win_mean": 4.287052262432001,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->code": {
+          "win_mean": 5.301569602427812,
+          "extrapolated": false
+        }
+      },
+      "synthesis": {
+        "rules": {
+          "wiki": {
+            "D_uni": 0.26418515963242967,
+            "D_bi": 0.09536410855046118,
+            "D_shuf": 0.24965674653472542,
+            "recipe_confirmed": false,
+            "order2_earns_keep": true
+          },
+          "code": {
+            "D_uni": 0.29969380304648574,
+            "D_bi": 0.11095318731331794,
+            "D_shuf": 0.2878952210752784,
+            "recipe_confirmed": false,
+            "order2_earns_keep": true
+          }
+        },
+        "climb_to_order3": true,
+        "note": "\u00a73b pre-registered gates for the traffic-histogram RECIPE claim: uni_* is the recipe estimator, shuf_* its without-replacement control (D_shuf for wiki = the Stage-1 null->wiki cell); no higher orders unless order2_earns_keep on BOTH eval sides"
+      }
+    },
+    "2.5": {
+      "cells": {
+        "wiki->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 5.715000754976615,
+            "qwen3-8b_2048_off10240.safetensors": 4.819927907247854
+          },
+          "win_mean": 5.267464331112235,
+          "extrapolated": false
+        },
+        "wiki->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.8648373216797802,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.8634900136168406
+          },
+          "win_mean": 3.8641636676483104,
+          "extrapolated": false
+        },
+        "code->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 4.016035291186384,
+            "qwen3-8b_2048_off10240.safetensors": 4.011181997169791
+          },
+          "win_mean": 4.013608644178087,
+          "extrapolated": false
+        },
+        "code->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 5.974638570925371,
+            "qwen3-8b_2048_code_off10240.safetensors": 4.747583661559464
+          },
+          "win_mean": 5.361111116242418,
+          "extrapolated": false
+        },
+        "null->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 4.153228237061291,
+            "qwen3-8b_2048_off10240.safetensors": 3.7398426889338126
+          },
+          "win_mean": 3.9465354629975518,
+          "extrapolated": false
+        },
+        "null->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.2294118796092204,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.2186062728984366
+          },
+          "win_mean": 3.2240090762538287,
+          "extrapolated": false
+        },
+        "shufcode->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 3.164628498064203,
+            "qwen3-8b_2048_off10240.safetensors": 3.1914044002922757
+          },
+          "win_mean": 3.1780164491782394,
+          "extrapolated": false
+        },
+        "shufcode->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 4.0797347064648415,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.519936591021237
+          },
+          "win_mean": 3.799835648743039,
+          "extrapolated": false
+        },
+        "uniwiki->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 4.044843135636828,
+            "qwen3-8b_2048_off10240.safetensors": 3.686464917967856
+          },
+          "win_mean": 3.865654026802342,
+          "extrapolated": false
+        },
+        "uniwiki->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.1912649902723693,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.163836967665174
+          },
+          "win_mean": 3.177550978968772,
+          "extrapolated": false
+        },
+        "unicode->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 3.1122337259137898,
+            "qwen3-8b_2048_off10240.safetensors": 3.154527048912876
+          },
+          "win_mean": 3.133380387413333,
+          "extrapolated": false
+        },
+        "unicode->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 4.017002364936824,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.4458740986566356
+          },
+          "win_mean": 3.7314382317967296,
+          "extrapolated": false
+        },
+        "biwiki->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 5.056660766072803,
+            "qwen3-8b_2048_off10240.safetensors": 4.454400105725406
+          },
+          "win_mean": 4.755530435899105,
+          "extrapolated": false
+        },
+        "biwiki->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 3.6135050519257805,
+            "qwen3-8b_2048_code_off10240.safetensors": 3.5846063435135838
+          },
+          "win_mean": 3.599055697719682,
+          "extrapolated": false
+        },
+        "bicode->wiki": {
+          "win_per_cache": {
+            "qwen3-8b_2048.safetensors": 3.719209638806861,
+            "qwen3-8b_2048_off10240.safetensors": 3.7155544060043564
+          },
+          "win_mean": 3.7173820224056087,
+          "extrapolated": false
+        },
+        "bicode->code": {
+          "win_per_cache": {
+            "qwen3-8b_2048_code.safetensors": 5.198115406633853,
+            "qwen3-8b_2048_code_off10240.safetensors": 4.298047212196276
+          },
+          "win_mean": 4.748081309415065,
+          "extrapolated": false
+        }
+      },
+      "D": {
+        "code->wiki": {
+          "mean": 0.23253693711685497,
+          "min": 0.1677921175671383,
+          "max": 0.29728175666657164,
+          "label": "as-measured"
+        },
+        "null->wiki": {
+          "mean": 0.24868170844804954,
+          "min": 0.22408742186576858,
+          "max": 0.2732759950303305,
+          "label": "as-measured"
+        },
+        "shufcode->wiki": {
+          "mean": 0.3920661523275126,
+          "min": 0.3378730010684856,
+          "max": 0.44625930358653954,
+          "label": "domain-sensitive"
+        },
+        "uniwiki->wiki": {
+          "mean": 0.263701414246723,
+          "min": 0.23516181384696222,
+          "max": 0.2922410146464838,
+          "label": "domain-sensitive"
+        },
+        "unicode->wiki": {
+          "mean": 0.4004756298949618,
+          "min": 0.34552401828057844,
+          "max": 0.4554272415093452,
+          "label": "domain-sensitive"
+        },
+        "biwiki->wiki": {
+          "mean": 0.09551593060666003,
+          "min": 0.07583677776026354,
+          "max": 0.11519508345305651,
+          "label": "insensitive"
+        },
+        "bicode->wiki": {
+          "mean": 0.2891731534033717,
+          "min": 0.22912656008460652,
+          "max": 0.34921974672213685,
+          "label": "domain-sensitive"
+        },
+        "wiki->code": {
+          "mean": 0.26967294063840014,
+          "min": 0.18621970900713314,
+          "max": 0.35312617226966714,
+          "label": "domain-sensitive"
+        },
+        "null->code": {
+          "mean": 0.39076688309901303,
+          "min": 0.32205380624273106,
+          "max": 0.459479959955295,
+          "label": "domain-sensitive"
+        },
+        "shufcode->code": {
+          "mean": 0.2878707320374279,
+          "min": 0.2585835570373025,
+          "max": 0.3171579070375533,
+          "label": "domain-sensitive"
+        },
+        "uniwiki->code": {
+          "mean": 0.3997274088064895,
+          "min": 0.33359005481413007,
+          "max": 0.4658647627988489,
+          "label": "domain-sensitive"
+        },
+        "unicode->code": {
+          "mean": 0.3009206376528491,
+          "min": 0.2741835964772127,
+          "max": 0.3276576788284855,
+          "label": "domain-sensitive"
+        },
+        "biwiki->code": {
+          "mean": 0.3200773190164527,
+          "min": 0.24496194294844098,
+          "max": 0.3951926950844644,
+          "label": "domain-sensitive"
+        },
+        "bicode->code": {
+          "mean": 0.11232865901437139,
+          "min": 0.09468742025612376,
+          "max": 0.12996989777261903,
+          "label": "as-measured"
+        }
+      },
+      "model_intrinsic_flag": false,
+      "hybrid": {
+        "basis_wiki_alloc_code": {
+          "win_mean": 3.799623370818437,
+          "recovery": 0.708738037401765,
+          "h3_pass": false,
+          "extrapolated": false
+        },
+        "basis_code_alloc_wiki": {
+          "win_mean": 3.913290106908585,
+          "recovery": 0.742917248398773,
+          "h3_pass": false,
+          "extrapolated": false
+        }
+      },
+      "wcross": {
+        "sigma_wiki_W_code->wiki": {
+          "win_mean": 5.107918898737307,
+          "extrapolated": false
+        },
+        "sigma_wiki_W_code->code": {
+          "win_mean": 4.0786655822371625,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->wiki": {
+          "win_mean": 4.158739520383419,
+          "extrapolated": false
+        },
+        "sigma_code_W_wiki->code": {
+          "win_mean": 5.094007623674592,
+          "extrapolated": false
+        }
+      },
+      "synthesis": {
+        "rules": {
+          "wiki": {
+            "D_uni": 0.263701414246723,
+            "D_bi": 0.09551593060666003,
+            "D_shuf": 0.24868170844804954,
+            "recipe_confirmed": false,
+            "order2_earns_keep": true
+          },
+          "code": {
+            "D_uni": 0.3009206376528491,
+            "D_bi": 0.11232865901437139,
+            "D_shuf": 0.2878707320374279,
+            "recipe_confirmed": false,
+            "order2_earns_keep": true
+          }
+        },
+        "climb_to_order3": true,
+        "note": "\u00a73b pre-registered gates for the traffic-histogram RECIPE claim: uni_* is the recipe estimator, shuf_* its without-replacement control (D_shuf for wiki = the Stage-1 null->wiki cell); no higher orders unless order2_earns_keep on BOTH eval sides"
+      }
+    }
+  }
+}
