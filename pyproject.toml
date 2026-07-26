@@ -1,6 +1,7 @@
 [project]
 name = "bmx"
 version = "0.1.0"
+license = { file = "LICENSE" }
 description = "Kill-or-confirm LLM tensor-compression research: weights break-even law, KV-cache codecs (K2b/K3 streaming, K4 spectral), fused dequant-attention kernels"
 readme = "README.md"
 authors = [
