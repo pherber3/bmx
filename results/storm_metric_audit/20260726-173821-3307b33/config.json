@@ -1,0 +1,8 @@
+{
+  "niah_root": "results/k3_niah",
+  "longbench_root": "results/k3_longbench",
+  "frontier_root": "results/k4_frontier",
+  "exclude_run_substr": "f9eeafe",
+  "spectral_fit_mode": "heldout",
+  "gate_threshold": 0.8
+}
