@@ -1,0 +1,293 @@
+{
+  "task": "storm Task-8 attention predictability (Tier-3 prefetch gatekeeper)",
+  "pre_registered": {
+    "gate_x_pct": 1.0,
+    "gate_k_frac": 0.05,
+    "threshold": 0.9,
+    "gate_quantity": "per model: MAX over the 4 pre-registered cheap predictors of MICRO-pooled recall@k over ALL (layer, head, step) realized events (> X% per-head mass) at scope=head; gate passes only if EVERY model clears >= 0.9",
+    "predictors": [
+      "identity",
+      "identity_recency",
+      "ema",
+      "ema_recency"
+    ],
+    "n_recent": 16,
+    "n_sink": 4,
+    "ema_lambda": 0.5
+  },
+  "per_model": {
+    "gpt2": {
+      "label": "gpt2",
+      "model_name": "gpt2",
+      "n_layers": 12,
+      "n_heads": 12,
+      "eff_prompt": 768,
+      "S_first": 770,
+      "S_last": 1024,
+      "n_step_pairs": 255,
+      "per_predictor": {
+        "identity": {
+          "recall": 0.7757183485338826,
+          "mass_coverage": 0.7111954787649886,
+          "n_realized": 377289.0
+        },
+        "identity_recency": {
+          "recall": 0.8186085467638866,
+          "mass_coverage": 0.765867690746765,
+          "n_realized": 377289.0
+        },
+        "ema": {
+          "recall": 0.7858299605872422,
+          "mass_coverage": 0.712405454630106,
+          "n_realized": 377289.0
+        },
+        "ema_recency": {
+          "recall": 0.8261597873248359,
+          "mass_coverage": 0.7661804483859063,
+          "n_realized": 377289.0
+        }
+      },
+      "best_predictor": "ema_recency",
+      "best": {
+        "recall": 0.8261597873248359,
+        "mass_coverage": 0.7661804483859063,
+        "n_realized": 377289.0
+      },
+      "layer_pooled_companion": {
+        "best_predictor": "identity_recency",
+        "recall": 0.8760539372355645,
+        "mass_coverage": 0.7360944143989507,
+        "n_realized": 32853.0
+      },
+      "worst_head": {
+        "layer": 3,
+        "head": 0,
+        "recall": 0.2544689800210305,
+        "mass_coverage": 0.3210824161074033,
+        "n_realized": 2853.0,
+        "n_heads_without_realized_events": 0
+      },
+      "decomposition": {
+        "sink": {
+          "realized_event_share": 0.07936091431237062,
+          "realized_mass_share": 0.31047267158030517,
+          "recall": 0.9825328969340725,
+          "mass_coverage": 0.9962132379038354
+        },
+        "recent": {
+          "realized_event_share": 0.47075583968787854,
+          "realized_mass_share": 0.32878812405339974,
+          "recall": 1.0,
+          "mass_coverage": 1.0
+        },
+        "content": {
+          "realized_event_share": 0.4498832459997509,
+          "realized_mass_share": 0.3607392396819398,
+          "recall": 0.6166694160343121,
+          "mass_coverage": 0.3550912270265324
+        },
+        "static_realized_mass_share": 0.6392607956337049
+      },
+      "stability": {
+        "n_steps": 255,
+        "mean": 0.8336425907243149,
+        "std": 0.08620020399439801,
+        "min": 0.5996326905417815,
+        "frac_steps_ge_gate": 0.27450980392156865
+      },
+      "grid": {
+        "X=0.5%|k=0.025S": {
+          "predictor": "ema",
+          "recall": 0.5415485468715857,
+          "mass_coverage": 0.6534601005533233
+        },
+        "X=0.5%|k=0.05S": {
+          "predictor": "ema_recency",
+          "recall": 0.7183888120037876,
+          "mass_coverage": 0.7661804483859063
+        },
+        "X=0.5%|k=0.1S": {
+          "predictor": "ema_recency",
+          "recall": 0.8516862116687304,
+          "mass_coverage": 0.8317057027895481
+        },
+        "X=1%|k=0.025S": {
+          "predictor": "ema",
+          "recall": 0.6851167142429279,
+          "mass_coverage": 0.6534601005533233
+        },
+        "X=1%|k=0.05S": {
+          "predictor": "ema_recency",
+          "recall": 0.8261597873248359,
+          "mass_coverage": 0.7661804483859063
+        },
+        "X=1%|k=0.1S": {
+          "predictor": "ema_recency",
+          "recall": 0.9019531446715913,
+          "mass_coverage": 0.8317057027895481
+        },
+        "X=2%|k=0.025S": {
+          "predictor": "ema_recency",
+          "recall": 0.7926173287834608,
+          "mass_coverage": 0.6893751726877575
+        },
+        "X=2%|k=0.05S": {
+          "predictor": "ema_recency",
+          "recall": 0.8826736504938494,
+          "mass_coverage": 0.7661804483859063
+        },
+        "X=2%|k=0.1S": {
+          "predictor": "ema_recency",
+          "recall": 0.9311434232111651,
+          "mass_coverage": 0.8317057027895481
+        }
+      }
+    },
+    "qwen3-0.6b": {
+      "label": "qwen3-0.6b",
+      "model_name": "Qwen/Qwen3-0.6B",
+      "n_layers": 28,
+      "n_heads": 16,
+      "eff_prompt": 1024,
+      "S_first": 1026,
+      "S_last": 1280,
+      "n_step_pairs": 255,
+      "per_predictor": {
+        "identity": {
+          "recall": 0.7897745091638098,
+          "mass_coverage": 0.7473934189347027,
+          "n_realized": 934273.0
+        },
+        "identity_recency": {
+          "recall": 0.8616828271822048,
+          "mass_coverage": 0.827013584423826,
+          "n_realized": 934273.0
+        },
+        "ema": {
+          "recall": 0.7959654191012692,
+          "mass_coverage": 0.7468178778311942,
+          "n_realized": 934273.0
+        },
+        "ema_recency": {
+          "recall": 0.8640632877114077,
+          "mass_coverage": 0.825251038722965,
+          "n_realized": 934273.0
+        }
+      },
+      "best_predictor": "ema_recency",
+      "best": {
+        "recall": 0.8640632877114077,
+        "mass_coverage": 0.825251038722965,
+        "n_realized": 934273.0
+      },
+      "layer_pooled_companion": {
+        "best_predictor": "identity_recency",
+        "recall": 0.9260384531488579,
+        "mass_coverage": 0.799164999766844,
+        "n_realized": 64182.0
+      },
+      "worst_head": {
+        "layer": 3,
+        "head": 10,
+        "recall": 0.15976331360946747,
+        "mass_coverage": 0.4003495200591929,
+        "n_realized": 2873.0,
+        "n_heads_without_realized_events": 0
+      },
+      "decomposition": {
+        "sink": {
+          "realized_event_share": 0.10639074446120138,
+          "realized_mass_share": 0.4256014386599405,
+          "recall": 0.9979476448218274,
+          "mass_coverage": 0.999014334949021
+        },
+        "recent": {
+          "realized_event_share": 0.4088558697511327,
+          "realized_mass_share": 0.2524538222634134,
+          "recall": 1.0,
+          "mass_coverage": 1.0
+        },
+        "content": {
+          "realized_event_share": 0.4847533857876659,
+          "realized_mass_share": 0.3219447828111353,
+          "recall": 0.7200259664555788,
+          "mass_coverage": 0.4585111672131328
+        },
+        "static_realized_mass_share": 0.6780552609233539
+      },
+      "stability": {
+        "n_steps": 255,
+        "mean": 0.8677285409066777,
+        "std": 0.07980022220319087,
+        "min": 0.5330289193302892,
+        "frac_steps_ge_gate": 0.38823529411764707
+      },
+      "grid": {
+        "X=0.5%|k=0.025S": {
+          "predictor": "ema",
+          "recall": 0.6132201157102614,
+          "mass_coverage": 0.6997026687801773
+        },
+        "X=0.5%|k=0.05S": {
+          "predictor": "ema_recency",
+          "recall": 0.78093000133406,
+          "mass_coverage": 0.825251038722965
+        },
+        "X=0.5%|k=0.1S": {
+          "predictor": "ema_recency",
+          "recall": 0.8842813634212716,
+          "mass_coverage": 0.8764470408487006
+        },
+        "X=1%|k=0.025S": {
+          "predictor": "ema_recency",
+          "recall": 0.7460677981703421,
+          "mass_coverage": 0.7663483141576513
+        },
+        "X=1%|k=0.05S": {
+          "predictor": "ema_recency",
+          "recall": 0.8640632877114077,
+          "mass_coverage": 0.825251038722965
+        },
+        "X=1%|k=0.1S": {
+          "predictor": "ema_recency",
+          "recall": 0.9223727968163481,
+          "mass_coverage": 0.8764470408487006
+        },
+        "X=2%|k=0.025S": {
+          "predictor": "identity_recency",
+          "recall": 0.8435721987382057,
+          "mass_coverage": 0.7681587483567357
+        },
+        "X=2%|k=0.05S": {
+          "predictor": "ema_recency",
+          "recall": 0.9106950315448586,
+          "mass_coverage": 0.825251038722965
+        },
+        "X=2%|k=0.1S": {
+          "predictor": "identity_recency",
+          "recall": 0.9450044957486261,
+          "mass_coverage": 0.8777181239035307
+        }
+      }
+    }
+  },
+  "gate": {
+    "threshold": 0.9,
+    "per_model_recall": {
+      "gpt2": 0.8261597873248359,
+      "qwen3-0.6b": 0.8640632877114077
+    },
+    "min_model": "gpt2",
+    "min_recall": 0.8261597873248359,
+    "gate_pass": false,
+    "gate_outcome": "KILL \u2014 one-step-ahead recall@k < 0.9: the two-tier prefetch mechanism is killed by prefetch pollution before any engineering"
+  },
+  "caveats": [
+    "teacher-forced decode (the plan's harness); free-running drift is unmeasured",
+    "mechanism scale (124M/0.6B); Llama-scale rides the next rental only if this gate survives",
+    "gpt2 prompt clamped to n_positions - decode_steps = 768 (its absolute context ceiling is 1024)",
+    "the recent class (newest 16 positions) is trivially resident in any deployment \u2014 the decomposition separates it so content predictability is read directly",
+    "attention rows are q-head-level; GQA KV-fetch granularity (union over q-heads sharing a KV head) lies between scope=head and scope=layer_pooled"
+  ],
+  "git_sha": "1cd2f90"
+}
