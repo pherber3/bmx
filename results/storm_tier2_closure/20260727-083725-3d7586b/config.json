@@ -1,0 +1,23 @@
+{
+  "gpt2_fit_caches": [
+    "results/cache/gpt2_1024_off1024.safetensors",
+    "results/cache/gpt2_1024_off2048.safetensors",
+    "results/cache/gpt2_1024_off3072.safetensors",
+    "results/cache/gpt2_1024_off4096.safetensors"
+  ],
+  "gpt2_score_cache": "results/cache/gpt2_1024.safetensors",
+  "gpt2_pack": "results/cache/k4_packs_gpt2.safetensors",
+  "qwen_fit_caches": [
+    "results/cache/qwen3-0.6b_2048_off2048.safetensors",
+    "results/cache/qwen3-0.6b_2048_off4096.safetensors"
+  ],
+  "qwen_score_cache": "results/cache/qwen3-0.6b_2048.safetensors",
+  "qwen_pack": "results/cache/k4_packs_qwen3_06b.safetensors",
+  "qwen_model_name": "Qwen/Qwen3-0.6B",
+  "budget": 2.5,
+  "qwen_budget": 3.0,
+  "position_stride": 8,
+  "k4_measured_mean_kv_bpe": 3.081,
+  "include_qwen": true,
+  "out_root": ""
+}

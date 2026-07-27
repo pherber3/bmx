@@ -1,0 +1,123 @@
+{
+  "git_sha": "3d7586b",
+  "budget_gpt2": 2.5,
+  "budget_qwen": 3.0,
+  "verdicts": {
+    "a": {
+      "gpt2": {
+        "sub_item": "a",
+        "model": "gpt2",
+        "budget": 2.5,
+        "gate": "in-distribution second-moment-sufficiency: mean rel_gap < 0.10",
+        "mean_rel_gap_in_distribution": 0.012312140363163712,
+        "max_rel_gap_in_distribution": 0.033901948066834824,
+        "mean_rel_gap_ood_heldout": 0.4991589836055858,
+        "passes": true,
+        "verdict_line": "[a/gpt2] in-dist mean |D_oracle-D_avg|/D_avg = 0.0123 (max 0.0339) \u2014 NULL as predicted (gap\u22480, avg W sufficient); [OOD leading-slice diagnostic gap 0.499 = distribution shift, not a sufficiency violation]"
+      },
+      "qwen3-0.6b": {
+        "sub_item": "a",
+        "model": "qwen3-0.6b",
+        "budget": 3.0,
+        "gate": "in-distribution second-moment-sufficiency: mean rel_gap < 0.10",
+        "mean_rel_gap_in_distribution": 0.02132659212479052,
+        "max_rel_gap_in_distribution": 0.04459362662501998,
+        "mean_rel_gap_ood_heldout": 0.25896074739681796,
+        "passes": true,
+        "verdict_line": "[a/qwen3-0.6b] in-dist mean |D_oracle-D_avg|/D_avg = 0.0213 (max 0.0446) \u2014 NULL as predicted (gap\u22480, avg W sufficient); [OOD leading-slice diagnostic gap 0.259 = distribution shift, not a sufficiency violation]"
+      }
+    },
+    "b": {
+      "gpt2": {
+        "sub_item": "b",
+        "model": "gpt2",
+        "budget": 2.5,
+        "gate": "RA-safe global-center cuts weighted residual \u22650.5 bit on \u226590% layers",
+        "frac_layers_global_ge_half_bit": 0.0,
+        "mean_dbit_global_center": 0.03830719141769119,
+        "mean_dbit_local_window_NOT_RA_SAFE": -0.0012166938235454961,
+        "passes": false,
+        "verdict_line": "[b/gpt2] global-center \u0394bit\u22650.5 on 0% of layers (mean \u0394bit 0.038) \u2014 NULL: predictor buys < 0.5 bit; [not-RA-safe prev-token mean \u0394bit -0.001, excluded]"
+      },
+      "qwen3-0.6b": {
+        "sub_item": "b",
+        "model": "qwen3-0.6b",
+        "budget": 3.0,
+        "gate": "RA-safe global-center cuts weighted residual \u22650.5 bit on \u226590% layers",
+        "frac_layers_global_ge_half_bit": 0.0,
+        "mean_dbit_global_center": 0.034270346044421605,
+        "mean_dbit_local_window_NOT_RA_SAFE": -0.1884571463541791,
+        "passes": false,
+        "verdict_line": "[b/qwen3-0.6b] global-center \u0394bit\u22650.5 on 0% of layers (mean \u0394bit 0.034) \u2014 NULL: predictor buys < 0.5 bit; [not-RA-safe prev-token mean \u0394bit -0.188, excluded]"
+      }
+    },
+    "c": {
+      "all": {
+        "sub_item": "c",
+        "gate": "arithmetic settle (no pass/fail) \u2014 MLA caveat + GQA crossover number",
+        "h_cache_over_fp16_kv": [
+          2.0,
+          2.0
+        ],
+        "k4_pack_over_fp16_kv": [
+          0.1925625,
+          0.1925625
+        ],
+        "mla_caveat": "No MLA number holds for Llama-3.1-8B / Qwen3-8B: both are GQA (n_kv=8, d_head=128), not MLA \u2014 a latent KV cache is an architecture property, not a codec applicable post-hoc. The MLA column is a reference (DeepSeek-V2 kv_lora_rank+rope=576/layer) shown only to size the caveat.",
+        "gqa_crossover": "h-cache (d_model=4096/layer) is 2.0\u00d7 the fp16 GQA-KV (2\u00b78\u00b7128=2048/layer) for both models \u2014 recompute-from-hidden LOSES to GQA-KV at this ratio; k4-pack KV further shrinks the winning side.",
+        "verdict_line": "[c] fp16 GQA-KV/layer=2048B; h-cache/layer=4096B (2.0\u00d7, loses); k4-pack KV @ measured 3.081 mean-kv bits = 0.193\u00d7 fp16-KV. MLA: N/A (GQA arch, no number holds) \u2014 caveat sentence produced."
+      }
+    },
+    "d": {
+      "qwen3-0.6b": {
+        "sub_item": "d",
+        "model": "qwen3-0.6b",
+        "budget": 3.0,
+        "gate": "radial coord special iff frac_radial \u2265 frac_klt_top1 (matched 1 coord)",
+        "mean_frac_radial": 0.8021978015807175,
+        "mean_frac_klt_top1": 0.8622434489477333,
+        "mean_ratio_radial_to_klt1": 0.9253241038461031,
+        "mean_frac_radial_plus_top3": 0.928954566843146,
+        "mean_frac_klt_top4": 0.935164366256385,
+        "passes": false,
+        "verdict_line": "[d/qwen3-0.6b] radial carries 0.802 of weighted metric vs top-1 KLT 0.862 (ratio 0.925; 4-coord: rad+3=0.929 vs KLT4=0.935) \u2014 NULL: KLT dominates, no privileged radial axis (sphere Gaussianizes tangential bulk)"
+      }
+    },
+    "e": {
+      "all": {
+        "sub_item": "e",
+        "gate": "GQA-null: union read-subspace over a kv-group's q-heads fills up (union V-energy-frac > per-head frac) so no per-kv-head routing survives",
+        "mean_wov_effective_rank_gpt2_MHA": 60.33363746949178,
+        "mean_v_energy_frac_top_gpt2_MHA": 0.9279801883427792,
+        "mean_v_energy_frac_union_qwen_GQA": 1.0,
+        "mean_v_energy_frac_perhead_qwen_GQA": 0.8900146313161418,
+        "gqa_null_confirmed": true,
+        "verdict_line": "[e] gpt2(MHA) W_OV erank\u224860.3, per-head V-read frac\u22480.928; qwen3(GQA g=2) per-head frac\u22480.890 vs union frac\u22481.000 \u2014 GQA-NULL confirmed (union fills up)"
+      }
+    },
+    "f": {
+      "gpt2": {
+        "sub_item": "f",
+        "model": "gpt2",
+        "budget": 2.5,
+        "gate": "mean-centering cuts weighted distortion \u22650.5 bit-equiv at matched bpe on \u226590% layers (else NULL, close the ledger)",
+        "frac_layers_ge_half_bit": 0.0,
+        "mean_dbit_centering": 0.03830719141769119,
+        "mean_bpe_gap_centered_minus_baseline": 0.0,
+        "passes": false,
+        "verdict_line": "[f/gpt2] mean-centering \u0394bit\u22650.5 on 0% of layers (mean \u0394bit +0.0383, bpe gap +0.0000) \u2014 NULL: centering buys < 0.5 bit \u2014 taxonomy row disposed"
+      },
+      "qwen3-0.6b": {
+        "sub_item": "f",
+        "model": "qwen3-0.6b",
+        "budget": 3.0,
+        "gate": "mean-centering cuts weighted distortion \u22650.5 bit-equiv at matched bpe on \u226590% layers (else NULL, close the ledger)",
+        "frac_layers_ge_half_bit": 0.0,
+        "mean_dbit_centering": 0.034270346044421605,
+        "mean_bpe_gap_centered_minus_baseline": 0.0,
+        "passes": false,
+        "verdict_line": "[f/qwen3-0.6b] mean-centering \u0394bit\u22650.5 on 0% of layers (mean \u0394bit +0.0343, bpe gap +0.0000) \u2014 NULL: centering buys < 0.5 bit \u2014 taxonomy row disposed"
+      }
+    }
+  }
+}
