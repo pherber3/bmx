@@ -1,0 +1,200 @@
+{
+  "task": "storm Task-9 consolidation probe (superposed storage)",
+  "model": "gpt2",
+  "gate_arms": [
+    "cons_pure",
+    "cons_post"
+  ],
+  "gate_m_over_s": 0.5,
+  "per_layer_class": {
+    "friendly": {
+      "layer": 8,
+      "d_eff": 1.210842786358179,
+      "margin_mean": 0.0039004292339086533,
+      "margin_worst": 0.00951324213562768,
+      "per_budget": {
+        "2.2": {
+          "pack": {
+            "bpe": 2.3720703125,
+            "dist": 0.02277854084968567,
+            "worst_ratio": 0.026709221859789103,
+            "out_err": 0.0611133836209774,
+            "out_err_causal": 0.06292925029993057
+          },
+          "arms": {
+            "cons_pure": {
+              "mode": "none",
+              "m": 151,
+              "m_over_S": 0.1474609375,
+              "bpe": 2.3612950642903647,
+              "dist": 0.17649149894714355,
+              "worst_ratio": 0.18999824696456497,
+              "out_err": 0.47576162219047546,
+              "out_err_causal": 0.5155699849128723,
+              "dist_over_pack": 7.748147702339724,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            },
+            "cons_assign": {
+              "mode": "none",
+              "m": 151,
+              "m_over_S": 0.1474609375,
+              "bpe": 2.3697916666666665,
+              "dist": 0.17649149894714355,
+              "worst_ratio": 0.18999824696456497,
+              "out_err": 0.4757590591907501,
+              "out_err_causal": 0.49617061018943787,
+              "dist_over_pack": 7.748147702339724,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            }
+          }
+        },
+        "2.5": {
+          "pack": {
+            "bpe": 2.6842448711395264,
+            "dist": 0.018878111615777016,
+            "worst_ratio": 0.017195979724161422,
+            "out_err": 0.05046674236655235,
+            "out_err_causal": 0.052958112210035324
+          },
+          "arms": {
+            "cons_pure": {
+              "mode": "none",
+              "m": 171,
+              "m_over_S": 0.1669921875,
+              "bpe": 2.6740493774414062,
+              "dist": 0.16962289810180664,
+              "worst_ratio": 0.19889451489140994,
+              "out_err": 0.4609614908695221,
+              "out_err_causal": 0.49186956882476807,
+              "dist_over_pack": 8.985162369738697,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            },
+            "cons_assign": {
+              "mode": "none",
+              "m": 171,
+              "m_over_S": 0.1669921875,
+              "bpe": 2.6822916666666665,
+              "dist": 0.16962289810180664,
+              "worst_ratio": 0.19889451489140994,
+              "out_err": 0.46095940470695496,
+              "out_err_causal": 0.47489824891090393,
+              "dist_over_pack": 8.985162369738697,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            }
+          }
+        }
+      }
+    },
+    "steep": {
+      "layer": 1,
+      "d_eff": 1.5135795009346558,
+      "margin_mean": 0.0018113902769982815,
+      "margin_worst": 0.002423605049353284,
+      "per_budget": {
+        "2.2": {
+          "pack": {
+            "bpe": 2.3404947916666665,
+            "dist": 0.009596596471965313,
+            "worst_ratio": 0.011278329975758549,
+            "out_err": 0.009252640418708324,
+            "out_err_causal": 0.008798329159617424
+          },
+          "arms": {
+            "cons_pure": {
+              "mode": "none",
+              "m": 149,
+              "m_over_S": 0.1455078125,
+              "bpe": 2.3300196329752603,
+              "dist": 0.17316502332687378,
+              "worst_ratio": 0.360973878124799,
+              "out_err": 0.2496979683637619,
+              "out_err_causal": 0.3090702295303345,
+              "dist_over_pack": 18.04442062691116,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            },
+            "cons_assign": {
+              "mode": "none",
+              "m": 149,
+              "m_over_S": 0.1455078125,
+              "bpe": 2.3385416666666665,
+              "dist": 0.17316502332687378,
+              "worst_ratio": 0.360973878124799,
+              "out_err": 0.24969817698001862,
+              "out_err_causal": 0.28644686937332153,
+              "dist_over_pack": 18.04442062691116,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            }
+          }
+        },
+        "2.5": {
+          "pack": {
+            "bpe": 2.650716225306193,
+            "dist": 0.0077852061949670315,
+            "worst_ratio": 0.008854724926405265,
+            "out_err": 0.007759645115584135,
+            "out_err_causal": 0.007434088736772537
+          },
+          "arms": {
+            "cons_pure": {
+              "mode": "none",
+              "m": 169,
+              "m_over_S": 0.1650390625,
+              "bpe": 2.6427739461263022,
+              "dist": 0.1675751954317093,
+              "worst_ratio": 0.32168851755213856,
+              "out_err": 0.23067496716976166,
+              "out_err_causal": 0.30762168765068054,
+              "dist_over_pack": 21.52482429303453,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            },
+            "cons_assign": {
+              "mode": "none",
+              "m": 168,
+              "m_over_S": 0.1640625,
+              "bpe": 2.6354166666666665,
+              "dist": 0.16794437170028687,
+              "worst_ratio": 0.32168851755213856,
+              "out_err": 0.23159129917621613,
+              "out_err_causal": 0.3023361265659332,
+              "dist_over_pack": 21.572244523062125,
+              "holds_mean": false,
+              "holds_worst": false,
+              "holds": false
+            }
+          }
+        }
+      }
+    }
+  },
+  "gate_outcome": "FAIL \u2014 the token-identity doctrine gets its first direct positive defense",
+  "confirmed": false,
+  "git_sha": "131eb1f",
+  "d_eff_all_layers": {
+    "0": 1.4632768849580853,
+    "1": 1.5135795009346558,
+    "2": 1.4744176332029868,
+    "3": 1.289292230391466,
+    "4": 1.3371618256763076,
+    "5": 1.214003889166058,
+    "6": 1.2262670952358037,
+    "7": 1.2139402716067336,
+    "8": 1.210842786358179,
+    "9": 1.2748333104697545,
+    "10": 1.3339160342029897,
+    "11": 1.4646025450313016
+  }
+}

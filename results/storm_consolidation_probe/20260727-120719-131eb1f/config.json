@@ -1,0 +1,15 @@
+{
+  "cache_path": "results/cache/qwen3-0.6b_2048.safetensors",
+  "pack_path": "results/cache/k4_packs_qwen3_06b.safetensors",
+  "model_label": "qwen3-0.6b",
+  "model_name": "Qwen/Qwen3-0.6B",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "kmeans_iters": 100,
+  "kmeans_restarts": 4,
+  "seed": 0,
+  "ridge": 0.001,
+  "out_root": ""
+}

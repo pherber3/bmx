@@ -1,0 +1,15 @@
+{
+  "cache_path": "results/cache/gpt2_1024.safetensors",
+  "pack_path": "results/cache/k4_packs_gpt2.safetensors",
+  "model_label": "gpt2",
+  "model_name": "",
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "kmeans_iters": 100,
+  "kmeans_restarts": 4,
+  "seed": 0,
+  "ridge": 0.001,
+  "out_root": ""
+}
