@@ -1,0 +1,283 @@
+{
+  "task": "storm Task-4 head-role regression",
+  "gate_verbatim": "R^2 >= 0.5 => role is real allocation signal (spec a role-prior lever). R^2 < 0.5 => honest null: the query-weighted spectrum already subsumes function.",
+  "primary_regression": "head-level OLS R^2 of log10(per-head lambda-mass total) on the role predictors, per model (declared in the module docstring before running)",
+  "budget": 2.5,
+  "main_event": "qwen3-0.6b (RoPE + QK-norm); gpt2 lacks the positional-frequency role component (no RoPE)",
+  "per_model": {
+    "gpt2": {
+      "model": "gpt2",
+      "rope": false,
+      "predictors": [
+        "qk_erank",
+        "q_conc",
+        "k_conc",
+        "ov_pos_mass"
+      ],
+      "primary_response": "log10_lam_total (per-head \u03bb-mass total)",
+      "head_level": {
+        "n": 144,
+        "ols_r2": 0.5140025139600672,
+        "ols_adj_r2": 0.5000169747934504,
+        "rank_ols_r2": 0.4046727543541401,
+        "coef_std": {
+          "qk_erank": 0.2892168031437646,
+          "q_conc": 0.4773500339661282,
+          "k_conc": -0.20889809276963567,
+          "ov_pos_mass": 0.08430484289045541
+        },
+        "univariate": {
+          "qk_erank": {
+            "r2": 0.02221087407467648,
+            "spearman": -0.32211638935776865
+          },
+          "q_conc": {
+            "r2": 0.33330111524894235,
+            "spearman": 0.5961618840929186
+          },
+          "k_conc": {
+            "r2": 0.08067375004011512,
+            "spearman": -0.38767783940197736
+          },
+          "ov_pos_mass": {
+            "r2": 0.0039019470595773598,
+            "spearman": 0.043363745030567134
+          }
+        },
+        "dominant_by_univariate_r2": "q_conc",
+        "dominant_by_abs_coef": "q_conc"
+      },
+      "head_level_top_share": {
+        "n": 144,
+        "ols_r2": 0.2858939557188571,
+        "ols_adj_r2": 0.26534414149493935,
+        "rank_ols_r2": 0.35922397813541107,
+        "coef_std": {
+          "qk_erank": 0.012922313008942109,
+          "q_conc": 0.0035862184483857803,
+          "k_conc": 0.04550834082364569,
+          "ov_pos_mass": -0.009152098995794868
+        },
+        "univariate": {
+          "qk_erank": {
+            "r2": 0.07179604225759606,
+            "spearman": 0.3481834257696327
+          },
+          "q_conc": {
+            "r2": 0.010879682275773739,
+            "spearman": -0.22324973876698015
+          },
+          "k_conc": {
+            "r2": 0.2664332391249995,
+            "spearman": 0.563089783779439
+          },
+          "ov_pos_mass": {
+            "r2": 0.0012453290346543522,
+            "spearman": -0.03715137035345146
+          }
+        },
+        "dominant_by_univariate_r2": "k_conc",
+        "dominant_by_abs_coef": "k_conc"
+      },
+      "layer_level": {
+        "n": 12,
+        "ols_r2": 0.805170676524483,
+        "ols_adj_r2": 0.6938396345384734,
+        "rank_ols_r2": 0.5255938179474505,
+        "coef_std": {
+          "qk_erank": 0.5794217059150875,
+          "q_conc": 0.32127433317317394,
+          "k_conc": -0.2428394427721377,
+          "ov_pos_mass": -0.3964246739688624
+        },
+        "univariate": {
+          "qk_erank": {
+            "r2": 2.971070642188156e-05,
+            "spearman": -0.5524475524475525
+          },
+          "q_conc": {
+            "r2": 0.5506695115374378,
+            "spearman": 0.6643356643356644
+          },
+          "k_conc": {
+            "r2": 0.04304689896614644,
+            "spearman": -0.43356643356643365
+          },
+          "ov_pos_mass": {
+            "r2": 0.1821666203330129,
+            "spearman": -0.41958041958041964
+          }
+        },
+        "dominant_by_univariate_r2": "q_conc",
+        "dominant_by_abs_coef": "qk_erank",
+        "spread_ratio": 86.65536717324935
+      },
+      "head_spread_ratio": 14942.721477108948,
+      "validation": {
+        "pack_lam_sum_reldiff_max": 3.911945058393719e-08,
+        "attribution_reldiff_max": 6.114146804017707e-08,
+        "block_diag_index_mean": 0.15723537345003033,
+        "block_diag_index_baseline": 0.08333333333333333,
+        "h": 12,
+        "h_kv": 12,
+        "d": 64,
+        "n_layers": 12
+      },
+      "gate": {
+        "r2": 0.5140025139600672,
+        "threshold": 0.5,
+        "gate_pass": true,
+        "outcome": "CONFIRM: role is real allocation signal (spec a role-prior lever)"
+      }
+    },
+    "qwen3-0.6b": {
+      "model": "qwen3-0.6b",
+      "rope": true,
+      "predictors": [
+        "qk_erank",
+        "q_conc",
+        "k_conc",
+        "ov_pos_mass",
+        "pos_peak_log1p"
+      ],
+      "primary_response": "log10_lam_total (per-head \u03bb-mass total)",
+      "head_level": {
+        "n": 224,
+        "ols_r2": 0.0821133301918322,
+        "ols_adj_r2": 0.061060883636599006,
+        "rank_ols_r2": 0.08300761494995768,
+        "coef_std": {
+          "qk_erank": -0.002551595372050273,
+          "q_conc": 0.06411203152144987,
+          "k_conc": 0.07212790110226307,
+          "ov_pos_mass": 0.04382581846435111,
+          "pos_peak_log1p": 0.12489415242535959
+        },
+        "univariate": {
+          "qk_erank": {
+            "r2": 0.0018303673170367851,
+            "spearman": 0.007938287422592357
+          },
+          "q_conc": {
+            "r2": 0.008122094968184168,
+            "spearman": 0.06744074311338885
+          },
+          "k_conc": {
+            "r2": 0.004720383512444859,
+            "spearman": 0.16372410847747174
+          },
+          "ov_pos_mass": {
+            "r2": 0.0017960287720750756,
+            "spearman": 0.005532607780919926
+          },
+          "pos_peak_log1p": {
+            "r2": 0.019730630640213853,
+            "spearman": 0.0970443030505301
+          }
+        },
+        "dominant_by_univariate_r2": "pos_peak_log1p",
+        "dominant_by_abs_coef": "pos_peak_log1p"
+      },
+      "head_level_top_share": {
+        "n": 224,
+        "ols_r2": 0.18364453115917911,
+        "ols_adj_r2": 0.16492078187383918,
+        "rank_ols_r2": 0.35885937650747435,
+        "coef_std": {
+          "qk_erank": 0.001823408352162846,
+          "q_conc": 0.0222975245229895,
+          "k_conc": 0.02575380843761488,
+          "ov_pos_mass": 0.002605507073163445,
+          "pos_peak_log1p": 0.0067341760190082
+        },
+        "univariate": {
+          "qk_erank": {
+            "r2": 0.09232995024848156,
+            "spearman": 0.39427290198590653
+          },
+          "q_conc": {
+            "r2": 0.11748509019767417,
+            "spearman": 0.4197298740123853
+          },
+          "k_conc": {
+            "r2": 0.13365329228257095,
+            "spearman": 0.5395910740978006
+          },
+          "ov_pos_mass": {
+            "r2": 0.00011358560715035715,
+            "spearman": -0.0374675183434058
+          },
+          "pos_peak_log1p": {
+            "r2": 0.04722624653245233,
+            "spearman": -0.27034774523792615
+          }
+        },
+        "dominant_by_univariate_r2": "k_conc",
+        "dominant_by_abs_coef": "k_conc"
+      },
+      "layer_level": {
+        "n": 28,
+        "ols_r2": 0.3685956220941281,
+        "ols_adj_r2": 0.22509462711552086,
+        "rank_ols_r2": 0.27385204479827696,
+        "coef_std": {
+          "qk_erank": 0.16836795634131047,
+          "q_conc": -0.0028780153554088528,
+          "k_conc": 0.07487573581381504,
+          "ov_pos_mass": 0.12882469480062791,
+          "pos_peak_log1p": 0.07321898776730959
+        },
+        "univariate": {
+          "qk_erank": {
+            "r2": 0.1763351247760524,
+            "spearman": 0.3404488232074439
+          },
+          "q_conc": {
+            "r2": 0.02856440275620098,
+            "spearman": 0.13738368910782706
+          },
+          "k_conc": {
+            "r2": 0.20029447011863966,
+            "spearman": 0.4406130268199233
+          },
+          "ov_pos_mass": {
+            "r2": 0.013866773275423072,
+            "spearman": 0.10180623973727422
+          },
+          "pos_peak_log1p": {
+            "r2": 0.04883391527452141,
+            "spearman": -0.1231527093596059
+          }
+        },
+        "dominant_by_univariate_r2": "k_conc",
+        "dominant_by_abs_coef": "qk_erank",
+        "spread_ratio": 15.840227263992178
+      },
+      "head_spread_ratio": 78.08322482828272,
+      "validation": {
+        "pack_lam_sum_reldiff_max": 3.804384194312812e-08,
+        "attribution_reldiff_max": 7.2991630717477e-08,
+        "block_diag_index_mean": 0.19069882879465044,
+        "block_diag_index_baseline": 0.125,
+        "h": 16,
+        "h_kv": 8,
+        "d": 128,
+        "n_layers": 28
+      },
+      "gate": {
+        "r2": 0.0821133301918322,
+        "threshold": 0.5,
+        "gate_pass": false,
+        "outcome": "honest null: the query-weighted spectrum already subsumes function"
+      }
+    }
+  },
+  "overall": {
+    "per_model_gate_pass": {
+      "gpt2": true,
+      "qwen3-0.6b": false
+    },
+    "outcome": "SPLIT: gpt2 CONFIRM; qwen3-0.6b honest null"
+  },
+  "git_sha": "feb10e4"
+}

@@ -1,0 +1,8 @@
+{
+  "models": [
+    "gpt2",
+    "qwen3-0.6b"
+  ],
+  "budget": 2.5,
+  "out_root": ""
+}
