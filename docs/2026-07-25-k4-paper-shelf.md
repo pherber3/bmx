@@ -145,6 +145,58 @@ until all results are in (user's call); this is the shelf, not the draft.
   (`5720588`); rotated-W is Llama-licensed (Qwen frozen-W by scope); the
   full incident record (rental doc §9) as ops-transparency material.
 
+## THE NEGATIVE-RESULTS APPENDIX (2026-07-27 — "what we tried and what
+## killed it"; the user plans this as an appendix or wherever it fits)
+
+Source docs: `2026-07-27-storm-gates-results.md` (the battery, reviewed),
+`2026-07-26-storm-kv-mechanisms-briefing.md` (provenance of the ideas),
+`2026-07-26-breakeven-blindspot-audit.md`, the chronicle Parts III/VII
+(the pre-storm negatives), and the quantizer declination ledger above.
+Every entry is a pre-registered gate with a measured kill and a mechanism —
+the appendix's thesis: **the codec's design is what remains after
+everything else measurably failed.** Suggested grouping:
+
+1. **Allocation/basis attempts (June era):** raw-basis waterfill (uniform
+   wins 32/32 — funded channels aren't query-read); eigenbasis KLT (wins
+   2.24× but +8 bpe per-sequence basis charge — the KV-side break-even
+   law; the kill that DESIGNED K4's amortization); structured/streamable
+   rotations (blockdiag 2× worse; frozen rotation drifts, eigengap ≈ 1).
+2. **Codec-refinement attempts (July era):** charge-aware allocation (the
+   plain budget knob walks the same locus); LW/OAS shrinkage (log-scale
+   waterfill amplifies relative tail lifts; c_used explodes); Gaussian-
+   Lloyd K codebooks (shape-matched RTN wins where the metric lives —
+   the tangent-normal/sphere-Gaussianization account); blanket int8
+   decoders (certified 54% implied degradation → rescued only tier-gated);
+   mean-centering (+0.038 bit at matched bpe); unbiased/aggregation
+   coding (2× variance never repaid; QJL-class collapses at softmax);
+   entropy coding (foreclosed by paged random access).
+3. **Alternative storage axes (the storm battery):** geometry-scored
+   token selection (leverage ≠ attention: 37–48% of true attention mass
+   dropped; the max-logit token itself dropped in 53–77% of cells; 28–68×
+   distortion loss at spectral budgets); two-tier speculative prefetch
+   (attention predictable only where static — content reads 0.36–0.46
+   mass coverage); sequence consolidation (7.7–30× at matched bits;
+   position-merging alone ~4.8× on the friendliest layer — token identity
+   defended); recompute-from-hidden (2.0× fp16-KV bytes on GQA geometry,
+   arithmetically); head-role priors (R²=0.08 on RoPE+QK-norm — the
+   spectrum subsumes function); per-read query conditioning (average W is
+   a sufficient statistic, gap 0.01–0.02 in-distribution); vMF/radial
+   codebooks (the radial coordinate is already ~92%-captured by the top
+   KLT direction); W_OV V-routing (GQA union fills the space).
+4. **Validations-by-failure worth stating positively:** sinks are priced
+   automatically by the W-metric (<0.5% of budget at 31–47% of attention
+   mass); prompt-policy robustness PASSES (retention ≥0.987; chat wrap
+   moves consumed moments ~30× less than document variation).
+5. **The two flags the appendix must not bury:** the per-event metric
+   FLAG (logit ranking is not a safe proxy in parity regimes; the
+   K-instrument cannot see the V-budget axis; the p99-tail screen
+   separates architecture fragility where means do not) and the
+   still-untested per-position scale schedule (spec'd, predicted null).
+
+Scope sentence for the appendix header: all battery results are mechanism
+scale (gpt2 / qwen3-0.6b, n=2 small models); the pre-storm negatives are
+gpt2-mechanism with Llama confirmations where noted in their docs.
+
 ## Numbers the headline tables cite (SUPERSEDED — pre-refit; see the rental
 ## additions above)
 
