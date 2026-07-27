@@ -93,6 +93,23 @@ until all results are in (user's call); this is the shelf, not the draft.
   OR sampling-limited" (cannot distinguish without shape stats); the
   measured high-tier values are real (platykurtic), do not pin analytic.
 
+## PRACTITIONER CAVEAT (2026-07-26, from
+## `2026-07-26-practitioner-adoption-review.md` — binding on the paper's
+## deployment section)
+
+- "Resident memory at speed parity" is **k2b_ph's** measured claim, NOT
+  k4's: the spectral arm has no fused decode kernel (routes chunked BY
+  DESIGN, `packed_streaming.py` — verified by the GH200 path probe) and its
+  end-to-end ms/token is UNMEASURED at any scale. The paper must state the
+  k4 systems claim as: resident memory (−20% vs fp16 @128k) with decode
+  latency an open engineering item (fused spectral kernel = the named
+  adoption blocker for serving personas). Do not let k2b's latency numbers
+  stand in for k4's.
+- k4 co-residency (seqs/GPU) is unmeasured (the 2.258 GiB/seq figure is
+  k2b) — next-rental item alongside k4 chunked ms/token.
+- Below ~5.6k context the pack charge makes k4's bits WORSE than tq_b3 —
+  the crossover is the claim, never a blanket win.
+
 ## RENTAL ADDITIONS (2026-07-26 — every number now measured; the pre-refit
 ## section below is superseded by `2026-07-26-gh200-rental-results.md`)
 
