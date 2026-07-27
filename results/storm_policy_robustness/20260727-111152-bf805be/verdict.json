@@ -1,0 +1,162 @@
+{
+  "task": "storm Task-5 prompt-policy pack robustness",
+  "model": "qwen3-0.6b",
+  "substrate_note": "qwen3-0.6b ONLY: gpt2 ships no chat template, so the CHAT policy is undefined there (qwen-only is in-scope per the plan)",
+  "scope_note": "mechanism scale; w_source=corpus, w_rope=frozen (the shipped mechanism-scale instrument default; the locked Llama-refit config uses w_rope=rotated \u2014 that axis is NOT probed here)",
+  "wrapping": "CHAT = same underlying wikitext slice wrapped as ONE user turn via apply_chat_template(add_generation_prompt=True, tokenize=True, return_dict=True) under tokenizer template defaults (Qwen3: thinking-mode default), content-trimmed so the wrapped stream is exactly S tokens \u2014 bmx.eval.layer_swap.chat_wrap_token_ids",
+  "fit_offsets": [
+    2048,
+    4096,
+    6144,
+    8192
+  ],
+  "heldout_offset": 0,
+  "n_layers": 28,
+  "gate": {
+    "threshold": 0.9,
+    "retention": {
+      "budget 2.2 raw_to_chat": 0.9882234730566593,
+      "budget 2.2 chat_to_raw": 0.9998720271731424,
+      "budget 2.5 raw_to_chat": 0.9874167938589524,
+      "budget 2.5 chat_to_raw": 0.9998819216492111
+    },
+    "min_retention": 0.9874167938589524,
+    "min_at": "budget 2.5 raw_to_chat",
+    "gate_pass": true,
+    "gate_outcome": "ROBUST \u2014 cross-policy win retention >= 0.9 of same-policy at every (budget, direction): the shipped-pack story survives the largest measured shift axis"
+  },
+  "gate_deploy_companion": {
+    "threshold": 0.9,
+    "retention": {
+      "budget 2.2 raw_to_chat": 0.988258538285085,
+      "budget 2.2 chat_to_raw": 0.9999627719047491,
+      "budget 2.5 raw_to_chat": 0.9874012085218238,
+      "budget 2.5 chat_to_raw": 1.0000318281226501
+    },
+    "min_retention": 0.9874012085218238,
+    "min_at": "budget 2.5 raw_to_chat",
+    "gate_pass": true,
+    "gate_outcome": "ROBUST \u2014 cross-policy win retention >= 0.9 of same-policy at every (budget, direction): the shipped-pack story survives the largest measured shift axis"
+  },
+  "deploy_gate_agrees": true,
+  "per_cell": {
+    "raw_pack_on_raw@b2.2": {
+      "win_model": 17.109651775699838,
+      "win_deploy": 14.31210417976439,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.3695765904017856,
+      "bpe_skeptic_deploy": 2.7110116141183034,
+      "extrapolated": false,
+      "n_layers": 28
+    },
+    "raw_pack_on_raw@b2.5": {
+      "win_model": 17.790901560107116,
+      "win_deploy": 14.601940406307792,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.6839163643973216,
+      "bpe_skeptic_deploy": 3.0519801548549106,
+      "extrapolated": false,
+      "n_layers": 28
+    },
+    "raw_pack_on_chat@b2.2": {
+      "win_model": 16.866516009251402,
+      "win_deploy": 14.110618684841947,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.3695765904017856,
+      "bpe_skeptic_deploy": 2.7110116141183034,
+      "extrapolated": false,
+      "n_layers": 28
+    },
+    "raw_pack_on_chat@b2.5": {
+      "win_model": 17.529082502302803,
+      "win_deploy": 14.389587661081675,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.6839163643973216,
+      "bpe_skeptic_deploy": 3.0519801548549106,
+      "extrapolated": false,
+      "n_layers": 28
+    },
+    "chat_pack_on_raw@b2.2": {
+      "win_model": 17.107462205195553,
+      "win_deploy": 14.311571367386746,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.3695504324776784,
+      "bpe_skeptic_deploy": 2.7107936314174106,
+      "extrapolated": false,
+      "n_layers": 28
+    },
+    "chat_pack_on_raw@b2.5": {
+      "win_model": 17.78880083979185,
+      "win_deploy": 14.602405158657973,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.683750697544643,
+      "bpe_skeptic_deploy": 3.0515529087611606,
+      "extrapolated": false,
+      "n_layers": 28
+    },
+    "chat_pack_on_chat@b2.2": {
+      "win_model": 17.067512024463287,
+      "win_deploy": 14.278266403170125,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.3695504324776784,
+      "bpe_skeptic_deploy": 2.7107936314174106,
+      "extrapolated": false,
+      "n_layers": 28
+    },
+    "chat_pack_on_chat@b2.5": {
+      "win_model": 17.75246543437537,
+      "win_deploy": 14.573192271683991,
+      "layer_win_frac_model": 1.0,
+      "layer_win_frac_deploy": 1.0,
+      "bpe_model": 2.683750697544643,
+      "bpe_skeptic_deploy": 3.0515529087611606,
+      "extrapolated": false,
+      "n_layers": 28
+    }
+  },
+  "per_layer_retention": {
+    "budget 2.2 raw_to_chat": {
+      "frac_layers_ge_gate": 1.0,
+      "min_layer_retention": 0.9678393821767808,
+      "median_layer_retention": 0.9884933428558471
+    },
+    "budget 2.2 chat_to_raw": {
+      "frac_layers_ge_gate": 1.0,
+      "min_layer_retention": 0.9914498439395436,
+      "median_layer_retention": 0.9983015893477879
+    },
+    "budget 2.5 raw_to_chat": {
+      "frac_layers_ge_gate": 1.0,
+      "min_layer_retention": 0.9683193130413436,
+      "median_layer_retention": 0.9878696121406354
+    },
+    "budget 2.5 chat_to_raw": {
+      "frac_layers_ge_gate": 1.0,
+      "min_layer_retention": 0.989325792082857,
+      "median_layer_retention": 0.9998115155785731
+    }
+  },
+  "shift_diagnostic": {
+    "definition": "jensen_gap_report([A,B]).log_gap = (1/C)[logdet((A+B)/2) - (logdet A + logdet B)/2] per layer; Sigma = pooled fit-corpus pre-RoPE key second moment, W = ridge-floored query moment (assemble_whitener squared)",
+    "units": "nats/dim",
+    "sigma_cross_mean": 0.0036471495005719412,
+    "sigma_cross_max": 0.006233386413808439,
+    "w_cross_mean": 0.0012315324148186378,
+    "w_cross_max": 0.0024408233294079817,
+    "sigma_cross_matched_mean": 0.0060932967998425834,
+    "w_cross_matched_mean": 0.0016794320210129002,
+    "sigma_within_mean": 0.19712664573967198,
+    "w_within_mean": 0.03892928821488867,
+    "sigma_cross_over_within": 0.030910569075930358,
+    "w_cross_over_within": 0.04314057867543015,
+    "note": "cross_over_within compares MATCHED 2-cache subsets on both sides so finite-sample log-det bias cancels to first order; the 4v4 cross gap is the headline magnitude"
+  },
+  "git_sha": "bf805be"
+}

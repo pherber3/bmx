@@ -1,0 +1,41 @@
+{
+  "model_name": "Qwen/Qwen3-0.6B",
+  "model_label": "qwen3-0.6b",
+  "seq_len": 2048,
+  "n_q_keep": 256,
+  "fit_offsets": [
+    2048,
+    4096,
+    6144,
+    8192
+  ],
+  "heldout_offset": 0,
+  "budgets": [
+    2.2,
+    2.5
+  ],
+  "tiers": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8
+  ],
+  "group": 64,
+  "ridge": 0.001,
+  "position_stride": 8,
+  "w_source": "corpus",
+  "w_rope": "frozen",
+  "tq_bits": [
+    2,
+    3,
+    4
+  ],
+  "seed": 0,
+  "collect_missing": true,
+  "cache_root": "results/cache",
+  "max_layers": 0,
+  "out_root": ""
+}

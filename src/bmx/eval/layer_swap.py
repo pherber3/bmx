@@ -155,6 +155,86 @@ def load_eval_tokens(
     return out
 
 
+def chat_wrap_token_ids(
+    tok, tokens: torch.Tensor, target_len: int, *, max_search: int = 8
+) -> torch.Tensor:
+    """Wrap a raw 1-D token stream as a SINGLE USER CHAT TURN, content-trimmed
+    so the wrapped stream has EXACTLY target_len tokens (storm Task-5's CHAT
+    collection policy; the single source of truth for what "chat-wrapped"
+    means in this codebase).
+
+    The wrapping: decode the leading n content tokens to text, then
+
+        tok.apply_chat_template([{"role": "user", "content": text}],
+                                add_generation_prompt=True, tokenize=True,
+                                return_dict=True, return_tensors="pt")
+
+    — so the wrapped stream is `<role header> + content + <end + generation
+    prompt>` under the tokenizer's own template defaults (for Qwen3 that is
+    the thinking-mode-default template). return_dict=True + ["input_ids"] is
+    the stable transformers-5.x interface: without it, fast tokenizers can
+    hand back a list of tokenizers.Encoding objects IGNORING return_tensors
+    (the 2026-07-06 on-VM trap; see bmx.cache.longbench.build_longbench_prompt).
+
+    Trimming: the template adds a deterministic-but-content-dependent number
+    of overhead tokens (role markers + generation prompt, plus decode→re-encode
+    boundary merges), so n is found iteratively: estimate the overhead by
+    wrapping the full target_len prefix, correct once by the residual length
+    error, then scan n within ±max_search for an exact hit. Fails fast
+    (AssertionError) if no content length wraps to exactly target_len.
+
+    Identity note: the content is TEXT-level identical to the raw stream's
+    prefix — decode→re-encode inside the template may re-tokenize boundaries,
+    so the CHAT policy is "the same underlying text, chat-wrapped", not a
+    token-level superset of the raw slice.
+    """
+    assert tokens.ndim == 1 and tokens.numel() >= target_len > 0, (
+        f"need a 1-D stream with >= target_len={target_len} tokens; "
+        f"got shape {tuple(tokens.shape)}"
+    )
+
+    def wrap(n: int) -> torch.Tensor:
+        text = tok.decode(tokens[:n], skip_special_tokens=True)
+        out = tok.apply_chat_template(
+            [{"role": "user", "content": text}],
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        ids = out["input_ids"]
+        assert torch.is_tensor(ids) and ids.dim() == 2 and ids.shape[0] == 1, (
+            f"apply_chat_template returned {type(ids)!r}; expected (1, L) ids tensor"
+        )
+        return ids[0]
+
+    full = wrap(target_len)
+    overhead = int(full.numel()) - target_len
+    assert overhead >= 0, (
+        f"chat template SHRANK the stream ({int(full.numel())} < {target_len}); "
+        "decode/re-encode is not near-identity for this tokenizer"
+    )
+    n = target_len - overhead
+    assert n > 0, f"template overhead {overhead} >= target_len {target_len}"
+    cur = wrap(n)
+    if cur.numel() != target_len:  # boundary merges: correct once ...
+        n = n - (int(cur.numel()) - target_len)
+        assert 0 < n <= tokens.numel(), f"corrected content length {n} out of range"
+        cur = wrap(n)
+    if cur.numel() == target_len:
+        return cur
+    for delta in range(1, max_search + 1):  # ... then scan a small window
+        for cand in (n - delta, n + delta):
+            if 0 < cand <= tokens.numel():
+                c = wrap(cand)
+                if c.numel() == target_len:
+                    return c
+    raise AssertionError(
+        f"no content length within ±{max_search} of {n} wraps to exactly "
+        f"{target_len} tokens (nearest attempt gave {int(cur.numel())})"
+    )
+
+
 def synth_stream(window: torch.Tensor, mode: str, seed: int) -> torch.Tensor:
     """Sample a same-length synthetic token stream from `window`'s own n-gram
     statistics (spec §3b: the 'synthesize calibration text from traffic token

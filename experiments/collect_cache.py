@@ -30,7 +30,7 @@ import torch
 import tyro
 
 from bmx.cache.collect import collect_cache, save_cache
-from bmx.eval.layer_swap import load_eval_tokens
+from bmx.eval.layer_swap import chat_wrap_token_ids, load_eval_tokens
 
 
 @dataclasses.dataclass
@@ -49,6 +49,13 @@ class Config:
     shuffle_seed: int = -1  # >=0 => seeded post-slice token shuffle (null corpus)
     synth: str = ""  # "" | "unigram" | "bigram" | "trigram" — §3b sampled stream
     synth_seed: int = -1  # required >=0 when synth set; recorded seed: 20260723
+    # ---- prompt policy (storm Task-5) --------------------------------------
+    # Wrap the token slice as ONE user chat turn via apply_chat_template,
+    # content-trimmed so the wrapped stream is exactly seq_len tokens (see
+    # bmx.eval.layer_swap.chat_wrap_token_ids for the exact wrapping contract).
+    # Default False is byte-exact inert (pinned by
+    # tests/test_storm_policy_robustness.py); True requires --corpus-label.
+    chat_wrap: bool = False
     corpus_label: str = ""  # REQUIRED when any corpus knob above is non-default
 
 
@@ -93,11 +100,29 @@ def _out_path(cfg: Config) -> Path:
     )
 
 
+def _maybe_chat_wrap(cfg: Config, tokens: torch.Tensor, tok=None) -> torch.Tensor:
+    """Flag-gated CHAT-policy wrap (storm Task-5). chat_wrap=False returns
+    `tokens` UNCHANGED — the IDENTICAL object, so the default collect path is
+    byte-exact inert (pinned by tests/test_storm_policy_robustness.py).
+    chat_wrap=True wraps the slice as a single user turn via
+    `chat_wrap_token_ids`, content-trimmed so the wrapped stream is exactly
+    cfg.seq_len tokens. `tok` is injectable for offline tests; None loads
+    cfg.model_name's tokenizer."""
+    if not cfg.chat_wrap:
+        return tokens
+    if tok is None:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(cfg.model_name)
+    return chat_wrap_token_ids(tok, tokens, target_len=cfg.seq_len)
+
+
 def main(cfg: Config) -> None:
-    # Never overwrite wikitext-named caches with a different corpus's content.
-    assert _corpus_is_default(cfg) or cfg.corpus_label, (
-        "non-default corpus knobs require --corpus-label so the output name "
-        "encodes the corpus"
+    # Never overwrite wikitext-named caches with a different corpus's (or a
+    # different prompt policy's) content.
+    assert (_corpus_is_default(cfg) and not cfg.chat_wrap) or cfg.corpus_label, (
+        "non-default corpus knobs (incl. --chat-wrap) require --corpus-label so "
+        "the output name encodes the corpus"
     )
     out_path = _out_path(cfg)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,6 +150,9 @@ def main(cfg: Config) -> None:
         synth=cfg.synth,
         synth_seed=cfg.synth_seed,
     )
+    if cfg.chat_wrap:
+        print(f"Chat-wrapping slice to exactly {cfg.seq_len} tokens", flush=True)
+    tokens = _maybe_chat_wrap(cfg, tokens)
     input_ids = tokens.unsqueeze(0)  # (1, S)
 
     # Collect
