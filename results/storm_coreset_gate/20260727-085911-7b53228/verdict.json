@@ -1,0 +1,238 @@
+{
+  "task": "storm Task-2 leverage-score token coreset gate",
+  "model": "gpt2",
+  "n_sinks": 4,
+  "gate_win_frac": 0.9,
+  "per_level": {
+    "2": {
+      "best_uniform_arm_mode": "turboquant_mse@2",
+      "mean_best_uniform_dist": 0.20038717364271483,
+      "n_layers": 12,
+      "per_variant": {
+        "cs_r16": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9333031127850214,
+          "mean_drop_mass": 0.5997139985362688,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.1259765625
+        },
+        "cs_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9362812538941702,
+          "mean_drop_mass": 0.6016959324479103,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.1259765625
+        },
+        "cs_r64": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9329108397165934,
+          "mean_drop_mass": 0.6103130926688513,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.1259765625
+        },
+        "cs_rstable": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9027201881011327,
+          "mean_drop_mass": 0.5684667627016703,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.1259765625
+        },
+        "mixed_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8361602127552032,
+          "mean_drop_mass": 0.21099504580100378,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.34375
+        }
+      },
+      "best_variant": "cs_r16",
+      "best_variant_win_frac": 0.0
+    },
+    "2.2": {
+      "best_uniform_arm_mode": "spectral@2.2",
+      "mean_best_uniform_dist": 0.019182963646017015,
+      "n_layers": 12,
+      "per_variant": {
+        "cs_r16": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9210942834615707,
+          "mean_drop_mass": 0.585660956799984,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.14713541666666666
+        },
+        "cs_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9249743322531382,
+          "mean_drop_mass": 0.5868051648139954,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.14713541666666666
+        },
+        "cs_r64": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9219261854887009,
+          "mean_drop_mass": 0.5949285750587782,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.14713541666666666
+        },
+        "cs_rstable": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8885713915030161,
+          "mean_drop_mass": 0.5501539086302122,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.14713541666666666
+        },
+        "mixed_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8220270673433939,
+          "mean_drop_mass": 0.204347662627697,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.3658854166666667
+        }
+      },
+      "best_variant": "cs_r16",
+      "best_variant_win_frac": 0.0
+    },
+    "2.5": {
+      "best_uniform_arm_mode": "spectral@2.5",
+      "mean_best_uniform_dist": 0.01587785144026081,
+      "n_layers": 12,
+      "per_variant": {
+        "cs_r16": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9086558272441229,
+          "mean_drop_mass": 0.572725273668766,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.16666666666666666
+        },
+        "cs_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9142529318730036,
+          "mean_drop_mass": 0.5741343423724174,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.16666666666666666
+        },
+        "cs_r64": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.9112896223862966,
+          "mean_drop_mass": 0.5816173255443573,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.16666666666666666
+        },
+        "cs_rstable": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.87685227394104,
+          "mean_drop_mass": 0.5319860329230627,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.16666666666666666
+        },
+        "mixed_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8092496544122696,
+          "mean_drop_mass": 0.19776331074535847,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.3854166666666667
+        }
+      },
+      "best_variant": "cs_r16",
+      "best_variant_win_frac": 0.0
+    },
+    "3": {
+      "best_uniform_arm_mode": "spectral@3",
+      "mean_best_uniform_dist": 0.011637785394365588,
+      "n_layers": 12,
+      "per_variant": {
+        "cs_r16": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8895761122306188,
+          "mean_drop_mass": 0.5511202787359556,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.19889322916666666
+        },
+        "cs_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8961447328329086,
+          "mean_drop_mass": 0.5521331702669462,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.19889322916666666
+        },
+        "cs_r64": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8935952732960383,
+          "mean_drop_mass": 0.5557224303483963,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.19889322916666666
+        },
+        "cs_rstable": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.856971283753713,
+          "mean_drop_mass": 0.5027372141679128,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.19889322916666666
+        },
+        "mixed_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.7922641634941101,
+          "mean_drop_mass": 0.19296937125424543,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.4020182291666667
+        }
+      },
+      "best_variant": "cs_r16",
+      "best_variant_win_frac": 0.0
+    },
+    "4": {
+      "best_uniform_arm_mode": "turboquant_mse@4",
+      "mean_best_uniform_dist": 0.04477060120552778,
+      "n_layers": 12,
+      "per_variant": {
+        "cs_r16": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8535579691330591,
+          "mean_drop_mass": 0.510549321770668,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.2566731770833333
+        },
+        "cs_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.862804189324379,
+          "mean_drop_mass": 0.514215831955274,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.2566731770833333
+        },
+        "cs_r64": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8607988903919855,
+          "mean_drop_mass": 0.5101315279801687,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.2566731770833333
+        },
+        "cs_rstable": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.8222215473651886,
+          "mean_drop_mass": 0.4514077405134837,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.2566731770833333
+        },
+        "mixed_r32": {
+          "layer_win_frac": 0.0,
+          "mean_dist": 0.7633204658826193,
+          "mean_drop_mass": 0.18054237154622874,
+          "max_worst_ratio": 1.0,
+          "mean_kept_frac": 0.443603515625
+        }
+      },
+      "best_variant": "cs_r16",
+      "best_variant_win_frac": 0.0
+    }
+  },
+  "gate_outcome": "honest negative \u2014 coreset loses everywhere at matched bits",
+  "confirmed": false,
+  "mechanism": [
+    "softmax-denominator bias (47.9% of true causal attention mass lands on dropped tokens, mean over selection rows; max 87.6%)",
+    "worst-case needle loss (a dropped token carries a logit up to 1.00x the max true causal logit \u2014 under eviction that logit error is the full logit)"
+  ],
+  "drop_mass_mean": 0.4786234284026755,
+  "drop_mass_max": 0.8756401538848877,
+  "worst_ratio_max": 1.0,
+  "git_sha": "7b53228"
+}
